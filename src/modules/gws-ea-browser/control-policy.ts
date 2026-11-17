@@ -135,6 +135,9 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind =
 
 const ACTION_PARAMETER = /^(?:action|operation|intent|command|do)$/iu;
 const PROSE_WORDS = 4;
+const submissionBooking = /\b(?:book(?:ings?)?|reserv(?:e|ations?)|appointments?)\b/iu;
+const submissionLookup =
+  /\b(?:search|availability|available|lookup|slots?|times?|quote|estimate|preview|check|cart)\b/iu;
 
 function navigationEvidence(url: URL): string | undefined {
   try {
@@ -147,14 +150,16 @@ function navigationEvidence(url: URL): string | undefined {
   }
 }
 
-function routeWords(url: URL): string | undefined {
+function pathnameWords(url: URL): string | undefined {
   try {
     decodeURIComponent(url.search);
-    return [
-      ...url.pathname.split('/').map((segment) => decodeURIComponent(segment)),
-      ...[...url.searchParams].map(([name, value]) => (ACTION_PARAMETER.test(name) ? `${name} ${value}` : name)),
-    ]
-      .map((piece) => piece.replace(/[_/-]+/gu, ' ').trim())
+    return url.pathname
+      .split('/')
+      .map((segment) =>
+        decodeURIComponent(segment)
+          .replace(/[_/-]+/gu, ' ')
+          .trim(),
+      )
       .filter((piece) => piece && piece.split(/\s+/u).length < PROSE_WORDS)
       .join(' ');
   } catch (error) {
@@ -163,11 +168,53 @@ function routeWords(url: URL): string | undefined {
   }
 }
 
+function routeWords(url: URL, pathOnly: string): string {
+  const paramKeys = [...url.searchParams]
+    .filter(([name]) => !ACTION_PARAMETER.test(name))
+    .map(([name]) => name.replace(/[_/-]+/gu, ' ').trim())
+    .filter((piece) => piece && piece.split(/\s+/u).length < PROSE_WORDS);
+  return [pathOnly, ...paramKeys].filter(Boolean).join(' ');
+}
+
 function actionParameterWords(url: URL): string {
   return [...url.searchParams]
     .filter(([name]) => ACTION_PARAMETER.test(name))
     .map(([name, value]) => `${name} ${value}`.replace(/[_/-]+/gu, ' ').trim())
     .join(' ');
+}
+
+function submissionCommits(words: string, pathOnly: string): boolean {
+  return (
+    commitPurchase.test(words) ||
+    purchaseRoute.test(words) ||
+    purchase.test(words) ||
+    (submissionBooking.test(pathOnly) && !submissionLookup.test(pathOnly))
+  );
+}
+
+/**
+ * Whether a non-GET script or form submission targets a purchase or booking commit endpoint, independent of
+ * whether query parameters also carry security or speaking terms.
+ */
+export function isPurchaseSubmissionUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch (_error) {
+    return true;
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return true;
+  const pathOnly = pathnameWords(url);
+  if (pathOnly === undefined) return true;
+  const words = routeWords(url, pathOnly);
+  const actions = actionParameterWords(url);
+  const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
+  if (reviewed === 'ordinary' && !actions) return false;
+  if (reviewed === 'purchase_control') return true;
+  return (
+    submissionCommits(words, pathOnly) ||
+    Boolean(actions && (purchase.test(actions) || purchaseRoute.test(actions) || submissionBooking.test(actions)))
+  );
 }
 
 /**
@@ -184,18 +231,21 @@ export function classifyNavigationUrl(raw: string, purpose: NavigationUrlPurpose
     return 'blocked_address';
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return 'blocked_address';
-  const words = routeWords(url);
-  if (words === undefined) return 'blocked_address';
+  const pathOnly = pathnameWords(url);
+  if (pathOnly === undefined) return 'blocked_address';
+  const words = routeWords(url, pathOnly);
   const actions = actionParameterWords(url);
-  if (security.test(words) || securityRoute.test(words) || security.test(actions) || securityRoute.test(actions))
-    return 'account_security';
-  if (speaking.test(words) || speaking.test(actions)) return 'speaks_as_principal';
+  if (security.test(words) || securityRoute.test(words)) return 'account_security';
+  if (speaking.test(words)) return 'speaks_as_principal';
   const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
-  if (reviewed === 'ordinary' && ![...url.searchParams.keys()].some((name) => ACTION_PARAMETER.test(name)))
-    return 'ordinary';
-  if (commitPurchase.test(words) || purchaseRoute.test(words) || purchase.test(actions) || purchaseRoute.test(actions))
-    return 'purchase_control';
+  if (reviewed === 'ordinary' && !actions) return 'ordinary';
+  if (commitPurchase.test(words) || purchaseRoute.test(words)) return 'purchase_control';
   if (purpose === 'submission' && purchase.test(words)) return 'purchase_control';
+  if (actions) {
+    if (security.test(actions) || securityRoute.test(actions)) return 'account_security';
+    if (speaking.test(actions)) return 'speaks_as_principal';
+    if (purchase.test(actions) || purchaseRoute.test(actions)) return 'purchase_control';
+  }
   return reviewed && reviewed !== 'ordinary' ? reviewed : 'ordinary';
 }
 

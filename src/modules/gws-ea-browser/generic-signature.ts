@@ -91,7 +91,7 @@ const VOCABULARY = {
     /\b(?:fees?|charges?|charged|deposits?|pre-?pa(?:y|id|yment)|payments?|pay|billing|billed|trial|subscriptions?|membership\s+fees?|credit\s+card|debit\s+card)\b|\b(?:card|payment|authori[sz]ation)\s+hold\b/iu,
   /** Wording that denies a charge: "No payment is needed", "No credit card required". A no-show is no denial. */
   negated:
-    /\b(?:no|without|zero)\s+(?!show\b)(?:\w+\s+){0,2}(?:fees?|charges?|deposits?|payments?|pre-?payment|credit\s+card|debit\s+card|card|billing)\b|\b(?:payments?|cards?|credit\s+cards?|deposits?|fees?)\s+(?:is\s+|are\s+)?not\s+(?:needed|required|charged)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b|\bfree\s+of\s+charge\b/iu,
+    /\b(?:no|without|zero)\s+(?!show\b)(?:\w+\s+){0,2}(?:fees?|charges?|surcharges?|penalt(?:y|ies)|deposits?|payments?|pre-?payment|credit\s+card|debit\s+card|card|billing)\b|\b(?:payments?|cards?|credit\s+cards?|deposits?|fees?|surcharges?|penalt(?:y|ies))\s+(?:is\s+|are\s+)?not\s+(?:needed|required|charged)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b|\bfree\s+of\s+charge\b/iu,
   conditionalFee:
     /\b(?:cancell?ation|no[\s-]?shows?|late[\s-]?cancell?ation)\b.{0,60}?\b(?:fees?|charges?|penalt(?:y|ies))\b|\b(?:fees?|charges?|penalt(?:y|ies))\b.{0,60}?\b(?:cancel\w*|no[\s-]?shows?)\b|\bcharged\s+if\s+you\s+(?:miss|cancel|do\s+not\s+show|don'?t\s+show)\b/iu,
   noShow: /\bno[\s-]?shows?\b|\bmiss\s+your\b|\bdo(?:n'?t|\s+not)\s+show\b/iu,
@@ -211,7 +211,12 @@ function undenied(text: string): string {
 }
 
 function chargeWording(text: string): boolean {
-  return VOCABULARY.freeBlocker.test(undenied(text));
+  const words = undenied(text);
+  return (
+    VOCABULARY.freeBlocker.test(words) ||
+    VOCABULARY.unpricedFeeWording.test(words) ||
+    VOCABULARY.cardRequired.test(words)
+  );
 }
 
 /** The amounts a line labels: its own, or those alone on the line after a short label ("Order total", "$42.00"). */
@@ -363,22 +368,31 @@ function readTerms(
   lines: readonly Line[],
   booking: GenericBookingFacts | undefined,
   now: number,
-): { terms: FinancialCommitment[]; missing: string[]; boxes: CheckoutBox[]; currencies: string[] } {
+): {
+  terms: FinancialCommitment[];
+  missing: string[];
+  boxes: CheckoutBox[];
+  currencies: string[];
+  consumed: Set<number>;
+} {
   const terms: FinancialCommitment[] = [];
   const missing: string[] = [];
   const boxes: CheckoutBox[] = [];
   const currencies: string[] = [];
   const recurringTerms: FinancialCommitment[] = [];
+  const consumed = new Set<number>();
   for (let index = 0; index < lines.length; index++) {
     let line = lines[index];
     const words = undenied(line.text);
     const kind = TERM_KINDS.find((term) => term.wording.test(words) && (!term.priced || line.money.length > 0))?.kind;
     if (!kind) continue;
+    consumed.add(index);
     // A label alone on its line, whose terms stand on the next: "Cancellation fee", then "$25 per person…".
     const next = lines[index + 1];
     if (!line.money.length && next?.money.length && !VOCABULARY.total.test(next.text)) {
       line = { text: `${line.text}: ${next.text}`, box: union([line.box, next.box]), money: next.money };
       index++;
+      consumed.add(index);
     }
     const charge = line.money.at(0);
     if (charge) {
@@ -436,7 +450,7 @@ function readTerms(
       if (!term.frequency) missing.push('the recurring frequency');
       if (term.amountMinor === undefined) missing.push('the price after the trial');
     }
-  return { terms, missing: distinct(missing), boxes, currencies: distinct(currencies) };
+  return { terms, missing: distinct(missing), boxes, currencies: distinct(currencies), consumed };
 }
 
 function readItems(
@@ -606,7 +620,7 @@ export function decideGenericCheckout(
     };
   }
 
-  const { terms, missing, boxes: termBoxes, currencies } = readTerms(lines, booking, now);
+  const { terms, missing, boxes: termBoxes, currencies, consumed } = readTerms(lines, booking, now);
   const totals: Array<{ money: ConfirmationCharge; boxes: CheckoutBox[] }> = [];
   const dues: ConfirmationCharge[] = [];
   let nothingNow = false;
@@ -619,13 +633,18 @@ export function decideGenericCheckout(
     else for (const amount of money) totals.push({ money: amount, boxes });
   });
   const totalValues = distinct(totals.map((total) => total.money));
-  if (
-    !missing.length &&
-    !terms.length &&
-    !totalValues.length &&
-    lines.some((line) => !line.money.length && VOCABULARY.unpricedFeeWording.test(undenied(line.text)))
-  )
-    missing.push('the fee amount');
+  const hasUnpricedFee = lines.some((line, index) => {
+    if (consumed.has(index) || !VOCABULARY.unpricedFeeWording.test(undenied(line.text))) return false;
+    if (statedAmounts(line.text).length > 0 || /\bfree\b/iu.test(line.text) || VOCABULARY.nothingNow.test(line.text))
+      return false;
+    if (VOCABULARY.total.test(line.text) && labelled(lines, index).money.length > 0) return false;
+    const next = lines[index + 1];
+    return !(
+      next &&
+      ((statedAmounts(next.text).length > 0 && !VOCABULARY.total.test(next.text)) || /\bfree\b/iu.test(next.text))
+    );
+  });
+  if (hasUnpricedFee) missing.push('the fee amount');
   if (missing.length) return { status: 'facts_incomplete', missing: distinct(missing) };
 
   const partySize = booking?.partySize ?? 1;

@@ -552,9 +552,12 @@ export async function browserRefForElement(
     return [...current, ...refs(tree.children)];
   };
   for (const ref of refs(structure.tree)) {
-    const sameElement = await page
-      .getByRef(ref)
-      .evaluate((node, other) => node === other, element)
+    const candidate = page.getByRef(ref);
+    const sameElement = await candidate
+      .count()
+      .then((count) =>
+        count > 0 ? candidate.evaluate((node, other) => node === other, element, { timeout: 500 }) : false,
+      )
       .catch(() => false);
     if (sameElement) {
       if (state.generation !== generation || state.scope !== scope || !(await mainDocumentCurrent(page, scope)))

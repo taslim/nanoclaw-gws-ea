@@ -824,13 +824,25 @@ it('refuses only script requests that are no GET, to a payment processor or a pu
     ['PUT', 'https://checkoutshopper-live.adyen.com/checkoutshopper/v1/payments'],
     ['POST', 'https://pay.shopify.com/session'],
     ['POST', 'https://shop.example/api/checkout/submit'],
+    ['POST', 'https://bistro.example/api/reservations'],
+    ['POST', 'https://salon.example/api/bookings?time=19%3A00'],
+    ['POST', 'https://salon.example/api/appointments'],
+    ['POST', 'https://shop.example/api/charge?action=please-change-password-now'],
   ])
     expect(refusedScriptRequest({ method, url })).toBe(true);
   for (const [method, url] of [
     ['GET', 'https://api.stripe.com/v1/elements/sessions'],
     ['POST', 'https://shop.example/api/cart/add'],
+    ['POST', 'https://bistro.example/api/reservations/availability'],
+    ['POST', 'https://salon.example/api/bookings/search'],
     ['POST', 'https://notstripe.com/collect'],
     ['POST', 'https://www.google.com/recaptcha/api2/reload'],
   ])
     expect(refusedScriptRequest({ method, url })).toBe(false);
+  expect(classifyNavigationUrl('https://shop.example/api/charge?action=please-change-password-now', 'submission')).toBe(
+    'purchase_control',
+  );
+  expect(isolatedFacts.PAGE_VOCABULARY.commitName.test('Appointment options')).toBe(false);
+  expect(isolatedFacts.PAGE_VOCABULARY.commitName.test('Confirm appointment')).toBe(true);
+  expect(isolatedFacts.PAGE_VOCABULARY.commitName.test('Complete appointment')).toBe(true);
 });

@@ -18,6 +18,7 @@ import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from '.
 import {
   classifyControlFacts,
   classifyNavigationUrl,
+  isPurchaseSubmissionUrl,
   pressesControl,
   reviewedMerchantFlow,
   type ActionClass,
@@ -372,7 +373,7 @@ export function refusedScriptRequest(
   const url = new URL(request.url);
   const host = url.hostname.toLowerCase();
   if (paymentProcessorHost(host)) return true;
-  if (classifyNavigationUrl(url.href, 'submission') !== 'purchase_control') return false;
+  if (!isPurchaseSubmissionUrl(url.href)) return false;
   for (const admission of admissions)
     if (admission.matches(url) && admission.classify(url) === 'purchase_control') return false;
   return true;

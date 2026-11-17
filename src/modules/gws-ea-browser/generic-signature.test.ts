@@ -414,9 +414,43 @@ describe('the free-commit test', () => {
         {
           ...table,
           lines: ['Party size 2', 'A booking surcharge applies.'],
-          fields: [party, cardInput, email('aya.web@example.test')],
+          fields: [party],
         },
         'table.example',
+      ),
+    ).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the fee amount'],
+    });
+    expect(
+      decide(
+        {
+          ...table,
+          lines: ['Party size 2', 'A card is required to hold this table.'],
+          fields: [party],
+        },
+        'table.example',
+      ),
+    ).toEqual({
+      status: 'card_needed',
+      needed: { site: 'table.example', account: 'guest checkout', items: ['Party size 2'] },
+    });
+    expect(
+      decide(
+        {
+          label: 'Confirm appointment',
+          lines: [
+            'Due now: $0.00',
+            'No-show fee: $25.00 if you miss your appointment.',
+            'A booking surcharge applies.',
+            'No credit card is required — pay at the salon.',
+          ],
+          fields: [email('aya.web@example.test')],
+          times: [{ datetime: '2026-11-20T14:00:00-08:00', text: 'Friday, November 20 at 2:00 PM' }],
+          frameUrl: 'https://salon.example/book/confirm',
+          frames: [frame({ url: 'https://salon.example/book/confirm', heading: 'Cedar Studio' })],
+        },
+        'salon.example',
       ),
     ).toEqual({
       status: 'facts_incomplete',

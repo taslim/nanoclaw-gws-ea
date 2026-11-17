@@ -1,7 +1,12 @@
 import type { ElementHandle, Page } from 'playwright-core';
 import type { ActivationIntent } from './commit-classifier.js';
 import { BrowserConsentStop, runConsentPass } from './consent.js';
-import { classifyNavigationUrl, type ActionClass, type ReviewedMerchantFlow } from './control-policy.js';
+import {
+  classifyNavigationUrl,
+  isPurchaseSubmissionUrl,
+  type ActionClass,
+  type ReviewedMerchantFlow,
+} from './control-policy.js';
 import { genericCheckoutSignature } from './generic-signature.js';
 
 /**
@@ -88,7 +93,10 @@ export async function approvedPress(
   return {
     origin: checkout.origin,
     matches: (url) => url.origin === checkout.origin,
-    classify: (url) => classifyNavigationUrl(url.href, 'submission'),
+    classify: (url) => {
+      const nav = classifyNavigationUrl(url.href, 'submission');
+      return nav === 'ordinary' && isPurchaseSubmissionUrl(url.href) ? 'purchase_control' : nav;
+    },
   };
 }
 
