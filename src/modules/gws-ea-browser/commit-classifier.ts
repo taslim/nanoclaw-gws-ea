@@ -22,6 +22,7 @@ import {
   reviewedMerchantFlow,
   type ActionClass,
   type ActivationKind,
+  type NavigationUrlPurpose,
   type ReviewedMerchantFlow,
 } from './control-policy.js';
 import type { ConsentScope } from './consent.js';
@@ -203,7 +204,7 @@ export interface BrowserNavigationPolicy {
    * A refusal here replaces the generic class; `ordinary` replaces only an approved press's refusal of a route its
    * flow does not know.
    */
-  classify?(url: URL): ActionClass;
+  classify?(url: URL, document?: NavigationDocument): ActionClass;
   stripReferrer?: boolean;
   /** Every document the scope loads must be a GET, or it is refused as `read_only`. */
   readOnly?: boolean;
@@ -264,6 +265,10 @@ export function registrableSite(raw: string): string | undefined {
   return getDomain(url.hostname, { allowPrivateDomains: true }) ?? undefined;
 }
 
+function documentPurpose(method: string | undefined): NavigationUrlPurpose {
+  return method?.toUpperCase() === 'GET' ? 'document' : 'submission';
+}
+
 /**
  * A document no operation asked for: page script acting between operations. It loads only when it is a GET the
  * open rule calls ordinary, on the site the job's lease admitted the page to; a frame's document, or a window's,
@@ -275,7 +280,7 @@ function decideIdleDocument(
   pageUrl: string,
   leasedSite: string | undefined,
 ): ActionClass {
-  const classification = classifyNavigationUrl(url);
+  const classification = classifyNavigationUrl(url, documentPurpose(document.method));
   if (classification !== 'ordinary') return classification;
   const site = registrableSite(document.topLevel ? url : pageUrl);
   return document.method === 'GET' && site !== undefined && site === leasedSite ? 'ordinary' : 'blocked_address';
@@ -292,7 +297,7 @@ async function decideNavigation(
   approved: ApprovedPress | undefined,
   idle: () => ActionClass,
 ): Promise<ActionClass | 'site_busy' | 'read_only'> {
-  let classification: ActionClass = classifyNavigationUrl(url);
+  let classification: ActionClass = classifyNavigationUrl(url, documentPurpose(document.method));
   const target = URL.canParse(url) ? new URL(url) : undefined;
   // Whether the approved press refused a route its flow does not know: a sign-in scope's own reading replaces it.
   let pressRefused = false;
@@ -324,7 +329,7 @@ async function decideNavigation(
     if (!policy.classify) continue;
     let scoped: ActionClass;
     try {
-      scoped = policy.classify(new URL(url));
+      scoped = policy.classify(new URL(url), document);
     } catch (_error) {
       scoped = 'blocked_address';
     }
@@ -367,7 +372,7 @@ export function refusedScriptRequest(
   const url = new URL(request.url);
   const host = url.hostname.toLowerCase();
   if (paymentProcessorHost(host)) return true;
-  if (classifyNavigationUrl(url.href) !== 'purchase_control') return false;
+  if (classifyNavigationUrl(url.href, 'submission') !== 'purchase_control') return false;
   for (const admission of admissions)
     if (admission.matches(url) && admission.classify(url) === 'purchase_control') return false;
   return true;

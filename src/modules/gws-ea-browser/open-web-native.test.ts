@@ -53,7 +53,7 @@ import {
   withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
-import { freePressInProgress } from './free-press.js';
+import { currentFreeDialog, freePressInProgress } from './free-press.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
 import { BrowserDiagnosticAttempt } from './diagnostics.js';
@@ -2591,7 +2591,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
   });
 
   it('presses Continue then Place order under one card, as one attempt', async () => {
-    expect(classifyNavigationUrl(GENERIC.placeOrder)).toBe('purchase_control');
+    expect(classifyNavigationUrl(GENERIC.placeOrder, 'document')).toBe('purchase_control');
     await open(GENERIC.steps);
     expect(await purchase('Continue')).toMatchObject({ status: 'awaiting_principal' });
     await approve((await approvals())[0]);
@@ -2794,6 +2794,339 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     await approve((await approvals())[0]);
     expect(await attempts()).toMatchObject([
       { site: 'osteria.example', platform: 'tables.example', resolution: 'committed', merchant_record_id: 'OJ-818' },
+    ]);
+  });
+
+  it('prepares a multi-step venue booking without approval at entry, refuses a sneaky link POST without a purchase target, and stops recipe replay at a free final booking', async () => {
+    const entry = 'https://salon.example/book-now/cedar-studio-9x2k/all-offer';
+    const provider = 'https://salon.example/providers/cedar-studio-9x2k';
+    const services = 'https://salon.example/providers/cedar-studio-9x2k/services';
+    const confirm = 'https://salon.example/providers/cedar-studio-9x2k/confirm';
+    const booked = 'https://salon.example/providers/cedar-studio-9x2k/booked';
+    fixture.serve(entry, () => ({ status: 302, headers: { location: provider } }));
+    fixture.serve(
+      provider,
+      htmlPage(
+        'Cedar Studio',
+        `<h1>Cedar Studio</h1><a href="/providers/cedar-studio-9x2k/services">Book now</a><a id="sneaky-fetch" href="/providers/cedar-studio-9x2k/services">Check availability</a><a id="sneaky-redirect" href="/providers/cedar-studio-9x2k/services">Instant book</a>`,
+        `document.getElementById('sneaky-fetch').addEventListener('click', (event) => { event.preventDefault(); fetch('/api/checkout/charge', { method: 'POST', body: 'card=1' }).catch(() => undefined); });
+document.getElementById('sneaky-redirect').addEventListener('click', (event) => { event.preventDefault(); location.assign('/checkout/placeorder'); });`,
+      ),
+    );
+    fixture.serve(
+      services,
+      htmlPage(
+        'Select a service',
+        `<h1>Select a service</h1><button type="button" id="pick">Cut &amp; finish</button><button type="button" id="prelim" disabled>Book now</button><button type="button" id="continue-step" disabled>Continue</button>`,
+        `document.getElementById('pick').addEventListener('click', () => { document.getElementById('prelim').disabled = false; document.getElementById('continue-step').disabled = false; });
+document.getElementById('continue-step').addEventListener('click', () => { location.assign('/providers/cedar-studio-9x2k/confirm'); });`,
+      ),
+    );
+    fixture.serve(
+      confirm,
+      htmlPage(
+        'Confirm appointment',
+        `<h1>Cedar Studio</h1><form method="post" action="/providers/cedar-studio-9x2k/booked"><label>Party size <select name="party"><option selected>1</option></select></label><p>Cut &amp; finish on <time datetime="2026-10-24T11:00:00-07:00">Saturday, October 24, 11:00 AM</time></p><p>No payment is needed to reserve.</p><button type="submit">Complete reservation</button></form>`,
+      ),
+    );
+    fixture.serve(booked, placedPage('CS-1100', '$0.00'));
+
+    // A sneaky script POST on an ordinary link is aborted, while a sneaky redirect to a commit route stops with continuation refused and no target.
+    expect(await open(entry)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(page.url()).toBe(provider);
+    expect(
+      await run('sneaky-fetch', [{ kind: 'click', ...refIn(await observePage(page), 'Check availability') }]),
+    ).toMatchObject({ status: 'completed' });
+    expect(posts()).toEqual([]);
+    const sneaky = await run('sneaky-redirect', [{ kind: 'click', ...refIn(await observePage(page), 'Instant book') }]);
+    expect(sneaky).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: { status: 'refused' },
+    });
+    expect(sneaky.continuation).not.toHaveProperty('target');
+    expect(posts()).toEqual([]);
+
+    // A preliminary "Book now" button with no identifiable booking/item stops without acquiring free-press state.
+    await open(services);
+    await run('enable-prelim', [{ kind: 'click', ...refIn(await observePage(page), 'Cut & finish') }]);
+    const prelimStop = await run('prelim-button', [{ kind: 'click', ...refIn(await observePage(page), 'Book now') }]);
+    expect(prelimStop).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: { status: 'ready', target: { ref: expect.any(String) } },
+    });
+    expect(freePressInProgress(session.thread_id!)).toBe(false);
+    expect(currentFreeDialog(page)).toBeUndefined();
+    expect(await purchase('Book now')).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the items'],
+      repeat_safe: true,
+    });
+
+    // Re-open the provider entry; ordinary entry links, service selection and Continue steps proceed cleanly.
+    expect(await open(entry)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await run('entry-link', [{ kind: 'click', ...refIn(await observePage(page), 'Book now') }])).toMatchObject({
+      status: 'stopped',
+      reason: 'navigated',
+    });
+    expect(page.url()).toBe(services);
+    expect(
+      await run('pick-service', [{ kind: 'click', ...refIn(await observePage(page), 'Cut & finish') }]),
+    ).toMatchObject({
+      status: 'completed',
+    });
+    expect(
+      await run('continue-step', [{ kind: 'click', ...refIn(await observePage(page), 'Continue') }]),
+    ).toMatchObject({
+      status: 'stopped',
+      reason: 'navigated',
+    });
+    expect(page.url()).toBe(confirm);
+    expect(await approvals()).toEqual([]);
+    expect(freePressInProgress(session.thread_id!)).toBe(false);
+    expect(currentFreeDialog(page)).toBeUndefined();
+
+    // Pressing the genuinely free final booking commits once; saving and replaying the path stops at Complete reservation without pressing it.
+    const freePress = await run('free-commit', [
+      { kind: 'click', ...refIn(await observePage(page), 'Complete reservation') },
+    ]);
+    expect(freePress).toMatchObject({ status: 'stopped', reason: 'pressed' });
+    expect(posts()).toEqual([booked]);
+    const { last } = (await getDb().get<{ last: number }>(
+      'SELECT MAX(action_index) AS last FROM gws_ea_browser_action_trace',
+    ))!;
+    const saved = await errandRequest(host, 'save-salon', 'save_recipe', {
+      name: 'Cedar booking',
+      first_action: last - 3,
+      last_action: last,
+      parameters: [],
+    });
+    expect(saved).toMatchObject({ status: 'saved' });
+    await open(provider);
+    const replayed = await errandRequest(host, 'replay-salon', 'run_recipe', {
+      recipe_id: saved.recipe_id,
+      parameters: {},
+    });
+    expect(replayed).toMatchObject({
+      status: 'reached_commit_point',
+      step: 3,
+      target: {
+        generation: (replayed.observation as BrowserSnapshotObservation).generation,
+        ref: expect.any(String),
+      },
+    });
+    expect(posts()).toEqual([booked]);
+  });
+
+  it('returns an observed commit continuation for click, Enter, Space and form_input, reports changed targets, and enforces purchase bounds', async () => {
+    await open(GENERIC.review);
+    const seen = await observePage(page);
+    const byClick = await run('stop-click', [{ kind: 'click', ...refIn(seen, 'Place order') }]);
+    expect(byClick).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: {
+        status: 'ready',
+        target: { generation: (byClick.observation as { generation: number }).generation, ref: expect.any(String) },
+      },
+    });
+
+    const persisted = await getDb().get<{ answer_json: string }>(
+      'SELECT answer_json FROM gws_ea_browser_requests WHERE session_id = ? AND request_id = ?',
+      session.id,
+      'stop-click',
+    );
+    expect(JSON.parse(persisted!.answer_json)).toMatchObject({
+      ok: true,
+      data: { continuation: byClick.continuation },
+    });
+    expect(persisted!.answer_json).not.toMatch(/locator|framePath|element/u);
+
+    const byEnter = await run('stop-enter', [
+      { kind: 'key', ...refIn(await observePage(page), 'Email'), key: 'Enter' },
+    ]);
+    expect(byEnter).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: {
+        status: 'ready',
+        target: { generation: (byEnter.observation as { generation: number }).generation, ref: expect.any(String) },
+      },
+    });
+    expect(await page.getByRef((byEnter.continuation as { target: { ref: string } }).target.ref).textContent()).toBe(
+      'Place order',
+    );
+
+    const bySpace = await run('stop-space', [
+      { kind: 'key', ...refIn(await observePage(page), 'Place order'), key: 'Space' },
+    ]);
+    expect(bySpace).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: {
+        status: 'ready',
+        target: { generation: (bySpace.observation as { generation: number }).generation, ref: expect.any(String) },
+      },
+    });
+
+    const formSeen = await observePage(page);
+    const byForm = await run('stop-form', [
+      {
+        kind: 'form_input',
+        fields: [{ ...refIn(formSeen, 'Delivery instructions'), value: 'Ring bell' }],
+        submit: refIn(formSeen, 'Place order'),
+      },
+    ]);
+    expect(byForm).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: {
+        status: 'ready',
+        target: { generation: (byForm.observation as { generation: number }).generation, ref: expect.any(String) },
+      },
+    });
+    expect(posts()).toEqual([]);
+
+    // purchase distinguishes preparation controls from lapsed checkouts, and preserves delivery_window bounds on continuation.target.
+    const handler = getDeliveryAction('purchase')!;
+    const withPrep = 'https://pottery.example/checkout/with-prep';
+    fixture.serve(
+      withPrep,
+      checkoutPage({
+        action: '/checkout/placed',
+        commit: 'Place order',
+        items: ['Celadon mug × 2'],
+        total: '$42.00',
+        payment: 'Visa ending in 4242',
+        email: ALIAS,
+        outside:
+          '<button type="button" id="summary">Show order summary</button><div id="cookie" role="dialog" aria-label="Cookie preferences" hidden><button type="button" id="reject-cookies">Reject all</button></div><script>document.getElementById("reject-cookies").addEventListener("click", () => { document.getElementById("cookie").remove(); document.getElementById("commit").remove(); });</script>',
+      }),
+    );
+    await open(withPrep);
+    await handler(
+      { action: 'purchase', requestId: 'prep-target', target: refIn(await observePage(page), 'Show order summary') },
+      session,
+    );
+    await queue.idle();
+    expect(await answer('prep-target')).toEqual({
+      status: 'not_a_purchase',
+      reason: 'preparing',
+      repeat_safe: true,
+    });
+
+    const stopOnPrep = await run('stop-prep-commit', [
+      { kind: 'click', ...refIn(await observePage(page), 'Place order') },
+    ]);
+    const commitTarget = (stopOnPrep.continuation as { target: { ref: string; generation: number } }).target;
+    await handler(
+      {
+        action: 'purchase',
+        requestId: 'bounded-purchase',
+        target: commitTarget,
+        delivery_window: { start: '2026-10-23', end: '2026-10-25' },
+      },
+      session,
+    );
+    await queue.idle();
+    expect(await answer('bounded-purchase')).toMatchObject({ status: 'awaiting_principal' });
+    const storedCard = await getDb().get<{ bounds_json: string }>(
+      "SELECT bounds_json FROM gws_ea_browser_purchase_cards WHERE status = 'open'",
+    );
+    expect(JSON.parse(storedCard!.bounds_json)).toEqual({
+      deliveryWindow: { start: '2026-10-23', end: '2026-10-25' },
+    });
+    const [boundedCard] = await approvals();
+    await approve(boundedCard);
+    expect(posts()).toEqual([GENERIC.placed]);
+
+    // If a cookie-banner settle removes the commit target before observation completes, continuation reports changed with no target.
+    await open(withPrep);
+    await page.evaluate(`document.getElementById('cookie').hidden = false`);
+    const vanished = await run('stop-vanished', [{ kind: 'click', ...refIn(await observePage(page), 'Place order') }]);
+    expect(vanished).toMatchObject({
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: { status: 'changed' },
+    });
+    expect(vanished.continuation).not.toHaveProperty('target');
+
+    // If an observed commit control hides before purchase reads its checkout box, purchase reports reason: 'changed'.
+    await open(withPrep);
+    const vanishedCommit = refIn(await observePage(page), 'Place order');
+    await page.evaluate(`document.getElementById('commit').style.display = 'none'`);
+    await handler({ action: 'purchase', requestId: 'lapsed-checkout', target: vanishedCommit }, session);
+    await queue.idle();
+    expect(await answer('lapsed-checkout')).toEqual({
+      status: 'not_a_purchase',
+      reason: 'changed',
+      repeat_safe: true,
+    });
+  });
+
+  it('withholds an unreadable venue fee as facts_incomplete without pressing authority, and cards a readable pay-at-venue fee booking', async () => {
+    const unreadable = 'https://salon.example/book/unreadable-fee';
+    const payAtVenue = 'https://salon.example/book/venue-terms';
+    const salonBooked = 'https://salon.example/book/confirmed';
+    fixture.serve(
+      unreadable,
+      htmlPage(
+        'Confirm appointment',
+        `<h1>Atelier Salon</h1><form method="post" action="/book/confirmed"><p>Cut &amp; finish on <time datetime="2026-10-24T14:00:00-07:00">Saturday, October 24, 2:00 PM</time></p><p>A cancellation fee applies to late cancellations.</p><label>Email <input type="email" name="email" value="${ALIAS}"></label><button type="submit">Confirm appointment</button></form>`,
+      ),
+    );
+    fixture.serve(
+      payAtVenue,
+      htmlPage(
+        'Confirm appointment',
+        `<h1>Atelier Salon</h1><form method="post" action="/book/confirmed"><label>Party size <select name="party"><option selected>1</option></select></label><p>Cut &amp; finish on <time datetime="2026-10-24T14:00:00-07:00">Saturday, October 24, 2:00 PM</time></p><p>No-show fee: $25.00 if you miss your appointment.</p><p id="pay-terms">No card required — pay at the salon.</p><label>Email <input type="email" name="email" value="${ALIAS}"></label><button type="submit">Confirm appointment</button></form>`,
+      ),
+    );
+    fixture.serve(
+      salonBooked,
+      htmlPage('Appointment booked', '<h1>Thank you for your booking!</h1><p>Booking reference: AS-204</p>'),
+    );
+
+    expect(await open(unreadable)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await purchase('Confirm appointment')).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the fee amount'],
+      repeat_safe: true,
+    });
+    expect(await approvals()).toEqual([]);
+    // Missing facts grant no authority to press with browser.
+    expect(
+      await run('still-blocked', [{ kind: 'click', ...refIn(await observePage(page), 'Confirm appointment') }]),
+    ).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+    expect(posts()).toEqual([]);
+
+    expect(await open(payAtVenue)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    const payAtVenueAnswer = await purchase('Confirm appointment');
+    expect(payAtVenueAnswer).toEqual({
+      status: 'awaiting_principal',
+      card_id: expect.any(String),
+      repeat_safe: false,
+    });
+    const [card] = await approvals();
+    expect(card.question).toContain(
+      'Financial commitment: conditional_fee; "No-show fee: $25.00 if you miss your appointment."',
+    );
+    expect(card.question).toContain('Amount due later/exposure: $25.00 total');
+    expect(card.question).toContain('Payment: "No card required — pay at the salon."');
+
+    // Mutating the payment arrangement before approval triggers a revalidation card rather than committing under changed terms.
+    await page.locator('#pay-terms').evaluate((node) => {
+      node.textContent = 'Card on file: Visa ending in 4242';
+    });
+    await approve(card);
+    expect(posts()).toEqual([]);
+    const [changedCard] = await approvals();
+    expect(changedCard.question).toContain('Visa ending in 4242');
+    await approve(changedCard);
+    expect(posts()).toEqual([salonBooked]);
+    expect(await attempts()).toMatchObject([
+      { site: 'salon.example', resolution: 'committed', merchant_record_id: 'AS-204' },
     ]);
   });
 

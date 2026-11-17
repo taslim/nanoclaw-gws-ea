@@ -234,6 +234,43 @@ it('records an unconfirmed purchase as its operational code, never its attempt i
   expect(JSON.stringify(evidence)).not.toContain(canary);
 });
 
+it('projects purchase preparation and changed reasons as operational codes without exposing continuation targets', async () => {
+  await getDb().run(
+    'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+    JSON.stringify({
+      ok: true,
+      data: {
+        status: 'stopped',
+        reason: 'purchase_control',
+        continuation: { status: 'ready', target: { ref: canary, generation: 7 } },
+        observation: { snapshot: canary },
+      },
+    }),
+    await accept('batch-stop', 'browser'),
+  );
+  await getDb().run(
+    'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+    JSON.stringify({ ok: true, data: { status: 'not_a_purchase', reason: 'preparing', message: canary } }),
+    await accept('preparing', 'purchase'),
+  );
+  await getDb().run(
+    'UPDATE gws_ea_browser_requests SET answer_json=? WHERE id=?',
+    JSON.stringify({ ok: true, data: { status: 'not_a_purchase', reason: 'changed', message: canary } }),
+    await accept('changed', 'purchase'),
+  );
+  const evidence = await readBrowserEvidence(thread);
+  expect(evidence.requests.map(({ requestId, status, reason }) => [requestId, status, reason])).toEqual(
+    expect.arrayContaining([
+      ['batch-stop', 'stopped', 'purchase_control'],
+      ['preparing', 'not_a_purchase', 'preparing'],
+      ['changed', 'not_a_purchase', 'changed'],
+    ]),
+  );
+  expect(evidence.requests).toHaveLength(3);
+  expect(JSON.stringify(evidence)).not.toContain(canary);
+  expect(JSON.stringify(evidence)).not.toContain('continuation');
+});
+
 it('leaves truncated mailbox timing unavailable and never provisions an absent mailbox', async () => {
   await accept('old-request');
   await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {

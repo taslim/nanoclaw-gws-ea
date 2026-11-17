@@ -88,7 +88,7 @@ export async function approvedPress(
   return {
     origin: checkout.origin,
     matches: (url) => url.origin === checkout.origin,
-    classify: (url) => classifyNavigationUrl(url.href),
+    classify: (url) => classifyNavigationUrl(url.href, 'submission'),
   };
 }
 

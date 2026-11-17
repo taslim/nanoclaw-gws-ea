@@ -395,9 +395,21 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
       await page.setContent(
         `<body><h1>Reservation review</h1><p>Quoted example: [ref=e999]</p><p>Card on file: Visa ending in 4242</p><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button${role ? ` role="${role}"` : ''}>Confirm reservation</button></form></body>`,
       );
+      const stopped = await executeBrowserBatch(context, {
+        actions: [{ kind: 'key', ...(await target('Guest')), key: 'Enter' }],
+      });
+      expect(stopped).toMatchObject({
+        reason: 'purchase_control',
+        continuation: {
+          status: 'ready',
+          target: { generation: stopped.observation?.generation, ref: expect.any(String) },
+        },
+      });
       expect(
-        await executeBrowserBatch(context, { actions: [{ kind: 'key', ...(await target('Guest')), key: 'Enter' }] }),
-      ).toMatchObject({ reason: 'purchase_control' });
+        await page
+          .getByRef((stopped.continuation as { target: BrowserRef }).target.ref)
+          .evaluate((node) => node.tagName),
+      ).toBe('BUTTON');
       const saved = await saveBrowserRecipe(context, {
         name: 'Enter reservation',
         first_action: 0,
@@ -410,6 +422,59 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
       expect(await page.getByRef(current.ref).evaluate((node) => node.tagName)).toBe('BUTTON');
     },
   );
+  it('replays booking-entry URLs and entry links before stopping at the real commit control', async () => {
+    server.removeAllListeners('request');
+    server.on('request', (req, res) => {
+      if (req.url === 'http://fixture.example/book-now/salon/all-offer') {
+        res
+          .writeHead(200, { 'content-type': 'text/html' })
+          .end('<body><h1>Choose a branch</h1><a href="/providers/salon/review">Book now</a></body>');
+        return;
+      }
+      if (req.url === 'http://fixture.example/providers/salon/review') {
+        res
+          .writeHead(200, { 'content-type': 'text/html' })
+          .end(
+            '<body><h1>Confirm appointment</h1><form method="post" action="/book/confirmed"><p>Cut &amp; finish</p><p>Card on file: Visa ending in 4242</p><button type="submit" onclick="window.commits=(window.commits||0)+1">Confirm booking</button></form></body>',
+          );
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await observePage(page);
+    expect(
+      await executeBrowserBatch(context, {
+        actions: [{ kind: 'navigate', url: 'http://fixture.example/book-now/salon/all-offer' }],
+      }),
+    ).toMatchObject({ reason: 'navigated', actions: [{ trace_index: 0, status: 'completed' }] });
+    expect(
+      await executeBrowserBatch(context, {
+        actions: [{ kind: 'click', ...(await target('Book now')) }],
+      }),
+    ).toMatchObject({ reason: 'navigated', actions: [{ trace_index: 1, status: 'completed' }] });
+    const commitStop = await executeBrowserBatch(context, {
+      actions: [{ kind: 'click', ...(await target('Confirm booking')) }],
+    });
+    expect(commitStop).toMatchObject({
+      reason: 'purchase_control',
+      continuation: { status: 'ready', target: { generation: commitStop.observation?.generation } },
+      actions: [{ trace_index: 2, status: 'stopped', reason: 'purchase_control' }],
+    });
+    const saved = await saveBrowserRecipe(context, {
+      name: 'Appointment entry',
+      first_action: 0,
+      last_action: 2,
+      parameters: [],
+    });
+    const replay = await executeRecipe(context, { recipe_id: saved.recipe_id, parameters: {} });
+    expect(replay).toMatchObject({
+      status: 'reached_commit_point',
+      step: 2,
+      target: { generation: (replay.observation as { generation: number }).generation, ref: expect.any(String) },
+    });
+    expect(await page.getByRef((replay.target as BrowserRef).ref).textContent()).toBe('Confirm booking');
+    expect(await page.evaluate('window.commits||0')).toBe(0);
+  });
   it('binds an exact accessible slot name and the actual selected link href', async () => {
     const slots =
       '<body><h1>Slots</h1><a href="/r/slots?slot=7&venue=venue-A">7:00 PM</a><a href="/r/slots?slot=8&venue=venue-A">8:00 PM</a></body>';

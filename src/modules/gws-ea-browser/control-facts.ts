@@ -155,7 +155,7 @@ const PAGE_VOCABULARY = {
   orderWords: /\b(?:orders?|purchase|payment|pay|charged?|booking|reservation|subscription|checkout)\b/iu,
   /** A control that commits a booking or an order, in whose form free text is a booking or order note. */
   commitName:
-    /\b(?:buy|pay|purchase|order|checkout|check\s*out|reserve|reservation|book(?:ing)?|subscribe|donate|bid|register|rsvp|wait\s*list|waitlist|notify\s+me)\b/iu,
+    /\b(?:buy|pay|purchase|order|checkout|check\s*out|reserve|reservation|book(?:ing)?|appointment|subscribe|donate|bid|register|rsvp|wait\s*list|waitlist|notify\s+me)\b/iu,
   bookingField:
     /(?:^|[^a-z])(?:party|guests?|covers|adults|children|kids|tickets?|quantity|qty|check.?in|check.?out|arrival|departure|nights|seats?)(?:[^a-z]|$)/iu,
   /** A lookup field: a formless one holds a query, never free text. */

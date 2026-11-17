@@ -79,6 +79,8 @@ describe('the open rule', () => {
       'Renew membership',
       'Place bid',
       'Complete reservation',
+      'Confirm appointment',
+      'Complete appointment',
     ];
     expectClasses([
       ...each(words, (name) => button(name), 'purchase_control'),
@@ -266,7 +268,7 @@ describe('the open rule', () => {
   });
 });
 
-it('opens any public page and refuses only blocked and commit-class routes', () => {
+it('opens any public page, including booking-entry URLs, and refuses only blocked and commit-class routes', () => {
   for (const url of [
     'https://shop.example/unknown-action',
     'https://shop.example/about',
@@ -274,25 +276,83 @@ it('opens any public page and refuses only blocked and commit-class routes', () 
     // An article's slug is prose, not a route that acts.
     'https://news.example/guides/the-best-time-to-buy-a-kettle',
     'https://book.example/venues/42/book?party=2&time=19%3A00',
+    'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
+    'https://salon.example/book-now/downtown',
+    'https://bistro.example/reserve-now/dinner',
     'https://shop.example/search?q=restaurant',
   ])
-    expect(classifyNavigationUrl(url)).toBe('ordinary');
-  expect(classifyNavigationUrl('https://shop.example/buy?oneclick=1')).toBe('purchase_control');
-  expect(classifyNavigationUrl('https://shop.example/checkout/place-order')).toBe('purchase_control');
-  expect(classifyNavigationUrl('https://shop.example/checkout/submit')).toBe('purchase_control');
-  expect(classifyNavigationUrl('https://shop.example/account/change-password')).toBe('account_security');
-  expect(classifyNavigationUrl('https://shop.example/reviews/new?action=post-review')).toBe('speaks_as_principal');
-  for (const url of ['file:///etc/passwd', 'https://user:secret@shop.example/', 'javascript:alert(1)', 'not a url'])
-    expect(classifyNavigationUrl(url)).toBe('blocked_address');
+    expect(classifyNavigationUrl(url, 'document')).toBe('ordinary');
+  for (const url of [
+    'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
+    'https://salon.example/reserve-now/downtown',
+  ])
+    expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');
+  for (const url of [
+    'https://salon.example/venues?action=book%2Dnow',
+    'https://bistro.example/tables?intent=reserve%20now',
+    'https://shop.example/buy?oneclick=1',
+    'https://shop.example/checkout/place-order',
+    'https://shop.example/checkout/submit',
+    'https://shop.example/api/charge',
+    'https://shop.example/orders/confirm-booking',
+  ]) {
+    expect(classifyNavigationUrl(url, 'document')).toBe('purchase_control');
+    expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');
+  }
+  expect(classifyNavigationUrl('https://shop.example/account/change-password', 'document')).toBe('account_security');
+  expect(classifyNavigationUrl('https://shop.example/reviews/new?action=post-review', 'document')).toBe(
+    'speaks_as_principal',
+  );
+  for (const url of [
+    'file:///etc/passwd',
+    'https://user:secret@shop.example/',
+    'javascript:alert(1)',
+    'not a url',
+    'https://shop.example/%E0%A4%A',
+    'https://shop.example/venues?action=%E0%A4%A',
+  ])
+    expect(classifyNavigationUrl(url, 'document')).toBe('blocked_address');
+});
+
+it('treats ordinary booking-entry anchors and preparation choices as ordinary while keeping commit controls gated', () => {
+  const checkout = { region: region({ transaction: true }), transaction: true };
+  expectClasses([
+    [link('Book now', 'https://booking.example/book-now/cedar-studio-9x2k/all-offer'), 'ordinary'],
+    [link('Reserve now', 'https://bistro.example/reserve-now/patio'), 'ordinary'],
+    [button('Choose location: Book now', { tag: 'select', role: 'combobox', type: 'select-one' }), 'ordinary'],
+    [button('Haircut — Book now', { tag: 'div', role: 'option', type: '' }), 'ordinary'],
+    // Scripted links, links in a transaction region, explicit buy/confirm anchors, and buttons remain commit-gated.
+    [link('Book now', 'https://salon.example/page#book', { scripted: true }), 'purchase_control'],
+    [link('Book now', 'https://bistro.example/step-2', checkout), 'purchase_control'],
+    [link('Buy now', 'https://shop.example/instant'), 'purchase_control'],
+    [link('Confirm booking', 'https://bistro.example/finish'), 'purchase_control'],
+    [button('Book now'), 'purchase_control'],
+    [button('Reserve now'), 'purchase_control'],
+    [
+      button('Continue', { formAction: 'https://salon.example/book-now/submit', formMethod: 'post' }),
+      'purchase_control',
+    ],
+    [button('Search', { formAction: 'https://salon.example/book-now/all', formMethod: 'get' }), 'ordinary'],
+  ]);
+  expect(
+    refusedScriptRequest({
+      method: 'POST',
+      url: 'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
+    }),
+  ).toBe(true);
 });
 
 it('keeps reviewed Amazon authentication routes precise and leaves its other routes to the open rule', () => {
   for (const path of ['/ap/signin', '/ap/mfa', '/ap/cvf'])
-    expect(classifyNavigationUrl(`https://www.amazon.com${path}`)).toBe('ordinary');
-  expect(classifyNavigationUrl('https://www.amazon.com/ap/signin?action=purchase')).toBe('purchase_control');
-  expect(classifyNavigationUrl('https://www.amazon.com/ap/signin?operation=change-password')).toBe('account_security');
-  expect(classifyNavigationUrl('https://www.amazon.com/ap/unknown')).toBe('ordinary');
-  expect(classifyNavigationUrl('http://www.amazon.com/ap/signin')).toBe('ordinary');
+    expect(classifyNavigationUrl(`https://www.amazon.com${path}`, 'document')).toBe('ordinary');
+  expect(classifyNavigationUrl('https://www.amazon.com/ap/signin?action=purchase', 'document')).toBe(
+    'purchase_control',
+  );
+  expect(classifyNavigationUrl('https://www.amazon.com/ap/signin?operation=change-password', 'document')).toBe(
+    'account_security',
+  );
+  expect(classifyNavigationUrl('https://www.amazon.com/ap/unknown', 'document')).toBe('ordinary');
+  expect(classifyNavigationUrl('http://www.amazon.com/ap/signin', 'document')).toBe('ordinary');
 });
 
 it('runs ordinary sign-in controls through the browser action and still refuses a purchase destination', async () => {
@@ -339,14 +399,14 @@ it('lets a reviewed flow decide only what the open rule leaves ordinary', async 
 });
 
 it('recognizes the reviewed read-only Amazon review URL and refuses unknown activating/security paths', () => {
-  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/display.html')).toBe('ordinary');
-  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/static-submit-decoupled.html')).toBe(
+  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/display.html', 'document')).toBe('ordinary');
+  expect(
+    classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/static-submit-decoupled.html', 'document'),
+  ).toBe('purchase_control');
+  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/display.html?action=buy', 'document')).toBe(
     'purchase_control',
   );
-  expect(classifyNavigationUrl('https://www.amazon.com/gp/buy/spc/handlers/display.html?action=buy')).toBe(
-    'purchase_control',
-  );
-  expect(classifyNavigationUrl('https://www.amazon.com/unknown-oneclick')).toBe('purchase_control');
+  expect(classifyNavigationUrl('https://www.amazon.com/unknown-oneclick', 'document')).toBe('purchase_control');
 });
 
 describe('the credential activation scope', () => {
@@ -421,7 +481,9 @@ describe('the credential activation scope', () => {
       classifyCredentialNavigation('https://www.shop.example/account/change-password', 'rotation', 'shop.example'),
     ).toBe('ordinary');
     expect(classifyCredentialNavigation('https://www.shop.example/welcome', 'signup', 'shop.example')).toBe('ordinary');
-    expect(classifyNavigationUrl('https://www.shop.example/account/change-password')).toBe('account_security');
+    expect(classifyNavigationUrl('https://www.shop.example/account/change-password', 'document')).toBe(
+      'account_security',
+    );
     for (const [url, reason] of [
       ['https://www.shop.example/account/change-password', 'account_security'],
       ['https://www.shop.example/account/change-email', 'account_security'],

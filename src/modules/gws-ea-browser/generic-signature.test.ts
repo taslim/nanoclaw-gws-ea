@@ -339,6 +339,163 @@ describe('the free-commit test', () => {
       },
     });
   });
+
+  it('keeps preliminary entry pages and step controls out of free state while preserving real free appointments and waitlists', () => {
+    expect(
+      decide(
+        {
+          label: 'Book now',
+          lines: ['Choose a location', 'Downtown studio', 'Uptown studio'],
+          fields: [],
+          frameUrl: 'https://salon.example/providers/cedar',
+          frames: [frame({ url: 'https://salon.example/providers/cedar', heading: 'Cedar Studio' })],
+        },
+        'salon.example',
+      ),
+    ).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the items'],
+    });
+    expect(decide({ ...table, label: 'Continue to details' }, 'table.example')).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the final confirmation button'],
+    });
+    expect(
+      decide(
+        {
+          label: 'Join waitlist',
+          lines: ['Party of 2'],
+          fields: [],
+          frameUrl: 'https://table.example/waitlist',
+        },
+        'table.example',
+      ),
+    ).toMatchObject({
+      status: 'free',
+      facts: { control: { label: 'Join waitlist' }, items: ['Party of 2'], booking: { partySize: 2 } },
+    });
+    expect(
+      decide(
+        {
+          label: 'Book appointment',
+          lines: ['No payment is needed to book.'],
+          times: [{ datetime: '2026-11-20T14:00:00-08:00', text: 'Friday, November 20 at 2:00 PM' }],
+          frameUrl: 'https://salon.example/book/confirm',
+          frames: [frame({ url: 'https://salon.example/book/confirm', heading: 'Cedar Studio' })],
+        },
+        'salon.example',
+      ),
+    ).toMatchObject({
+      status: 'free',
+      facts: {
+        items: ['Cedar Studio, Friday, November 20 at 2:00 PM'],
+        booking: { venue: 'Cedar Studio', timeText: 'Friday, November 20 at 2:00 PM' },
+      },
+    });
+  });
+
+  it('names missing fee facts before card_needed, supports explicit no-card venue payment terms, and detects their change', () => {
+    const cardInput = field({ name: 'cardnumber', card: true, value: null });
+    expect(
+      decide(
+        {
+          ...table,
+          lines: ['Party size 2', 'No-show fee applies to missed reservations.'],
+          fields: [party, cardInput, email('aya.web@example.test')],
+        },
+        'table.example',
+      ),
+    ).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the fee amount'],
+    });
+    expect(
+      decide(
+        {
+          ...table,
+          lines: ['Party size 2', 'A booking surcharge applies.'],
+          fields: [party, cardInput, email('aya.web@example.test')],
+        },
+        'table.example',
+      ),
+    ).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the fee amount'],
+    });
+    expect(
+      decide(
+        {
+          ...table,
+          lines: ['Party size 2', 'A card is required to hold this table.', 'No-show fee: $25 per person.'],
+          fields: [party, email('aya.web@example.test')],
+        },
+        'table.example',
+      ),
+    ).toMatchObject({
+      status: 'card_needed',
+      needed: { site: 'table.example', items: ['Party size 2'], total: '$0.00' },
+    });
+    expect(
+      decide(
+        {
+          ...table,
+          lines: ['Party size 2', 'No-show fee: $25 per person.'],
+          fields: [party, email('aya.web@example.test')],
+        },
+        'table.example',
+      ),
+    ).toEqual({
+      status: 'facts_incomplete',
+      missing: ['the payment terms'],
+    });
+
+    const venuePaid = ready(
+      decide(
+        {
+          label: 'Confirm appointment',
+          lines: [
+            'Due now: $0.00',
+            'No-show fee: $25.00 if you miss your appointment.',
+            'No credit card is required — pay at the salon.',
+          ],
+          fields: [email('aya.web@example.test')],
+          times: [{ datetime: '2026-11-20T14:00:00-08:00', text: 'Friday, November 20 at 2:00 PM' }],
+          frameUrl: 'https://salon.example/book/confirm',
+          frames: [frame({ url: 'https://salon.example/book/confirm', heading: 'Cedar Studio' })],
+        },
+        'salon.example',
+      ),
+    );
+    expect(completePurchaseFacts(venuePaid)).toBe(true);
+    expect(venuePaid).toMatchObject({
+      totalMinor: 0,
+      dueNowMinor: 0,
+      cardEnding: null,
+      commitments: [{ kind: 'conditional_fee', conditionalTrigger: 'no_show', amountMinor: 2500 }],
+      generic: {
+        items: ['Cedar Studio, Friday, November 20 at 2:00 PM'],
+        payment: 'No credit card is required — pay at the salon.',
+      },
+    });
+    const switchedToSavedCard = ready(
+      decide(
+        {
+          label: 'Confirm appointment',
+          lines: [
+            'Due now: $0.00',
+            'No-show fee: $25.00 if you miss your appointment.',
+            'Saved card: Visa ending in 4242',
+          ],
+          fields: [email('aya.web@example.test')],
+          times: [{ datetime: '2026-11-20T14:00:00-08:00', text: 'Friday, November 20 at 2:00 PM' }],
+          frameUrl: 'https://salon.example/book/confirm',
+          frames: [frame({ url: 'https://salon.example/book/confirm', heading: 'Cedar Studio' })],
+        },
+        'salon.example',
+      ),
+    );
+    expect(materialPurchaseChange(venuePaid, switchedToSavedCard, {})).toBe('The payment method changed.');
+  });
 });
 
 it('tells a decline on the page from another failure', () => {

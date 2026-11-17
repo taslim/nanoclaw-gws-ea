@@ -1,9 +1,8 @@
 import { linkWatchBookingRecipe } from './watch-recipes.js';
 import { type BrowserRecipeParameter, loadRecipe } from './recipe-store.js';
 import { checkpoint as recordedCheckpoint, type BrowserRecipeStep, type RecipeCheckpoint } from './recording.js';
-import { browserKeyboardSubmitTarget } from './action-targets.js';
 import { type BrowserAction, type BrowserBatchOptions } from './actions.js';
-import { checkpointUrl, captureElementRole, resolveLocator, type StructuredBrowserLocator } from './locators.js';
+import { checkpointUrl, resolveLocator, type StructuredBrowserLocator } from './locators.js';
 import { randomUUID } from 'node:crypto';
 import type { Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
@@ -12,7 +11,7 @@ import { classifyNavigationUrl } from './control-policy.js';
 import { readPageControlFacts, withheldField } from './control-facts.js';
 import { executeBrowserBatch } from './executor.js';
 import { browserSite } from './leases.js';
-import { browserRefForElement, observePage, snapshotBrowserStructure, type BrowserRef } from './observe.js';
+import { observePage, snapshotBrowserStructure } from './observe.js';
 import { redactPageData } from './page-privacy.js';
 import type { BrowserExecutionContext, BrowserOperationContext, BrowserQueuedAction } from './actions.js';
 
@@ -305,7 +304,7 @@ export async function executeRecipe(
       const element = await resolveLocator(page, targets[0]);
       try {
         const href = (await readPageControlFacts(page, element)).href;
-        if (!href || !sameLinkShape(step.clickHref, href) || classifyNavigationUrl(href) !== 'ordinary')
+        if (!href || !sameLinkShape(step.clickHref, href) || classifyNavigationUrl(href, 'document') !== 'ordinary')
           return failed(index, { target_url: step.clickHref }, { target_url: 'origin, path or query keys changed' });
         activeHrefs.set(checkpointUrl(step.clickHref), checkpointUrl(href));
       } finally {
@@ -324,43 +323,24 @@ export async function executeRecipe(
     // A step that bought something nobody approved has stopped the job: the replay ends with it.
     if (result.reason === 'unapproved_commit') return { ...result, ...coverage(), step: index, repeat_safe: false };
     if (result.repeat_safe === false) repeatSafe = false;
-    const observation =
-      result.observation ??
-      (await observePage(page, context.assertActive, {
-        remaining: context.remaining,
-        signal: context.signal,
-      }));
     if (result.reason === 'purchase_control') {
-      const commit = targets[action.kind === 'form_input' ? targets.length - 1 : 0];
-      if (!commit) return failed(index, { commit: 'recorded control' }, { commit: 'unavailable' });
-      try {
-        let target: BrowserRef;
-        const element = await resolveLocator(page, commit);
-        try {
-          if (action.kind === 'key' && /^(?:Shift\+)?Enter$/u.test(action.key)) {
-            const handle = await browserKeyboardSubmitTarget(element);
-            try {
-              const submit = handle.asElement();
-              if (!submit) throw new Error('No submit control');
-              target = await browserRefForElement(page, submit, { role: await captureElementRole(submit) });
-            } finally {
-              await handle.dispose();
-            }
-          } else target = await browserRefForElement(page, element, commit);
-        } finally {
-          await element.dispose();
-        }
+      if (
+        result.continuation?.status === 'ready' &&
+        result.observation?.generation === result.continuation.target.generation
+      )
         return {
           status: 'reached_commit_point',
           ...coverage(),
           step: index,
-          target,
-          observation,
+          target: result.continuation.target,
+          observation: result.observation,
           repeat_safe: repeatSafe,
         };
-      } catch (_error) {
-        return failed(index, { commit: 'recorded control' }, { commit: 'changed' });
-      }
+      return failed(
+        index,
+        { commit: 'recorded control' },
+        { commit: result.continuation?.status === 'refused' ? 'unavailable' : 'changed' },
+      );
     }
     if (result.status === 'stopped' && result.reason !== 'navigated')
       return failed(index, { action: action.kind }, { reason: result.reason });

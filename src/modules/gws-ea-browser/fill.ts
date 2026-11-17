@@ -327,12 +327,12 @@ export async function fillBoundBrowserSecrets(
     });
     await guard.runWithPolicy(
       {
-        classify(url) {
+        classify(url, document) {
           if (!httpsOrigin(url.href) || carriesSecret(url, secrets)) {
             departed = true;
             return 'blocked_address';
           }
-          return classifyNavigationUrl(url.href);
+          return classifyNavigationUrl(url.href, document?.method?.toUpperCase() === 'GET' ? 'document' : 'submission');
         },
       },
       () =>
