@@ -357,6 +357,51 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
   });
 
+  it('leaves a watch claim unspent across booking-entry navigation and preparation controls until the final free booking', async () => {
+    const entry = 'https://larder.example/book-now/the-larder/all-offer';
+    const provider = 'https://larder.example/providers/the-larder';
+    fixture.serve(entry, () => ({ status: 302, headers: { location: provider } }));
+    fixture.serve(
+      provider,
+      htmlPage(
+        'The Larder',
+        `<h1>The Larder</h1><a href="/tables?date=2026-10-24&amp;party=2">Book now</a><button type="button" id="step-book">Book a table</button><div id="revealed" hidden><a href="/book?slot=1930">7:30 PM</a></div>`,
+        `document.getElementById('step-book').addEventListener('click', () => { document.getElementById('revealed').hidden = false; });`,
+      ),
+    );
+    await setWatch();
+    site.slots = ['1930'];
+    await checkNow();
+    expect(await notices()).toEqual([expect.objectContaining({ status: 'changed' })]);
+
+    expect(await run([{ kind: 'navigate', url: entry }])).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(page.url()).toBe(provider);
+    expect(await run([{ kind: 'click', ...refIn(await observePage(page), 'Book a table') }])).toMatchObject({
+      status: 'completed',
+    });
+    expect(await run([{ kind: 'click', ...refIn(await observePage(page), 'Book now') }])).toMatchObject({
+      status: 'stopped',
+      reason: 'navigated',
+    });
+    expect(page.url()).toBe(WATCHED.tables);
+    expect(await watch()).toMatchObject({ status: 'armed' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+
+    expect(await run([{ kind: 'click', ...refIn(await observePage(page), '7:30 PM') }])).toMatchObject({
+      status: 'stopped',
+      reason: 'navigated',
+    });
+    expect(await watch()).toMatchObject({ status: 'armed' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
+
+    expect(await run([{ kind: 'click', ...refIn(await observePage(page), 'Reserve now') }])).toMatchObject({
+      status: 'stopped',
+      reason: 'pressed',
+    });
+    expect(await watch()).toMatchObject({ status: 'outcome_unknown' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'unknown' });
+  });
+
   it('returns current refs after a successful mark and makes refs stale when a region snapshot fails', async () => {
     site.slots = ['1930'];
     const marked = await setWatch();

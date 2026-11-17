@@ -146,10 +146,21 @@ export type BrowserActionResult = { index: number } & (
     }
 );
 
+export type BrowserCommitmentContinuation =
+  | { readonly status: 'ready'; readonly target: BrowserRef }
+  | { readonly status: 'changed' }
+  | { readonly status: 'refused' };
+
 /** Core batch outcomes are closed; domain tools keep their own native result contracts. */
 export type BrowserBatchResult = (
-  | { status: 'completed'; reason?: never; actions: BrowserActionResult[] }
-  | { status: 'stopped'; reason: BrowserStopReason; actions?: BrowserActionResult[] }
+  | { status: 'completed'; reason?: never; actions: BrowserActionResult[]; continuation?: never }
+  | {
+      status: 'stopped';
+      reason: BrowserStopReason;
+      actions?: BrowserActionResult[];
+      /** Next step when `reason === 'purchase_control'`; grants no purchase authority. */
+      continuation?: BrowserCommitmentContinuation;
+    }
 ) & {
   repeat_safe: boolean;
   consent?: readonly import('./consent.js').ConsentStopView[];

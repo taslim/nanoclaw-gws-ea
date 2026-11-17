@@ -148,6 +148,36 @@ it('shows the page after an observe action, and only what changed after another 
   expect((await run('observe')).observation).toHaveProperty('snapshot');
 });
 
+it('stops raw commit-URL navigation with a refused continuation and no purchase target', async () => {
+  await runMigrations(await initTestDb());
+  try {
+    const { page } = listingsPage('Contact the host');
+    const context = {
+      job: { id: 'job' },
+      page: async () => page,
+      assertActive: async () => undefined,
+      remaining: () => 90_000,
+      signal: new AbortController().signal,
+      store: { db: getDb() },
+    } as unknown as BrowserExecutionContext;
+    for (const url of [
+      'https://shop.example/checkout/place-order',
+      'https://shop.example/book-now/salon/all-offer?oneClick=1',
+    ]) {
+      const result = await executeBrowserBatch(context, { actions: [{ kind: 'navigate', url }] }, { record: false });
+      expect(result, url).toMatchObject({
+        status: 'stopped',
+        reason: 'purchase_control',
+        continuation: { status: 'refused' },
+        actions: [{ index: 0, status: 'stopped', reason: 'purchase_control' }],
+      });
+      expect(result.continuation).not.toHaveProperty('target');
+    }
+  } finally {
+    await closeDb();
+  }
+});
+
 it('accepts an observation within a ref only as the batch’s closing look', () => {
   const within = { ref: 'f1e4', generation: 3 };
   expect(validateBrowserBatch({ actions: [{ kind: 'observe', within }] })).toEqual({

@@ -443,7 +443,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       proxy: { server: `http://127.0.0.1:${proxyAddress.port}` },
       args: ['--ignore-certificate-errors'],
     });
-  });
+  }, 30_000);
   afterAll(async () => {
     await browser?.close();
     for (const socket of transportSockets) socket.destroy();
@@ -454,7 +454,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       new Promise<void>((resolve) => fixtureProxy?.close(() => resolve())),
     ]);
     if (certificateRoot) fs.rmSync(certificateRoot, { recursive: true, force: true });
-  });
+  }, 30_000);
   beforeEach(async () => {
     // Each job's queue reconciles the browser group's gateway identity.
     useFakeGateway();
@@ -540,7 +540,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     setBrowserAdmissionReady(true);
-  });
+  }, 30_000);
   afterEach(async () => {
     vi.mocked(loginStoreModule.getLoginStore).mockRestore();
     await stopHeldBrowserRequests();

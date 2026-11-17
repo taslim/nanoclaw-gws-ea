@@ -1,14 +1,25 @@
 import { classifyNavigationUrl, type ActionClass } from './control-policy.js';
 import { readPageControlFacts, withheldField, type ControlFacts } from './control-facts.js';
-import { browserActionRefs } from './actions.js';
-import { browserStructureFacts } from './observe.js';
+import { browserActionRefs, type BrowserAction, type BrowserCommitmentContinuation } from './actions.js';
+import { browserRefForElement, browserStructureFacts, type BrowserRef, type PinnedBrowserRef } from './observe.js';
 import { browserPageReplayUrl, redactPageData } from './page-privacy.js';
-import { ariaNodes, flatten, captureSnapshotLocator, type StructuredBrowserLocator } from './locators.js';
+import {
+  ariaNodes,
+  captureElementRole,
+  captureSnapshotLocator,
+  flatten,
+  type StructuredBrowserLocator,
+} from './locators.js';
 import { checkpoint, type BrowserRecipeStep } from './recording.js';
-import type { ElementHandle, JSHandle, Page } from 'playwright-core';
+import type { ElementHandle, Frame, JSHandle, Page } from 'playwright-core';
 import { classifyActivation, type ActivationIntent } from './commit-classifier.js';
-import type { BrowserRef, PinnedBrowserRef } from './observe.js';
-import type { BrowserAction } from './actions.js';
+
+export interface CapturedBrowserCommitTarget {
+  readonly element: ElementHandle;
+  readonly frame: Frame;
+  readonly documentHref: string;
+  dispose(): Promise<void>;
+}
 
 /** The keyboard and recipe paths must identify the very same native submit control. */
 export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSHandle<unknown>> {
@@ -18,6 +29,64 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
       ? (e.form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])') ?? null)
       : node;
   });
+}
+
+/** Retains an independent handle to the actual control refused with `purchase_control` across ref cleanup. */
+export async function captureBrowserCommitTarget(
+  element: ElementHandle | null | undefined,
+): Promise<CapturedBrowserCommitTarget | undefined> {
+  if (!element) return undefined;
+  const handle = await element.evaluateHandle((node) => node).catch(() => undefined);
+  const cloned = handle?.asElement();
+  if (!cloned) {
+    await handle?.dispose().catch(() => undefined);
+    return undefined;
+  }
+  try {
+    const frame = await cloned.ownerFrame();
+    const state = await cloned
+      .evaluate((node) => ({
+        connected: (node as unknown as { isConnected?: boolean }).isConnected === true,
+        href: (node as unknown as { ownerDocument?: { location?: { href?: string } } }).ownerDocument?.location?.href,
+      }))
+      .catch(() => undefined);
+    if (!frame || !state?.connected || !state.href) {
+      await cloned.dispose().catch(() => undefined);
+      return undefined;
+    }
+    return {
+      element: cloned,
+      frame,
+      documentHref: state.href,
+      dispose: () => cloned.dispose().catch(() => undefined),
+    };
+  } catch {
+    await cloned.dispose().catch(() => undefined);
+    return undefined;
+  }
+}
+
+/** Rebinds a captured commit control in the closing observation's generation, or reports that recovery is needed. */
+export async function resolveObservedCommitTarget(
+  page: Page,
+  captured: CapturedBrowserCommitTarget | undefined,
+  observationGeneration: number | undefined,
+): Promise<BrowserCommitmentContinuation> {
+  if (!captured || observationGeneration === undefined || page.isClosed()) return { status: 'changed' };
+  try {
+    const frame = await captured.element.ownerFrame();
+    if (!frame || frame !== captured.frame) return { status: 'changed' };
+    const current = await captured.element.evaluate((node) => ({
+      connected: (node as unknown as { isConnected?: boolean }).isConnected === true,
+      href: (node as unknown as { ownerDocument?: { location?: { href?: string } } }).ownerDocument?.location?.href,
+    }));
+    if (!current.connected || current.href !== captured.documentHref) return { status: 'changed' };
+    const role = await captureElementRole(captured.element);
+    const target = await browserRefForElement(page, captured.element, { role });
+    return target.generation === observationGeneration ? { status: 'ready', target } : { status: 'changed' };
+  } catch {
+    return { status: 'changed' };
+  }
 }
 
 async function readOnlyTarget(page: Page, target: PinnedBrowserRef, kind: ActivationIntent['kind']): Promise<boolean> {
@@ -39,7 +108,7 @@ export async function isReadOnlyBrowserAction(
   const targets: Array<{ ref: BrowserRef; kind: ActivationIntent['kind'] }> = [];
   switch (action.kind) {
     case 'navigate':
-      return classifyNavigationUrl(action.url) === 'ordinary';
+      return classifyNavigationUrl(action.url, 'document') === 'ordinary';
     case 'observe':
     case 'wait_for':
     case 'scroll':

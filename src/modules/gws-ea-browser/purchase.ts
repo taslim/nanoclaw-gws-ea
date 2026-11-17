@@ -865,11 +865,16 @@ export async function executeBrowserPurchase(
           );
         const ref = refs.values().next().value as { element: ElementHandle } | undefined;
         // On an unreviewed site only a commit-class control is a purchase: the agent presses anything else itself.
-        if (
-          merchantSignatureFor(page) === genericCheckoutSignature &&
-          (!ref || (await classifyActivation(page, ref.element)) !== 'purchase_control')
-        )
-          return { status: 'not_a_purchase', repeat_safe: true };
+        if (merchantSignatureFor(page) === genericCheckoutSignature) {
+          if (!ref) return { status: 'not_a_purchase', reason: 'changed', repeat_safe: true };
+          const classification = await classifyActivation(page, ref.element);
+          if (classification !== 'purchase_control')
+            return {
+              status: 'not_a_purchase',
+              reason: classification === 'ordinary' ? 'preparing' : classification,
+              repeat_safe: true,
+            };
+        }
         const read = await readMerchantPurchase(page, ref?.element);
         switch (read.status) {
           case 'ready':
@@ -886,7 +891,7 @@ export async function executeBrowserPurchase(
           case 'facts_incomplete':
             return { status: 'facts_incomplete', missing: [...read.missing], repeat_safe: true };
           case 'checkout_lapsed':
-            return { status: 'not_a_purchase', repeat_safe: true };
+            return { status: 'not_a_purchase', reason: 'changed', repeat_safe: true };
           case 'terms_unavailable':
             return { status: read.status, repeat_safe: true };
           default: {

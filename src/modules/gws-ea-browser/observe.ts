@@ -534,7 +534,7 @@ export async function observePageChanges(
 export async function browserRefForElement(
   page: Page,
   element: ElementHandle,
-  target: { role: string; name?: string },
+  target?: { role?: string; name?: string },
 ): Promise<BrowserRef> {
   const state = stateFor(page);
   const { structure, scope, generation } = state;
@@ -543,8 +543,8 @@ export async function browserRefForElement(
     if (Array.isArray(tree)) return tree.flatMap(refs);
     if (!isRecord(tree)) return [];
     const current =
-      tree.role === target.role &&
-      (target.name === undefined || tree.name === target.name) &&
+      (target?.role === undefined || tree.role === target.role) &&
+      (target?.name === undefined || tree.name === target.name) &&
       typeof tree.ref === 'string' &&
       BROWSER_REF_PATTERN.test(tree.ref)
         ? [tree.ref]
@@ -552,7 +552,14 @@ export async function browserRefForElement(
     return [...current, ...refs(tree.children)];
   };
   for (const ref of refs(structure.tree)) {
-    if (await page.getByRef(ref).evaluate((node, other) => node === other, element)) {
+    const candidate = page.getByRef(ref);
+    const sameElement = await candidate
+      .count()
+      .then((count) =>
+        count > 0 ? candidate.evaluate((node, other) => node === other, element, { timeout: 500 }) : false,
+      )
+      .catch(() => false);
+    if (sameElement) {
       if (state.generation !== generation || state.scope !== scope || !(await mainDocumentCurrent(page, scope)))
         throw new BrowserRefError('stale_ref');
       return { ref, generation };

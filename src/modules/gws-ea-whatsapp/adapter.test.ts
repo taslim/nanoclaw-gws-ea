@@ -30,6 +30,7 @@ function create(resolveVersion = async (): Promise<[number, number, number]> => 
       return socket;
     },
     downloadMedia: async () => Buffer.from('recording'),
+    now: () => Date.parse('2026-10-18T12:00:00.000Z'),
   });
 }
 beforeEach(async () => {

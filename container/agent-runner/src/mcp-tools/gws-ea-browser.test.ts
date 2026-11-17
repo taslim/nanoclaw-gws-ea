@@ -155,10 +155,8 @@ const UNNAMED_CODES = new Set([
   'authority_unavailable',
   'purchase_blocked',
   'checking',
-  'preparing',
   'booking',
   'region_read',
-  'ready',
   'failed',
   'unavailable',
   // An answer to main’s relay of a sign-in code.
@@ -536,5 +534,25 @@ describe('a browser request that times out', () => {
     expect((result.content[0] as { text: string }).text).toContain(
       'or make the same call again: a repeat changes nothing twice',
     );
+  });
+
+  it('preserves commitment continuation through request_status and explains purchase, preparation and missing-facts bounds', async () => {
+    await timedOut(browser, { actions: [{ kind: 'click', ref: 'e3', generation: 1 }] });
+    const request = getUndeliveredMessages()[0];
+    const stopped = {
+      status: 'stopped',
+      reason: 'purchase_control',
+      continuation: { status: 'ready', target: { ref: 'e7', generation: 2 } },
+      observation: { generation: 2, url: 'https://salon.example/checkout', delta: { removed: [], added: [] } },
+      repeat_safe: false,
+    };
+    answer(request.id, stopped);
+    expect(await requestStatus.handler({ request_id: request.id })).toEqual({
+      content: [{ type: 'text', text: JSON.stringify(stopped) }],
+    });
+    expect(browser.tool.description).toContain('continuation.status is ready with continuation.target');
+    expect(purchase.tool.description).toContain('without pressing the commit control');
+    expect(purchase.tool.description).toContain('with reason preparing');
+    expect(runRecipe.tool.description).toContain('before a free or paid commit');
   });
 });

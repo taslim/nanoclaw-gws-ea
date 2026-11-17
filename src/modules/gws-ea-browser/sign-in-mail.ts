@@ -302,7 +302,7 @@ export async function openVerificationLink<T>(
   if (
     !url ||
     getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain ||
-    classifyNavigationUrl(url.href) === 'account_security'
+    classifyNavigationUrl(url.href, 'document') === 'account_security'
   )
     return { status: 'refused' };
   const origin = httpsOrigin(page.mainFrame().url());
@@ -369,10 +369,10 @@ async function openBearerLink<T>(
     const landed = await guard.runWithPolicy(
       {
         stripReferrer: true,
-        classify(url) {
+        classify(url, document) {
           if (!httpsOrigin(url.href) || getDomain(url.hostname, { allowPrivateDomains: true }) !== claim.domain)
             return 'blocked_address';
-          return classifyNavigationUrl(url.href);
+          return classifyNavigationUrl(url.href, document?.method?.toUpperCase() === 'GET' ? 'document' : 'submission');
         },
         async beforeNavigate(url) {
           await context.assertActive();

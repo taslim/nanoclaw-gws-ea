@@ -487,7 +487,12 @@ CDP on an explicit nonzero `127.0.0.1` port. Host health may report that integer
 port; debugger endpoint URLs and browser IDs stay private. Browser request
 evidence distinguishes an observed website response,
 a local rule refusal, a transport failure and a runtime failure; a completed
-navigation onto an Access Denied page is still a challenge. A website denial is
+navigation onto an Access Denied page is still a challenge. Ordinary booking and
+venue entry pages load without commitment stops; `purchase_control` in request
+evidence records a held commitment control or refused submission request, and
+`not_a_purchase` records whether a `purchase` call targeted preparation
+(`preparing`) or a changed checkout (`changed`), without exporting page text or
+element refs. A website denial is
 not proof of its cause or a completed booking. Main reports the practical
 limitation; operator evidence stays bounded and redacted.
 
@@ -523,7 +528,8 @@ unavailable coverage; fix that storage failure forward.
 
 Real OpenTable, Resy and Tock results, sign-in and confirmed-result checks, active
 operator focus/Spaces, cross-install isolation and the elapsed watch soak remain
-separate release acceptance evidence. Follow
+separate release acceptance evidence; anonymous public entry-page checks establish
+only entry-page load compatibility, not live booking completion. Follow
 [`scripts/browser-live-check/README.md`](../scripts/browser-live-check/README.md)
 on the authorized deployed release. Fixture passes and a locked-desktop sample
 do not establish those claims.

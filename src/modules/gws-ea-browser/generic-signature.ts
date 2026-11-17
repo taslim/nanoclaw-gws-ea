@@ -91,7 +91,7 @@ const VOCABULARY = {
     /\b(?:fees?|charges?|charged|deposits?|pre-?pa(?:y|id|yment)|payments?|pay|billing|billed|trial|subscriptions?|membership\s+fees?|credit\s+card|debit\s+card)\b|\b(?:card|payment|authori[sz]ation)\s+hold\b/iu,
   /** Wording that denies a charge: "No payment is needed", "No credit card required". A no-show is no denial. */
   negated:
-    /\b(?:no|without|zero)\s+(?!show\b)(?:\w+\s+){0,2}(?:fees?|charges?|deposits?|payments?|pre-?payment|credit\s+card|debit\s+card|card|billing)\b|\b(?:payments?|cards?|credit\s+cards?|deposits?|fees?)\s+(?:is\s+|are\s+)?not\s+(?:needed|required|charged)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b|\bfree\s+of\s+charge\b/iu,
+    /\b(?:no|without|zero)\s+(?!show\b)(?:\w+\s+){0,2}(?:fees?|charges?|surcharges?|penalt(?:y|ies)|deposits?|payments?|pre-?payment|credit\s+card|debit\s+card|card|billing)\b|\b(?:payments?|cards?|credit\s+cards?|deposits?|fees?|surcharges?|penalt(?:y|ies))\s+(?:is\s+|are\s+)?not\s+(?:needed|required|charged)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b|\bfree\s+of\s+charge\b/iu,
   conditionalFee:
     /\b(?:cancell?ation|no[\s-]?shows?|late[\s-]?cancell?ation)\b.{0,60}?\b(?:fees?|charges?|penalt(?:y|ies))\b|\b(?:fees?|charges?|penalt(?:y|ies))\b.{0,60}?\b(?:cancel\w*|no[\s-]?shows?)\b|\bcharged\s+if\s+you\s+(?:miss|cancel|do\s+not\s+show|don'?t\s+show)\b/iu,
   noShow: /\bno[\s-]?shows?\b|\bmiss\s+your\b|\bdo(?:n'?t|\s+not)\s+show\b/iu,
@@ -122,6 +122,16 @@ const VOCABULARY = {
   /** A press's name that can commit, for finding a checkout's next commit control. */
   commitWords:
     /\b(?:buy|pay|purchase|order|checkout|check\s*out|reserve|book|subscribe|donate|bid|register|rsvp|join|confirm|complete|continue|next|submit|place|proceed|review|finish|start)\b/iu,
+  /** A final booking, registration or zero-charge order control rather than an intermediate step. */
+  finalFreeControl:
+    /\b(?:reserve|reservation|book(?:ing)?|rsvp|wait\s*list|waitlist|register|confirm|complete|place\s+(?:your\s+)?order|order\s+now|submit)\b/iu,
+  stepControl: /\b(?:continue|next|proceed)\b/iu,
+  unpricedFeeWording: /\b(?:fees?|charges?|surcharges?|penalt(?:y|ies))\b/iu,
+  cardRequired:
+    /\b(?:a\s+)?(?:credit\s+|debit\s+)?cards?\s+(?:on\s+file\s+)?(?:is|are)\s+(?:required|needed)\b|\b(?:require|need)s?\s+a\s+(?:credit\s+|debit\s+)?card\b|\benter\s+(?:your\s+)?(?:card|payment)\b/iu,
+  /** Explicit host-read payment arrangement when nothing is due online and no card is collected. */
+  noCardPayment:
+    /\bno\s+(?:credit\s+|debit\s+)?cards?\s+(?:is\s+|are\s+)?(?:required|needed)\b|\b(?:cards?|credit\s+cards?)\s+(?:is\s+|are\s+)?not\s+(?:required|needed)\b|\bpay(?:able)?\s+(?:at|in)\s+(?:the\s+)?(?:venue|salon|shop|store|studio|counter|location|person|arrival|appointment)\b|\b(?:paid|collected|settled)\s+(?:at|in)\s+(?:the\s+)?(?:venue|salon|shop|store|studio|counter|location|person|arrival|appointment)\b/iu,
   /** A route that enters a checkout: what a redirect to a payment platform leaves from. */
   checkoutPath:
     /(?:^|[/_.-])(?:checkout|cart|basket|bag|pay(?:ments?)?|orders?|book(?:ings?)?|reserv\w*|purchase)(?:[/_.-]|$)/iu,
@@ -201,7 +211,12 @@ function undenied(text: string): string {
 }
 
 function chargeWording(text: string): boolean {
-  return VOCABULARY.freeBlocker.test(undenied(text));
+  const words = undenied(text);
+  return (
+    VOCABULARY.freeBlocker.test(words) ||
+    VOCABULARY.unpricedFeeWording.test(words) ||
+    VOCABULARY.cardRequired.test(words)
+  );
 }
 
 /** The amounts a line labels: its own, or those alone on the line after a short label ("Order total", "$42.00"). */
@@ -319,8 +334,9 @@ function readBooking(read: CheckoutRead, lines: readonly Line[], label: string):
   const zone = read.region.times.find((time) => OFFSET_TIME.test(time.datetime));
   const offset = zone ? OFFSET_TIME.exec(zone.datetime)?.[1] : undefined;
   const venueLine = lines.map((line) => VOCABULARY.venueLine.exec(line.text)?.[1]).find(Boolean);
-  const venue = structured.venue ?? venueLine ?? read.frames.find((frame) => frame.top)?.heading ?? undefined;
   const timeText = read.region.times.find((time) => time.text)?.text;
+  if (!parties.length && !times.length && !timeText && !structured.at && !venueLine) return undefined;
+  const venue = structured.venue ?? venueLine ?? read.frames.find((frame) => frame.top)?.heading ?? undefined;
   return {
     ...(venue ? { venue: bounded(squash(venue)) } : {}),
     ...(parties.length === 1 ? { partySize: parties[0] } : {}),
@@ -352,22 +368,31 @@ function readTerms(
   lines: readonly Line[],
   booking: GenericBookingFacts | undefined,
   now: number,
-): { terms: FinancialCommitment[]; missing: string[]; boxes: CheckoutBox[]; currencies: string[] } {
+): {
+  terms: FinancialCommitment[];
+  missing: string[];
+  boxes: CheckoutBox[];
+  currencies: string[];
+  consumed: Set<number>;
+} {
   const terms: FinancialCommitment[] = [];
   const missing: string[] = [];
   const boxes: CheckoutBox[] = [];
   const currencies: string[] = [];
   const recurringTerms: FinancialCommitment[] = [];
+  const consumed = new Set<number>();
   for (let index = 0; index < lines.length; index++) {
     let line = lines[index];
     const words = undenied(line.text);
     const kind = TERM_KINDS.find((term) => term.wording.test(words) && (!term.priced || line.money.length > 0))?.kind;
     if (!kind) continue;
+    consumed.add(index);
     // A label alone on its line, whose terms stand on the next: "Cancellation fee", then "$25 per person…".
     const next = lines[index + 1];
     if (!line.money.length && next?.money.length && !VOCABULARY.total.test(next.text)) {
       line = { text: `${line.text}: ${next.text}`, box: union([line.box, next.box]), money: next.money };
       index++;
+      consumed.add(index);
     }
     const charge = line.money.at(0);
     if (charge) {
@@ -425,7 +450,7 @@ function readTerms(
       if (!term.frequency) missing.push('the recurring frequency');
       if (term.amountMinor === undefined) missing.push('the price after the trial');
     }
-  return { terms, missing: distinct(missing), boxes, currencies: distinct(currencies) };
+  return { terms, missing: distinct(missing), boxes, currencies: distinct(currencies), consumed };
 }
 
 function readItems(
@@ -451,8 +476,11 @@ function readItems(
     .filter((field) => field.value && VOCABULARY.partyField.test(`${field.name} ${field.label}`))
     .map((field) => bounded(`${field.label || field.name} ${field.value ?? ''}`.trim()));
   if (party.length) return party;
-  const shown = [booking?.venue, booking?.timeText].filter((part): part is string => Boolean(part));
-  return shown.length ? [bounded(shown.join(', '))] : [];
+  if (booking?.timeText || booking?.at) {
+    const shown = [booking.venue, booking.timeText ?? booking.at].filter((part): part is string => Boolean(part));
+    if (shown.length) return [bounded(shown.join(', '))];
+  }
+  return [];
 }
 
 /** Lowercased; `ambiguous` when the checkout shows more than one. */
@@ -540,8 +568,9 @@ export function offersPayment(read: CheckoutRead): boolean {
 }
 
 /**
- * What one read of an unreviewed checkout is, decided in order: free, needing a card, incomplete, or a card's
- * facts. Pure: the host's isolated-world read and the job's merchant are its only inputs.
+ * What one read of an unreviewed checkout is, decided in order: free (with concrete booking/item identity and a
+ * final control), incomplete obligation/checkout facts, needing a card, or complete card facts. Pure: the host's
+ * isolated-world read and the job's merchant are its only inputs.
  */
 export function decideGenericCheckout(
   read: CheckoutRead,
@@ -562,14 +591,17 @@ export function decideGenericCheckout(
   const items = readItems(lines, read.region.fields, booking);
   const note = readNote(read.region.fields);
   const payment = readPayment(read, lines);
+  const paymentOffered = offersPayment(read);
 
-  // Free only when the booking's own form or dialog states no money and no charge wording, and nothing on the
-  // page offers or holds a way to pay.
-  const free =
-    !lines.some((line) => line.money.length || chargeWording(line.text)) &&
-    !positive(label).length &&
-    !offersPayment(read);
-  if (free)
+  // Free only when the booking's own form or dialog states no money and no charge wording, nothing on the page
+  // offers or holds a way to pay, and the host read both the intended booking/items and a final commit control.
+  const noFinancialSignal =
+    !lines.some((line) => line.money.length || chargeWording(line.text)) && !positive(label).length && !paymentOffered;
+  if (noFinancialSignal) {
+    if (!label) return { status: 'facts_incomplete', missing: ["the checkout's place-order button"] };
+    if (!items.length) return { status: 'facts_incomplete', missing: ['the items'] };
+    if (!VOCABULARY.finalFreeControl.test(label) || VOCABULARY.stepControl.test(label))
+      return { status: 'facts_incomplete', missing: ['the final confirmation button'] };
     return {
       status: 'free',
       facts: {
@@ -586,8 +618,9 @@ export function decideGenericCheckout(
         ...(booking ? { booking } : {}),
       },
     };
+  }
 
-  const { terms, missing, boxes: termBoxes, currencies } = readTerms(lines, booking, now);
+  const { terms, missing, boxes: termBoxes, currencies, consumed } = readTerms(lines, booking, now);
   const totals: Array<{ money: ConfirmationCharge; boxes: CheckoutBox[] }> = [];
   const dues: ConfirmationCharge[] = [];
   let nothingNow = false;
@@ -600,6 +633,20 @@ export function decideGenericCheckout(
     else for (const amount of money) totals.push({ money: amount, boxes });
   });
   const totalValues = distinct(totals.map((total) => total.money));
+  const hasUnpricedFee = lines.some((line, index) => {
+    if (consumed.has(index) || !VOCABULARY.unpricedFeeWording.test(undenied(line.text))) return false;
+    if (statedAmounts(line.text).length > 0 || /\bfree\b/iu.test(line.text) || VOCABULARY.nothingNow.test(line.text))
+      return false;
+    if (VOCABULARY.total.test(line.text) && labelled(lines, index).money.length > 0) return false;
+    const next = lines[index + 1];
+    return !(
+      next &&
+      ((statedAmounts(next.text).length > 0 && !VOCABULARY.total.test(next.text)) || /\bfree\b/iu.test(next.text))
+    );
+  });
+  if (hasUnpricedFee) missing.push('the fee amount');
+  if (missing.length) return { status: 'facts_incomplete', missing: distinct(missing) };
+
   const partySize = booking?.partySize ?? 1;
   // What a term charges, beyond a fee that applies only on its condition.
   const charges = (kinds: ReadonlyArray<FinancialCommitment['kind']>): number =>
@@ -623,7 +670,17 @@ export function decideGenericCheckout(
       ? formatMoney(total.amountMinor, total.currency)
       : undefined;
 
-  if (!payment.payment && !payment.ambiguous)
+  const cardDemanded =
+    paymentOffered ||
+    lines.some((line) => VOCABULARY.cardRequired.test(undenied(line.text))) ||
+    (dueNow !== undefined && dueNow > 0);
+  const noCardArrangement =
+    !payment.payment && !payment.ambiguous && !cardDemanded && dueNow === 0
+      ? lines.find((line) => VOCABULARY.noCardPayment.test(line.text))?.text
+      : undefined;
+  const resolvedPayment = payment.payment ?? (noCardArrangement ? bounded(noCardArrangement) : undefined);
+
+  if (!resolvedPayment && !payment.ambiguous && cardDemanded)
     return {
       status: 'card_needed',
       needed: {
@@ -640,7 +697,8 @@ export function decideGenericCheckout(
   if (!contactEmail) missing.push('the contact email');
   if (!account) missing.push('the account the purchase signs in with');
   if (payment.ambiguous) missing.push('which saved payment method pays');
-  if (missing.length || !total || dueNow === undefined || !contactEmail || !account || !payment.payment)
+  else if (!resolvedPayment) missing.push('the payment terms');
+  if (missing.length || !total || dueNow === undefined || !contactEmail || !account || !resolvedPayment)
     return { status: 'facts_incomplete', missing: distinct(missing) };
 
   // The card's picture shows the total and the commit control, placed on the main frame's viewport.
@@ -670,7 +728,7 @@ export function decideGenericCheckout(
         guest,
         contactEmail,
         items,
-        payment: payment.payment,
+        payment: resolvedPayment,
         ...(note ? { note } : {}),
         ...(booking ? { booking } : {}),
       },

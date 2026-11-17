@@ -119,7 +119,7 @@ const NO_TEXT_ENTRY = /^(?:hidden|submit|button|reset|image|checkbox|radio|file|
  * What the host recognizes in a page's text, fields and controls. Vocabulary is data: widen or narrow it
  * here, never by changing the order the classifier decides in.
  */
-const PAGE_VOCABULARY = {
+export const PAGE_VOCABULARY = {
   moneyTerms,
   /** A total or an amount due now; a subtotal is not one. */
   total:
@@ -155,7 +155,7 @@ const PAGE_VOCABULARY = {
   orderWords: /\b(?:orders?|purchase|payment|pay|charged?|booking|reservation|subscription|checkout)\b/iu,
   /** A control that commits a booking or an order, in whose form free text is a booking or order note. */
   commitName:
-    /\b(?:buy|pay|purchase|order|checkout|check\s*out|reserve|reservation|book(?:ing)?|subscribe|donate|bid|register|rsvp|wait\s*list|waitlist|notify\s+me)\b/iu,
+    /\b(?:buy|pay|purchase|order|checkout|check\s*out|reserve|reservation|book(?:ing)?|(?:confirm|complete|book|reserve|schedule)\s+appointment|subscribe|donate|bid|register|rsvp|wait\s*list|waitlist|notify\s+me)\b/iu,
   bookingField:
     /(?:^|[^a-z])(?:party|guests?|covers|adults|children|kids|tickets?|quantity|qty|check.?in|check.?out|arrival|departure|nights|seats?)(?:[^a-z]|$)/iu,
   /** A lookup field: a formless one holds a query, never free text. */

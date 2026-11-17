@@ -272,7 +272,7 @@ export {
   type BrowserRequest,
 } from './db.js';
 export { registerBrowserActionDelivery } from './queue.js';
-export type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
+export type { BrowserCommitmentContinuation, BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 export {
   activateControl,
   classifyActivation,
@@ -334,4 +334,4 @@ register({
   },
 });
 
-export { classifyNavigationUrl } from './control-policy.js';
+export { classifyNavigationUrl, type NavigationUrlPurpose } from './control-policy.js';

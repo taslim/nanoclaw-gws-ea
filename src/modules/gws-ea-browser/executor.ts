@@ -1,7 +1,7 @@
 import { classifyControlFacts, classifyNavigationUrl } from './control-policy.js';
 import { beginBrowserDiagnosticAction, captureBrowserDiagnosticRefusal } from './diagnostics.js';
 import path from 'node:path';
-import { errors, type Page } from 'playwright-core';
+import { errors, type ElementHandle, type Page } from 'playwright-core';
 
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { sessionDir } from '../../session-manager.js';
@@ -54,9 +54,12 @@ import {
 import {
   isReadOnlyBrowserAction,
   browserKeyboardSubmitTarget,
+  captureBrowserCommitTarget,
+  resolveObservedCommitTarget,
   prepareBrowserActionFacts,
   enrichBrowserActionFacts,
   type BrowserActionControl,
+  type CapturedBrowserCommitTarget,
 } from './action-targets.js';
 import {
   BrowserExecutionError,
@@ -68,6 +71,7 @@ import {
   type BrowserBatchResult,
   type BrowserBatchOptions,
   type BrowserBatch,
+  type BrowserCommitmentContinuation,
 } from './actions.js';
 import { ControlFactsUnavailableError, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import { entryRefusal } from './authentication-signatures.js';
@@ -467,6 +471,25 @@ async function executeBatch(
     press = result.freePress;
     return result.ordinaryPress;
   };
+  let commitAttempted = false;
+  let capturedCommit: CapturedBrowserCommitTarget | undefined;
+  const activatePress = async (
+    element: ElementHandle,
+    pressAction: () => Promise<void>,
+    activationIntent: ActivationIntent,
+    commitCandidate: ElementHandle | null | undefined = element,
+  ): Promise<boolean> => {
+    try {
+      return pressedBy(await activateControl(page, element, pressAction, undefined, activationIntent));
+    } catch (error) {
+      if (error instanceof BrowserActivationError && error.reason === 'purchase_control') {
+        commitAttempted = true;
+        await capturedCommit?.dispose();
+        capturedCommit = await captureBrowserCommitTarget(commitCandidate);
+      }
+      throw error;
+    }
+  };
   page.on('framenavigated', navigated);
   try {
     beginBrowserDiagnosticAction(page, 0);
@@ -536,7 +559,7 @@ async function executeBatch(
           case 'observe':
             break;
           case 'navigate': {
-            const classification = classifyNavigationUrl(action.url);
+            const classification = classifyNavigationUrl(action.url, 'document');
             if (classification !== 'ordinary') {
               captureBrowserDiagnosticRefusal(page)(
                 'address',
@@ -584,14 +607,10 @@ async function executeBatch(
           }
           case 'click':
             if (target)
-              pressed = pressedBy(
-                await activateControl(
-                  page,
-                  target.element,
-                  () => nativeAction(context, (options) => target.element.click(options)),
-                  undefined,
-                  intent('click', target),
-                ),
+              pressed = await activatePress(
+                target.element,
+                () => nativeAction(context, (options) => target.element.click(options)),
+                intent('click', target),
               );
             break;
           case 'type':
@@ -627,22 +646,18 @@ async function executeBatch(
                 try {
                   // A field's Enter submits its form through the form's own submit control; a formless field's
                   // Enter is the field's own press.
-                  pressed = pressedBy(
-                    await activateControl(
-                      page,
-                      formSubmit.asElement() ?? target.element,
-                      keyPress,
-                      undefined,
-                      intent('submit', target),
-                    ),
+                  const submitElement = formSubmit.asElement();
+                  pressed = await activatePress(
+                    submitElement ?? target.element,
+                    keyPress,
+                    intent('submit', target),
+                    submitElement,
                   );
                 } finally {
                   await formSubmit.dispose();
                 }
               } else if (SPACE_KEY.test(action.key))
-                pressed = pressedBy(
-                  await activateControl(page, target.element, keyPress, undefined, intent('click', target)),
-                );
+                pressed = await activatePress(target.element, keyPress, intent('click', target));
               // Any other key edits or moves within the field: typing, inside the same window as a fill.
               else await guard.duringAction(context.remaining(), keyPress);
             }
@@ -675,14 +690,10 @@ async function executeBatch(
             );
             if (action.submit) {
               const submit = refs.get(action.submit.ref)!;
-              pressed = pressedBy(
-                await activateControl(
-                  page,
-                  submit.element,
-                  () => nativeAction(context, (options) => submit.element.click(options)),
-                  undefined,
-                  intent('submit', submit),
-                ),
+              pressed = await activatePress(
+                submit.element,
+                () => nativeAction(context, (options) => submit.element.click(options)),
+                intent('submit', submit),
               );
             }
             break;
@@ -797,46 +808,57 @@ async function executeBatch(
     await disposeBrowserRefs(refs);
   }
   let observation;
-  if (!page.isClosed()) {
-    try {
-      // Still inside the job's operation: the host settles a cookie banner before it observes.
-      const cookieBanner = await settleCookieBanners(page, {
-        scope: { jobId: context.job.id, db: context.store.db },
-        assertActive: context.assertActive,
-        remaining: context.remaining,
-      });
-      const look = { cookieBanner, remaining: context.remaining, signal: context.signal };
-      const closing = actions.at(-1);
-      // An observe action asks to see the page, as a free press's answer does; after any other action, only what
-      // changed may be enough.
-      observation =
-        closing?.kind === 'observe' || press
-          ? await observePage(page, context.assertActive, {
-              ...look,
-              ...(closing?.kind === 'observe' && closing.within && results.at(-1)?.status === 'completed'
-                ? { within: closing.within }
-                : {}),
-            })
-          : await observePageChanges(page, context.assertActive, look);
-    } catch (error) {
-      if (!unapproved) {
-        const failure = batchErrorReason(error, guard.reason(), context, page);
-        if (!reason || reason === 'navigated') reason = failure;
+  let continuation: BrowserCommitmentContinuation | undefined;
+  try {
+    if (!page.isClosed()) {
+      try {
+        // Still inside the job's operation: the host settles a cookie banner before it observes.
+        const cookieBanner = await settleCookieBanners(page, {
+          scope: { jobId: context.job.id, db: context.store.db },
+          assertActive: context.assertActive,
+          remaining: context.remaining,
+        });
+        const look = { cookieBanner, remaining: context.remaining, signal: context.signal };
+        const closing = actions.at(-1);
+        // An observe action asks to see the page, as a free press's answer does; after any other action, only what
+        // changed may be enough.
+        observation =
+          closing?.kind === 'observe' || press
+            ? await observePage(page, context.assertActive, {
+                ...look,
+                ...(closing?.kind === 'observe' && closing.within && results.at(-1)?.status === 'completed'
+                  ? { within: closing.within }
+                  : {}),
+              })
+            : await observePageChanges(page, context.assertActive, look);
+      } catch (error) {
+        if (!unapproved) {
+          const failure = batchErrorReason(error, guard.reason(), context, page);
+          if (!reason || reason === 'navigated') reason = failure;
+        }
       }
     }
+    // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
+    const blocked = guard.reason();
+    if ((!reason || reason === 'navigated') && blocked) reason = blocked;
+    // The whole page, not the agent's cut of it, decides what the page shows.
+    const pageText = observation ? observedPageText(page) : '';
+    if (observation && (!reason || reason === 'navigated') && hasBrowserChallenge(pageText)) reason = 'challenge';
+    if (
+      observation &&
+      (!reason || reason === 'navigated') &&
+      /(?:sign in to continue|log in to continue|please sign in)/iu.test(pageText)
+    )
+      reason = 'sign_in_wall';
+    continuation =
+      reason === 'purchase_control'
+        ? commitAttempted
+          ? await resolveObservedCommitTarget(page, capturedCommit, observation?.generation)
+          : { status: 'refused' }
+        : undefined;
+  } finally {
+    await capturedCommit?.dispose();
   }
-  // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
-  const blocked = guard.reason();
-  if ((!reason || reason === 'navigated') && blocked) reason = blocked;
-  // The whole page, not the agent's cut of it, decides what the page shows.
-  const pageText = observation ? observedPageText(page) : '';
-  if (observation && (!reason || reason === 'navigated') && hasBrowserChallenge(pageText)) reason = 'challenge';
-  if (
-    observation &&
-    (!reason || reason === 'navigated') &&
-    /(?:sign in to continue|log in to continue|please sign in)/iu.test(pageText)
-  )
-    reason = 'sign_in_wall';
   let recording: { status: 'complete' | 'unavailable'; trace_indices: number[] } | undefined;
   if (options.record !== false && context.kind !== 'watch_check') {
     let complete = true;
@@ -859,7 +881,9 @@ async function executeBatch(
   }
   return {
     answer: {
-      ...(reason ? { status: 'stopped' as const, reason } : { status: 'completed' as const }),
+      ...(reason
+        ? { status: 'stopped' as const, reason, ...(continuation ? { continuation } : {}) }
+        : { status: 'completed' as const }),
       ...(consent ? { consent } : {}),
       ...(press ? { press: pressFacts(press) } : {}),
       actions: results,

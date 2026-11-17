@@ -379,7 +379,7 @@ export function completePurchaseFacts(facts: PurchaseFacts): boolean {
 }
 
 /** A commit label that books rather than buys. */
-export const BOOKING_CONTROL = /\b(?:reserve|reservation|book(?:ing)?|table|rsvp|wait\s*list|waitlist)\b/iu;
+export const BOOKING_CONTROL = /\b(?:reserve|reservation|book(?:ing)?|appointment|table|rsvp|wait\s*list|waitlist)\b/iu;
 
 export function freeCommitBooks(facts: FreeCommitFacts): boolean {
   return Boolean(facts.booking) || BOOKING_CONTROL.test(facts.control.label);
