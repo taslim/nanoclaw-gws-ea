@@ -49,7 +49,7 @@ import {
   framesUnreadyStop,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
-import { readConfirmations, readPageLines } from './confirmation.js';
+import { readConfirmationBaseline, readConfirmations, readPageLines } from './confirmation.js';
 import {
   BrowserConsentStop,
   consentStopsForAgent,
@@ -68,7 +68,12 @@ import {
   type PurchaseFacts,
 } from './fingerprint.js';
 import { pressFreeCheckout, type FreePressAnswer } from './free-press.js';
-import { genericCheckoutSignature, pressRefusal, readGenericPostPressEvidence } from './generic-signature.js';
+import {
+  genericCheckoutSignature,
+  isGenericConfirmationOrigin,
+  pressRefusal,
+  readGenericPostPressEvidence,
+} from './generic-signature.js';
 import { stopForUnapprovedCommit, type IncidentKind, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
@@ -767,12 +772,16 @@ export async function executeAuthorizedPurchase(
           commitClaim = checked;
         }
         await context.assertActive();
+        // Snapshot pre-press confirmation references before the final checkout read so `begin()` verifies the live terms.
+        beforeConfirmations = facts.generic
+          ? await readConfirmationBaseline(page, (url) =>
+              isGenericConfirmationOrigin(url, facts.site, facts.generic?.platform),
+            )
+          : undefined;
         // The consent check immediately before the press, inside the facts `begin()` checks.
         const consent = await checkoutConsent(context, page, element);
         const immediate = await readMerchantPurchase(page, element);
         if (immediate.status !== 'ready') throw new PurchaseAuthorityError('changed');
-        // Snapshot pre-press confirmation references right at the native press boundary after all waits finish.
-        beforeConfirmations = new Set((await readConfirmations(page)).map((item) => item.reference));
         await store.begin(context, authority.id, withConsent(immediate.facts, consent), commitClaim);
         marked = true;
       });
@@ -828,13 +837,15 @@ export async function executeAuthorizedPurchase(
         const next = step.element;
         await press(genericCheckoutSignature, next, async () => {
           await context.assertActive();
+          const snapshot = await readConfirmationBaseline(page, (url) =>
+            isGenericConfirmationOrigin(url, facts.site, facts.generic?.platform),
+          );
+          if (!snapshot) beforeConfirmations = undefined;
+          else if (beforeConfirmations) for (const existing of snapshot) beforeConfirmations.add(existing);
           // The same checks as the first press: consent, then the facts the press carries, under the same approval.
           const consent = await checkoutConsent(context, page, next);
           const immediate = await readMerchantPurchase(page, next);
           if (immediate.status !== 'ready') throw new PurchaseAuthorityError('changed');
-          const snapshot = await readConfirmations(page);
-          beforeConfirmations ??= new Set();
-          for (const existing of snapshot) beforeConfirmations.add(existing.reference);
           await store.continueCommit(context, authority.id, withConsent(immediate.facts, consent));
         });
       }

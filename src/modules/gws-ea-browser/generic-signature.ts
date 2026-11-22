@@ -1023,10 +1023,15 @@ export function pressRefusal(lines: readonly string[]): 'declined' | 'failed' | 
   return lines.some((line) => VOCABULARY.failure.test(line)) ? 'failed' : undefined;
 }
 
+/** Whether `url` belongs to the merchant's site or its checkout payment platform. */
+export function isGenericConfirmationOrigin(url: string, site: string, platform?: string): boolean {
+  const at = siteOf(url);
+  return at !== undefined && (at === site || at === platform);
+}
+
 /** A confirmation on any site but the merchant's or its payment platform's proves nothing of its attempt. */
 export function confirmsOnSite(confirmation: ConfirmationEvidence, site: string, platform?: string): boolean {
-  const at = siteOf(confirmation.source);
-  return at !== undefined && (at === site || at === platform);
+  return isGenericConfirmationOrigin(confirmation.source, site, platform);
 }
 
 function buildGenericEvidence(

@@ -231,6 +231,38 @@ export async function readConfirmations(page: Page): Promise<ConfirmationEvidenc
 }
 
 /**
+ * Reads every visible confirmation reference on `page` alongside whether every non-detached frame matching
+ * `eligible` answered cleanly. Returns `undefined` if an eligible frame could not be read, so callers never
+ * treat an unreadable frame's hidden receipt as absent.
+ */
+export async function readConfirmationBaseline(
+  page: Page,
+  eligible: (url: string) => boolean,
+): Promise<Set<string> | undefined> {
+  const references = new Set<string>();
+  let complete = true;
+  await Promise.all(
+    page.frames().map(async (frame) => {
+      if (frame.isDetached()) return;
+      const address = frame.url();
+      /* eslint-disable no-catch-all/no-catch-all -- a frame that cannot be read marks the baseline incomplete when eligible */
+      try {
+        const [text, structured] = await Promise.all([
+          frame.locator('body').innerText({ timeout: READ_TIMEOUT_MS }),
+          frame.locator('script[type="application/ld+json" i]').allTextContents(),
+        ]);
+        const evidence = confirmationEvidence(frame.url(), text, structured);
+        if (evidence) references.add(evidence.reference);
+      } catch (_error) {
+        if (!frame.isDetached() && eligible(address)) complete = false;
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
+    }),
+  );
+  return complete ? references : undefined;
+}
+
+/**
  * What the page's documents confirm, the main document first: the first that shows a charge, else the first
  * confirmation at all; undefined when no document confirms anything.
  */
