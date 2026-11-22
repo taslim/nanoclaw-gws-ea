@@ -387,7 +387,7 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
         if (!view) return { line: 'no such browser job' };
         const held = view.held_sites.length === 0 ? '' : `; sites: ${view.held_sites.join(', ')}`;
         const card = view.open_card
-          ? `; card awaiting the principal: ${view.open_card.site}, ${view.open_card.total}, ${view.open_card.due_now} due now, until ${view.open_card.expires}`
+          ? `; card awaiting the principal: ${view.open_card.site}${view.open_card.total ? `, ${view.open_card.total}` : ''}${view.open_card.due_now ? `, ${view.open_card.due_now} due now` : ''}, until ${view.open_card.expires}`
           : '';
         const unconfirmed = (view.unconfirmed ?? [])
           .map(

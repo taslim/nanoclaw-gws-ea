@@ -162,3 +162,37 @@ it('correlates redirects within an action and discards late events and redirects
   ]);
   expect(JSON.stringify(result)).not.toContain('secret-sentinel');
 });
+
+it('retains host refusals and HTTP error responses by evicting routine 2xx responses once the cap is full', () => {
+  const { events, page } = pageFixture();
+  const capture = attempt();
+  capture.observe(page);
+  for (let index = 0; index < 64; index++) {
+    const ok = request();
+    events.emit('request', ok);
+    events.emit('response', { request: () => ok, status: () => 200 });
+  }
+  captureBrowserDiagnosticRefusal(page)(
+    'document',
+    { url: 'https://payments.booking.com/pay/methods', method: 'GET', resource: 'document' },
+    'purchase_control',
+  );
+  const failing = request();
+  events.emit('request', failing);
+  events.emit('response', { request: () => failing, status: () => 500 });
+  const trailingOk = request();
+  events.emit('request', trailingOk);
+  events.emit('response', { request: () => trailingOk, status: () => 200 });
+  const result = capture.finish();
+  expect(result.events).toHaveLength(64);
+  expect(result.omitted_events).toBe(3);
+  expect(result.events).toContainEqual(
+    expect.objectContaining({
+      source: 'host_refusal',
+      category: 'document',
+      site: 'booking.com',
+      rule: 'purchase_control',
+    }),
+  );
+  expect(result.events).toContainEqual(expect.objectContaining({ source: 'http_response', status: 500 }));
+});

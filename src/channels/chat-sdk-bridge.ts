@@ -620,6 +620,7 @@ function textRequest(
 interface RequestPictures {
   readonly named: number;
   readonly files?: readonly OutboundFile[];
+  readonly required: boolean;
 }
 
 function requestPictures(
@@ -630,7 +631,8 @@ function requestPictures(
     typeof content.pictures === 'number' && Number.isSafeInteger(content.pictures) && content.pictures > 0
       ? content.pictures
       : 0;
-  return named > 0 && files?.length === named ? { named, files } : { named };
+  const required = content.requirePictures === true;
+  return named > 0 && files?.length === named ? { named, files, required } : { named, required };
 }
 
 function picturesMissing(named: number): string {
@@ -955,13 +957,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       try {
         return await attacher.postWithFiles(tid, compose(), pictures.files);
       } catch (error) {
-        if (!(error instanceof FilesNotAttachedError)) throw error;
+        if (!(error instanceof FilesNotAttachedError) || pictures.required) throw error;
         log.warn('Posting a request without its pictures, which could not be attached', {
           adapter: adapter.name,
           pictures: pictures.named,
           err: error,
         });
       }
+    } else if (pictures.required) {
+      throw new FilesNotAttachedError('Required pictures could not be attached to the approval card');
     }
     return adapter.postMessage(tid, compose(picturesMissing(pictures.named)));
   }

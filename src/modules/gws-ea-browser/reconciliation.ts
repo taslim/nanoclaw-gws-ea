@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 import { PurchaseAuthorityStore, type PurchaseAttemptRow } from './authority.js';
-import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
+import { GENERIC_FLOW_ID, genericAccountKey, genericCheckoutBooks, type PurchaseFacts } from './fingerprint.js';
 import { readMerchantPurchaseEvidence } from './merchant-read.js';
 import { merchantSignatures } from './merchant-signatures.js';
 import type { MerchantPurchaseEvidence } from './merchant-contract.js';
@@ -15,13 +15,12 @@ export function evidenceMatchesAttempt(
   attempt: Pick<PurchaseAttemptRow, 'facts_json' | 'attempted_at'>,
 ): boolean {
   const facts = JSON.parse(attempt.facts_json) as PurchaseFacts;
-  if (facts.generic)
-    return (
-      facts.flowId === GENERIC_FLOW_ID &&
-      evidence.flowId === GENERIC_FLOW_ID &&
-      evidence.resolution === 'committed' &&
-      evidence.account === facts.generic.contactEmail
-    );
+  if (facts.generic) {
+    if (facts.flowId !== GENERIC_FLOW_ID || evidence.flowId !== GENERIC_FLOW_ID || evidence.resolution !== 'committed')
+      return false;
+    const accountKey = genericAccountKey(facts);
+    return accountKey !== undefined && evidence.account === accountKey;
+  }
   const ordered = Date.parse(evidence.orderedAt);
   const attempted = Date.parse(attempt.attempted_at);
   // A native purchase id, when the merchant exposes it, is stronger than a time window.
@@ -74,7 +73,7 @@ export async function reconcilePurchaseAttempt(
   const evidence = await readMerchantPurchaseEvidence(page, facts);
   if (!evidence || !evidenceMatchesAttempt(evidence, attempt)) return inconclusive;
   const placed = evidence.resolution === 'committed';
-  const status = placed ? (evidence.reservation || facts.generic?.booking ? 'booked' : 'placed') : 'not_placed';
+  const status = placed ? (evidence.reservation || genericCheckoutBooks(facts) ? 'booked' : 'placed') : 'not_placed';
   const result = await store.resolve(attempt.id, {
     placed,
     source: 'page',

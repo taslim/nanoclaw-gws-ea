@@ -279,22 +279,33 @@ it('opens any public page, including booking-entry URLs, and refuses only blocke
     'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
     'https://salon.example/book-now/downtown',
     'https://bistro.example/reserve-now/dinner',
+    'https://payments.booking.com/pay/methods?token=abc',
+    'https://checkout.stripe.com/c/pay/cs_live_123',
+    'https://shop.example/orders/purchase-history',
     'https://shop.example/search?q=restaurant',
   ])
     expect(classifyNavigationUrl(url, 'document')).toBe('ordinary');
   for (const url of [
     'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
     'https://salon.example/reserve-now/downtown',
+    'https://payments.booking.com/pay/methods',
+    'https://shop.example/buy',
   ])
     expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');
   for (const url of [
     'https://salon.example/venues?action=book%2Dnow',
     'https://bistro.example/tables?intent=reserve%20now',
+    'https://shop.example/checkout?action=pay',
     'https://shop.example/buy?oneclick=1',
+    'https://shop.example/pay/now',
+    'https://payments.booking.com/pay/charge',
     'https://shop.example/checkout/place-order',
     'https://shop.example/checkout/submit',
     'https://shop.example/api/charge',
     'https://shop.example/orders/confirm-booking',
+    'https://shop.example/purchase?options=gift',
+    'https://shop.example/items?purchase=1&options=gift',
+    'https://shop.example/checkout?submit=1',
   ]) {
     expect(classifyNavigationUrl(url, 'document')).toBe('purchase_control');
     expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');
@@ -791,6 +802,62 @@ describe("an ordinary action's script-request window", () => {
     expect(window.listening()).toBe(0);
   });
 
+  it('ignores child-frame navigations started after the main document has been replaced', async () => {
+    const window = await windowFixture('destination.example');
+    const main = window.page.mainFrame();
+    const child = { isDetached: () => false, url: () => 'https://payments.destination.example/pay/methods' };
+    vi.useFakeTimers();
+    let returned = false;
+    const pressed = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', { isNavigationRequest: () => true, frame: () => main });
+      })
+      .then(() => {
+        returned = true;
+      });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(returned).toBe(false);
+    window.events.emit('framenavigated', main);
+    // A child iframe navigation on the newly loaded destination page must not pin the previous action's window.
+    window.events.emit('request', { isNavigationRequest: () => true, frame: () => child });
+    await vi.advanceTimersByTimeAsync(50);
+    await pressed;
+    expect(returned).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await window.guard.actionsSettled();
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+  });
+
+  it('keeps tracking a later main-frame navigation past the settle interval after the first main document commits', async () => {
+    const window = await windowFixture('redirect.example');
+    const main = window.page.mainFrame();
+    vi.useFakeTimers();
+    let returned = false;
+    const pressed = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', { isNavigationRequest: () => true, frame: () => main });
+      })
+      .then(() => {
+        returned = true;
+      });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(returned).toBe(false);
+    window.events.emit('framenavigated', main);
+    // A second main-frame navigation started after replacement must keep the guard window open past settle.
+    window.events.emit('request', { isNavigationRequest: () => true, frame: () => main });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(returned).toBe(false);
+    expect(window.armed()).toEqual(['Fetch.enable']);
+    window.events.emit('framenavigated', main);
+    await vi.advanceTimersByTimeAsync(50);
+    await pressed;
+    expect(returned).toBe(true);
+    await window.guard.actionsSettled();
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+  });
+
   it('starts an approved press only once every ordinary window on its page has closed', async () => {
     approveReviewedFixture();
     const window = await windowFixture('www.amazon.com');
@@ -824,6 +891,7 @@ it('refuses only script requests that are no GET, to a payment processor or a pu
     ['PUT', 'https://checkoutshopper-live.adyen.com/checkoutshopper/v1/payments'],
     ['POST', 'https://pay.shopify.com/session'],
     ['POST', 'https://shop.example/api/checkout/submit'],
+    ['POST', 'https://shop.example/checkout?submit=1'],
     ['POST', 'https://bistro.example/api/reservations'],
     ['POST', 'https://salon.example/api/bookings?time=19%3A00'],
     ['POST', 'https://salon.example/api/appointments'],

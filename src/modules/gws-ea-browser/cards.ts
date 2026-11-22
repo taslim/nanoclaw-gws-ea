@@ -7,7 +7,15 @@ import { formatLocalTime, formatLocalTimeWithZone, timeZoneLabel } from '../../t
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
 import type { PendingApproval } from '../../types.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
-import { bookedReservation, formatMoney, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import {
+  bookedReservation,
+  currencyExponent,
+  formatMoney,
+  hasPurchaseDueNow,
+  hasPurchaseTotal,
+  type PurchaseBounds,
+  type PurchaseFacts,
+} from './fingerprint.js';
 import { quoted } from '../approvals/request-text.js';
 import type { PrincipalClock } from './watch-policy.js';
 
@@ -102,13 +110,13 @@ function isAssistantAddress(address: string, identity: CardIdentity): boolean {
 function termLines(
   facts: PurchaseFacts,
   partySize: number | undefined,
-  money: (amount: number) => string,
+  money: ((amount: number) => string) | undefined,
   clock: PrincipalClock,
 ): string[] {
   const lines: string[] = [];
   for (const term of facts.commitments) {
     lines.push(`Financial commitment: ${term.kind}; ${quoted(term.terms, 700)}`);
-    if (term.amountMinor !== undefined)
+    if (term.amountMinor !== undefined && money)
       lines.push(
         `Amount due later/exposure: ${money(term.amountMinor)}${term.perPerson ? ` per person × ${partySize ?? 'unknown party size'}` : ' total'}`,
       );
@@ -143,21 +151,45 @@ function renderGenericCard(
 ): string {
   const generic = facts.generic;
   if (!generic) throw new Error('A generic card needs the generic facts');
-  const money = (amount: number): string => formatMoney(amount, facts.currency);
+  const review = generic.review;
+  const hasCurrency = currencyExponent(facts.currency) !== undefined;
+  const money = hasCurrency ? (amount: number): string => formatMoney(amount, facts.currency) : undefined;
+  const hasTotal = hasPurchaseTotal(facts);
+  const hasDueNow = hasPurchaseDueNow(facts);
   const assistant = (address: string): boolean => isAssistantAddress(address, identity);
   const booking = generic.booking;
+  const accountText = generic.guest
+    ? 'guest checkout'
+    : assistant(facts.account)
+      ? "your assistant's account"
+      : review?.missing.includes('the account the purchase signs in with')
+        ? facts.account
+        : quoted(facts.account, SELLER_TEXT_LIMIT);
   const lines = [
-    "I'd like to place this purchase using the facts I read from the checkout.",
+    review
+      ? "I'd like to place this purchase, but I couldn't read every detail automatically. Check the attached screenshot before approving."
+      : "I'd like to place this purchase using the facts I read from the checkout.",
     ...(change ? [change] : []),
     ...earlierLines(earlier, clock),
     `Site: ${facts.site}`,
     ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
-    `Account: ${generic.guest ? 'guest checkout' : assistant(facts.account) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
-    `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quoted(generic.contactEmail, SELLER_TEXT_LIMIT)}`,
+    ...(review ? [`Button I'll press: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`] : []),
+    `Account: ${accountText}`,
+    ...(generic.contactEmail
+      ? [
+          `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quoted(generic.contactEmail, SELLER_TEXT_LIMIT)}`,
+        ]
+      : review?.contactEmails?.length
+        ? [
+            `Contact emails shown: ${review.contactEmails
+              .map((address) => (assistant(address) ? "your assistant's email" : quoted(address, SELLER_TEXT_LIMIT)))
+              .join(', ')}`,
+          ]
+        : []),
     ...generic.items.map((item) => `Item: ${quoted(item, SELLER_TEXT_LIMIT)}`),
-    `Total: ${money(facts.totalMinor)} (${facts.currency})`,
-    `Due now: ${money(facts.dueNowMinor)}`,
-    `Payment: ${quoted(generic.payment, SELLER_TEXT_LIMIT)}`,
+    ...(hasTotal && money ? [`Total: ${money(facts.totalMinor)} (${facts.currency})`] : []),
+    ...(hasDueNow && money ? [`Due now: ${money(facts.dueNowMinor)}`] : []),
+    ...(generic.payment ? [`Payment: ${quoted(generic.payment, SELLER_TEXT_LIMIT)}`] : []),
     ...(generic.note ? [`Note: ${quoted(generic.note, 700)}`] : []),
     ...(booking?.venue ? [`Venue: ${quoted(booking.venue, SELLER_TEXT_LIMIT)}`] : []),
     ...(booking?.partySize !== undefined ? [`Party size: ${booking.partySize}`] : []),
@@ -168,8 +200,9 @@ function renderGenericCard(
         : []),
     ...choiceLines(facts),
     ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, clock),
+    ...(review ? [`Could not verify automatically: ${review.missing.join(', ')}.`] : []),
   ];
-  if (!facts.commitments.length)
+  if (!review && !facts.commitments.length)
     lines.push('Due later: none shown. The checkout states no hold, deposit, fee, trial or subscription.');
   return lines.join('\n');
 }

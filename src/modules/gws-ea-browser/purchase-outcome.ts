@@ -131,7 +131,7 @@ export async function recordPurchaseOutcome(
       if (placed && recorded.outcome === 'not_placed') {
         const raised = await lateConfirmation(job, result.attempt, source, session, requestIdOf(content), queue());
         const { what, total } = attemptSummary(result.attempt);
-        const purchase = `The ${what} for ${total}`;
+        const purchase = `The ${what}${total ? ` for ${total}` : ''}`;
         return {
           status: 'possible_duplicate',
           thread: job.thread_id,

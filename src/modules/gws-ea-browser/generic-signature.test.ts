@@ -1,9 +1,20 @@
 /** The generic signature's decisions and fact floor, from host reads shaped as the isolated-world reader returns them. */
 import { describe, expect, it } from 'vitest';
 
+import { confirmationReferences } from './confirmation.js';
 import type { CheckoutField, CheckoutFrame, CheckoutRead } from './control-facts.js';
-import { completePurchaseFacts, materialPurchaseChange, type PurchaseFacts } from './fingerprint.js';
+import {
+  authorizablePurchaseFacts,
+  completePurchaseFacts,
+  genericAccountKey,
+  GENERIC_FLOW_ID,
+  guaranteeCoversReservation,
+  materialPurchaseChange,
+  validReviewPurchaseFacts,
+  type PurchaseFacts,
+} from './fingerprint.js';
 import { decideGenericCheckout, pressRefusal, type GenericDecision } from './generic-signature.js';
+import { evidenceMatchesAttempt } from './reconciliation.js';
 
 const NOW = Date.parse('2026-10-17T12:00:00.000Z');
 const locator = {
@@ -71,8 +82,8 @@ function read(shown: Shown): CheckoutRead {
     frames: shown.frames ?? [frame({ url: frameUrl, lines: shown.lines })],
   };
 }
-const decide = (shown: Shown, merchant = 'pottery.example'): GenericDecision =>
-  decideGenericCheckout(read(shown), { merchant, locator, controlBox: { x: 60, y: 450, width: 120, height: 30 } }, NOW);
+const decide = (shown: Shown, merchant = 'pottery.example', now = NOW): GenericDecision =>
+  decideGenericCheckout(read(shown), { merchant, locator, controlBox: { x: 60, y: 450, width: 120, height: 30 } }, now);
 const ready = (decision: GenericDecision): PurchaseFacts => {
   if (decision.status !== 'ready') throw new Error(`Expected a card's facts, got ${JSON.stringify(decision)}`);
   return decision.facts;
@@ -146,24 +157,48 @@ describe('the generic fact floor', () => {
     });
   });
 
-  it('stops naming what it cannot read', () => {
-    expect(decide({ ...shop, fields: [email('aya.web@example.test'), email('morgan@example.test')] })).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the contact email'],
-    });
-    expect(decide({ ...shop, lines: ['Visa ending in 4242', 'Order total $42.00'] })).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the items'],
-    });
-    expect(
+  it('falls back to screenshot-backed review facts when a financial checkout has unread details, and locks its visible lines', () => {
+    const ambiguousEmail = ready(
+      decide({ ...shop, fields: [email('aya.web@example.test'), email('morgan@example.test')] }),
+    );
+    expect(ambiguousEmail.generic?.review?.missing).toEqual(['the contact email']);
+    expect(completePurchaseFacts(ambiguousEmail)).toBe(false);
+    expect(validReviewPurchaseFacts(ambiguousEmail)).toBe(true);
+    expect(authorizablePurchaseFacts(ambiguousEmail, 'checkout')).toBe(true);
+    expect(authorizablePurchaseFacts(ambiguousEmail, 'watch')).toBe(false);
+    expect(authorizablePurchaseFacts(ambiguousEmail, 'reservation_guarantee')).toBe(false);
+
+    const noItems = ready(decide({ ...shop, lines: ['Visa ending in 4242', 'Order total $42.00'] }));
+    expect(noItems.generic?.review?.missing).toEqual(['the items']);
+
+    const unpricedHold = ready(
       decide({ ...shop, lines: [...shop.lines, 'A hold may be placed on your card', 'Pre-authorization applies'] }),
-    ).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the hold amount'],
-    });
+    );
+    expect(unpricedHold.generic?.review?.missing).toEqual(['the hold amount']);
+    // Volatile countdown ticks stay ignored even on a review card, while real line edits trigger a fresh card.
+    const withTimer = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'A hold may be placed on your card', 'We are holding your items for 9:59'],
+      }),
+    );
+    const timerTicked = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'A hold may be placed on your card', 'We are holding your items for 7:42'],
+      }),
+    );
+    expect(materialPurchaseChange(withTimer, timerTicked, {})).toBeUndefined();
+    const wordingChanged = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'A refundable hold may be placed on your card', 'Pre-authorization applies'],
+      }),
+    );
+    expect(materialPurchaseChange(unpricedHold, wordingChanged, {})).toBe('The checkout page changed.');
   });
 
-  it('reads recurring and trial terms, and names an unreadable frequency or end date', () => {
+  it('reads recurring and trial terms, and flags an unreadable frequency or end date for screenshot review', () => {
     const club = ready(
       decide({ ...shop, lines: [...shop.lines, 'Membership: $12.00/month, renews automatically until you cancel.'] }),
     );
@@ -187,14 +222,16 @@ describe('the generic fact floor', () => {
         frequency: 'monthly',
       },
     ]);
-    expect(decide({ ...shop, lines: [...shop.lines, 'Start your free trial today, then $12.00/month.'] })).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the date the trial ends'],
-    });
-    expect(decide({ ...shop, lines: [...shop.lines, 'Membership $12.00, renews automatically.'] })).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the recurring frequency'],
-    });
+    const unreadTrial = ready(
+      decide({ ...shop, lines: [...shop.lines, 'Start your free trial today, then $12.00/month.'] }),
+    );
+    expect(unreadTrial.generic?.review?.missing).toEqual(['the date the trial ends']);
+    expect(completePurchaseFacts(unreadTrial)).toBe(false);
+    const unreadRecurring = ready(
+      decide({ ...shop, lines: [...shop.lines, 'Membership $12.00, renews automatically.'] }),
+    );
+    expect(unreadRecurring.generic?.review?.missing).toEqual(['the recurring frequency']);
+    expect(completePurchaseFacts(unreadRecurring)).toBe(false);
   });
 
   it('makes no term of a membership named as an item, or of a newsletter’s frequency', () => {
@@ -394,7 +431,7 @@ describe('the free-commit test', () => {
     });
   });
 
-  it('names missing fee facts before card_needed, supports explicit no-card venue payment terms, and detects their change', () => {
+  it('returns card_needed when a card is required without a saved method, supports explicit pay-at-property terms, and avoids false fee warnings', () => {
     const cardInput = field({ name: 'cardnumber', card: true, value: null });
     expect(
       decide(
@@ -406,10 +443,10 @@ describe('the free-commit test', () => {
         'table.example',
       ),
     ).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the fee amount'],
+      status: 'card_needed',
+      needed: { site: 'table.example', account: 'guest checkout', items: ['Party size 2'] },
     });
-    expect(
+    const unpricedSurcharge = ready(
       decide(
         {
           ...table,
@@ -418,10 +455,19 @@ describe('the free-commit test', () => {
         },
         'table.example',
       ),
-    ).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the fee amount'],
-    });
+    );
+    expect(unpricedSurcharge.generic?.review?.missing).toContain('the fee amount');
+    expect(completePurchaseFacts(unpricedSurcharge)).toBe(false);
+    expect(
+      guaranteeCoversReservation({ currency: 'USD', max_total_minor: 10000, revoked_at: null }, unpricedSurcharge, {
+        reservation: {
+          venueId: 'table.example',
+          partySize: 2,
+          windowStart: '2026-10-20T00:00:00.000Z',
+          windowEnd: '2026-10-30T00:00:00.000Z',
+        },
+      }),
+    ).toBe(false);
     expect(
       decide(
         {
@@ -435,7 +481,7 @@ describe('the free-commit test', () => {
       status: 'card_needed',
       needed: { site: 'table.example', account: 'guest checkout', items: ['Party size 2'] },
     });
-    expect(
+    const salonUnpriced = ready(
       decide(
         {
           label: 'Confirm appointment',
@@ -452,10 +498,9 @@ describe('the free-commit test', () => {
         },
         'salon.example',
       ),
-    ).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the fee amount'],
-    });
+    );
+    expect(salonUnpriced.generic?.review?.missing).toEqual(['the fee amount']);
+    expect(completePurchaseFacts(salonUnpriced)).toBe(false);
     expect(
       decide(
         {
@@ -469,7 +514,7 @@ describe('the free-commit test', () => {
       status: 'card_needed',
       needed: { site: 'table.example', items: ['Party size 2'], total: '$0.00' },
     });
-    expect(
+    const missingPaymentTerms = ready(
       decide(
         {
           ...table,
@@ -478,10 +523,8 @@ describe('the free-commit test', () => {
         },
         'table.example',
       ),
-    ).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the payment terms'],
-    });
+    );
+    expect(missingPaymentTerms.generic?.review?.missing).toEqual(['the payment terms']);
 
     const venuePaid = ready(
       decide(
@@ -529,6 +572,336 @@ describe('the free-commit test', () => {
       ),
     );
     expect(materialPurchaseChange(venuePaid, switchedToSavedCard, {})).toBe('The payment method changed.');
+
+    // "Includes taxes and fees" and verb "charge you" are not unpriced fees, and "No prepayment needed" + "Pay with the property" resolves cleanly.
+    const payAtPropertyComplete = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: [
+            'Your booking',
+            'Deluxe Room × 1',
+            'Total US$86.13',
+            'Includes taxes and fees',
+            'Price information',
+            'Includes $12.30 in taxes and fees',
+            'No prepayment needed',
+            'Pay with the property',
+            'The property will handle payment. The date they charge you will depend on your booking conditions.',
+          ],
+          fields: [email('aya.web@example.test')],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    );
+    expect(completePurchaseFacts(payAtPropertyComplete)).toBe(true);
+    expect(payAtPropertyComplete).toMatchObject({
+      currency: 'USD',
+      totalMinor: 8613,
+      dueNowMinor: 0,
+      cardEnding: null,
+      generic: { payment: 'Pay with the property' },
+    });
+
+    // An extra unpriced fee on the same line as "Includes taxes and fees" is still flagged,
+    // and negated inclusion wording ("Not all fees are included") is never stripped.
+    const includedPlusExtraFee = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Includes taxes and fees. A resort fee applies at check-in.'],
+      }),
+    );
+    expect(includedPlusExtraFee.generic?.review?.missing).toEqual(['the fee amount']);
+    const notAllFeesIncluded = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Not all fees are included.'],
+      }),
+    );
+    expect(notAllFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
+    const notAllTaxesAndFeesIncluded = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Not all taxes and fees are included.'],
+      }),
+    );
+    expect(notAllTaxesAndFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
+    const notAllCleaningFeesIncluded = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Not all cleaning fees are included.'],
+      }),
+    );
+    expect(notAllCleaningFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
+
+    // An unpriced deposit beside a priced cancellation fee must not invent a verified $0.00 total.
+    const unpricedDeposit = ready(
+      decide({
+        label: 'Confirm reservation',
+        lines: ['Table for 2', 'A deposit is required.', 'Cancellation fee: $25.00.'],
+        fields: [email('aya.web@example.test')],
+        frameUrl: 'https://table.example/book',
+        frames: [frame({ url: 'https://table.example/book', lines: ['Visa ending in 4242'] })],
+      }),
+    );
+    expect(unpricedDeposit.generic?.review?.missing).toContain('the deposit amount');
+    expect(unpricedDeposit.generic?.review?.missing).toContain('the total');
+
+    // A pay-at-property checkout with a saved card on file must not infer the full total is due now.
+    const payLaterWithSavedCard = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Deluxe Room × 1', 'Total US$86.13', 'Pay with the property', 'Visa ending in 4242'],
+          fields: [email('aya.web@example.test')],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    );
+    expect(payLaterWithSavedCard.generic?.review?.missing).toEqual(['the amount due now']);
+
+    // Relative trial durations stay stable across rereads within the same day.
+    const trialFirst = ready(
+      decide(
+        {
+          ...shop,
+          lines: ['Pro plan × 1', 'Total $0.00', '7-day free trial, then $12.00/month', 'Visa ending in 4242'],
+          fields: [],
+        },
+        'pottery.example',
+        NOW,
+      ),
+    );
+    const trialLater = ready(
+      decide(
+        {
+          ...shop,
+          lines: ['Pro plan × 1', 'Total $0.00', '7-day free trial, then $12.00/month', 'Visa ending in 4242'],
+          fields: [],
+        },
+        'pottery.example',
+        NOW + 120_000,
+      ),
+    );
+    expect(materialPurchaseChange(trialFirst, trialLater, {})).toBeUndefined();
+
+    // Header signed-in account changes require a new approval even when contact email and snapshot stay identical.
+    const signedInMorgan = ready(
+      decide({
+        ...shop,
+        frames: [frame({ url: 'https://pottery.example/checkout/review', lines: ['Signed in as Morgan'] })],
+      }),
+    );
+    const signedInTaylor = ready(
+      decide({
+        ...shop,
+        frames: [frame({ url: 'https://pottery.example/checkout/review', lines: ['Signed in as Taylor'] })],
+      }),
+    );
+    expect(materialPurchaseChange(signedInMorgan, signedInTaylor, {})).toBe('The account changed.');
+
+    // Booking.com Step 3 without email or "No prepayment needed": not card_needed and not a false fee failure,
+    // routed to screenshot-backed review with total and payment method preserved.
+    const bookingStep3 = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: [
+            'Monty Suites Calabar',
+            'Total US$86.13',
+            'Includes taxes and fees',
+            'Price information',
+            'Includes $12.30 in taxes and fees',
+            'Pay with the property',
+            'The property will handle payment. The date they charge you will depend on your booking conditions.',
+          ],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    );
+    expect(bookingStep3).toMatchObject({
+      currency: 'USD',
+      totalMinor: 8613,
+      generic: { payment: 'Pay with the property' },
+    });
+    expect(bookingStep3.generic?.review?.missing).not.toContain('the fee amount');
+    expect(bookingStep3.generic?.review?.missing).toContain('the contact email');
+    expect(bookingStep3.generic?.review?.missing).toContain('the amount due now');
+
+    // If a card entry field IS present on a pay-at-property step with no saved card, it still returns card_needed.
+    expect(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [cardInput],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    ).toMatchObject({ status: 'card_needed', needed: { site: 'booking.example', total: '$86.13' } });
+  });
+
+  it('binds ambiguous contact-email candidates to review approvals and ignores secret/card email values', () => {
+    const ambiguous = ready(
+      decide({
+        ...shop,
+        fields: [
+          email('Aya.Web@example.test'),
+          field({ type: 'email', name: 'recipient_email', label: 'Recipient email', value: 'morgan@example.test' }),
+          field({ type: 'email', name: 'secret_email', label: 'Email', value: 'secret@example.test', secret: true }),
+          field({ type: 'email', name: 'card_email', label: 'Card email', value: 'card@example.test', card: true }),
+        ],
+      }),
+    );
+    expect(ambiguous.generic?.contactEmail).toBeUndefined();
+    expect(ambiguous.generic?.review?.missing).toEqual(['the contact email']);
+    expect(ambiguous.generic?.review?.contactEmails).toEqual(['aya.web@example.test', 'morgan@example.test']);
+    expect(validReviewPurchaseFacts(ambiguous)).toBe(true);
+    expect(authorizablePurchaseFacts(ambiguous, 'checkout')).toBe(true);
+    expect(authorizablePurchaseFacts(ambiguous, 'watch')).toBe(false);
+    expect(authorizablePurchaseFacts(ambiguous, 'reservation_guarantee')).toBe(false);
+
+    const mutated = ready(
+      decide({
+        ...shop,
+        fields: [
+          email('aya.web@example.test'),
+          field({ type: 'email', name: 'recipient_email', label: 'Recipient email', value: 'attacker@example.test' }),
+        ],
+      }),
+    );
+    expect(materialPurchaseChange(ambiguous, mutated, {})).toBe('The contact email changed.');
+
+    const swapped = ready(
+      decide({
+        ...shop,
+        fields: [
+          email('morgan@example.test'),
+          field({ type: 'email', name: 'recipient_email', label: 'Recipient email', value: 'aya.web@example.test' }),
+        ],
+      }),
+    );
+    expect(materialPurchaseChange(ambiguous, swapped, {})).toBe('The contact email changed.');
+
+    expect(
+      validReviewPurchaseFacts({
+        ...ambiguous,
+        generic: {
+          ...ambiguous.generic!,
+          review: { ...ambiguous.generic!.review!, contactEmails: ['aya.web@example.test'] },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      validReviewPurchaseFacts({
+        ...ambiguous,
+        generic: {
+          ...ambiguous.generic!,
+          contactEmail: 'aya.web@example.test',
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it('refuses generic evidence matching via shared guest or unnamed-account strings', () => {
+    const guestReview = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    );
+    expect(genericAccountKey(guestReview)).toBeUndefined();
+    const guestEvidence = {
+      flowId: GENERIC_FLOW_ID,
+      source: 'https://booking.example/book/confirmed',
+      recordId: 'BK-9021',
+      orderedAt: new Date(NOW).toISOString(),
+      resolution: 'committed' as const,
+      account: 'guest checkout',
+      items: [],
+      totalMinor: 8613,
+      currency: 'USD',
+      cardEnding: null,
+      address: null,
+    };
+    expect(
+      evidenceMatchesAttempt(guestEvidence, {
+        facts_json: JSON.stringify(guestReview),
+        attempted_at: new Date(NOW).toISOString(),
+      }),
+    ).toBe(false);
+
+    const unnamedSignedIn = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [
+            frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar', signedIn: true }),
+          ],
+        },
+        'booking.example',
+      ),
+    );
+    expect(genericAccountKey(unnamedSignedIn)).toBeUndefined();
+    expect(
+      evidenceMatchesAttempt(
+        { ...guestEvidence, account: 'the signed-in account' },
+        { facts_json: JSON.stringify(unnamedSignedIn), attempted_at: new Date(NOW).toISOString() },
+      ),
+    ).toBe(false);
+
+    const namedSignedInNoEmail = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [
+            frame({
+              url: 'https://booking.example/book.html',
+              heading: 'Monty Suites Calabar',
+              lines: ['Signed in as Morgan'],
+            }),
+          ],
+        },
+        'booking.example',
+      ),
+    );
+    expect(genericAccountKey(namedSignedInNoEmail)).toBeUndefined();
+    expect(
+      evidenceMatchesAttempt(
+        { ...guestEvidence, account: 'Morgan' },
+        { facts_json: JSON.stringify(namedSignedInNoEmail), attempted_at: new Date(NOW).toISOString() },
+      ),
+    ).toBe(false);
+
+    const emailBound = ready(decide(shop));
+    expect(genericAccountKey(emailBound)).toBe('aya.web@example.test');
+    expect(
+      evidenceMatchesAttempt(
+        { ...guestEvidence, account: 'aya.web@example.test' },
+        { facts_json: JSON.stringify(emailBound), attempted_at: new Date(NOW).toISOString() },
+      ),
+    ).toBe(true);
   });
 });
 
@@ -536,4 +909,12 @@ it('tells a decline on the page from another failure', () => {
   expect(pressRefusal(['Your card was declined. Try another card.'])).toBe('declined');
   expect(pressRefusal(['Something went wrong. Please try again.'])).toBe('failed');
   expect(pressRefusal(['If your card is ever refused, call your bank.'])).toBeUndefined();
+});
+
+it('extracts every pre-existing confirmation reference in a document rather than only the first', () => {
+  expect(
+    confirmationReferences('Thank you for your previous orders!\nOrder number: OLD111\nBooking reference: OLD222', [
+      JSON.stringify({ '@type': 'Order', orderNumber: 'JSON-333' }),
+    ]),
+  ).toEqual(['JSON-333', 'OLD111', 'OLD222']);
 });

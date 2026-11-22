@@ -49,7 +49,7 @@ import {
   framesUnreadyStop,
   withBrowserJobNavigation,
 } from './commit-classifier.js';
-import { readConfirmations, readPageLines } from './confirmation.js';
+import { readConfirmationBaseline, readConfirmations, readPageLines } from './confirmation.js';
 import {
   BrowserConsentStop,
   consentStopsForAgent,
@@ -60,9 +60,20 @@ import {
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { unapprovedCommit } from './executor.js';
-import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import {
+  genericCheckoutBooks,
+  hasPurchaseTotal,
+  materialPurchaseChange,
+  type PurchaseBounds,
+  type PurchaseFacts,
+} from './fingerprint.js';
 import { pressFreeCheckout, type FreePressAnswer } from './free-press.js';
-import { genericCheckoutSignature, pressRefusal } from './generic-signature.js';
+import {
+  genericCheckoutSignature,
+  isGenericConfirmationOrigin,
+  pressRefusal,
+  readGenericPostPressEvidence,
+} from './generic-signature.js';
 import { stopForUnapprovedCommit, type IncidentKind, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
@@ -163,6 +174,24 @@ function withConsent(facts: PurchaseFacts, consent: CheckoutConsent): PurchaseFa
     ...(consent.agreements.length ? { agreements: [...consent.agreements] } : {}),
     ...(consent.addOns.length ? { addOns: [...consent.addOns] } : {}),
   };
+}
+
+/**
+ * Consent pass first, re-reading a generic checkout so the card's facts and locked snapshot reflect the
+ * post-consent DOM state (e.g., when unticking an optional extra updates the price or visible copy).
+ */
+async function readWithConsent(
+  context: BrowserExecutionContext,
+  page: Page,
+  element: ElementHandle,
+  initial: PurchaseFacts,
+): Promise<{ status: 'ready'; facts: PurchaseFacts } | Exclude<MerchantCheckoutRead, { status: 'ready' }>> {
+  const consent = await checkoutConsent(context, page, element);
+  if (!initial.generic) return { status: 'ready', facts: withConsent(initial, consent) };
+  const after = await readMerchantPurchase(page, element);
+  if ('element' in after && after.element !== element) await after.element.dispose();
+  if (after.status !== 'ready') return after;
+  return { status: 'ready', facts: withConsent(after.facts, consent) };
 }
 
 /** A real calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
@@ -319,8 +348,21 @@ async function requestPurchaseCard(
   });
   if (decision.effect === 'deny') throw forbidden(decision.reason);
   if (decision.effect !== 'hold') throw forbidden(purchaseMessage('notHeld'));
-  // The card's picture, taken before anything durable changes; null leaves the card saying it is unavailable.
+  // The card's picture, taken before anything durable changes; complete cards can still post without one,
+  // while screenshot-reviewed generic cards require a safe capture and fail closed to facts_incomplete without it.
+  // When a replacement card fails capture, retire the stale prior authority/pending commit and release its lease.
   const picture = await checkoutPicture(context, facts);
+  if (facts.generic?.review && !picture) {
+    if (change !== undefined) {
+      const retired = await db.transaction(async () => ({
+        cards: await detachPurchaseCards(context.job.id, 'superseded'),
+        waitingJobs: await new SiteLeaseStore(db).releaseUnheldPurchases(context.job.id),
+      }));
+      await context.wakeWaiters(retired.waitingJobs, `review-capture-failed-${id}`);
+      await finishPurchaseCardWithdrawals(retired.cards, purchaseCardWithdrawal());
+    }
+    return { status: 'facts_incomplete', missing: [...facts.generic.review.missing], repeat_safe: true };
+  }
   const expires = new Date(Date.now() + PURCHASE_CARD_LIFE_MS).toISOString();
   const detached = await db.transaction(async () => {
     const job = await db.get<{ cancelled: number; cancel_requested: number }>(
@@ -371,8 +413,14 @@ async function requestPurchaseCard(
     approverUserId: decision.approverUserId,
     expiresAt: expires,
     originLine: ERRAND_ORIGIN_LINE,
-    details: { facts: { site: facts.site, total_minor: String(facts.totalMinor), currency: facts.currency } },
+    details: {
+      facts: {
+        site: facts.site,
+        ...(hasPurchaseTotal(facts) ? { total_minor: String(facts.totalMinor), currency: facts.currency } : {}),
+      },
+    },
     pictures: [picture],
+    requirePictures: Boolean(facts.generic?.review),
   });
   // A synchronous card click may already have created the authority; never reopen its logical card.
   if (approvalId) {
@@ -510,22 +558,45 @@ registerApprovalResolvedHandler(async (event) => {
 });
 
 /**
- * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, or a
- * generic checkout's confirmation page, whose contact email keys the order number.
+ * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, or
+ * — immediately after the host's own press — a newly appeared generic confirmation whose reference was not
+ * already visible on the page before pressing.
  */
 async function verifyPlaced(
   page: Page,
   authority: SpendingAuthority,
   store: PurchaseAuthorityStore,
   facts: PurchaseFacts,
-): Promise<{ outcome: Record<string, unknown>; evidence: MerchantPurchaseEvidence } | undefined> {
-  const evidence = await readMerchantPurchaseEvidence(page, facts);
+  beforeConfirmations: ReadonlySet<string> | undefined,
+): Promise<
+  { outcome: Record<string, unknown>; evidence: MerchantPurchaseEvidence; recordAccount: string | null } | undefined
+> {
   const attempt = await store.attempt(authority.attempt_id);
-  if (evidence?.resolution !== 'committed' || !attempt || !evidenceMatchesAttempt(evidence, attempt)) return undefined;
+  if (!attempt) return undefined;
+  if (facts.generic) {
+    const matched = beforeConfirmations
+      ? await readGenericPostPressEvidence(page, facts, beforeConfirmations)
+      : undefined;
+    if (!matched) return undefined;
+    if (matched.recordAccount !== null && !evidenceMatchesAttempt(matched.evidence, attempt)) return undefined;
+    return {
+      evidence: matched.evidence,
+      recordAccount: matched.recordAccount,
+      outcome: {
+        status: genericCheckoutBooks(facts) ? 'booked' : 'placed',
+        order_number: matched.evidence.recordId,
+        evidence: matched.evidence,
+        repeat_safe: false,
+      },
+    };
+  }
+  const evidence = await readMerchantPurchaseEvidence(page, facts);
+  if (evidence?.resolution !== 'committed' || !evidenceMatchesAttempt(evidence, attempt)) return undefined;
   return {
     evidence,
+    recordAccount: evidence.account,
     outcome: {
-      status: evidence.reservation || facts.generic?.booking ? 'booked' : 'placed',
+      status: evidence.reservation ? 'booked' : 'placed',
       order_number: evidence.recordId,
       evidence,
       repeat_safe: false,
@@ -566,7 +637,12 @@ async function nextCheckoutStep(
     const decline = same && refusal === 'declined' ? pressRefusalWording(lines) : undefined;
     return decline ? { kind: 'declined', wording: decline } : { kind: 'unconfirmed' };
   }
-  const facts = withConsent(next.facts, await checkoutConsent(context, page, next.element));
+  const consented = await readWithConsent(context, page, next.element, next.facts);
+  if (consented.status !== 'ready') {
+    await next.element.dispose();
+    return { kind: 'unconfirmed' };
+  }
+  const facts = consented.facts;
   const change = materialPurchaseChange(approved, facts, bounds);
   if (change) {
     await next.element.dispose();
@@ -667,13 +743,19 @@ export async function executeAuthorizedPurchase(
       return outcome;
     };
     try {
-      facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
+      const consented = await readWithConsent(context, page, read.element, read.facts);
+      if (consented.status !== 'ready') {
+        await store.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', authority.id);
+        return unreadyCommit(consented);
+      }
+      facts = consented.facts;
       const change = materialPurchaseChange(approved, facts, bounds);
       const expired = authority.expires_at <= new Date().toISOString();
       if (authority.kind === 'watch' && (change || expired))
         return { status: 'outside_bounds', watchId: authority.watch_id, repeat_safe: false };
       if (change) return requestPurchaseCard(context, facts, bounds, change);
       if (expired) return requestPurchaseCard(context, facts, bounds, purchaseApprovalExpired(), false);
+      let beforeConfirmations: Set<string> | undefined;
       // Re-read once more inside the classifier's authority callback, immediately before its only native press.
       await press(read.signature, element, async () => {
         await context.assertActive();
@@ -690,6 +772,12 @@ export async function executeAuthorizedPurchase(
           commitClaim = checked;
         }
         await context.assertActive();
+        // Snapshot pre-press confirmation references before the final checkout read so `begin()` verifies the live terms.
+        beforeConfirmations = facts.generic
+          ? await readConfirmationBaseline(page, (url) =>
+              isGenericConfirmationOrigin(url, facts.site, facts.generic?.platform),
+            )
+          : undefined;
         // The consent check immediately before the press, inside the facts `begin()` checks.
         const consent = await checkoutConsent(context, page, element);
         const immediate = await readMerchantPurchase(page, element);
@@ -699,13 +787,13 @@ export async function executeAuthorizedPurchase(
       });
       // An approval covers the checkout, not one control: a middle step is pressed on, up to three presses.
       for (let presses = 1; ; presses++) {
-        const placed = await verifyPlaced(page, authority, store, facts);
+        const placed = await verifyPlaced(page, authority, store, facts, beforeConfirmations);
         if (placed) {
           const resolved = await store.resolve(authority.attempt_id, {
             placed: true,
             source: 'page',
             evidence: { ...placed.evidence },
-            record: { id: placed.evidence.recordId, account: placed.evidence.account },
+            record: { id: placed.evidence.recordId, account: placed.recordAccount },
             outcome: placed.outcome,
           });
           if (resolved.status === 'resolved') return settle(placed.outcome);
@@ -749,6 +837,11 @@ export async function executeAuthorizedPurchase(
         const next = step.element;
         await press(genericCheckoutSignature, next, async () => {
           await context.assertActive();
+          const snapshot = await readConfirmationBaseline(page, (url) =>
+            isGenericConfirmationOrigin(url, facts.site, facts.generic?.platform),
+          );
+          if (!snapshot) beforeConfirmations = undefined;
+          else if (beforeConfirmations) for (const existing of snapshot) beforeConfirmations.add(existing);
           // The same checks as the first press: consent, then the facts the press carries, under the same approval.
           const consent = await checkoutConsent(context, page, next);
           const immediate = await readMerchantPurchase(page, next);
@@ -908,7 +1001,25 @@ export async function executeBrowserPurchase(
           await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:merchant-lease`);
           if (!lease.acquired) return { status: 'site_purchase_blocked', reason: 'site_busy', repeat_safe: true };
         }
-        const facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
+        const consented = await readWithConsent(context, page, read.element, read.facts);
+        if (consented.status !== 'ready') {
+          switch (consented.status) {
+            case 'card_needed':
+              return { status: 'card_needed', ...consented.needed, repeat_safe: true };
+            case 'facts_incomplete':
+              return { status: 'facts_incomplete', missing: [...consented.missing], repeat_safe: true };
+            case 'terms_unavailable':
+              return { status: 'terms_unavailable', repeat_safe: true };
+            case 'free':
+            case 'checkout_lapsed':
+              return { status: 'checkout_lapsed', repeat_safe: true };
+            default: {
+              const unknown: never = consented;
+              throw new Error(purchaseInvariantMessage(unknown));
+            }
+          }
+        }
+        const facts = consented.facts;
         const store = new PurchaseAuthorityStore(context.store.db);
         const { prepareWatchPurchase } = await import('./watch-purchase.js');
         const watch = await prepareWatchPurchase(context, facts);

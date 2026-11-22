@@ -336,3 +336,54 @@ it('covers an unreviewed booking under the standing guarantee only when its venu
     }),
   ).toBe(false);
 });
+
+it('renders screenshot-reviewed generic cards honestly, omitting unread amounts and never claiming no fees due later', async () => {
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
+  const reviewed: PurchaseFacts = {
+    ...booking,
+    currency: 'USD',
+    totalMinor: 8613,
+    dueNowMinor: 0,
+    cardEnding: null,
+    commitments: [],
+    generic: {
+      guest: true,
+      items: [],
+      payment: 'Pay with the property',
+      booking: { venue: 'Monty Suites Calabar' },
+      review: {
+        missing: ['the items', 'the amount due now', 'the contact email'],
+        snapshot: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+      },
+    },
+  };
+  const card = renderPurchaseCard(reviewed, {}, NO_EARLIER_PURCHASES, () => 'America/Los_Angeles');
+  expect(card).toContain("couldn't read every detail automatically. Check the attached screenshot before approving.");
+  expect(card).toContain('Button I\'ll press: "Reserve now"');
+  expect(card).toContain('Total: $86.13 (USD)');
+  expect(card).toContain('Payment: "Pay with the property"');
+  expect(card).toContain('Could not verify automatically: the items, the amount due now, the contact email.');
+  expect(card).not.toContain('Due now:');
+  expect(card).not.toContain('Due later: none shown');
+  expect(card).not.toContain('Contact email:');
+
+  // Even when currency/total are completely unread, rendering never throws.
+  const withoutTotal = renderPurchaseCard(
+    {
+      ...reviewed,
+      currency: '',
+      totalMinor: 0,
+      generic: {
+        ...reviewed.generic!,
+        payment: undefined,
+        review: { missing: ['the total', 'the payment terms'], snapshot: ['Booking fee applies'] },
+      },
+    },
+    {},
+    NO_EARLIER_PURCHASES,
+    () => 'UTC',
+  );
+  expect(withoutTotal).toContain('Could not verify automatically: the total, the payment terms.');
+  expect(withoutTotal).not.toContain('Total:');
+  expect(withoutTotal).not.toContain('Payment:');
+});

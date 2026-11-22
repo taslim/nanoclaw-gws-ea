@@ -4,6 +4,7 @@ import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cl
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
+import { withMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import {
   detachApproval,
@@ -188,6 +189,7 @@ registerApprovalHandler(
       grant: approval,
     });
     if (decision.effect !== 'allow' || typeof payload.proposalId !== 'string') return;
+    let granted: Pick<StandingGuarantee, 'currency' | 'max_total_minor'> | undefined;
     await getDb().transaction(async () => {
       const proposal = await getDb().get<GuaranteeProposal>(
         'SELECT * FROM gws_ea_browser_guarantee_proposals WHERE id = ?',
@@ -196,16 +198,18 @@ registerApprovalHandler(
       if (
         !proposal ||
         proposal.session_id !== session.id ||
-        proposal.expires_at <= new Date().toISOString() ||
         (proposal.approval_id !== null && proposal.approval_id !== approval.approval_id)
       )
         return;
-      const existing = await getDb().get(
-        'SELECT id FROM gws_ea_browser_reservation_guarantees WHERE approval_id = ?',
+      const existing = await getDb().get<Pick<StandingGuarantee, 'id' | 'currency' | 'max_total_minor'>>(
+        'SELECT id,currency,max_total_minor FROM gws_ea_browser_reservation_guarantees WHERE approval_id = ?',
         approval.approval_id,
       );
-      if (existing) return;
-      if (proposal.status !== 'open') return;
+      if (existing) {
+        granted = existing;
+        return;
+      }
+      if (proposal.status !== 'open' || proposal.expires_at <= new Date().toISOString()) return;
       const at = new Date().toISOString();
       await getDb().run('UPDATE gws_ea_browser_reservation_guarantees SET revoked_at = ? WHERE revoked_at IS NULL', at);
       await getDb().run(
@@ -225,7 +229,28 @@ registerApprovalHandler(
         approval.approval_id,
         proposal.id,
       );
+      granted = { currency: proposal.currency, max_total_minor: proposal.max_total_minor };
     });
+    if (granted) {
+      const noteId = `appr-approve-${approval.approval_id}`;
+      const written = await withMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+        mailbox.hasMessage(noteId),
+      );
+      if (!written)
+        await writeSessionMessage(session.agent_group_id, session.id, {
+          id: noteId,
+          kind: 'chat',
+          timestamp: new Date().toISOString(),
+          platformId: session.agent_group_id,
+          channelType: 'agent',
+          threadId: null,
+          content: JSON.stringify({
+            text: `The principal approved standing reservation guarantees of up to ${formatMoney(granted.max_total_minor, granted.currency)} (${granted.currency}).`,
+            sender: 'system',
+            senderId: 'system',
+          }),
+        });
+    }
   },
   { restartSafe: true, rejectionNote: guaranteeRejectionNote },
 );
