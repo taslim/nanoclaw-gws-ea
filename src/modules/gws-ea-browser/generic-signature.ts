@@ -11,7 +11,8 @@ import type { ElementHandle, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
 
 import {
-  readConfirmation,
+  readConfirmations,
+  showsCharge,
   statedAmounts,
   TOTAL_WORD,
   type ConfirmationCharge,
@@ -32,6 +33,7 @@ import {
   BOOKING_CONTROL,
   currencyExponent,
   formatMoney,
+  genericAccountKey,
   hasPurchaseTotal,
   type FinancialCommitment,
   type FreeCommitFacts,
@@ -129,9 +131,9 @@ const VOCABULARY = {
   stepControl: /\b(?:continue|next|proceed)\b/iu,
   unpricedFeeWording:
     /\b(?:fees?|charges|charge(?!\s+(?:you|your|the\s+card|this\s+card|my\s+card|it)\b)|surcharges?|penalt(?:y|ies))\b/iu,
-  /** Wording stating taxes or fees are already included in the displayed price rather than an extra unpriced fee. */
+  /** Affirmative wording stating taxes or fees are already included in the displayed price (never negated "not all fees are included"). */
   includedFees:
-    /\b(?:includ(?:es?|ing)|incl\.?)\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\b|\b(?:all\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\s+(?:are\s+)?included\b/iu,
+    /(?<!\b(?:not|doesn'?t|does\s+not|aren'?t|are\s+not|isn'?t|is\s+not|won'?t|will\s+not)\s+)\b(?:includ(?:es?|ing)|incl\.?)\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\b|(?<!\bnot\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?)\b(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\s+(?:are\s+)?included\b/iu,
   cardRequired:
     /\b(?:a\s+)?(?:credit\s+|debit\s+)?cards?\s+(?:on\s+file\s+)?(?:is|are)\s+(?:required|needed)\b|\b(?:require|need)s?\s+a\s+(?:credit\s+|debit\s+)?card\b|\benter\s+(?:your\s+)?(?:card|payment)\b/iu,
   /** Explicit host-read payment arrangement when nothing is due online and no card is collected. */
@@ -273,7 +275,11 @@ function stateDate(text: string, now: number): string | undefined {
     parsed = /^\d/u.test(written[1])
       ? Date.parse(`${written[2]} ${written[1]}, ${written[3]} 12:00:00 GMT`)
       : Date.parse(`${written[1]} ${written[2]}, ${written[3]} 12:00:00 GMT`);
-  else if (days) parsed = now + Number(days[1] ?? days[2]) * 24 * 60 * 60 * 1000;
+  else if (days) {
+    // Snap relative trial lengths to noon UTC on that calendar day (matching explicit dates) so rereads stay stable.
+    const date = new Date(now + Number(days[1] ?? days[2]) * 24 * 60 * 60 * 1000);
+    parsed = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 12, 0, 0);
+  }
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 }
 
@@ -394,8 +400,18 @@ function readTerms(
     if (!kind) continue;
     consumed.add(index);
     // A label alone on its line, whose terms stand on the next: "Cancellation fee", then "$25 per person…".
+    // Never steal the amount from a following line that starts a different financial term kind.
     const next = lines[index + 1];
-    if (!line.money.length && next?.money.length && !VOCABULARY.total.test(next.text)) {
+    const nextKind = next
+      ? TERM_KINDS.find((term) => term.wording.test(undenied(next.text)) && (!term.priced || next.money.length > 0))
+          ?.kind
+      : undefined;
+    if (
+      !line.money.length &&
+      next?.money.length &&
+      !VOCABULARY.total.test(next.text) &&
+      (!nextKind || nextKind === kind)
+    ) {
       line = { text: `${line.text}: ${next.text}`, box: union([line.box, next.box]), money: next.money };
       index++;
       consumed.add(index);
@@ -489,13 +505,17 @@ function readItems(
   return [];
 }
 
-/** Lowercased; `ambiguous` when the checkout shows more than one. */
-function readContactEmail(lines: readonly Line[], fields: readonly CheckoutField[]): string | 'ambiguous' | undefined {
+/** Distinct lowercased contact-email candidates in document order (excluding secret/card fields); `contactEmail` is set only when unique. */
+function readContactEmail(
+  lines: readonly Line[],
+  fields: readonly CheckoutField[],
+): { contactEmail?: string; candidates: string[] } {
   const fieldValues = distinct(
     fields
       .filter(
         (field) =>
           !field.secret &&
+          !field.card &&
           field.value &&
           (field.type === 'email' ||
             VOCABULARY.emailField.test(field.autocomplete) ||
@@ -507,7 +527,7 @@ function readContactEmail(lines: readonly Line[], fields: readonly CheckoutField
   const shown = fieldValues.length
     ? fieldValues
     : distinct(lines.flatMap((line) => line.text.match(VOCABULARY.email) ?? []).map((value) => value.toLowerCase()));
-  return shown.length === 1 ? shown[0] : shown.length > 1 ? 'ambiguous' : undefined;
+  return shown.length === 1 ? { contactEmail: shown[0], candidates: shown } : { candidates: shown };
 }
 
 /** A note that rides along with the order or booking: what was written in its free-text fields. */
@@ -592,8 +612,7 @@ export function decideGenericCheckout(
   const origin = new URL(read.frameUrl).origin;
   const checkoutSite = siteOf(read.frameUrl);
   const platform = checkoutSite && checkoutSite !== context.merchant ? checkoutSite : undefined;
-  const contact = readContactEmail(lines, read.region.fields);
-  const contactEmail = contact === 'ambiguous' ? undefined : contact;
+  const { contactEmail, candidates: contactEmails } = readContactEmail(lines, read.region.fields);
   const { account, guest } = readAccount(read, contactEmail);
   const booking = readBooking(read, lines, label);
   const items = readItems(lines, read.region.fields, booking);
@@ -659,17 +678,25 @@ export function decideGenericCheckout(
   });
   if (hasUnpricedFee) missing.push('the fee amount');
 
-  const partySize = booking?.partySize ?? 1;
-  // What a term charges, beyond a fee that applies only on its condition.
-  const charges = (kinds: ReadonlyArray<FinancialCommitment['kind']>): number =>
-    terms
-      .filter((term) => kinds.includes(term.kind))
-      .reduce((sum, term) => sum + (term.amountMinor ?? 0) * (term.perPerson ? partySize : 1), 0);
+  const partySize = booking?.partySize;
+  // What a term charges, beyond a fee that applies only on its condition. Undefined if any needed term lacks a price or party size.
+  const charges = (kinds: ReadonlyArray<FinancialCommitment['kind']>): number | undefined => {
+    let sum = 0;
+    for (const term of terms) {
+      if (!kinds.includes(term.kind)) continue;
+      if (term.amountMinor === undefined) return undefined;
+      if (term.perPerson && partySize === undefined) return undefined;
+      sum += term.amountMinor * (term.perPerson ? (partySize ?? 1) : 1);
+    }
+    return sum;
+  };
   let total: ConfirmationCharge | undefined;
   if (totalValues.length === 1) total = totalValues[0];
-  else if (!totalValues.length && terms.length && currencies.length === 1)
+  else if (!totalValues.length && terms.length && currencies.length === 1) {
     // A booking that states only its terms charges its deposits, prepayments and holds; a fee only on its condition.
-    total = { currency: currencies[0], amountMinor: charges(['deposit', 'prepayment', 'hold']) };
+    const derivedTotal = charges(['deposit', 'prepayment', 'hold']);
+    if (derivedTotal !== undefined) total = { currency: currencies[0], amountMinor: derivedTotal };
+  }
   const validTotal = total && currencyExponent(total.currency) !== undefined ? total : undefined;
   const payLaterArrangement = lines.find((line) => VOCABULARY.noCardPayment.test(line.text))?.text;
   const explicitCardDemanded =
@@ -679,8 +706,7 @@ export function decideGenericCheckout(
   if (dueValues.length === 1) dueNow = dueValues[0].amountMinor;
   else if (dueValues.length) dueNow = undefined;
   else if (nothingNow) dueNow = 0;
-  else if (totalValues.length === 1)
-    dueNow = payLaterArrangement && !explicitCardDemanded ? undefined : validTotal?.amountMinor;
+  else if (totalValues.length === 1) dueNow = payLaterArrangement ? undefined : validTotal?.amountMinor;
   else if (validTotal) dueNow = charges(['deposit', 'prepayment']);
   const totalText = validTotal ? formatMoney(validTotal.amountMinor, validTotal.currency) : undefined;
 
@@ -747,7 +773,15 @@ export function decideGenericCheckout(
         ...(resolvedPayment ? { payment: resolvedPayment } : {}),
         ...(note ? { note } : {}),
         ...(booking ? { booking } : {}),
-        ...(incomplete ? { review: { missing: missingFacts, snapshot } } : {}),
+        ...(incomplete
+          ? {
+              review: {
+                missing: missingFacts,
+                snapshot,
+                ...(contactEmails.length > 1 ? { contactEmails } : {}),
+              },
+            }
+          : {}),
       },
     },
     regions: {
@@ -985,19 +1019,13 @@ export function confirmsOnSite(confirmation: ConfirmationEvidence, site: string,
   return at !== undefined && (at === site || at === platform);
 }
 
-/**
- * What a confirmation page proves of a paid attempt on an unreviewed site: an order number on a document of its
- * merchant or payment platform, and any charge it states in the attempt's currency at its total or its amount due
- * now (when the attempt read a total). The attempt's contact email keys the order number when present.
- */
-async function readGenericEvidence(
-  page: Page,
-  attempted?: PurchaseFacts,
-): Promise<MerchantPurchaseEvidence | undefined> {
-  const generic = attempted?.generic;
-  if (!attempted || !generic) return undefined;
-  const confirmation = await readConfirmation(page);
-  if (!confirmation || !confirmsOnSite(confirmation, attempted.site, generic.platform)) return undefined;
+function buildGenericEvidence(
+  confirmation: ConfirmationEvidence,
+  attempted: PurchaseFacts,
+  account: string,
+): MerchantPurchaseEvidence | undefined {
+  const generic = attempted.generic;
+  if (!generic || !confirmsOnSite(confirmation, attempted.site, generic.platform)) return undefined;
   const { charged } = confirmation;
   if (
     charged &&
@@ -1012,13 +1040,61 @@ async function readGenericEvidence(
     recordId: confirmation.reference,
     orderedAt: new Date().toISOString(),
     resolution: 'committed',
-    account: generic.contactEmail ?? attempted.account,
+    account,
     items: [],
     totalMinor: charged?.amountMinor ?? attempted.totalMinor,
     currency: charged?.currency ?? attempted.currency,
     cardEnding: attempted.cardEnding,
     address: null,
   };
+}
+
+function selectGenericEvidence(
+  confirmations: readonly ConfirmationEvidence[],
+  attempted: PurchaseFacts,
+  account: string,
+): MerchantPurchaseEvidence | undefined {
+  const matched = confirmations
+    .map((confirmation) => ({
+      confirmation,
+      evidence: buildGenericEvidence(confirmation, attempted, account),
+    }))
+    .filter(
+      (candidate): candidate is { confirmation: ConfirmationEvidence; evidence: MerchantPurchaseEvidence } =>
+        candidate.evidence !== undefined,
+    );
+  return (matched.find(({ confirmation }) => showsCharge(confirmation)) ?? matched[0])?.evidence;
+}
+
+/**
+ * What a confirmation page proves of a paid attempt on an unreviewed site: an order number on a document of its
+ * merchant or payment platform, and any charge it states in the attempt's currency at its total or its amount due
+ * now (when the attempt read a total). Requires an attempt-specific contact email so late reconciliation cannot
+ * resolve an unbound attempt from an unrelated confirmation page on the same site.
+ */
+async function readGenericEvidence(
+  page: Page,
+  attempted?: PurchaseFacts,
+): Promise<MerchantPurchaseEvidence | undefined> {
+  if (!attempted) return undefined;
+  const accountKey = genericAccountKey(attempted);
+  if (!accountKey) return undefined;
+  return selectGenericEvidence(await readConfirmations(page), attempted, accountKey);
+}
+
+/**
+ * Immediate post-press confirmation for an unbound generic checkout (such as a review checkout without a contact
+ * email). Valid only directly after the host's own press, filtering out every reference already visible on the
+ * page before the press before selecting a matching confirmation.
+ */
+export async function readUnboundGenericConfirmation(
+  page: Page,
+  attempted: PurchaseFacts,
+  beforeReferences: ReadonlySet<string>,
+): Promise<MerchantPurchaseEvidence | undefined> {
+  if (!attempted.generic || genericAccountKey(attempted) !== undefined) return undefined;
+  const fresh = (await readConfirmations(page)).filter((confirmation) => !beforeReferences.has(confirmation.reference));
+  return selectGenericEvidence(fresh, attempted, attempted.account);
 }
 
 /**

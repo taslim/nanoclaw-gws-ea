@@ -3250,6 +3250,125 @@ document.getElementById('continue-step').addEventListener('click', () => { locat
     expect(await attempts()).toMatchObject([
       { site: 'booking.example', resolution: 'committed', merchant_record_id: 'BK-9021' },
     ]);
+    const [bookedAuthority] = await authorities();
+    expect(JSON.parse(bookedAuthority.outcome_json!)).toMatchObject({ status: 'booked', order_number: 'BK-9021' });
+  });
+
+  it('fails closed on oversized or mid-capture mutated review screenshots, re-cards on ambiguous email edits, and refuses unbound guest reconciliation', async () => {
+    const reviewUrl = 'https://booking.example/review-hardening';
+    const confirmedUrl = 'https://booking.example/review-hardening/confirmed';
+    const pendingUrl = 'https://booking.example/review-hardening/pending';
+    fixture.serve(
+      reviewUrl,
+      htmlPage(
+        'Finish booking',
+        `<h1>Monty Suites Calabar</h1>
+         <form method="post" action="/review-hardening/confirmed">
+           <p id="total-line">Total US$86.13</p>
+           <p>Pay with the property</p>
+           <label>Guest email <input id="email-a" name="email" type="email" value="${ALIAS}"></label>
+           <label>Receipt email <input id="email-b" name="receipt_email" type="email" value="morgan@example.test"></label>
+           <button type="submit">Complete booking</button>
+         </form>`,
+      ),
+    );
+    fixture.serve(
+      pendingUrl,
+      htmlPage('Processing', '<h1>Working on your booking</h1><p>We will email you shortly.</p>'),
+    );
+    fixture.serve(
+      confirmedUrl,
+      htmlPage(
+        'Booking confirmed',
+        '<h1>Your booking is confirmed!</h1><p>Booking reference: BK-9099</p><p>Total: US$86.13</p><a href="/review-hardening">Back</a>',
+      ),
+    );
+    expect(await open(reviewUrl)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+
+    // Finding 2: a review checkout never falls back to a viewport screenshot when full-page capture exceeds 4 MiB.
+    const realScreenshot = page.screenshot.bind(page);
+    const oversizedPng = Buffer.alloc(4 * 1024 * 1024 + 64);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(oversizedPng, 0);
+    oversizedPng.write('IHDR', 12, 'latin1');
+    oversizedPng.writeUInt32BE(800, 16);
+    oversizedPng.writeUInt32BE(4000, 20);
+    const oversizedSpy = vi.spyOn(page, 'screenshot').mockImplementation(async (options) => {
+      if (options?.fullPage) return oversizedPng;
+      return realScreenshot(options);
+    });
+    try {
+      const oversized = await purchase('Complete booking', 'oversized-review');
+      expect(oversized).toMatchObject({ status: 'facts_incomplete', repeat_safe: true });
+      expect(oversizedSpy).toHaveBeenCalledTimes(1);
+      expect(await approvals()).toEqual([]);
+    } finally {
+      oversizedSpy.mockRestore();
+    }
+
+    // Finding 3: mutating the live checkout DOM during capture fails closed instead of pairing stale facts with a new image.
+    const driftSpy = vi.spyOn(page, 'screenshot').mockImplementation(async (options) => {
+      const shot = await realScreenshot(options);
+      await page.locator('#total-line').evaluate((node) => {
+        node.textContent = 'Total US$186.13';
+      });
+      return shot;
+    });
+    try {
+      const drifted = await purchase('Complete booking', 'drifted-review');
+      expect(drifted).toMatchObject({ status: 'facts_incomplete', repeat_safe: true });
+      expect(await approvals()).toEqual([]);
+    } finally {
+      driftSpy.mockRestore();
+    }
+    await page.locator('#total-line').evaluate((node) => {
+      node.textContent = 'Total US$86.13';
+    });
+
+    // Finding 5: ambiguous email inputs are bound to the review card; editing one post-approval opens a fresh card.
+    expect(await purchase('Complete booking', 'ambiguous-emails')).toMatchObject({
+      status: 'awaiting_principal',
+      repeat_safe: false,
+    });
+    const [firstCard] = await approvals();
+    expect(firstCard.question).toContain('Contact emails shown: your assistant\'s email, "morgan@example.test"');
+    await page.locator('#email-b').fill('other@example.test');
+    await approve(firstCard);
+    expect(posts()).toEqual([]);
+    const [revalidatedCard] = await approvals();
+    expect(revalidatedCard.approval_id).not.toBe(firstCard.approval_id);
+    expect(revalidatedCard.question).toContain('The contact email changed.');
+    expect(revalidatedCard.question).toContain('other@example.test');
+
+    // Finding 4: when an unbound guest review checkout ends unconfirmed, late reconcile stays inconclusive even on a confirmation page.
+    await page.locator('form').evaluate((form) => {
+      form.setAttribute('action', '/review-hardening/pending');
+    });
+    await approve(revalidatedCard);
+    expect(posts()).toEqual([pendingUrl]);
+    const [unconfirmedAttempt] = await getDb().all<{ id: string; resolution: string | null }>(
+      'SELECT id, resolution FROM gws_ea_browser_purchase_attempts ORDER BY attempted_at',
+    );
+    expect(unconfirmedAttempt.resolution).toBeNull();
+    expect(await open(confirmedUrl)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    const handler = getDeliveryAction('purchase')!;
+    await handler(
+      {
+        action: 'purchase',
+        requestId: 'reconcile-guest',
+        operation: 'reconcile',
+        attempt_id: unconfirmedAttempt.id,
+        target: refIn(await observePage(page), 'Back'),
+      },
+      session,
+    );
+    await queue.idle();
+    expect(await answer('reconcile-guest')).toEqual({
+      status: 'inconclusive',
+      attempt_id: unconfirmedAttempt.id,
+      purchase_blocked: true,
+      repeat_safe: true,
+    });
+    expect(await attempts()).toMatchObject([{ site: 'booking.example', resolution: null, merchant_record_id: null }]);
   });
 
   describe('a guest booking that verifies the guest after Complete reservation', () => {

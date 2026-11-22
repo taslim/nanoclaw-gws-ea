@@ -5,12 +5,15 @@ import type { CheckoutField, CheckoutFrame, CheckoutRead } from './control-facts
 import {
   authorizablePurchaseFacts,
   completePurchaseFacts,
+  genericAccountKey,
+  GENERIC_FLOW_ID,
   guaranteeCoversReservation,
   materialPurchaseChange,
   validReviewPurchaseFacts,
   type PurchaseFacts,
 } from './fingerprint.js';
 import { decideGenericCheckout, pressRefusal, type GenericDecision } from './generic-signature.js';
+import { evidenceMatchesAttempt } from './reconciliation.js';
 
 const NOW = Date.parse('2026-10-17T12:00:00.000Z');
 const locator = {
@@ -78,8 +81,8 @@ function read(shown: Shown): CheckoutRead {
     frames: shown.frames ?? [frame({ url: frameUrl, lines: shown.lines })],
   };
 }
-const decide = (shown: Shown, merchant = 'pottery.example'): GenericDecision =>
-  decideGenericCheckout(read(shown), { merchant, locator, controlBox: { x: 60, y: 450, width: 120, height: 30 } }, NOW);
+const decide = (shown: Shown, merchant = 'pottery.example', now = NOW): GenericDecision =>
+  decideGenericCheckout(read(shown), { merchant, locator, controlBox: { x: 60, y: 450, width: 120, height: 30 } }, now);
 const ready = (decision: GenericDecision): PurchaseFacts => {
   if (decision.status !== 'ready') throw new Error(`Expected a card's facts, got ${JSON.stringify(decision)}`);
   return decision.facts;
@@ -601,7 +604,8 @@ describe('the free-commit test', () => {
       generic: { payment: 'Pay with the property' },
     });
 
-    // An extra unpriced fee on the same line as "Includes taxes and fees" is still flagged.
+    // An extra unpriced fee on the same line as "Includes taxes and fees" is still flagged,
+    // and negated inclusion wording ("Not all fees are included") is never stripped.
     const includedPlusExtraFee = ready(
       decide({
         ...shop,
@@ -609,6 +613,88 @@ describe('the free-commit test', () => {
       }),
     );
     expect(includedPlusExtraFee.generic?.review?.missing).toEqual(['the fee amount']);
+    const notAllFeesIncluded = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Not all fees are included.'],
+      }),
+    );
+    expect(notAllFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
+    const notAllTaxesAndFeesIncluded = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Not all taxes and fees are included.'],
+      }),
+    );
+    expect(notAllTaxesAndFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
+
+    // An unpriced deposit beside a priced cancellation fee must not invent a verified $0.00 total.
+    const unpricedDeposit = ready(
+      decide({
+        label: 'Confirm reservation',
+        lines: ['Table for 2', 'A deposit is required.', 'Cancellation fee: $25.00.'],
+        fields: [email('aya.web@example.test')],
+        frameUrl: 'https://table.example/book',
+        frames: [frame({ url: 'https://table.example/book', lines: ['Visa ending in 4242'] })],
+      }),
+    );
+    expect(unpricedDeposit.generic?.review?.missing).toContain('the deposit amount');
+    expect(unpricedDeposit.generic?.review?.missing).toContain('the total');
+
+    // A pay-at-property checkout with a saved card on file must not infer the full total is due now.
+    const payLaterWithSavedCard = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Deluxe Room × 1', 'Total US$86.13', 'Pay with the property', 'Visa ending in 4242'],
+          fields: [email('aya.web@example.test')],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    );
+    expect(payLaterWithSavedCard.generic?.review?.missing).toEqual(['the amount due now']);
+
+    // Relative trial durations stay stable across rereads within the same day.
+    const trialFirst = ready(
+      decide(
+        {
+          ...shop,
+          lines: ['Pro plan × 1', 'Total $0.00', '7-day free trial, then $12.00/month', 'Visa ending in 4242'],
+          fields: [],
+        },
+        'pottery.example',
+        NOW,
+      ),
+    );
+    const trialLater = ready(
+      decide(
+        {
+          ...shop,
+          lines: ['Pro plan × 1', 'Total $0.00', '7-day free trial, then $12.00/month', 'Visa ending in 4242'],
+          fields: [],
+        },
+        'pottery.example',
+        NOW + 120_000,
+      ),
+    );
+    expect(materialPurchaseChange(trialFirst, trialLater, {})).toBeUndefined();
+
+    // Header signed-in account changes require a new approval even when contact email and snapshot stay identical.
+    const signedInMorgan = ready(
+      decide({
+        ...shop,
+        frames: [frame({ url: 'https://pottery.example/checkout/review', lines: ['Signed in as Morgan'] })],
+      }),
+    );
+    const signedInTaylor = ready(
+      decide({
+        ...shop,
+        frames: [frame({ url: 'https://pottery.example/checkout/review', lines: ['Signed in as Taylor'] })],
+      }),
+    );
+    expect(materialPurchaseChange(signedInMorgan, signedInTaylor, {})).toBe('The account changed.');
 
     // Booking.com Step 3 without email or "No prepayment needed": not card_needed and not a false fee failure,
     // routed to screenshot-backed review with total and payment method preserved.
@@ -654,6 +740,160 @@ describe('the free-commit test', () => {
         'booking.example',
       ),
     ).toMatchObject({ status: 'card_needed', needed: { site: 'booking.example', total: '$86.13' } });
+  });
+
+  it('binds ambiguous contact-email candidates to review approvals and ignores secret/card email values', () => {
+    const ambiguous = ready(
+      decide({
+        ...shop,
+        fields: [
+          email('Aya.Web@example.test'),
+          field({ type: 'email', name: 'recipient_email', label: 'Recipient email', value: 'morgan@example.test' }),
+          field({ type: 'email', name: 'secret_email', label: 'Email', value: 'secret@example.test', secret: true }),
+          field({ type: 'email', name: 'card_email', label: 'Card email', value: 'card@example.test', card: true }),
+        ],
+      }),
+    );
+    expect(ambiguous.generic?.contactEmail).toBeUndefined();
+    expect(ambiguous.generic?.review?.missing).toEqual(['the contact email']);
+    expect(ambiguous.generic?.review?.contactEmails).toEqual(['aya.web@example.test', 'morgan@example.test']);
+    expect(validReviewPurchaseFacts(ambiguous)).toBe(true);
+    expect(authorizablePurchaseFacts(ambiguous, 'checkout')).toBe(true);
+    expect(authorizablePurchaseFacts(ambiguous, 'watch')).toBe(false);
+    expect(authorizablePurchaseFacts(ambiguous, 'reservation_guarantee')).toBe(false);
+
+    const mutated = ready(
+      decide({
+        ...shop,
+        fields: [
+          email('aya.web@example.test'),
+          field({ type: 'email', name: 'recipient_email', label: 'Recipient email', value: 'attacker@example.test' }),
+        ],
+      }),
+    );
+    expect(materialPurchaseChange(ambiguous, mutated, {})).toBe('The contact email changed.');
+
+    const swapped = ready(
+      decide({
+        ...shop,
+        fields: [
+          email('morgan@example.test'),
+          field({ type: 'email', name: 'recipient_email', label: 'Recipient email', value: 'aya.web@example.test' }),
+        ],
+      }),
+    );
+    expect(materialPurchaseChange(ambiguous, swapped, {})).toBe('The contact email changed.');
+
+    expect(
+      validReviewPurchaseFacts({
+        ...ambiguous,
+        generic: {
+          ...ambiguous.generic!,
+          review: { ...ambiguous.generic!.review!, contactEmails: ['aya.web@example.test'] },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      validReviewPurchaseFacts({
+        ...ambiguous,
+        generic: {
+          ...ambiguous.generic!,
+          contactEmail: 'aya.web@example.test',
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it('refuses generic evidence matching via shared guest or unnamed-account strings', () => {
+    const guestReview = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar' })],
+        },
+        'booking.example',
+      ),
+    );
+    expect(genericAccountKey(guestReview)).toBeUndefined();
+    const guestEvidence = {
+      flowId: GENERIC_FLOW_ID,
+      source: 'https://booking.example/book/confirmed',
+      recordId: 'BK-9021',
+      orderedAt: new Date(NOW).toISOString(),
+      resolution: 'committed' as const,
+      account: 'guest checkout',
+      items: [],
+      totalMinor: 8613,
+      currency: 'USD',
+      cardEnding: null,
+      address: null,
+    };
+    expect(
+      evidenceMatchesAttempt(guestEvidence, {
+        facts_json: JSON.stringify(guestReview),
+        attempted_at: new Date(NOW).toISOString(),
+      }),
+    ).toBe(false);
+
+    const unnamedSignedIn = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [
+            frame({ url: 'https://booking.example/book.html', heading: 'Monty Suites Calabar', signedIn: true }),
+          ],
+        },
+        'booking.example',
+      ),
+    );
+    expect(genericAccountKey(unnamedSignedIn)).toBeUndefined();
+    expect(
+      evidenceMatchesAttempt(
+        { ...guestEvidence, account: 'the signed-in account' },
+        { facts_json: JSON.stringify(unnamedSignedIn), attempted_at: new Date(NOW).toISOString() },
+      ),
+    ).toBe(false);
+
+    const namedSignedInNoEmail = ready(
+      decide(
+        {
+          label: 'Complete booking',
+          lines: ['Monty Suites Calabar', 'Total US$86.13', 'Pay with the property'],
+          fields: [],
+          frameUrl: 'https://booking.example/book.html',
+          frames: [
+            frame({
+              url: 'https://booking.example/book.html',
+              heading: 'Monty Suites Calabar',
+              lines: ['Signed in as Morgan'],
+            }),
+          ],
+        },
+        'booking.example',
+      ),
+    );
+    expect(genericAccountKey(namedSignedInNoEmail)).toBeUndefined();
+    expect(
+      evidenceMatchesAttempt(
+        { ...guestEvidence, account: 'Morgan' },
+        { facts_json: JSON.stringify(namedSignedInNoEmail), attempted_at: new Date(NOW).toISOString() },
+      ),
+    ).toBe(false);
+
+    const emailBound = ready(decide(shop));
+    expect(genericAccountKey(emailBound)).toBe('aya.web@example.test');
+    expect(
+      evidenceMatchesAttempt(
+        { ...guestEvidence, account: 'aya.web@example.test' },
+        { facts_json: JSON.stringify(emailBound), attempted_at: new Date(NOW).toISOString() },
+      ),
+    ).toBe(true);
   });
 });
 

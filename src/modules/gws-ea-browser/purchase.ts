@@ -60,9 +60,15 @@ import {
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { unapprovedCommit } from './executor.js';
-import { hasPurchaseTotal, materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import {
+  genericCheckoutBooks,
+  hasPurchaseTotal,
+  materialPurchaseChange,
+  type PurchaseBounds,
+  type PurchaseFacts,
+} from './fingerprint.js';
 import { pressFreeCheckout, type FreePressAnswer } from './free-press.js';
-import { genericCheckoutSignature, pressRefusal } from './generic-signature.js';
+import { genericCheckoutSignature, pressRefusal, readUnboundGenericConfirmation } from './generic-signature.js';
 import { stopForUnapprovedCommit, type IncidentKind, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
@@ -166,8 +172,8 @@ function withConsent(facts: PurchaseFacts, consent: CheckoutConsent): PurchaseFa
 }
 
 /**
- * Consent pass first, re-reading a screenshot-reviewed generic checkout so its locked text snapshot reflects the
- * post-consent DOM state (preventing false change cards when unticking an optional box updates visible copy).
+ * Consent pass first, re-reading a generic checkout so the card's facts and locked snapshot reflect the
+ * post-consent DOM state (e.g., when unticking an optional extra updates the price or visible copy).
  */
 async function readWithConsent(
   context: BrowserExecutionContext,
@@ -176,7 +182,7 @@ async function readWithConsent(
   initial: PurchaseFacts,
 ): Promise<{ status: 'ready'; facts: PurchaseFacts } | Exclude<MerchantCheckoutRead, { status: 'ready' }>> {
   const consent = await checkoutConsent(context, page, element);
-  if (!initial.generic?.review) return { status: 'ready', facts: withConsent(initial, consent) };
+  if (!initial.generic) return { status: 'ready', facts: withConsent(initial, consent) };
   const after = await readMerchantPurchase(page, element);
   if ('element' in after && after.element !== element) await after.element.dispose();
   if (after.status !== 'ready') return after;
@@ -399,6 +405,7 @@ async function requestPurchaseCard(
       },
     },
     pictures: [picture],
+    requirePictures: Boolean(facts.generic?.review),
   });
   // A synchronous card click may already have created the authority; never reopen its logical card.
   if (approvalId) {
@@ -536,24 +543,45 @@ registerApprovalResolvedHandler(async (event) => {
 });
 
 /**
- * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, or a
- * generic checkout's confirmation page, whose contact email keys the order number.
+ * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, an
+ * account-keyed generic confirmation, or — immediately after the host's own press — a newly appeared confirmation
+ * on an unbound generic checkout whose reference was not present before the press.
  */
 async function verifyPlaced(
   page: Page,
   authority: SpendingAuthority,
   store: PurchaseAuthorityStore,
   facts: PurchaseFacts,
-): Promise<{ outcome: Record<string, unknown>; evidence: MerchantPurchaseEvidence } | undefined> {
-  const evidence = await readMerchantPurchaseEvidence(page, facts);
+  beforeConfirmations: ReadonlySet<string> | undefined,
+): Promise<
+  { outcome: Record<string, unknown>; evidence: MerchantPurchaseEvidence; recordAccount: string | null } | undefined
+> {
   const attempt = await store.attempt(authority.attempt_id);
-  if (evidence?.resolution !== 'committed' || !attempt || !evidenceMatchesAttempt(evidence, attempt)) return undefined;
-  return {
-    evidence,
-    outcome: {
-      status: evidence.reservation || facts.generic?.booking ? 'booked' : 'placed',
-      order_number: evidence.recordId,
+  if (!attempt) return undefined;
+  const evidence = await readMerchantPurchaseEvidence(page, facts);
+  if (evidence?.resolution === 'committed' && evidenceMatchesAttempt(evidence, attempt)) {
+    return {
       evidence,
+      recordAccount: evidence.account,
+      outcome: {
+        status: evidence.reservation || genericCheckoutBooks(facts) ? 'booked' : 'placed',
+        order_number: evidence.recordId,
+        evidence,
+        repeat_safe: false,
+      },
+    };
+  }
+  const unbound = beforeConfirmations
+    ? await readUnboundGenericConfirmation(page, facts, beforeConfirmations)
+    : undefined;
+  if (!unbound) return undefined;
+  return {
+    evidence: unbound,
+    recordAccount: null,
+    outcome: {
+      status: genericCheckoutBooks(facts) ? 'booked' : 'placed',
+      order_number: unbound.recordId,
+      evidence: unbound,
       repeat_safe: false,
     },
   };
@@ -710,6 +738,7 @@ export async function executeAuthorizedPurchase(
         return { status: 'outside_bounds', watchId: authority.watch_id, repeat_safe: false };
       if (change) return requestPurchaseCard(context, facts, bounds, change);
       if (expired) return requestPurchaseCard(context, facts, bounds, purchaseApprovalExpired(), false);
+      let beforeConfirmations: Set<string> | undefined;
       // Re-read once more inside the classifier's authority callback, immediately before its only native press.
       await press(read.signature, element, async () => {
         await context.assertActive();
@@ -730,18 +759,20 @@ export async function executeAuthorizedPurchase(
         const consent = await checkoutConsent(context, page, element);
         const immediate = await readMerchantPurchase(page, element);
         if (immediate.status !== 'ready') throw new PurchaseAuthorityError('changed');
+        // Snapshot pre-press confirmation references right at the native press boundary after all waits finish.
+        beforeConfirmations = new Set((await readConfirmations(page)).map((item) => item.reference));
         await store.begin(context, authority.id, withConsent(immediate.facts, consent), commitClaim);
         marked = true;
       });
       // An approval covers the checkout, not one control: a middle step is pressed on, up to three presses.
       for (let presses = 1; ; presses++) {
-        const placed = await verifyPlaced(page, authority, store, facts);
+        const placed = await verifyPlaced(page, authority, store, facts, beforeConfirmations);
         if (placed) {
           const resolved = await store.resolve(authority.attempt_id, {
             placed: true,
             source: 'page',
             evidence: { ...placed.evidence },
-            record: { id: placed.evidence.recordId, account: placed.evidence.account },
+            record: { id: placed.evidence.recordId, account: placed.recordAccount },
             outcome: placed.outcome,
           });
           if (resolved.status === 'resolved') return settle(placed.outcome);
@@ -789,6 +820,9 @@ export async function executeAuthorizedPurchase(
           const consent = await checkoutConsent(context, page, next);
           const immediate = await readMerchantPurchase(page, next);
           if (immediate.status !== 'ready') throw new PurchaseAuthorityError('changed');
+          const snapshot = await readConfirmations(page);
+          beforeConfirmations ??= new Set();
+          for (const existing of snapshot) beforeConfirmations.add(existing.reference);
           await store.continueCommit(context, authority.id, withConsent(immediate.facts, consent));
         });
       }

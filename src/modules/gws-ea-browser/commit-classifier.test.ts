@@ -826,6 +826,35 @@ describe("an ordinary action's script-request window", () => {
     expect(window.listening()).toBe(0);
   });
 
+  it('keeps tracking a later main-frame navigation past the settle interval after the first main document commits', async () => {
+    const window = await windowFixture('redirect.example');
+    const main = window.page.mainFrame();
+    vi.useFakeTimers();
+    let returned = false;
+    const pressed = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', { isNavigationRequest: () => true, frame: () => main });
+      })
+      .then(() => {
+        returned = true;
+      });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(returned).toBe(false);
+    window.events.emit('framenavigated', main);
+    // A second main-frame navigation started after replacement must keep the guard window open past settle.
+    window.events.emit('request', { isNavigationRequest: () => true, frame: () => main });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(returned).toBe(false);
+    expect(window.armed()).toEqual(['Fetch.enable']);
+    window.events.emit('framenavigated', main);
+    await vi.advanceTimersByTimeAsync(50);
+    await pressed;
+    expect(returned).toBe(true);
+    await window.guard.actionsSettled();
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
+    expect(window.listening()).toBe(0);
+  });
+
   it('starts an approved press only once every ordinary window on its page has closed', async () => {
     approveReviewedFixture();
     const window = await windowFixture('www.amazon.com');

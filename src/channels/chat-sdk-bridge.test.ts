@@ -29,6 +29,7 @@ import {
   attachmentBytesToBase64,
   CARD_TEXT_BLOCK_LENGTH,
   createChatSdkBridge,
+  FilesNotAttachedError,
   readPostedRequest,
   splitCardText,
   splitForLimit,
@@ -2097,7 +2098,7 @@ describe('createChatSdkBridge — pictures on requests', () => {
   const NO_PICTURE = "I couldn't attach the picture that goes with this.";
   const PICTURE: OutboundFile = { filename: 'checkout.png', mimeType: 'image/png', data: Buffer.from('png bytes') };
 
-  type Attaching = 'attaches' | 'fails';
+  type Attaching = 'attaches' | 'fails' | 'unattached';
   interface AttachCall {
     threadId: string;
     message: AdapterPostableMessage;
@@ -2141,6 +2142,7 @@ describe('createChatSdkBridge — pictures on requests', () => {
       postWithFiles: async (threadId, message, files) => {
         attached.push({ threadId, message, files });
         if (attaching === 'fails') throw new Error('Chat could not be reached');
+        if (attaching === 'unattached') throw new FilesNotAttachedError('Upload refused');
         return posted(threadId);
       },
     };
@@ -2156,7 +2158,7 @@ describe('createChatSdkBridge — pictures on requests', () => {
   }
 
   /** The approval request, naming `pictures` when given, with `files` beside it when given. */
-  function ask(pictures?: number, files?: OutboundFile[]) {
+  function ask(pictures?: number, files?: OutboundFile[], requirePictures = false) {
     return {
       kind: 'chat-sdk',
       content: {
@@ -2166,6 +2168,7 @@ describe('createChatSdkBridge — pictures on requests', () => {
         question: QUESTION,
         options: OPTIONS,
         ...(pictures === undefined ? {} : { pictures }),
+        ...(requirePictures ? { requirePictures: true } : {}),
       },
       ...(files === undefined ? {} : { files }),
     };
@@ -2232,6 +2235,28 @@ describe('createChatSdkBridge — pictures on requests', () => {
       expect(desk.posts).toEqual([{ threadId: DM, message: words() }]);
     } finally {
       await desk.bridge.teardown();
+    }
+  });
+
+  it('refuses to post a text-only fallback when requirePictures is set and attachment fails or is unsupported', async () => {
+    const refused = await pictureBridge('unattached');
+    try {
+      await expect(refused.bridge.deliver(DM, null, ask(1, [PICTURE], true))).rejects.toBeInstanceOf(
+        FilesNotAttachedError,
+      );
+      expect(refused.posts).toEqual([]);
+    } finally {
+      await refused.bridge.teardown();
+    }
+
+    const unsupported = await pictureBridge(undefined);
+    try {
+      await expect(unsupported.bridge.deliver(DM, null, ask(1, [PICTURE], true))).rejects.toBeInstanceOf(
+        FilesNotAttachedError,
+      );
+      expect(unsupported.posts).toEqual([]);
+    } finally {
+      await unsupported.bridge.teardown();
     }
   });
 });

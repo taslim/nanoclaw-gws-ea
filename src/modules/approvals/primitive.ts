@@ -355,6 +355,11 @@ export interface RequestApprovalOptions {
    * posted from anything kept after a restart, says they are unavailable.
    */
   pictures?: readonly (RequestPicture | null)[];
+  /**
+   * When true, delivery must attach every named picture rather than falling back
+   * to a text-only card (used for screenshot-reviewed purchase approvals).
+   */
+  requirePictures?: boolean;
 }
 
 /** Held only in memory (see `RequestApprovalOptions.pictures`). */
@@ -394,6 +399,13 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
     return null;
   }
 
+  const pictures = opts.pictures ?? [];
+  const taken = pictures.filter((picture): picture is RequestPicture => picture !== null);
+  if (opts.requirePictures && (pictures.length === 0 || taken.length !== pictures.length)) {
+    await notifyAgent(session, `${action} failed: required screenshot could not be attached.`);
+    return null;
+  }
+
   const asking = await requestOrigin(session.agent_group_id, origin, target.messagingGroup, opts.originLine);
   const question = asking ? `${opts.question}\n\n${asking.line}` : opts.question;
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -421,8 +433,6 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
   const adapter = getDeliveryAdapter();
   if (adapter) {
     // The card names its pictures; their bytes ride beside it for this one delivery.
-    const pictures = opts.pictures ?? [];
-    const taken = pictures.filter((picture): picture is RequestPicture => picture !== null);
     let messageId: string | void;
     try {
       messageId = await adapter.deliver(
@@ -437,6 +447,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
           question,
           options: APPROVAL_OPTIONS,
           ...(pictures.length === 0 ? {} : { pictures: pictures.length }),
+          ...(opts.requirePictures ? { requirePictures: true } : {}),
         }),
         taken.length === 0 ? undefined : taken,
         target.messagingGroup.instance,

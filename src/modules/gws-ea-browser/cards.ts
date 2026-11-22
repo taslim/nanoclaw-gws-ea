@@ -179,7 +179,13 @@ function renderGenericCard(
       ? [
           `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quoted(generic.contactEmail, SELLER_TEXT_LIMIT)}`,
         ]
-      : []),
+      : review?.contactEmails?.length
+        ? [
+            `Contact emails shown: ${review.contactEmails
+              .map((address) => (assistant(address) ? "your assistant's email" : quoted(address, SELLER_TEXT_LIMIT)))
+              .join(', ')}`,
+          ]
+        : []),
     ...generic.items.map((item) => `Item: ${quoted(item, SELLER_TEXT_LIMIT)}`),
     ...(hasTotal && money ? [`Total: ${money(facts.totalMinor)} (${facts.currency})`] : []),
     ...(hasDueNow && money ? [`Due now: ${money(facts.dueNowMinor)}`] : []),

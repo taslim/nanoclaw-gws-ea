@@ -634,24 +634,47 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       let lastEnded = 0;
       // Whether a navigation it started replaced the page's own document.
       let replaced = false;
+      const isMainFrameRequest = (request: Request): boolean => {
+        try {
+          return request.frame() === page.mainFrame();
+        } catch (error) {
+          if (error instanceof Error && /Service Worker|Frame for this request is not available/iu.test(error.message))
+            return false;
+          throw error;
+        }
+      };
       const started = (request: Request): void => {
         requests.add(request);
-        // Once the main document has been replaced, child-frame navigations belong to the destination page.
-        if (!replaced && request.isNavigationRequest()) navigations.add(request);
+        // Once the main document has been replaced, ignore destination child-frame navigations,
+        // while continuing to track any subsequent main-frame navigation.
+        if (request.isNavigationRequest() && (!replaced || isMainFrameRequest(request))) navigations.add(request);
       };
       const ended = (request: Request): void => {
         navigations.delete(request);
         if (requests.delete(request)) lastEnded = Date.now();
       };
       const committed = (frame: Frame): void => {
-        for (const request of navigations)
-          if (request.frame() === frame) {
-            navigations.delete(request);
-            if (frame === page.mainFrame()) {
-              replaced = true;
-              navigations.clear();
-            }
+        let mainCommitted = false;
+        for (const request of navigations) {
+          let requestFrame: Frame | undefined;
+          try {
+            requestFrame = request.frame();
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              !/Service Worker|Frame for this request is not available/iu.test(error.message)
+            )
+              throw error;
           }
+          if (requestFrame === frame) {
+            navigations.delete(request);
+            if (frame === page.mainFrame()) mainCommitted = true;
+          }
+        }
+        if (mainCommitted) {
+          replaced = true;
+          for (const pendingNav of navigations) if (!isMainFrameRequest(pendingNav)) navigations.delete(pendingNav);
+        }
       };
       page.on('request', started);
       page.on('requestfailed', ended);

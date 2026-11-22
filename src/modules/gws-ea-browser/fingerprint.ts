@@ -45,6 +45,8 @@ export interface GenericReviewFacts {
   readonly missing: readonly string[];
   /** Normalized non-volatile checkout lines visible when the card's screenshot was taken. */
   readonly snapshot: readonly string[];
+  /** Distinct lowercased contact-email candidates in document order when multiple email addresses were present. */
+  readonly contactEmails?: readonly string[];
 }
 export interface GenericCheckoutFacts {
   /** The checkout origin's registrable domain where it is not the merchant's: a payment platform or booking frame. */
@@ -199,6 +201,20 @@ export function hasPurchaseDueNow(facts: PurchaseFacts): boolean {
 }
 
 /**
+ * The attempt-specific account key for a generic checkout: its host-read contact email.
+ * Undefined when no unique contact email was read so late reconciliation never settles an attempt
+ * from an unrelated confirmation page on the same site.
+ */
+export function genericAccountKey(facts: PurchaseFacts): string | undefined {
+  return facts.generic?.contactEmail;
+}
+
+/** Whether a generic checkout books rather than buys, by parsed booking details or commit button wording. */
+export function genericCheckoutBooks(facts: PurchaseFacts): boolean {
+  return Boolean(facts.generic?.booking) || (Boolean(facts.generic) && BOOKING_CONTROL.test(facts.control.label));
+}
+
+/**
  * The commit label is not a material change: a checkout's next step names its own. Volatile text never reaches
  * these facts.
  */
@@ -216,6 +232,7 @@ function genericMaterialChange(
   for (const [changed, label] of [
     [approved.site !== current.site, 'site'],
     [approved.origin !== current.origin, 'checkout page'],
+    [approved.account !== current.account || approved.generic.guest !== current.generic.guest, 'account'],
     [!same(approved.generic.items, current.generic.items), 'items'],
     [
       approved.generic.payment !== current.generic.payment || approved.cardEnding !== current.cardEnding,
@@ -233,6 +250,8 @@ function genericMaterialChange(
   } else if (!same(approved.generic.booking, current.generic.booking)) return 'The booking changed.';
   if (approved.generic.review || current.generic.review) {
     if (!approved.generic.review || !current.generic.review) return CHECKOUT_PAGE_CHANGED;
+    if (!same(approved.generic.review.contactEmails, current.generic.review.contactEmails))
+      return 'The contact email changed.';
     if (!same(approved.generic.review.snapshot, current.generic.review.snapshot)) return CHECKOUT_PAGE_CHANGED;
   }
   return undefined;
@@ -396,6 +415,14 @@ export function validReviewPurchaseFacts(facts: PurchaseFacts): boolean {
   if (
     generic.contactEmail !== undefined &&
     (!EMAIL.test(generic.contactEmail) || generic.contactEmail !== generic.contactEmail.toLowerCase())
+  )
+    return false;
+  if (
+    review.contactEmails !== undefined &&
+    (generic.contactEmail !== undefined ||
+      review.contactEmails.length < 2 ||
+      new Set(review.contactEmails).size !== review.contactEmails.length ||
+      !review.contactEmails.every((address) => EMAIL.test(address) && address === address.toLowerCase()))
   )
     return false;
   if (facts.currency !== '' && currencyExponent(facts.currency) === undefined) return false;
