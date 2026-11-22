@@ -198,7 +198,6 @@ registerApprovalHandler(
       if (
         !proposal ||
         proposal.session_id !== session.id ||
-        proposal.expires_at <= new Date().toISOString() ||
         (proposal.approval_id !== null && proposal.approval_id !== approval.approval_id)
       )
         return;
@@ -210,7 +209,7 @@ registerApprovalHandler(
         granted = existing;
         return;
       }
-      if (proposal.status !== 'open') return;
+      if (proposal.status !== 'open' || proposal.expires_at <= new Date().toISOString()) return;
       const at = new Date().toISOString();
       await getDb().run('UPDATE gws_ea_browser_reservation_guarantees SET revoked_at = ? WHERE revoked_at IS NULL', at);
       await getDb().run(

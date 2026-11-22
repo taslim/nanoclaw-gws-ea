@@ -627,6 +627,13 @@ describe('the free-commit test', () => {
       }),
     );
     expect(notAllTaxesAndFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
+    const notAllCleaningFeesIncluded = ready(
+      decide({
+        ...shop,
+        lines: [...shop.lines, 'Not all cleaning fees are included.'],
+      }),
+    );
+    expect(notAllCleaningFeesIncluded.generic?.review?.missing).toEqual(['the fee amount']);
 
     // An unpriced deposit beside a priced cancellation fee must not invent a verified $0.00 total.
     const unpricedDeposit = ready(

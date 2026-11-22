@@ -3371,6 +3371,76 @@ document.getElementById('continue-step').addEventListener('click', () => { locat
     expect(await attempts()).toMatchObject([{ site: 'booking.example', resolution: null, merchant_record_id: null }]);
   });
 
+  it('retires a stale approval and releases its purchase lease when replacement capture fails, and ignores pre-press confirmations on bound checkouts', async () => {
+    const reviewUrl = 'https://booking.example/replacement-capture';
+    fixture.serve(
+      reviewUrl,
+      htmlPage(
+        'Finish booking',
+        `<h1>Monty Suites Calabar</h1>
+         <form method="post" action="/replacement-capture/confirmed">
+           <p id="total-line">Total US$86.13</p>
+           <p>Pay with the property</p>
+           <button type="submit">Complete booking</button>
+         </form>`,
+      ),
+    );
+    expect(await open(reviewUrl)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await purchase('Complete booking', 'initial-review')).toMatchObject({ status: 'awaiting_principal' });
+    const [initialCard] = await approvals();
+
+    // Mutate the checkout so approving requires a replacement card, then fail replacement screenshot capture.
+    await page.locator('#total-line').evaluate((node) => {
+      node.textContent = 'Total US$120.00';
+    });
+    const realScreenshot = page.screenshot.bind(page);
+    const oversizedPng = Buffer.alloc(4 * 1024 * 1024 + 64);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(oversizedPng, 0);
+    oversizedPng.write('IHDR', 12, 'latin1');
+    oversizedPng.writeUInt32BE(800, 16);
+    oversizedPng.writeUInt32BE(4000, 20);
+    const oversizedSpy = vi.spyOn(page, 'screenshot').mockImplementation(async (options) => {
+      if (options?.fullPage) return oversizedPng;
+      return realScreenshot(options);
+    });
+    try {
+      await approve(initialCard);
+      expect(posts()).toEqual([]);
+      expect(await approvals()).toEqual([]);
+      expect(await authorities()).toMatchObject([{ state: 'revoked' }]);
+      expect(await getDb().all('SELECT * FROM gws_ea_browser_pending_commits')).toEqual([]);
+      expect(await getDb().all('SELECT * FROM gws_ea_browser_site_leases WHERE site = ?', 'booking.example')).toEqual(
+        [],
+      );
+    } finally {
+      oversizedSpy.mockRestore();
+    }
+
+    // Even on an email-bound generic checkout, a pre-existing confirmation reference visible before pressing cannot resolve the new attempt.
+    const staleBannerUrl = 'https://pottery.example/stale-banner-checkout';
+    fixture.serve(
+      staleBannerUrl,
+      htmlPage(
+        'Checkout',
+        `<div id="banner">Thank you for your previous order! Order number: OLD-1001</div>
+         <form method="post" action="/stale-banner-checkout">
+           <p>Your order</p>
+           <p>Celadon mug × 1</p>
+           <p>Visa ending in 4242</p>
+           <p>Order total $42.00</p>
+           <label>Email <input name="email" type="email" value="${ALIAS}"></label>
+           <button type="submit">Place order</button>
+         </form>`,
+      ),
+    );
+    expect(await open(staleBannerUrl)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    expect(await purchase('Place order', 'stale-banner')).toMatchObject({ status: 'awaiting_principal' });
+    const [boundCard] = await approvals();
+    await approve(boundCard);
+    expect(posts()).toEqual([staleBannerUrl]);
+    expect(await attempts()).toMatchObject([{ site: 'pottery.example', resolution: null, merchant_record_id: null }]);
+  });
+
   describe('a guest booking that verifies the guest after Complete reservation', () => {
     const MOBILE = '+1 415 555 0134';
     const presses = async (): Promise<string | null> => page.locator('body').getAttribute('data-presses');

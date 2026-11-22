@@ -131,9 +131,12 @@ const VOCABULARY = {
   stepControl: /\b(?:continue|next|proceed)\b/iu,
   unpricedFeeWording:
     /\b(?:fees?|charges|charge(?!\s+(?:you|your|the\s+card|this\s+card|my\s+card|it)\b)|surcharges?|penalt(?:y|ies))\b/iu,
-  /** Affirmative wording stating taxes or fees are already included in the displayed price (never negated "not all fees are included"). */
+  /** Affirmative wording stating taxes or fees are already included in the displayed price. */
   includedFees:
-    /(?<!\b(?:not|doesn'?t|does\s+not|aren'?t|are\s+not|isn'?t|is\s+not|won'?t|will\s+not)\s+)\b(?:includ(?:es?|ing)|incl\.?)\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\b|(?<!\bnot\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?)\b(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\s+(?:are\s+)?included\b/iu,
+    /\b(?:includ(?:es?|ing)|incl\.?)\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\b|\b(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\s+(?:are\s+)?included\b/iu,
+  /** Clause-level negation or exclusion that prevents an included-fee exemption from stripping fee wording. */
+  negatedInclusion:
+    /\b(?:not|doesn'?t|does\s+not|aren'?t|are\s+not|isn'?t|is\s+not|won'?t|will\s+not|except|exclud(?:e|es|ing)|excl\.?)\b/iu,
   cardRequired:
     /\b(?:a\s+)?(?:credit\s+|debit\s+)?cards?\s+(?:on\s+file\s+)?(?:is|are)\s+(?:required|needed)\b|\b(?:require|need)s?\s+a\s+(?:credit\s+|debit\s+)?card\b|\benter\s+(?:your\s+)?(?:card|payment)\b/iu,
   /** Explicit host-read payment arrangement when nothing is due online and no card is collected. */
@@ -213,6 +216,13 @@ function volatileText(text: string): boolean {
 
 const DENIALS = new RegExp(VOCABULARY.negated.source, 'giu');
 const INCLUDED_FEES = new RegExp(VOCABULARY.includedFees.source, 'giu');
+/** Strips affirmative included-fee clauses while preserving negated/excluded clauses and separate fee sentences. */
+function stripIncludedFees(text: string): string {
+  return text
+    .split(/(?<=[.;!?])\s+/u)
+    .map((clause) => (VOCABULARY.negatedInclusion.test(clause) ? clause : clause.replace(INCLUDED_FEES, ' ')))
+    .join(' ');
+}
 /** The text without what it denies: "No deposit needed; a no-show fee applies" still names its fee. */
 function undenied(text: string): string {
   return text.replace(DENIALS, ' ');
@@ -665,7 +675,7 @@ export function decideGenericCheckout(
   const totalValues = distinct(totals.map((total) => total.money));
   const hasUnpricedFee = lines.some((line, index) => {
     if (consumed.has(index)) return false;
-    const feeWords = undenied(line.text).replace(INCLUDED_FEES, ' ');
+    const feeWords = stripIncludedFees(undenied(line.text));
     if (!VOCABULARY.unpricedFeeWording.test(feeWords)) return false;
     if (statedAmounts(line.text).length > 0 || /\bfree\b/iu.test(line.text) || VOCABULARY.nothingNow.test(line.text))
       return false;
@@ -1083,18 +1093,19 @@ async function readGenericEvidence(
 }
 
 /**
- * Immediate post-press confirmation for an unbound generic checkout (such as a review checkout without a contact
- * email). Valid only directly after the host's own press, filtering out every reference already visible on the
- * page before the press before selecting a matching confirmation.
+ * Immediate post-press confirmation for any generic checkout (email-bound or unbound). Filters out every
+ * confirmation reference already visible on the page before the host's press before selecting a matching record.
  */
-export async function readUnboundGenericConfirmation(
+export async function readGenericPostPressEvidence(
   page: Page,
   attempted: PurchaseFacts,
   beforeReferences: ReadonlySet<string>,
-): Promise<MerchantPurchaseEvidence | undefined> {
-  if (!attempted.generic || genericAccountKey(attempted) !== undefined) return undefined;
+): Promise<{ evidence: MerchantPurchaseEvidence; recordAccount: string | null } | undefined> {
+  if (!attempted.generic) return undefined;
   const fresh = (await readConfirmations(page)).filter((confirmation) => !beforeReferences.has(confirmation.reference));
-  return selectGenericEvidence(fresh, attempted, attempted.account);
+  const accountKey = genericAccountKey(attempted);
+  const evidence = selectGenericEvidence(fresh, attempted, accountKey ?? attempted.account);
+  return evidence ? { evidence, recordAccount: accountKey ?? null } : undefined;
 }
 
 /**

@@ -68,7 +68,7 @@ import {
   type PurchaseFacts,
 } from './fingerprint.js';
 import { pressFreeCheckout, type FreePressAnswer } from './free-press.js';
-import { genericCheckoutSignature, pressRefusal, readUnboundGenericConfirmation } from './generic-signature.js';
+import { genericCheckoutSignature, pressRefusal, readGenericPostPressEvidence } from './generic-signature.js';
 import { stopForUnapprovedCommit, type IncidentKind, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
 import type { MerchantCheckoutRead, MerchantPurchaseEvidence, MerchantSignature } from './merchant-contract.js';
@@ -345,9 +345,19 @@ async function requestPurchaseCard(
   if (decision.effect !== 'hold') throw forbidden(purchaseMessage('notHeld'));
   // The card's picture, taken before anything durable changes; complete cards can still post without one,
   // while screenshot-reviewed generic cards require a safe capture and fail closed to facts_incomplete without it.
+  // When a replacement card fails capture, retire the stale prior authority/pending commit and release its lease.
   const picture = await checkoutPicture(context, facts);
-  if (facts.generic?.review && !picture)
+  if (facts.generic?.review && !picture) {
+    if (change !== undefined) {
+      const retired = await db.transaction(async () => ({
+        cards: await detachPurchaseCards(context.job.id, 'superseded'),
+        waitingJobs: await new SiteLeaseStore(db).releaseUnheldPurchases(context.job.id),
+      }));
+      await context.wakeWaiters(retired.waitingJobs, `review-capture-failed-${id}`);
+      await finishPurchaseCardWithdrawals(retired.cards, purchaseCardWithdrawal());
+    }
     return { status: 'facts_incomplete', missing: [...facts.generic.review.missing], repeat_safe: true };
+  }
   const expires = new Date(Date.now() + PURCHASE_CARD_LIFE_MS).toISOString();
   const detached = await db.transaction(async () => {
     const job = await db.get<{ cancelled: number; cancel_requested: number }>(
@@ -543,9 +553,9 @@ registerApprovalResolvedHandler(async (event) => {
 });
 
 /**
- * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, an
- * account-keyed generic confirmation, or — immediately after the host's own press — a newly appeared confirmation
- * on an unbound generic checkout whose reference was not present before the press.
+ * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, or
+ * — immediately after the host's own press — a newly appeared generic confirmation whose reference was not
+ * already visible on the page before pressing.
  */
 async function verifyPlaced(
   page: Page,
@@ -558,30 +568,32 @@ async function verifyPlaced(
 > {
   const attempt = await store.attempt(authority.attempt_id);
   if (!attempt) return undefined;
-  const evidence = await readMerchantPurchaseEvidence(page, facts);
-  if (evidence?.resolution === 'committed' && evidenceMatchesAttempt(evidence, attempt)) {
+  if (facts.generic) {
+    const matched = beforeConfirmations
+      ? await readGenericPostPressEvidence(page, facts, beforeConfirmations)
+      : undefined;
+    if (!matched) return undefined;
+    if (matched.recordAccount !== null && !evidenceMatchesAttempt(matched.evidence, attempt)) return undefined;
     return {
-      evidence,
-      recordAccount: evidence.account,
+      evidence: matched.evidence,
+      recordAccount: matched.recordAccount,
       outcome: {
-        status: evidence.reservation || genericCheckoutBooks(facts) ? 'booked' : 'placed',
-        order_number: evidence.recordId,
-        evidence,
+        status: genericCheckoutBooks(facts) ? 'booked' : 'placed',
+        order_number: matched.evidence.recordId,
+        evidence: matched.evidence,
         repeat_safe: false,
       },
     };
   }
-  const unbound = beforeConfirmations
-    ? await readUnboundGenericConfirmation(page, facts, beforeConfirmations)
-    : undefined;
-  if (!unbound) return undefined;
+  const evidence = await readMerchantPurchaseEvidence(page, facts);
+  if (evidence?.resolution !== 'committed' || !evidenceMatchesAttempt(evidence, attempt)) return undefined;
   return {
-    evidence: unbound,
-    recordAccount: null,
+    evidence,
+    recordAccount: evidence.account,
     outcome: {
-      status: genericCheckoutBooks(facts) ? 'booked' : 'placed',
-      order_number: unbound.recordId,
-      evidence: unbound,
+      status: evidence.reservation ? 'booked' : 'placed',
+      order_number: evidence.recordId,
+      evidence,
       repeat_safe: false,
     },
   };

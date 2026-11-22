@@ -303,6 +303,8 @@ it('opens any public page, including booking-entry URLs, and refuses only blocke
     'https://shop.example/checkout/submit',
     'https://shop.example/api/charge',
     'https://shop.example/orders/confirm-booking',
+    'https://shop.example/purchase?options=gift',
+    'https://shop.example/items?purchase=1&options=gift',
   ]) {
     expect(classifyNavigationUrl(url, 'document')).toBe('purchase_control');
     expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');

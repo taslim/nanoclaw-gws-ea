@@ -180,11 +180,18 @@ function pathnameWords(segments: readonly string[]): string {
   return segments.filter((piece) => piece.split(/\s+/u).length < PROSE_WORDS).join(' ');
 }
 
-function routeWords(url: URL, pathOnly: string): string {
-  const paramKeys = [...url.searchParams]
+function queryParamKeys(url: URL): string[] {
+  return [...url.searchParams]
     .filter(([name]) => !ACTION_PARAMETER.test(name))
     .map(([name]) => name.replace(/[_/-]+/gu, ' ').trim())
-    .filter((piece) => piece && piece.split(/\s+/u).length < PROSE_WORDS);
+    .filter((piece) => Boolean(piece) && piece.split(/\s+/u).length < PROSE_WORDS);
+}
+
+function matchesPathOrKey(pattern: RegExp, pathOnly: string, paramKeys: readonly string[]): boolean {
+  return pattern.test(pathOnly) || paramKeys.some((key) => pattern.test(key));
+}
+
+function routeWords(pathOnly: string, paramKeys: readonly string[]): string {
   return [pathOnly, ...paramKeys].filter(Boolean).join(' ');
 }
 
@@ -199,11 +206,11 @@ function terminalSegmentIsLookup(lastSegment: string | undefined): boolean {
   return Boolean(lastSegment && submissionLookup.test(lastSegment) && !terminalBookingVerb.test(lastSegment));
 }
 
-function submissionCommits(words: string, pathOnly: string, lastSegment: string | undefined): boolean {
+function submissionCommits(pathOnly: string, paramKeys: readonly string[], lastSegment: string | undefined): boolean {
   return (
-    commitPurchase.test(words) ||
-    purchaseRoute.test(words) ||
-    purchase.test(words) ||
+    matchesPathOrKey(commitPurchase, pathOnly, paramKeys) ||
+    matchesPathOrKey(purchaseRoute, pathOnly, paramKeys) ||
+    matchesPathOrKey(purchase, pathOnly, paramKeys) ||
     (submissionBooking.test(pathOnly) && !terminalSegmentIsLookup(lastSegment))
   );
 }
@@ -223,13 +230,13 @@ export function isPurchaseSubmissionUrl(raw: string): boolean {
   const segments = decodedPathSegments(url);
   if (!segments) return true;
   const pathOnly = pathnameWords(segments);
-  const words = routeWords(url, pathOnly);
+  const paramKeys = queryParamKeys(url);
   const actions = actionParameterWords(url);
   const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
   if (reviewed === 'ordinary' && !actions) return false;
   if (reviewed === 'purchase_control') return true;
   return (
-    submissionCommits(words, pathOnly, segments.at(-1)) ||
+    submissionCommits(pathOnly, paramKeys, segments.at(-1)) ||
     Boolean(actions && (purchase.test(actions) || purchaseRoute.test(actions) || submissionBooking.test(actions)))
   );
 }
@@ -252,14 +259,19 @@ export function classifyNavigationUrl(raw: string, purpose: NavigationUrlPurpose
   const segments = decodedPathSegments(url);
   if (!segments || !queryDecodes(url)) return 'blocked_address';
   const pathOnly = pathnameWords(segments);
-  const words = routeWords(url, pathOnly);
+  const paramKeys = queryParamKeys(url);
+  const words = routeWords(pathOnly, paramKeys);
   const actions = actionParameterWords(url);
   if (security.test(words) || securityRoute.test(words)) return 'account_security';
   if (speaking.test(words)) return 'speaks_as_principal';
   const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
   if (reviewed === 'ordinary' && !actions) return 'ordinary';
-  if (explicitCommitPurchase.test(words) || purchaseRoute.test(words)) return 'purchase_control';
-  if (purpose === 'submission' && purchase.test(words)) return 'purchase_control';
+  if (
+    matchesPathOrKey(explicitCommitPurchase, pathOnly, paramKeys) ||
+    matchesPathOrKey(purchaseRoute, pathOnly, paramKeys)
+  )
+    return 'purchase_control';
+  if (purpose === 'submission' && matchesPathOrKey(purchase, pathOnly, paramKeys)) return 'purchase_control';
   if (actions) {
     if (security.test(actions) || securityRoute.test(actions)) return 'account_security';
     if (speaking.test(actions)) return 'speaks_as_principal';

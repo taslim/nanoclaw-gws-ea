@@ -367,5 +367,44 @@ describe('standing reservation guarantees through native host delivery', () => {
     } finally {
       replayDb.close();
     }
+
+    // Even if restart replay runs after the proposal's expires_at, an already-committed grant still completes its wake note.
+    const expiredNoteDb = new Database(inboundDbPath(main.agent_group_id, main.id));
+    try {
+      expiredNoteDb.prepare('DELETE FROM messages_in WHERE id = ?').run(`appr-approve-${approval.approval_id}`);
+    } finally {
+      expiredNoteDb.close();
+    }
+    await getDb().run(
+      'UPDATE gws_ea_browser_guarantee_proposals SET expires_at = ? WHERE approval_id = ?',
+      new Date(Date.now() - 60_000).toISOString(),
+      approval.approval_id,
+    );
+    await getDb().run(
+      `INSERT INTO pending_approvals(approval_id,session_id,request_id,action,payload,created_at,channel_type,platform_id,title,question,options_json,status,approver_user_id)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,'approved',?)`,
+      approval.approval_id,
+      approval.session_id,
+      approval.request_id,
+      approval.action,
+      approval.payload,
+      approval.created_at,
+      approval.channel_type,
+      approval.platform_id,
+      approval.title,
+      approval.question,
+      approval.options_json,
+      approval.approver_user_id,
+    );
+    await resumeApprovedApprovals();
+    const recoveredDb = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+    try {
+      const recovered = recoveredDb
+        .prepare('SELECT trigger FROM messages_in WHERE id = ?')
+        .get(`appr-approve-${approval.approval_id}`) as { trigger: number } | undefined;
+      expect(recovered).toEqual({ trigger: 1 });
+    } finally {
+      recoveredDb.close();
+    }
   });
 });
