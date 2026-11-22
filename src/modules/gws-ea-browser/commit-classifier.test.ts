@@ -305,6 +305,7 @@ it('opens any public page, including booking-entry URLs, and refuses only blocke
     'https://shop.example/orders/confirm-booking',
     'https://shop.example/purchase?options=gift',
     'https://shop.example/items?purchase=1&options=gift',
+    'https://shop.example/checkout?submit=1',
   ]) {
     expect(classifyNavigationUrl(url, 'document')).toBe('purchase_control');
     expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');
@@ -890,6 +891,7 @@ it('refuses only script requests that are no GET, to a payment processor or a pu
     ['PUT', 'https://checkoutshopper-live.adyen.com/checkoutshopper/v1/payments'],
     ['POST', 'https://pay.shopify.com/session'],
     ['POST', 'https://shop.example/api/checkout/submit'],
+    ['POST', 'https://shop.example/checkout?submit=1'],
     ['POST', 'https://bistro.example/api/reservations'],
     ['POST', 'https://salon.example/api/bookings?time=19%3A00'],
     ['POST', 'https://salon.example/api/appointments'],

@@ -125,11 +125,11 @@ function priceCharges(value: unknown, currency: unknown): ConfirmationCharge[] {
   return parsed ? [parsed] : [];
 }
 
-/** The reference and charges of a document's schema.org Order or Reservation data; undefined when it has none. */
+/** The references and charges of a document's schema.org Order or Reservation data; undefined when it has none. */
 function structuredEvidence(
   sources: readonly string[],
-): { reference?: string; charges: ConfirmationCharge[] } | undefined {
-  let found: { reference?: string; charges: ConfirmationCharge[] } | undefined;
+): { references: string[]; charges: ConfirmationCharge[] } | undefined {
+  let found: { references: string[]; charges: ConfirmationCharge[] } | undefined;
   for (const source of sources) {
     let parsed: unknown;
     try {
@@ -143,11 +143,10 @@ function structuredEvidence(
         (type): type is string => typeof type === 'string',
       );
       if (!types.some((type) => STRUCTURED_TYPE.test(type))) continue;
-      found ??= { charges: [] };
-      const reference = [node.orderNumber, node.confirmationNumber, node.reservationNumber, node.reservationId].find(
-        (value): value is string => typeof value === 'string' && REFERENCE_SHAPE.test(value.trim()),
-      );
-      if (reference && !found.reference) found.reference = reference.trim();
+      found ??= { references: [], charges: [] };
+      for (const value of [node.orderNumber, node.confirmationNumber, node.reservationNumber, node.reservationId]) {
+        if (typeof value === 'string' && REFERENCE_SHAPE.test(value.trim())) found.references.push(value.trim());
+      }
       found.charges.push(
         ...priceCharges(node.totalPaymentDue, node.priceCurrency),
         ...priceCharges(node.totalPrice, node.priceCurrency),
@@ -157,6 +156,23 @@ function structuredEvidence(
     }
   }
   return found;
+}
+
+const ALL_REFERENCES = new RegExp(CONFIRMATION_VOCABULARY.reference.source, 'giu');
+
+/** Every confirmation reference in a document (structured data and, when confirmed-worded, all labelled text references). */
+export function confirmationReferences(text: string, structuredSources: readonly string[]): string[] {
+  const lines = toLines(text);
+  const structured = structuredEvidence(structuredSources);
+  const references = [...(structured?.references ?? [])];
+  if (lines.some((line) => CONFIRMATION_VOCABULARY.confirmed.test(line))) {
+    for (const line of lines) {
+      for (const match of line.matchAll(ALL_REFERENCES)) {
+        if (match[1]) references.push(match[1]);
+      }
+    }
+  }
+  return [...new Set(references)];
 }
 
 function largest(charges: readonly ConfirmationCharge[]): ConfirmationCharge | undefined {
@@ -174,11 +190,7 @@ export function confirmationEvidence(
 ): ConfirmationEvidence | undefined {
   const lines = toLines(text);
   const structured = structuredEvidence(structuredSources);
-  const worded = lines.some((line) => CONFIRMATION_VOCABULARY.confirmed.test(line));
-  const textReference = lines
-    .map((line) => CONFIRMATION_VOCABULARY.reference.exec(line)?.[1])
-    .find((reference) => reference !== undefined);
-  const reference = structured?.reference ?? (worded ? textReference : undefined);
+  const reference = confirmationReferences(text, structuredSources)[0];
   if (!reference || !URL.canParse(address)) return undefined;
   const url = new URL(address);
   const charged = largest([...(structured?.charges ?? []), ...textCharges(lines)]);
@@ -251,8 +263,9 @@ export async function readConfirmationBaseline(
           frame.locator('body').innerText({ timeout: READ_TIMEOUT_MS }),
           frame.locator('script[type="application/ld+json" i]').allTextContents(),
         ]);
-        const evidence = confirmationEvidence(frame.url(), text, structured);
-        if (evidence) references.add(evidence.reference);
+        if (URL.canParse(frame.url())) {
+          for (const reference of confirmationReferences(text, structured)) references.add(reference);
+        }
       } catch (_error) {
         if (!frame.isDetached() && eligible(address)) complete = false;
       }

@@ -1,6 +1,7 @@
 /** The generic signature's decisions and fact floor, from host reads shaped as the isolated-world reader returns them. */
 import { describe, expect, it } from 'vitest';
 
+import { confirmationReferences } from './confirmation.js';
 import type { CheckoutField, CheckoutFrame, CheckoutRead } from './control-facts.js';
 import {
   authorizablePurchaseFacts,
@@ -908,4 +909,12 @@ it('tells a decline on the page from another failure', () => {
   expect(pressRefusal(['Your card was declined. Try another card.'])).toBe('declined');
   expect(pressRefusal(['Something went wrong. Please try again.'])).toBe('failed');
   expect(pressRefusal(['If your card is ever refused, call your bank.'])).toBeUndefined();
+});
+
+it('extracts every pre-existing confirmation reference in a document rather than only the first', () => {
+  expect(
+    confirmationReferences('Thank you for your previous orders!\nOrder number: OLD111\nBooking reference: OLD222', [
+      JSON.stringify({ '@type': 'Order', orderNumber: 'JSON-333' }),
+    ]),
+  ).toEqual(['JSON-333', 'OLD111', 'OLD222']);
 });

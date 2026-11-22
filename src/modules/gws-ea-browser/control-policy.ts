@@ -206,11 +206,19 @@ function terminalSegmentIsLookup(lastSegment: string | undefined): boolean {
   return Boolean(lastSegment && submissionLookup.test(lastSegment) && !terminalBookingVerb.test(lastSegment));
 }
 
-function submissionCommits(pathOnly: string, paramKeys: readonly string[], lastSegment: string | undefined): boolean {
+function submissionCommits(
+  words: string,
+  pathOnly: string,
+  paramKeys: readonly string[],
+  lastSegment: string | undefined,
+): boolean {
   return (
     matchesPathOrKey(commitPurchase, pathOnly, paramKeys) ||
     matchesPathOrKey(purchaseRoute, pathOnly, paramKeys) ||
     matchesPathOrKey(purchase, pathOnly, paramKeys) ||
+    commitPurchase.test(words) ||
+    purchaseRoute.test(words) ||
+    purchase.test(words) ||
     (submissionBooking.test(pathOnly) && !terminalSegmentIsLookup(lastSegment))
   );
 }
@@ -231,12 +239,13 @@ export function isPurchaseSubmissionUrl(raw: string): boolean {
   if (!segments) return true;
   const pathOnly = pathnameWords(segments);
   const paramKeys = queryParamKeys(url);
+  const words = routeWords(pathOnly, paramKeys);
   const actions = actionParameterWords(url);
   const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
   if (reviewed === 'ordinary' && !actions) return false;
   if (reviewed === 'purchase_control') return true;
   return (
-    submissionCommits(pathOnly, paramKeys, segments.at(-1)) ||
+    submissionCommits(words, pathOnly, paramKeys, segments.at(-1)) ||
     Boolean(actions && (purchase.test(actions) || purchaseRoute.test(actions) || submissionBooking.test(actions)))
   );
 }
@@ -268,10 +277,13 @@ export function classifyNavigationUrl(raw: string, purpose: NavigationUrlPurpose
   if (reviewed === 'ordinary' && !actions) return 'ordinary';
   if (
     matchesPathOrKey(explicitCommitPurchase, pathOnly, paramKeys) ||
-    matchesPathOrKey(purchaseRoute, pathOnly, paramKeys)
+    matchesPathOrKey(purchaseRoute, pathOnly, paramKeys) ||
+    explicitCommitPurchase.test(words) ||
+    purchaseRoute.test(words)
   )
     return 'purchase_control';
-  if (purpose === 'submission' && matchesPathOrKey(purchase, pathOnly, paramKeys)) return 'purchase_control';
+  if (purpose === 'submission' && (matchesPathOrKey(purchase, pathOnly, paramKeys) || purchase.test(words)))
+    return 'purchase_control';
   if (actions) {
     if (security.test(actions) || securityRoute.test(actions)) return 'account_security';
     if (speaking.test(actions)) return 'speaks_as_principal';
