@@ -18,7 +18,7 @@ import { credentialAttempts } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
-import { formatMoney, type PurchaseFacts } from './fingerprint.js';
+import { formatMoney, hasPurchaseDueNow, hasPurchaseTotal, type PurchaseFacts } from './fingerprint.js';
 import { loadPrincipalClock } from './watch-policy.js';
 
 import type { BrowserQueue } from './queue.js';
@@ -27,8 +27,8 @@ export type BrowserJobState = 'idle' | 'working' | 'awaiting_principal' | 'watch
 /** An open purchase card; `expires` is on the principal's clock. */
 export interface BrowserJobCard {
   readonly site: string;
-  readonly total: string;
-  readonly due_now: string;
+  readonly total?: string;
+  readonly due_now?: string;
   readonly expires: string;
 }
 /**
@@ -70,8 +70,8 @@ async function purchaseState(
       ? {
           open_card: {
             site: facts.site,
-            total: formatMoney(facts.totalMinor, facts.currency),
-            due_now: formatMoney(facts.dueNowMinor, facts.currency),
+            ...(hasPurchaseTotal(facts) ? { total: formatMoney(facts.totalMinor, facts.currency) } : {}),
+            ...(hasPurchaseDueNow(facts) ? { due_now: formatMoney(facts.dueNowMinor, facts.currency) } : {}),
             expires: formatLocalTimeWithZone(card.expires_at, clock(card.expires_at)),
           },
         }

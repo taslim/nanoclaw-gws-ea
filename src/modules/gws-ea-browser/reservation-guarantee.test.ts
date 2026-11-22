@@ -14,10 +14,11 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { requestWake } from '../../request-wake.js';
 import { resolveSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { finalizeReject } from '../approvals/finalize.js';
-import { handleApprovalsResponse } from '../approvals/response-handler.js';
+import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -313,5 +314,58 @@ describe('standing reservation guarantees through native host delivery', () => {
     expect(await getDb().all('SELECT max_total_minor FROM gws_ea_browser_reservation_guarantees')).toEqual([
       { max_total_minor: 5000 },
     ]);
+  });
+
+  it('wakes main with a triggering system note once when the principal approves a standing guarantee', async () => {
+    const wake = vi.mocked(requestWake);
+    wake.mockClear();
+    const approval = await propose('wake-on-approve', '86.13');
+    await answer(approval, 'approve');
+    const db = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+    let rows: Array<{ id: string; trigger: number; content: string }>;
+    try {
+      rows = db.prepare('SELECT id, trigger, content FROM messages_in ORDER BY seq').all() as Array<{
+        id: string;
+        trigger: number;
+        content: string;
+      }>;
+    } finally {
+      db.close();
+    }
+    const approvalRows = rows.filter((row) => row.id === `appr-approve-${approval.approval_id}`);
+    expect(approvalRows).toHaveLength(1);
+    expect(approvalRows[0].trigger).toBe(1);
+    const note = (JSON.parse(approvalRows[0].content) as { text?: string }).text ?? '';
+    expect(note).toBe('The principal approved standing reservation guarantees of up to $86.13 (USD).');
+    expect(note).not.toMatch(/admin|browser_reservation_guarantee|guarantee-[0-9a-f]|appr-/u);
+    expect(wake).toHaveBeenCalledWith(expect.objectContaining({ id: main.id }), 'approval-response');
+
+    // Replaying an approved row after restart does not duplicate the approval note.
+    await getDb().run(
+      `INSERT INTO pending_approvals(approval_id,session_id,request_id,action,payload,created_at,channel_type,platform_id,title,question,options_json,status,approver_user_id)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,'approved',?)`,
+      approval.approval_id,
+      approval.session_id,
+      approval.request_id,
+      approval.action,
+      approval.payload,
+      approval.created_at,
+      approval.channel_type,
+      approval.platform_id,
+      approval.title,
+      approval.question,
+      approval.options_json,
+      approval.approver_user_id,
+    );
+    await resumeApprovedApprovals();
+    const replayDb = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+    try {
+      const count = replayDb
+        .prepare('SELECT COUNT(*) AS count FROM messages_in WHERE id = ?')
+        .get(`appr-approve-${approval.approval_id}`) as { count: number };
+      expect(count.count).toBe(1);
+    } finally {
+      replayDb.close();
+    }
   });
 });

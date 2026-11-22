@@ -2500,8 +2500,18 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     await open(GENERIC.walletTable);
     expect(await read('#reserve')).toMatchObject({ status: 'card_needed' });
     await open(GENERIC.cardTable);
-    // The saved card beside the form is the payment: the booking reads as a paid checkout missing its other facts.
-    expect(await read('#reserve')).toEqual({ status: 'facts_incomplete', missing: ['the total', 'the contact email'] });
+    // The saved card beside the form is the payment: the booking is never free and falls back to screenshot review.
+    const cardTableRead = await read('#reserve');
+    expect(cardTableRead).toMatchObject({
+      status: 'ready',
+      facts: {
+        cardEnding: '4242',
+        generic: {
+          payment: expect.stringContaining('Visa ending in 4242'),
+          review: { missing: ['the total', 'the contact email'] },
+        },
+      },
+    });
     expect(posts()).toEqual([]);
   });
 
@@ -2564,7 +2574,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(posts()).toEqual([]);
   });
 
-  it('puts readable recurring terms on the card, and stops naming an unreadable frequency', async () => {
+  it('puts readable recurring terms on the card, sends a screenshot-backed review card when frequency is unread, and fails closed without a safe screenshot', async () => {
     await open(GENERIC.club);
     await page
       .locator('#checkout p:not(.item)')
@@ -2573,13 +2583,37 @@ document.getElementById('updated').addEventListener('click', () => location.assi
         (node as unknown as { textContent: string }).textContent =
           'Membership: $12.00, renews automatically until you cancel.';
       });
+    // When a filled secret prevents safe screenshot capture, a review checkout refuses to post a blind card.
+    await page.evaluate(`(() => {
+      const pw = document.createElement('input');
+      pw.type = 'password';
+      pw.id = 'secret-blocker';
+      pw.value = 'fixture-secret-123';
+      document.body.append(pw);
+    })()`);
     expect(await purchase('Subscribe')).toMatchObject({
       status: 'facts_incomplete',
       missing: ['the recurring frequency'],
       repeat_safe: true,
     });
     expect(await approvals()).toEqual([]);
-    // The page as the site serves it again: its readable terms reach the principal's card.
+
+    // Reload into a fresh untainted document: without a secret hiding the screenshot, the principal gets a review card.
+    await open(GENERIC.club);
+    await page
+      .locator('#checkout p:not(.item)')
+      .filter({ hasText: 'Membership' })
+      .evaluate((node) => {
+        (node as unknown as { textContent: string }).textContent =
+          'Membership: $12.00, renews automatically until you cancel.';
+      });
+    expect(await purchase('Subscribe')).toMatchObject({ status: 'awaiting_principal' });
+    const [reviewCard] = await approvals();
+    expect(reviewCard.question).toContain("couldn't read every detail automatically");
+    expect(reviewCard.question).toContain('Could not verify automatically: the recurring frequency.');
+    expect(cards().at(-1)).toMatchObject({ pictures: 1, files: [{ filename: 'checkout.png', mimeType: 'image/png' }] });
+
+    // The page as the site serves it again: its readable terms reach the principal's card directly.
     await open(GENERIC.club);
     expect(await purchase('Subscribe')).toMatchObject({ status: 'awaiting_principal' });
     const [approval] = await approvals();
@@ -2588,6 +2622,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
       'Recurring frequency: "monthly"',
     ])
       expect(approval.question).toContain(line);
+    expect(approval.question).not.toContain('Could not verify automatically:');
   });
 
   it('presses Continue then Place order under one card, as one attempt', async () => {
@@ -3065,7 +3100,7 @@ document.getElementById('continue-step').addEventListener('click', () => { locat
     });
   });
 
-  it('withholds an unreadable venue fee as facts_incomplete without pressing authority, and cards a readable pay-at-venue fee booking', async () => {
+  it('sends a screenshot-backed review card for an unreadable venue fee (locking text against mutation), and cards a readable pay-at-venue fee booking', async () => {
     const unreadable = 'https://salon.example/book/unreadable-fee';
     const payAtVenue = 'https://salon.example/book/venue-terms';
     const salonBooked = 'https://salon.example/book/confirmed';
@@ -3073,7 +3108,7 @@ document.getElementById('continue-step').addEventListener('click', () => { locat
       unreadable,
       htmlPage(
         'Confirm appointment',
-        `<h1>Atelier Salon</h1><form method="post" action="/book/confirmed"><p>Cut &amp; finish on <time datetime="2026-10-24T14:00:00-07:00">Saturday, October 24, 2:00 PM</time></p><p>A cancellation fee applies to late cancellations.</p><label>Email <input type="email" name="email" value="${ALIAS}"></label><button type="submit">Confirm appointment</button></form>`,
+        `<h1>Atelier Salon</h1><form method="post" action="/book/confirmed"><p>Cut &amp; finish on <time datetime="2026-10-24T14:00:00-07:00">Saturday, October 24, 2:00 PM</time></p><p id="fee-line">A cancellation fee applies to late cancellations.</p><label>Email <input type="email" name="email" value="${ALIAS}"></label><button type="submit">Confirm appointment</button></form>`,
       ),
     );
     fixture.serve(
@@ -3089,18 +3124,39 @@ document.getElementById('continue-step').addEventListener('click', () => { locat
     );
 
     expect(await open(unreadable)).toMatchObject({ status: 'stopped', reason: 'navigated' });
-    expect(await purchase('Confirm appointment')).toEqual({
-      status: 'facts_incomplete',
-      missing: ['the fee amount'],
-      repeat_safe: true,
-    });
-    expect(await approvals()).toEqual([]);
-    // Missing facts grant no authority to press with browser.
+    // Direct browser click stays blocked as purchase_control; purchase routes it to a screenshot-backed review card.
     expect(
       await run('still-blocked', [{ kind: 'click', ...refIn(await observePage(page), 'Confirm appointment') }]),
     ).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+    expect(await purchase('Confirm appointment')).toMatchObject({
+      status: 'awaiting_principal',
+      card_id: expect.any(String),
+      repeat_safe: false,
+    });
+    const [reviewCard] = await approvals();
+    expect(reviewCard.question).toContain("couldn't read every detail automatically");
+    expect(reviewCard.question).toContain(
+      'Could not verify automatically: the fee amount, the total, the payment terms.',
+    );
+    expect(cards().at(-1)).toMatchObject({ pictures: 1, files: [{ filename: 'checkout.png', mimeType: 'image/png' }] });
+    // Mutating the fee line on a screenshot-reviewed checkout before approval triggers a fresh card instead of clicking.
+    await page.locator('#fee-line').evaluate((node) => {
+      node.textContent = 'A strict cancellation fee applies to any cancellation.';
+    });
+    await approve(reviewCard);
     expect(posts()).toEqual([]);
+    const [revalidatedReview] = await approvals();
+    expect(revalidatedReview.approval_id).not.toBe(reviewCard.approval_id);
+    await approve(revalidatedReview);
+    expect(posts()).toEqual([salonBooked]);
+    expect(await attempts()).toMatchObject([
+      { site: 'salon.example', resolution: 'committed', merchant_record_id: 'AS-204' },
+    ]);
 
+    fixture.serve(
+      salonBooked,
+      htmlPage('Appointment booked', '<h1>Thank you for your booking!</h1><p>Booking reference: AS-205</p>'),
+    );
     expect(await open(payAtVenue)).toMatchObject({ status: 'stopped', reason: 'navigated' });
     const payAtVenueAnswer = await purchase('Confirm appointment');
     expect(payAtVenueAnswer).toEqual({
@@ -3120,13 +3176,79 @@ document.getElementById('continue-step').addEventListener('click', () => { locat
       node.textContent = 'Card on file: Visa ending in 4242';
     });
     await approve(card);
-    expect(posts()).toEqual([]);
+    expect(posts()).toEqual([salonBooked]);
     const [changedCard] = await approvals();
     expect(changedCard.question).toContain('Visa ending in 4242');
     await approve(changedCard);
-    expect(posts()).toEqual([salonBooked]);
+    expect(posts()).toEqual([salonBooked, salonBooked]);
     expect(await attempts()).toMatchObject([
       { site: 'salon.example', resolution: 'committed', merchant_record_id: 'AS-204' },
+      { site: 'salon.example', resolution: 'committed', merchant_record_id: 'AS-205' },
+    ]);
+  });
+
+  it('loads a hotel checkout payment-methods iframe cleanly and completes a pay-at-property booking via screenshot-backed principal approval', async () => {
+    const step3 = 'https://booking.example/book.html';
+    const paymentFrame = 'https://payments.booking.example/pay/methods?token=1';
+    const confirmed = 'https://booking.example/book/confirmed';
+    fixture.serve(paymentFrame, htmlPage('Payment methods', '<p>Pay with the property selected</p>'));
+    fixture.serve(
+      step3,
+      htmlPage(
+        'Finish booking',
+        `<h1>Monty Suites Calabar</h1>
+         <form method="post" action="/book/confirmed">
+           <section>
+             <p>Total US$86.13</p>
+             <p>Includes taxes and fees</p>
+             <h2>Price information</h2>
+             <p>Includes $12.30 in taxes and fees</p>
+             <p>Pay with the property</p>
+             <p>The property will handle payment. The date they charge you will depend on your booking conditions.</p>
+             <iframe id="pay-frame" src="${paymentFrame}" title="Payment options" width="320" height="80"></iframe>
+           </section>
+           <div style="height: 900px"></div>
+           <label><input type="checkbox" id="marketing" name="marketing" checked> Send me marketing emails and deals</label>
+           <button type="submit">Complete booking</button>
+         </form>`,
+      ),
+    );
+    fixture.serve(
+      confirmed,
+      htmlPage(
+        'Booking confirmed',
+        '<h1>Your booking is confirmed!</h1><p>Booking reference: BK-9021</p><p>Total: US$86.13</p>',
+      ),
+    );
+
+    // Loading a GET payment-methods iframe under /pay/ does not trigger a purchase_control document refusal.
+    expect(await open(step3)).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    await page.frameLocator('#pay-frame').locator('p').waitFor();
+
+    // Tall checkout without contact email or "No prepayment needed": unticks marketing, captures full-page
+    // screenshot, and asks the principal without false fee warnings.
+    expect(await purchase('Complete booking')).toMatchObject({ status: 'awaiting_principal', repeat_safe: false });
+    expect(await page.locator('#marketing').isChecked()).toBe(false);
+    const [card] = await approvals();
+    expect(card.question).toContain('Site: booking.example');
+    expect(card.question).toContain('Button I\'ll press: "Complete booking"');
+    expect(card.question).toContain('Total: $86.13 (USD)');
+    expect(card.question).toContain('Payment: "Pay with the property"');
+    expect(card.question).not.toContain('the fee amount');
+    expect(card.question).not.toContain('Due now:');
+    expect(cards().at(-1)).toMatchObject({ pictures: 1, files: [{ filename: 'checkout.png', mimeType: 'image/png' }] });
+
+    const jobView = await readBrowserJob(session.thread_id!);
+    expect(jobView).toMatchObject({
+      state: 'awaiting_principal',
+      open_card: { site: 'booking.example', total: '$86.13' },
+    });
+    expect(jobView?.open_card?.due_now).toBeUndefined();
+
+    await approve(card);
+    expect(posts()).toEqual([confirmed]);
+    expect(await attempts()).toMatchObject([
+      { site: 'booking.example', resolution: 'committed', merchant_record_id: 'BK-9021' },
     ]);
   });
 

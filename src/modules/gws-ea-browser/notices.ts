@@ -1,5 +1,5 @@
 import { formatLocalTimeWithZone } from '../../timezone.js';
-import { formatMoney, type PurchaseFacts } from './fingerprint.js';
+import { formatMoney, hasPurchaseTotal, type PurchaseFacts } from './fingerprint.js';
 import { principalClock } from './watch-policy.js';
 import type { PurchaseAttemptRow } from './authority.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -123,14 +123,14 @@ export async function tellOfPurchaseOnce(
 export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'facts_json' | 'site'>): {
   booking: boolean;
   what: string;
-  total: string;
+  total?: string;
 } {
   const facts = JSON.parse(attempt.facts_json) as PurchaseFacts;
   const booking = Boolean(facts.reservation || facts.generic?.booking);
   return {
     booking,
     what: `${booking ? 'booking' : 'purchase'} on ${attempt.site}`,
-    total: formatMoney(facts.totalMinor, facts.currency),
+    ...(hasPurchaseTotal(facts) ? { total: formatMoney(facts.totalMinor, facts.currency) } : {}),
   };
 }
 
@@ -138,7 +138,7 @@ export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'facts_json' | 
 async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Promise<string> {
   const { what, total } = attemptSummary(attempt);
   return (
-    `Browser job ${job.thread_id}: the ${what} for ${total}, pressed ` +
+    `Browser job ${job.thread_id}: the ${what}${total ? ` for ${total}` : ''}, pressed ` +
     `${formatLocalTimeWithZone(attempt.attempted_at, await principalClock())}, has no page proving whether it went through, so it is ` +
     `unconfirmed (attempt ${attempt.id}). When the merchant's order email reaches you, or once you have asked the ` +
     `principal whether it went through, record it with record_purchase_outcome. Until then another purchase on ` +

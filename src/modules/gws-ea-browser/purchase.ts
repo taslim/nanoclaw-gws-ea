@@ -60,7 +60,7 @@ import {
 import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { unapprovedCommit } from './executor.js';
-import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import { hasPurchaseTotal, materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
 import { pressFreeCheckout, type FreePressAnswer } from './free-press.js';
 import { genericCheckoutSignature, pressRefusal } from './generic-signature.js';
 import { stopForUnapprovedCommit, type IncidentKind, type UnapprovedCommit } from './incidents.js';
@@ -163,6 +163,24 @@ function withConsent(facts: PurchaseFacts, consent: CheckoutConsent): PurchaseFa
     ...(consent.agreements.length ? { agreements: [...consent.agreements] } : {}),
     ...(consent.addOns.length ? { addOns: [...consent.addOns] } : {}),
   };
+}
+
+/**
+ * Consent pass first, re-reading a screenshot-reviewed generic checkout so its locked text snapshot reflects the
+ * post-consent DOM state (preventing false change cards when unticking an optional box updates visible copy).
+ */
+async function readWithConsent(
+  context: BrowserExecutionContext,
+  page: Page,
+  element: ElementHandle,
+  initial: PurchaseFacts,
+): Promise<{ status: 'ready'; facts: PurchaseFacts } | Exclude<MerchantCheckoutRead, { status: 'ready' }>> {
+  const consent = await checkoutConsent(context, page, element);
+  if (!initial.generic?.review) return { status: 'ready', facts: withConsent(initial, consent) };
+  const after = await readMerchantPurchase(page, element);
+  if ('element' in after && after.element !== element) await after.element.dispose();
+  if (after.status !== 'ready') return after;
+  return { status: 'ready', facts: withConsent(after.facts, consent) };
 }
 
 /** A real calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
@@ -319,8 +337,11 @@ async function requestPurchaseCard(
   });
   if (decision.effect === 'deny') throw forbidden(decision.reason);
   if (decision.effect !== 'hold') throw forbidden(purchaseMessage('notHeld'));
-  // The card's picture, taken before anything durable changes; null leaves the card saying it is unavailable.
+  // The card's picture, taken before anything durable changes; complete cards can still post without one,
+  // while screenshot-reviewed generic cards require a safe capture and fail closed to facts_incomplete without it.
   const picture = await checkoutPicture(context, facts);
+  if (facts.generic?.review && !picture)
+    return { status: 'facts_incomplete', missing: [...facts.generic.review.missing], repeat_safe: true };
   const expires = new Date(Date.now() + PURCHASE_CARD_LIFE_MS).toISOString();
   const detached = await db.transaction(async () => {
     const job = await db.get<{ cancelled: number; cancel_requested: number }>(
@@ -371,7 +392,12 @@ async function requestPurchaseCard(
     approverUserId: decision.approverUserId,
     expiresAt: expires,
     originLine: ERRAND_ORIGIN_LINE,
-    details: { facts: { site: facts.site, total_minor: String(facts.totalMinor), currency: facts.currency } },
+    details: {
+      facts: {
+        site: facts.site,
+        ...(hasPurchaseTotal(facts) ? { total_minor: String(facts.totalMinor), currency: facts.currency } : {}),
+      },
+    },
     pictures: [picture],
   });
   // A synchronous card click may already have created the authority; never reopen its logical card.
@@ -566,7 +592,12 @@ async function nextCheckoutStep(
     const decline = same && refusal === 'declined' ? pressRefusalWording(lines) : undefined;
     return decline ? { kind: 'declined', wording: decline } : { kind: 'unconfirmed' };
   }
-  const facts = withConsent(next.facts, await checkoutConsent(context, page, next.element));
+  const consented = await readWithConsent(context, page, next.element, next.facts);
+  if (consented.status !== 'ready') {
+    await next.element.dispose();
+    return { kind: 'unconfirmed' };
+  }
+  const facts = consented.facts;
   const change = materialPurchaseChange(approved, facts, bounds);
   if (change) {
     await next.element.dispose();
@@ -667,7 +698,12 @@ export async function executeAuthorizedPurchase(
       return outcome;
     };
     try {
-      facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
+      const consented = await readWithConsent(context, page, read.element, read.facts);
+      if (consented.status !== 'ready') {
+        await store.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', authority.id);
+        return unreadyCommit(consented);
+      }
+      facts = consented.facts;
       const change = materialPurchaseChange(approved, facts, bounds);
       const expired = authority.expires_at <= new Date().toISOString();
       if (authority.kind === 'watch' && (change || expired))
@@ -908,7 +944,25 @@ export async function executeBrowserPurchase(
           await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:merchant-lease`);
           if (!lease.acquired) return { status: 'site_purchase_blocked', reason: 'site_busy', repeat_safe: true };
         }
-        const facts = withConsent(read.facts, await checkoutConsent(context, page, read.element));
+        const consented = await readWithConsent(context, page, read.element, read.facts);
+        if (consented.status !== 'ready') {
+          switch (consented.status) {
+            case 'card_needed':
+              return { status: 'card_needed', ...consented.needed, repeat_safe: true };
+            case 'facts_incomplete':
+              return { status: 'facts_incomplete', missing: [...consented.missing], repeat_safe: true };
+            case 'terms_unavailable':
+              return { status: 'terms_unavailable', repeat_safe: true };
+            case 'free':
+            case 'checkout_lapsed':
+              return { status: 'checkout_lapsed', repeat_safe: true };
+            default: {
+              const unknown: never = consented;
+              throw new Error(purchaseInvariantMessage(unknown));
+            }
+          }
+        }
+        const facts = consented.facts;
         const store = new PurchaseAuthorityStore(context.store.db);
         const { prepareWatchPurchase } = await import('./watch-purchase.js');
         const watch = await prepareWatchPurchase(context, facts);

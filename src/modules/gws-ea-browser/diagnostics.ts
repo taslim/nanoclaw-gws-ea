@@ -214,6 +214,10 @@ function safeFact(event: BrowserDiagnosticFact): BrowserDiagnosticFact {
   }
 }
 
+function routineDiagnosticEvent(event: BrowserDiagnosticEvent): boolean {
+  return event.source === 'http_response' && event.status < 400;
+}
+
 /** One immutable correlation/epoch; an event from an older attempt cannot enter a newer one. */
 export class BrowserDiagnosticAttempt {
   private readonly started = performance.now();
@@ -245,17 +249,27 @@ export class BrowserDiagnosticAttempt {
 
   record(event: BrowserDiagnosticFact, actionIndex?: number, requestIndex?: number, redirectedFrom?: number): void {
     if (this.closed) return;
-    if (this.events.length >= BROWSER_DIAGNOSTIC_EVENT_LIMIT) {
-      this.omitted++;
-      return;
-    }
-    this.events.push({
+    const entry: BrowserDiagnosticEvent = {
       ...safeFact(event),
       ...(actionIndex === undefined ? {} : { action_index: actionIndex }),
       ...(requestIndex === undefined ? {} : { request_index: requestIndex }),
       ...(redirectedFrom === undefined ? {} : { redirected_from: redirectedFrom }),
       elapsed_ms: Math.max(0, Math.round(performance.now() - this.started)),
-    });
+    };
+    if (this.events.length >= BROWSER_DIAGNOSTIC_EVENT_LIMIT) {
+      if (routineDiagnosticEvent(entry)) {
+        this.omitted++;
+        return;
+      }
+      const evict = this.events.findIndex(routineDiagnosticEvent);
+      if (evict === -1) {
+        this.omitted++;
+        return;
+      }
+      this.events.splice(evict, 1);
+      this.omitted++;
+    }
+    this.events.push(entry);
   }
 
   finish(): BrowserDiagnostics {

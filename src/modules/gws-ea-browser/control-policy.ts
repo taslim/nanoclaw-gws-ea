@@ -36,8 +36,10 @@ export function reviewedMerchantFlow(url: URL): ReviewedMerchantFlow | undefined
 export type NavigationUrlPurpose = 'document' | 'submission';
 
 // Vocabulary is data: widen or narrow it here, never by bypassing the classification order.
-const commitPurchase =
-  /\b(?:buy(?:\s+now)?|pay(?:\s+now)?|place\s+(?:your\s+)?order|order\s+now|purchase(?!\s+(?:history|details|summary|records?|protection|options?))|confirm\s+(?:purchase|order|reservation|booking|appointment)|complete\s+(?:purchase|order|booking|reservation|appointment)|subscribe|start\s+(?:free\s+)?trial|donate|accept\s+(?:fee|charge)|upgrade|renew|place\s+(?:a\s+|your\s+)?bid|bid\s+now)\b/iu;
+const explicitCommitPurchase =
+  /\b(?:buy\s+now|pay\s+now|place\s+(?:your\s+)?order|order\s+now|purchase(?!\s+(?:history|details|summary|records?|protection|options?))|confirm\s+(?:purchase|order|reservation|booking|appointment)|complete\s+(?:purchase|order|booking|reservation|appointment)|subscribe|start\s+(?:free\s+)?trial|donate|accept\s+(?:fee|charge)|upgrade|renew|place\s+(?:a\s+|your\s+)?bid|bid\s+now)\b/iu;
+const bareBuyOrPay = /\b(?:buy|pay)\b/iu;
+const commitPurchase = new RegExp(`${explicitCommitPurchase.source}|${bareBuyOrPay.source}`, 'iu');
 const entryBooking = /\b(?:reserve|book)\s+now\b/iu;
 const purchase = new RegExp(`${commitPurchase.source}|${entryBooking.source}`, 'iu');
 const registration = /\bregister\b/iu;
@@ -56,7 +58,7 @@ const unrelatedSecurity =
 const securityRoute =
   /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu;
 const purchaseRoute =
-  /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu;
+  /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase(?!\s+(?:history|details|summary|records?|protection|options?))|subscribe|starttrial)\b/iu;
 const preparation =
   /^(?:add\s+to\s+(?:(?:my|your)\s+)?calendar|(?:view|see|show|print|download)\s+(?:(?:my|your|the)\s+)?(?:receipt|invoice|order|booking|reservation|tickets?)(?:\s+details)?|track\s+(?:(?:my|your|the)\s+)?(?:order|package|parcel|delivery|shipment)|manage\s+(?:(?:my|your|the)\s+)?(?:booking|reservation|order|tickets?)|[+−–-]|plus|minus|(?:(?:increase|decrease|reduce|raise|lower|update|change|edit|set|select|choose)\s+(?:the\s+)?)?(?:quantity|qty)\b.*|remove\b.*|delete(?:\s+(?:item|this\s+item|from\s+.+))?|apply(?:\s+(?:code|coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher|credit))?|(?:add|enter|use|have\s+an?)\s+(?:a\s+)?(?:coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher)\b.*|(?:coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher)\b.*|edit\b.*|change(?:\s+(?:address|delivery|shipping|date|time|quantity|size|colou?r|items?))?|(?:use|add|edit|change|select|choose|save|enter)\s+(?:(?:a|this|new|another|the)\s+)?(?:(?:shipping|delivery|billing)\s+)?address(?:es)?\b.*|(?:select|choose|change)\s+(?:a\s+|the\s+)?(?:delivery|shipping)\s+(?:option|method|speed|date|time)|(?:standard|express|next.day|same.day|economy|priority|free)\s+(?:delivery|shipping)\b.*|back|go\s+back|previous|return\s+to\s+(?:cart|bag|basket|shop|store|shipping|information|details)|continue\s+(?:shopping|browsing)|keep\s+shopping|(?:show|hide|view|see|open|close)\s+(?:the\s+)?(?:order\s+)?(?:summary|details)|order\s+summary|add\s+to\s+(?:cart|bag|basket)|(?:view|go\s+to|open)\s+(?:cart|bag|basket)|(?:proceed|continue|go)\s+to\s+(?:checkout|shipping|delivery|payment|billing|information|details)|check\s*out|close|dismiss|cancel|not\s+now|no,?\s+thanks)$/iu;
 const choiceRole =
@@ -234,9 +236,10 @@ export function isPurchaseSubmissionUrl(raw: string): boolean {
 
 /**
  * The open rule for a navigation or submission address: any document loads, except a blocked address or an
- * account-security, speaking or commit route. Entry booking paths (`book-now`, `reserve-now`) load as documents
- * unless carried as an action parameter or submitted to a non-GET/script endpoint. A reviewed flow keeps its
- * exact routes; its other routes take the open rule.
+ * account-security, speaking or explicit commit route. Entry booking paths (`book-now`, `reserve-now`) and
+ * payment-widget document paths containing bare `pay` or `buy` load as GET documents unless carried as an action
+ * parameter or submitted to a non-GET/script endpoint. A reviewed flow keeps its exact routes; its other routes
+ * take the open rule.
  */
 export function classifyNavigationUrl(raw: string, purpose: NavigationUrlPurpose): ActionClass {
   let url: URL;
@@ -255,7 +258,7 @@ export function classifyNavigationUrl(raw: string, purpose: NavigationUrlPurpose
   if (speaking.test(words)) return 'speaks_as_principal';
   const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
   if (reviewed === 'ordinary' && !actions) return 'ordinary';
-  if (commitPurchase.test(words) || purchaseRoute.test(words)) return 'purchase_control';
+  if (explicitCommitPurchase.test(words) || purchaseRoute.test(words)) return 'purchase_control';
   if (purpose === 'submission' && purchase.test(words)) return 'purchase_control';
   if (actions) {
     if (security.test(actions) || securityRoute.test(actions)) return 'account_security';

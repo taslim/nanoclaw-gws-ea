@@ -21,7 +21,7 @@ import { BrowserStore, markBrowserRequestCommitStarted } from './db.js';
 import { heldCredentialSites } from './leases.js';
 import { LoginStoreError } from './login-store.js';
 import {
-  completePurchaseFacts,
+  authorizablePurchaseFacts,
   guaranteeCoversReservation,
   isFreeReservation,
   materialPurchaseChange,
@@ -225,7 +225,8 @@ export class PurchaseAuthorityStore {
     });
   }
   async create(input: NewSpendingAuthority): Promise<SpendingAuthority> {
-    if (!completePurchaseFacts(input.facts)) throw new Error('Complete host-read purchase facts are required');
+    if (!authorizablePurchaseFacts(input.facts, input.kind))
+      throw new Error('Complete host-read purchase facts are required');
     return this.db.transaction(async () => {
       const existing = await this.get(input.id);
       if (existing) return existing;
@@ -438,7 +439,7 @@ export class PurchaseAuthorityStore {
       JSON.parse(authority.bounds_json) as PurchaseBounds,
     );
     if (change) throw new PurchaseAuthorityError('changed', change);
-    if (!completePurchaseFacts(current))
+    if (!authorizablePurchaseFacts(current, authority.kind))
       throw new PurchaseAuthorityError('changed', 'The financial terms are unavailable.');
     // Every agreement the press carries stands approved, none withdrawn since the card.
     if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))

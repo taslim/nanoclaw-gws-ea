@@ -20,7 +20,7 @@ export function evidenceMatchesAttempt(
       facts.flowId === GENERIC_FLOW_ID &&
       evidence.flowId === GENERIC_FLOW_ID &&
       evidence.resolution === 'committed' &&
-      evidence.account === facts.generic.contactEmail
+      evidence.account === (facts.generic.contactEmail ?? facts.account)
     );
   const ordered = Date.parse(evidence.orderedAt);
   const attempted = Date.parse(attempt.attempted_at);

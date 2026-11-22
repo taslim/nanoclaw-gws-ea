@@ -32,6 +32,7 @@ import {
   BOOKING_CONTROL,
   currencyExponent,
   formatMoney,
+  hasPurchaseTotal,
   type FinancialCommitment,
   type FreeCommitFacts,
   type GenericBookingFacts,
@@ -66,7 +67,7 @@ const VOCABULARY = {
   dueNow:
     /\b(?:due|payable|to\s+pay|charged|paid)\s+(?:now|today|at\s+(?:booking|checkout)|when\s+you\s+book)\b|\bpay(?:ing)?\s+(?:now|today)\b|\bcharged\s+(?:on|at)\s+booking\b/iu,
   nothingNow:
-    /\bnothing\s+(?:is\s+)?(?:due|charged|to\s+pay)\b|\bno\s+(?:payment|charge)\s+(?:is\s+)?(?:due\s+)?(?:now|today|until)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b/iu,
+    /\bnothing\s+(?:is\s+)?(?:due|charged|to\s+pay)\b|\bno\s+(?:payment|charge|pre-?payment)\s+(?:is\s+)?(?:(?:due|needed|required)\s+)?(?:now|today|until)\b|\bno\s+pre-?payment\s+(?:is\s+)?(?:needed|required)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b/iu,
   /** A summary line beside the items: subtotals, shipping, taxes, discounts. */
   summary:
     /\b(?:sub[\s-]?total|total|shipping|delivery\s+(?:fee|charge)|tax(?:es)?|vat|discount|coupon|promo|tip|gratuity|savings|balance|amount\s+due|due\s+(?:now|today))\b/iu,
@@ -126,12 +127,16 @@ const VOCABULARY = {
   finalFreeControl:
     /\b(?:reserve|reservation|book(?:ing)?|rsvp|wait\s*list|waitlist|register|confirm|complete|place\s+(?:your\s+)?order|order\s+now|submit)\b/iu,
   stepControl: /\b(?:continue|next|proceed)\b/iu,
-  unpricedFeeWording: /\b(?:fees?|charges?|surcharges?|penalt(?:y|ies))\b/iu,
+  unpricedFeeWording:
+    /\b(?:fees?|charges|charge(?!\s+(?:you|your|the\s+card|this\s+card|my\s+card|it)\b)|surcharges?|penalt(?:y|ies))\b/iu,
+  /** Wording stating taxes or fees are already included in the displayed price rather than an extra unpriced fee. */
+  includedFees:
+    /\b(?:includ(?:es?|ing)|incl\.?)\s+(?:all\s+)?(?:applicable\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\b|\b(?:all\s+)?(?:taxes?(?:\s+and|\s*&)?\s+)?(?:fees?|charges?|surcharges?)\s+(?:are\s+)?included\b/iu,
   cardRequired:
     /\b(?:a\s+)?(?:credit\s+|debit\s+)?cards?\s+(?:on\s+file\s+)?(?:is|are)\s+(?:required|needed)\b|\b(?:require|need)s?\s+a\s+(?:credit\s+|debit\s+)?card\b|\benter\s+(?:your\s+)?(?:card|payment)\b/iu,
   /** Explicit host-read payment arrangement when nothing is due online and no card is collected. */
   noCardPayment:
-    /\bno\s+(?:credit\s+|debit\s+)?cards?\s+(?:is\s+|are\s+)?(?:required|needed)\b|\b(?:cards?|credit\s+cards?)\s+(?:is\s+|are\s+)?not\s+(?:required|needed)\b|\bpay(?:able)?\s+(?:at|in)\s+(?:the\s+)?(?:venue|salon|shop|store|studio|counter|location|person|arrival|appointment)\b|\b(?:paid|collected|settled)\s+(?:at|in)\s+(?:the\s+)?(?:venue|salon|shop|store|studio|counter|location|person|arrival|appointment)\b/iu,
+    /\bno\s+(?:credit\s+|debit\s+)?cards?\s+(?:is\s+|are\s+)?(?:required|needed)\b|\b(?:cards?|credit\s+cards?)\s+(?:is\s+|are\s+)?not\s+(?:required|needed)\b|\bpay(?:able)?\s+(?:at|with|in|on)\s+(?:the\s+)?(?:venue|property|hotel|salon|shop|store|studio|counter|location|person|arrival|check-?in|appointment)\b|\b(?:paid|collected|settled)\s+(?:at|with|in|on)\s+(?:the\s+)?(?:venue|property|hotel|salon|shop|store|studio|counter|location|person|arrival|check-?in|appointment)\b|\b(?:the\s+)?(?:property|hotel|venue)\s+(?:will\s+)?handles?\s+payment\b/iu,
   /** A route that enters a checkout: what a redirect to a payment platform leaves from. */
   checkoutPath:
     /(?:^|[/_.-])(?:checkout|cart|basket|bag|pay(?:ments?)?|orders?|book(?:ings?)?|reserv\w*|purchase)(?:[/_.-]|$)/iu,
@@ -205,6 +210,7 @@ function volatileText(text: string): boolean {
 }
 
 const DENIALS = new RegExp(VOCABULARY.negated.source, 'giu');
+const INCLUDED_FEES = new RegExp(VOCABULARY.includedFees.source, 'giu');
 /** The text without what it denies: "No deposit needed; a no-show fee applies" still names its fee. */
 function undenied(text: string): string {
   return text.replace(DENIALS, ' ');
@@ -569,8 +575,9 @@ export function offersPayment(read: CheckoutRead): boolean {
 
 /**
  * What one read of an unreviewed checkout is, decided in order: free (with concrete booking/item identity and a
- * final control), incomplete obligation/checkout facts, needing a card, or complete card facts. Pure: the host's
- * isolated-world read and the job's merchant are its only inputs.
+ * final control), needing a card, complete card facts, or screenshot-backed principal review facts when the
+ * checkout carries financial signals and visible checkout lines. Pure: the host's isolated-world read and the
+ * job's merchant are its only inputs.
  */
 export function decideGenericCheckout(
   read: CheckoutRead,
@@ -581,6 +588,7 @@ export function decideGenericCheckout(
     .filter((line) => !volatileText(line.text))
     .map((line) => ({ text: line.text, box: line.box, money: positive(line.text) }));
   const label = squash(read.region.label);
+  if (!label) return { status: 'facts_incomplete', missing: ["the checkout's place-order button"] };
   const origin = new URL(read.frameUrl).origin;
   const checkoutSite = siteOf(read.frameUrl);
   const platform = checkoutSite && checkoutSite !== context.merchant ? checkoutSite : undefined;
@@ -598,7 +606,6 @@ export function decideGenericCheckout(
   const noFinancialSignal =
     !lines.some((line) => line.money.length || chargeWording(line.text)) && !positive(label).length && !paymentOffered;
   if (noFinancialSignal) {
-    if (!label) return { status: 'facts_incomplete', missing: ["the checkout's place-order button"] };
     if (!items.length) return { status: 'facts_incomplete', missing: ['the items'] };
     if (!VOCABULARY.finalFreeControl.test(label) || VOCABULARY.stepControl.test(label))
       return { status: 'facts_incomplete', missing: ['the final confirmation button'] };
@@ -627,6 +634,10 @@ export function decideGenericCheckout(
   lines.forEach((line, index) => {
     if (VOCABULARY.nothingNow.test(line.text)) nothingNow = true;
     const due = VOCABULARY.dueNow.test(line.text);
+    if (due && !line.money.length) {
+      const zeroDue = statedAmounts(line.text);
+      if (zeroDue.length > 0 && zeroDue.every((amount) => amount.amountMinor === 0)) nothingNow = true;
+    }
     if (!due && !(VOCABULARY.total.test(line.text) && !VOCABULARY.partialTotal.test(line.text))) return;
     const { money, boxes } = labelled(lines, index);
     if (due) dues.push(...money);
@@ -634,7 +645,9 @@ export function decideGenericCheckout(
   });
   const totalValues = distinct(totals.map((total) => total.money));
   const hasUnpricedFee = lines.some((line, index) => {
-    if (consumed.has(index) || !VOCABULARY.unpricedFeeWording.test(undenied(line.text))) return false;
+    if (consumed.has(index)) return false;
+    const feeWords = undenied(line.text).replace(INCLUDED_FEES, ' ');
+    if (!VOCABULARY.unpricedFeeWording.test(feeWords)) return false;
     if (statedAmounts(line.text).length > 0 || /\bfree\b/iu.test(line.text) || VOCABULARY.nothingNow.test(line.text))
       return false;
     if (VOCABULARY.total.test(line.text) && labelled(lines, index).money.length > 0) return false;
@@ -645,7 +658,6 @@ export function decideGenericCheckout(
     );
   });
   if (hasUnpricedFee) missing.push('the fee amount');
-  if (missing.length) return { status: 'facts_incomplete', missing: distinct(missing) };
 
   const partySize = booking?.partySize ?? 1;
   // What a term charges, beyond a fee that applies only on its condition.
@@ -658,25 +670,24 @@ export function decideGenericCheckout(
   else if (!totalValues.length && terms.length && currencies.length === 1)
     // A booking that states only its terms charges its deposits, prepayments and holds; a fee only on its condition.
     total = { currency: currencies[0], amountMinor: charges(['deposit', 'prepayment', 'hold']) };
+  const validTotal = total && currencyExponent(total.currency) !== undefined ? total : undefined;
+  const payLaterArrangement = lines.find((line) => VOCABULARY.noCardPayment.test(line.text))?.text;
+  const explicitCardDemanded =
+    paymentOffered || lines.some((line) => VOCABULARY.cardRequired.test(undenied(line.text)));
   const dueValues = distinct(dues);
   let dueNow: number | undefined;
   if (dueValues.length === 1) dueNow = dueValues[0].amountMinor;
   else if (dueValues.length) dueNow = undefined;
   else if (nothingNow) dueNow = 0;
-  else if (totalValues.length === 1) dueNow = total?.amountMinor;
-  else if (total) dueNow = charges(['deposit', 'prepayment']);
-  const totalText =
-    total && currencyExponent(total.currency) !== undefined
-      ? formatMoney(total.amountMinor, total.currency)
-      : undefined;
+  else if (totalValues.length === 1)
+    dueNow = payLaterArrangement && !explicitCardDemanded ? undefined : validTotal?.amountMinor;
+  else if (validTotal) dueNow = charges(['deposit', 'prepayment']);
+  const totalText = validTotal ? formatMoney(validTotal.amountMinor, validTotal.currency) : undefined;
 
-  const cardDemanded =
-    paymentOffered ||
-    lines.some((line) => VOCABULARY.cardRequired.test(undenied(line.text))) ||
-    (dueNow !== undefined && dueNow > 0);
+  const cardDemanded = explicitCardDemanded || (dueNow !== undefined && dueNow > 0);
   const noCardArrangement =
-    !payment.payment && !payment.ambiguous && !cardDemanded && dueNow === 0
-      ? lines.find((line) => VOCABULARY.noCardPayment.test(line.text))?.text
+    !payment.payment && !payment.ambiguous && !cardDemanded && (dueNow === 0 || dueNow === undefined)
+      ? payLaterArrangement
       : undefined;
   const resolvedPayment = payment.payment ?? (noCardArrangement ? bounded(noCardArrangement) : undefined);
 
@@ -692,21 +703,26 @@ export function decideGenericCheckout(
     };
 
   if (!items.length) missing.unshift('the items');
-  if (!total) missing.push('the total');
+  if (!validTotal) missing.push('the total');
   else if (dueNow === undefined) missing.push('the amount due now');
   if (!contactEmail) missing.push('the contact email');
   if (!account) missing.push('the account the purchase signs in with');
   if (payment.ambiguous) missing.push('which saved payment method pays');
   else if (!resolvedPayment) missing.push('the payment terms');
-  if (missing.length || !total || dueNow === undefined || !contactEmail || !account || !resolvedPayment)
-    return { status: 'facts_incomplete', missing: distinct(missing) };
+  const missingFacts = distinct(missing);
+  const incomplete =
+    missingFacts.length > 0 || !validTotal || dueNow === undefined || !contactEmail || !account || !resolvedPayment;
+  const snapshot = incomplete ? lines.map((line) => squash(line.text)).filter(Boolean) : [];
+  if (incomplete && !snapshot.length) return { status: 'facts_incomplete', missing: missingFacts };
 
   // The card's picture shows the total and the commit control, placed on the main frame's viewport.
   const offset = {
     x: context.controlBox.x - read.region.controlBox.x,
     y: context.controlBox.y - read.region.controlBox.y,
   };
-  const totalBoxes = totals.find((candidate) => candidate.money === total)?.boxes ?? termBoxes.slice(0, 1);
+  const totalBoxes = validTotal
+    ? (totals.find((candidate) => candidate.money === validTotal)?.boxes ?? termBoxes.slice(0, 1))
+    : termBoxes.slice(0, 1);
   const totalRegion = totalBoxes.length ? union(totalBoxes) : undefined;
   return {
     status: 'ready',
@@ -715,22 +731,23 @@ export function decideGenericCheckout(
       site: context.merchant,
       origin,
       control: { label, locator: context.locator },
-      account,
+      account: account ?? (guest ? 'guest checkout' : 'the signed-in account'),
       items: [],
-      currency: total.currency,
-      totalMinor: total.amountMinor,
-      dueNowMinor: dueNow,
+      currency: validTotal?.currency ?? '',
+      totalMinor: validTotal?.amountMinor ?? 0,
+      dueNowMinor: validTotal ? (dueNow ?? 0) : 0,
       cardEnding: payment.cardEnding,
       address: null,
       commitments: terms,
       generic: {
         ...(platform ? { platform } : {}),
         guest,
-        contactEmail,
+        ...(contactEmail ? { contactEmail } : {}),
         items,
-        payment: resolvedPayment,
+        ...(resolvedPayment ? { payment: resolvedPayment } : {}),
         ...(note ? { note } : {}),
         ...(booking ? { booking } : {}),
+        ...(incomplete ? { review: { missing: missingFacts, snapshot } } : {}),
       },
     },
     regions: {
@@ -971,7 +988,7 @@ export function confirmsOnSite(confirmation: ConfirmationEvidence, site: string,
 /**
  * What a confirmation page proves of a paid attempt on an unreviewed site: an order number on a document of its
  * merchant or payment platform, and any charge it states in the attempt's currency at its total or its amount due
- * now. The attempt's contact email keys the order number.
+ * now (when the attempt read a total). The attempt's contact email keys the order number when present.
  */
 async function readGenericEvidence(
   page: Page,
@@ -984,6 +1001,7 @@ async function readGenericEvidence(
   const { charged } = confirmation;
   if (
     charged &&
+    hasPurchaseTotal(attempted) &&
     (charged.currency !== attempted.currency ||
       (charged.amountMinor !== attempted.totalMinor && charged.amountMinor !== attempted.dueNowMinor))
   )
@@ -994,10 +1012,10 @@ async function readGenericEvidence(
     recordId: confirmation.reference,
     orderedAt: new Date().toISOString(),
     resolution: 'committed',
-    account: generic.contactEmail,
+    account: generic.contactEmail ?? attempted.account,
     items: [],
     totalMinor: charged?.amountMinor ?? attempted.totalMinor,
-    currency: attempted.currency,
+    currency: charged?.currency ?? attempted.currency,
     cardEnding: attempted.cardEnding,
     address: null,
   };

@@ -37,19 +37,30 @@ export interface GenericBookingFacts {
   /** The time as the page words it. */
   timeText?: string;
 }
+/**
+ * Screenshot-backed principal review metadata for an unreviewed financial checkout where the host could not
+ * extract every structured fact. Unattended flows (free press, standing guarantee, watch) never accept review facts.
+ */
+export interface GenericReviewFacts {
+  readonly missing: readonly string[];
+  /** Normalized non-volatile checkout lines visible when the card's screenshot was taken. */
+  readonly snapshot: readonly string[];
+}
 export interface GenericCheckoutFacts {
   /** The checkout origin's registrable domain where it is not the merchant's: a payment platform or booking frame. */
   platform?: string;
   /** No account is signed in. */
   guest: boolean;
-  /** The contact email, lowercased: also the account key an order number is unique within. */
-  contactEmail: string;
+  /** The contact email, lowercased: also the account key an order number is unique within. Absent on screenshot-reviewed cards when not shown. */
+  contactEmail?: string;
   items: string[];
-  /** The saved payment method, as the page shows it. */
-  payment: string;
+  /** The saved payment method or explicit payment arrangement, as the page shows it. Absent on screenshot-reviewed cards when unread. */
+  payment?: string;
   /** A note that rides along with the order or booking. */
   note?: string;
   booking?: GenericBookingFacts;
+  /** Present only when the generic reader fell back to screenshot-backed principal review. */
+  review?: GenericReviewFacts;
 }
 /** What the host read of a free commit: a booking or sign-up that states no money. */
 export interface FreeCommitFacts {
@@ -177,6 +188,16 @@ export function withinReservationBounds(
 const CHECKOUT_PAGE_CHANGED = 'The checkout page changed.';
 const OUTSIDE_BOUNDS = 'The reservation no longer fits what you approved.';
 
+/** Whether `facts` carries a host-verified total in a supported currency (false on review cards with an unread total). */
+export function hasPurchaseTotal(facts: PurchaseFacts): boolean {
+  return currencyExponent(facts.currency) !== undefined && !facts.generic?.review?.missing.includes('the total');
+}
+
+/** Whether `facts` carries a host-verified amount due now (false when unread on a review card). */
+export function hasPurchaseDueNow(facts: PurchaseFacts): boolean {
+  return hasPurchaseTotal(facts) && !facts.generic?.review?.missing.includes('the amount due now');
+}
+
 /**
  * The commit label is not a material change: a checkout's next step names its own. Volatile text never reaches
  * these facts.
@@ -188,9 +209,9 @@ function genericMaterialChange(
 ): string | undefined {
   if (approved.flowId !== current.flowId || !approved.generic || !current.generic) return CHECKOUT_PAGE_CHANGED;
   if (approved.currency !== current.currency) return 'The currency changed.';
-  if (current.totalMinor > approved.totalMinor)
+  if (hasPurchaseTotal(approved) && hasPurchaseTotal(current) && current.totalMinor > approved.totalMinor)
     return `The total rose to ${formatMoney(current.totalMinor, current.currency)}, from ${formatMoney(approved.totalMinor, approved.currency)}.`;
-  if (current.dueNowMinor > approved.dueNowMinor)
+  if (hasPurchaseDueNow(approved) && hasPurchaseDueNow(current) && current.dueNowMinor > approved.dueNowMinor)
     return `The amount due now rose to ${formatMoney(current.dueNowMinor, current.currency)}, from ${formatMoney(approved.dueNowMinor, approved.currency)}.`;
   for (const [changed, label] of [
     [approved.site !== current.site, 'site'],
@@ -210,6 +231,10 @@ function genericMaterialChange(
   if (bounds.reservation) {
     if (!withinReservationBounds(bookedReservation(current), bounds.reservation)) return OUTSIDE_BOUNDS;
   } else if (!same(approved.generic.booking, current.generic.booking)) return 'The booking changed.';
+  if (approved.generic.review || current.generic.review) {
+    if (!approved.generic.review || !current.generic.review) return CHECKOUT_PAGE_CHANGED;
+    if (!same(approved.generic.review.snapshot, current.generic.review.snapshot)) return CHECKOUT_PAGE_CHANGED;
+  }
   return undefined;
 }
 
@@ -316,10 +341,23 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 /** The generic floor: unlike a reviewed signature's, it requires no address, item id or form action. */
 function completeGenericFacts(facts: PurchaseFacts): boolean {
   const generic = facts.generic;
-  if (!generic || !facts.site || !facts.origin || !facts.account || !facts.control.label || !facts.control.locator)
+  if (
+    !generic ||
+    generic.review ||
+    !facts.site ||
+    !facts.origin ||
+    !facts.account ||
+    !facts.control.label ||
+    !facts.control.locator
+  )
     return false;
-  if (!generic.items.length || !generic.items.every((item) => item.trim()) || !generic.payment.trim()) return false;
-  if (!EMAIL.test(generic.contactEmail) || generic.contactEmail !== generic.contactEmail.toLowerCase()) return false;
+  if (!generic.items.length || !generic.items.every((item) => item.trim()) || !generic.payment?.trim()) return false;
+  if (
+    !generic.contactEmail ||
+    !EMAIL.test(generic.contactEmail) ||
+    generic.contactEmail !== generic.contactEmail.toLowerCase()
+  )
+    return false;
   if (currencyExponent(facts.currency) === undefined) return false;
   if (![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
   if (facts.cardEnding !== null && !/^\d{4}$/u.test(facts.cardEnding)) return false;
@@ -332,6 +370,54 @@ function completeGenericFacts(facts: PurchaseFacts): boolean {
       ((term.kind !== 'subscription' && term.kind !== 'trial') || Boolean(term.frequency)) &&
       (term.kind !== 'trial' || (term.conversionAt !== undefined && Number.isFinite(Date.parse(term.conversionAt)))),
   );
+}
+
+/**
+ * Screenshot-reviewed generic checkout facts: valid only for explicit principal-approved checkout cards, never
+ * for unattended flows (free press, standing reservation guarantees, or background watches).
+ */
+export function validReviewPurchaseFacts(facts: PurchaseFacts): boolean {
+  if (facts.flowId !== GENERIC_FLOW_ID) return false;
+  const generic = facts.generic;
+  const review = generic?.review;
+  if (
+    !generic ||
+    !review ||
+    !facts.site ||
+    !facts.origin ||
+    !facts.account ||
+    !facts.control.label ||
+    !facts.control.locator
+  )
+    return false;
+  if (!review.missing.length || !review.missing.every((item) => item.trim())) return false;
+  if (!review.snapshot.length || !review.snapshot.every((line) => line.trim())) return false;
+  if (!generic.items.every((item) => item.trim())) return false;
+  if (
+    generic.contactEmail !== undefined &&
+    (!EMAIL.test(generic.contactEmail) || generic.contactEmail !== generic.contactEmail.toLowerCase())
+  )
+    return false;
+  if (facts.currency !== '' && currencyExponent(facts.currency) === undefined) return false;
+  if (![facts.totalMinor, facts.dueNowMinor].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
+  if (facts.currency === '' && (facts.totalMinor !== 0 || facts.dueNowMinor !== 0)) return false;
+  if (facts.cardEnding !== null && !/^\d{4}$/u.test(facts.cardEnding)) return false;
+  return facts.commitments.every(
+    (term) =>
+      term.terms.trim() &&
+      (term.amountMinor === undefined || (Number.isSafeInteger(term.amountMinor) && term.amountMinor >= 0)),
+  );
+}
+
+/**
+ * Checkout cards approved directly by the principal may carry screenshot-backed generic review facts; unattended
+ * standing guarantees and watches always require complete structured host facts.
+ */
+export function authorizablePurchaseFacts(
+  facts: PurchaseFacts,
+  kind: 'checkout' | 'watch' | 'reservation_guarantee',
+): boolean {
+  return completePurchaseFacts(facts) || (kind === 'checkout' && validReviewPurchaseFacts(facts));
 }
 
 /** Complete host facts are mandatory even for a zero-due-now commitment. Each signature has its own floor. */

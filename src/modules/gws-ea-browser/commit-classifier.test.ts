@@ -279,18 +279,26 @@ it('opens any public page, including booking-entry URLs, and refuses only blocke
     'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
     'https://salon.example/book-now/downtown',
     'https://bistro.example/reserve-now/dinner',
+    'https://payments.booking.com/pay/methods?token=abc',
+    'https://checkout.stripe.com/c/pay/cs_live_123',
+    'https://shop.example/orders/purchase-history',
     'https://shop.example/search?q=restaurant',
   ])
     expect(classifyNavigationUrl(url, 'document')).toBe('ordinary');
   for (const url of [
     'https://booking.example/book-now/cedar-studio-9x2k/all-offer',
     'https://salon.example/reserve-now/downtown',
+    'https://payments.booking.com/pay/methods',
+    'https://shop.example/buy',
   ])
     expect(classifyNavigationUrl(url, 'submission')).toBe('purchase_control');
   for (const url of [
     'https://salon.example/venues?action=book%2Dnow',
     'https://bistro.example/tables?intent=reserve%20now',
+    'https://shop.example/checkout?action=pay',
     'https://shop.example/buy?oneclick=1',
+    'https://shop.example/pay/now',
+    'https://payments.booking.com/pay/charge',
     'https://shop.example/checkout/place-order',
     'https://shop.example/checkout/submit',
     'https://shop.example/api/charge',
@@ -788,6 +796,33 @@ describe("an ordinary action's script-request window", () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(settled).toBe(true);
     expect(window.armed()).toHaveLength(6);
+    expect(window.listening()).toBe(0);
+  });
+
+  it('ignores child-frame navigations started after the main document has been replaced', async () => {
+    const window = await windowFixture('destination.example');
+    const main = window.page.mainFrame();
+    const child = { isDetached: () => false, url: () => 'https://payments.destination.example/pay/methods' };
+    vi.useFakeTimers();
+    let returned = false;
+    const pressed = window.guard
+      .duringAction(10_000, async () => {
+        window.events.emit('request', { isNavigationRequest: () => true, frame: () => main });
+      })
+      .then(() => {
+        returned = true;
+      });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(returned).toBe(false);
+    window.events.emit('framenavigated', main);
+    // A child iframe navigation on the newly loaded destination page must not pin the previous action's window.
+    window.events.emit('request', { isNavigationRequest: () => true, frame: () => child });
+    await vi.advanceTimersByTimeAsync(50);
+    await pressed;
+    expect(returned).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await window.guard.actionsSettled();
+    expect(window.armed()).toEqual(['Fetch.enable', 'Fetch.disable']);
     expect(window.listening()).toBe(0);
   });
 

@@ -636,7 +636,8 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       let replaced = false;
       const started = (request: Request): void => {
         requests.add(request);
-        if (request.isNavigationRequest()) navigations.add(request);
+        // Once the main document has been replaced, child-frame navigations belong to the destination page.
+        if (!replaced && request.isNavigationRequest()) navigations.add(request);
       };
       const ended = (request: Request): void => {
         navigations.delete(request);
@@ -646,7 +647,10 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         for (const request of navigations)
           if (request.frame() === frame) {
             navigations.delete(request);
-            if (frame === page.mainFrame()) replaced = true;
+            if (frame === page.mainFrame()) {
+              replaced = true;
+              navigations.clear();
+            }
           }
       };
       page.on('request', started);
