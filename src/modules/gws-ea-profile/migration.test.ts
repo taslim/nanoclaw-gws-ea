@@ -13,6 +13,7 @@ import {
   gwsEaExternalChatPointerMigration,
   gwsEaPrincipalMessagesMigration,
   gwsEaPrincipalDmRoutingMigration,
+  gwsEaPrincipalPronounsMigration,
 } from './migration.js';
 
 let db: SqliteDriver;
@@ -27,6 +28,7 @@ const profileMigrations = [
   gwsEaPrincipalMessagesMigration,
   gwsEaPrincipalDmRoutingMigration,
   gwsEaAliasConfirmationMigration,
+  gwsEaPrincipalPronounsMigration,
 ];
 
 beforeEach(async () => {

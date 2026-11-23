@@ -108,8 +108,11 @@ describe('Manual front page', () => {
     ])
       expect(rendered, fact).toContain(fact);
     expect(rendered.length).toBeLessThanOrEqual(MANUAL_FRONT_PAGE_BUDGET_CHARS);
-    await getDb().run("UPDATE gws_ea_profile SET principal_timezone='Europe/London' WHERE singleton=1");
+    await getDb().run(
+      "UPDATE gws_ea_profile SET principal_timezone='Europe/London', principal_pronouns='she/her' WHERE singleton=1",
+    );
     rendered = await loadManualFrontPage();
+    expect(rendered).toContain('Pronouns: she/her');
     expect(rendered).toContain('Home time zone: Europe/London');
     expect(rendered).not.toContain('Home time zone: America/Los_Angeles');
     for (const key of MANUAL_KEYS) await setManualSection(key, 'x'.repeat(MANUAL_SECTION_BUDGET_CHARS));

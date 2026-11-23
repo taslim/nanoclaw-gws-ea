@@ -4,10 +4,56 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
+import { previouslyContactedAddresses } from '../gws-ea-inbox/thread-map.js';
 import { isDuplicateNote } from '../gws-ea-profile/main-note.js';
 import { getChat } from './db.js';
 import { chatMatterIds, getChatCalendar, listChatHandoffs } from './handoffs.js';
-import { listChatMembers } from './roster.js';
+import { listChatMembers, type ChatMember } from './roster.js';
+
+/** Non-principal members whose verified email or linked person email already exchanged mail with the assistant. */
+async function membersMetByEmail(members: readonly ChatMember[]): Promise<Set<string>> {
+  const db = getDb();
+  if (!(await db.hasTable('gws_ea_thread_addresses')) || !(await db.hasTable('gws_ea_thread_messages'))) {
+    return new Set();
+  }
+  const byMember = new Map<string, string[]>();
+  const personIds: string[] = [];
+  for (const member of members) {
+    if (member.is_principal === 1) continue;
+    const emails: string[] = [];
+    if (member.email !== null) emails.push(member.email.toLowerCase());
+    if (member.person_id !== null) personIds.push(member.person_id);
+    byMember.set(member.member_key, emails);
+  }
+  if (personIds.length > 0 && (await db.hasTable('gws_ea_people_identities'))) {
+    const uniqueIds = [...new Set(personIds)];
+    const rows = await db.all<{ person_id: string; handle: string }>(
+      `SELECT person_id, handle FROM gws_ea_people_identities
+        WHERE person_id IN (${uniqueIds.map(() => '?').join(',')}) AND handle LIKE 'email:%'`,
+      ...uniqueIds,
+    );
+    const emailsByPerson = new Map<string, string[]>();
+    for (const row of rows) {
+      const address = row.handle.slice('email:'.length).toLowerCase();
+      const list = emailsByPerson.get(row.person_id) ?? [];
+      list.push(address);
+      emailsByPerson.set(row.person_id, list);
+    }
+    for (const member of members) {
+      if (member.is_principal === 1 || member.person_id === null) continue;
+      const extra = emailsByPerson.get(member.person_id);
+      if (extra) byMember.get(member.member_key)?.push(...extra);
+    }
+  }
+  const allEmails = [...new Set([...byMember.values()].flat())];
+  if (allEmails.length === 0) return new Set();
+  const contacted = new Set(await previouslyContactedAddresses(allEmails));
+  const met = new Set<string>();
+  for (const [key, emails] of byMember) {
+    if (emails.some((address) => contacted.has(address))) met.add(key);
+  }
+  return met;
+}
 
 /** Current chat facts, with exactly one field from a resolved person: their level. */
 export async function renderChatContext(chatId: string): Promise<string> {
@@ -15,6 +61,7 @@ export async function renderChatContext(chatId: string): Promise<string> {
   const group = await getMessagingGroup(chatId);
   if (!chat || !group) throw new Error('The chat does not exist.');
   const members = await listChatMembers(chatId);
+  const metByEmail = await membersMetByEmail(members);
   const calendar = await getChatCalendar(chatId);
   const personIds = [...new Set(members.flatMap((member) => (member.person_id === null ? [] : [member.person_id])))];
   const levels = new Map(
@@ -34,8 +81,9 @@ export async function renderChatContext(chatId: string): Promise<string> {
   ];
   for (const member of members) {
     const level = member.person_id === null ? undefined : levels.get(member.person_id);
+    const metNote = metByEmail.has(member.member_key) ? '; met before by email: true' : '';
     lines.push(
-      `Member ${member.member_key}; verified principal: ${member.is_principal === 1}; level: ${level ?? 'unknown'}.`,
+      `Member ${member.member_key}; verified principal: ${member.is_principal === 1}; level: ${level ?? 'unknown'}${metNote}.`,
       untrustedLine(member.name ?? 'Unnamed member', 500, 'chat member name'),
     );
   }

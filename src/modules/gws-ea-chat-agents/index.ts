@@ -122,9 +122,10 @@ registerRequiredProjectDocSection('gws-ea-chat-agents:principal', async (group) 
   const profile = await getGwsEaProfile();
   const principal =
     profile.principal_display_name === null ? 'the principal' : escapeMarkdownInline(profile.principal_display_name);
+  const pronouns = profile.principal_pronouns === null ? '' : ` (${escapeMarkdownInline(profile.principal_pronouns)})`;
   return {
     name: 'Principal',
-    body: `You work for ${principal}, whose home time zone is ${resolveTimezone(profile.principal_timezone ?? TIMEZONE)}.`,
+    body: `You work for ${principal}${pronouns}, whose home time zone is ${resolveTimezone(profile.principal_timezone ?? TIMEZONE)}.`,
   };
 });
 for (const [type, file] of [

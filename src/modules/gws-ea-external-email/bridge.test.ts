@@ -79,6 +79,7 @@ import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrati
 import { findSessionForAgent } from '../../db/sessions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { registerReconcileEnqueue } from '../../reconcile-feeds.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSystemSession, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
@@ -96,13 +97,16 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import '../gws-ea-preferences/index.js';
 import { ensureInbox, ensurePrincipalConversation, INBOX_PLATFORM_ID } from '../gws-ea-inbox/index.js';
 import { emailMessagingGroupIds, recordCalendarAccess, replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
+import { HANDOFF_SETTLE_MS } from '../gws-ea-inbox/pace.js';
 import { threadRecipients } from '../gws-ea-inbox/recipients.js';
 import {
   createThread,
   findThreadFile,
   getThread,
+  placeThread,
   recordThreadAddresses,
   recordThreadMessage,
+  releaseThread,
   threadAccount,
   threadAddresses,
   threadPlacement,
@@ -360,6 +364,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  registerReconcileEnqueue(null);
   await closeDb();
   dataDir.path = TEST_DIR;
   fs.rmSync(RELEASES, { recursive: true, force: true });
@@ -406,11 +411,60 @@ describe('email_handoff', () => {
         "main's words:\n" +
         'Pat forwarded Remy’s lunch invitation and said to reply: yes to Thursday, and ask where.',
     );
-    // No mail waits in a new thread, so main's words are due now, and wake its session.
-    expect(row.process_after).toBeNull();
-    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
+    // No mail waits in a new thread, so the handoff starts the short settle window so rapid corrections coalesce.
+    expect(row.process_after).not.toBeNull();
+    const waitMs = Date.parse(row.process_after ?? '') - Date.now();
+    expect(waitMs).toBeGreaterThan(HANDOFF_SETTLE_MS - 5_000);
+    expect(waitMs).toBeLessThanOrEqual(HANDOFF_SETTLE_MS + 1_000);
+    expect(requestWake).not.toHaveBeenCalled();
     expect(data(frame).message).toContain(key);
     expect(data(frame).message).toContain(`with ${REMY}, ${PRINCIPAL}`);
+  });
+
+  it('coalesces a rapid follow-up handoff into the same settle window and notes prior contact and unanswered outbound sends', async () => {
+    // Prior released thread with Remy so a new thread to Remy gets the met-before signal.
+    const prior = await createThread('g-prior', now(), 'mail-prior');
+    await placeThread(prior.threadKey, 'nowhere');
+    await releaseThread(prior.threadKey);
+    await recordThreadAddresses(prior.threadKey, [REMY], 'message', now());
+    await recordThreadMessage(
+      { threadKey: prior.threadKey, side: 'outside', gmailMessageId: 'gm-prior-1', origin: 'sent' },
+      now(),
+    );
+
+    const first = await handoff({ people: [REMY], message: 'Offer noon Friday.' }, undefined, 'act-first');
+    const key = keyOf(first);
+    const session = await requireThreadSession(key);
+    expect(rows(session)[0].content.text).toContain(
+      `You have emailed ${REMY} in an earlier thread, so they already know who you are — skip the cold introduction.`,
+    );
+
+    // An incoming-only released thread (assistant never replied) does not suppress the cold introduction.
+    const inboundOnly = await createThread('g-inbound-only', now(), 'mail-inbound-only');
+    await placeThread(inboundOnly.threadKey, 'nowhere');
+    await releaseThread(inboundOnly.threadKey);
+    await recordThreadAddresses(inboundOnly.threadKey, [JANE], 'message', now());
+    await recordThreadMessage(
+      { threadKey: inboundOnly.threadKey, side: 'outside', gmailMessageId: 'gm-in-only', origin: 'received' },
+      now(),
+    );
+    const janeKey = keyOf(
+      await handoff({ people: [JANE], message: 'Introduce yourself to Jane.' }, undefined, 'act-jane'),
+    );
+    const janeSession = await requireThreadSession(janeKey);
+    expect(rows(janeSession)[0].content.text).not.toContain('skip the cold introduction');
+
+    // Rapid correction joins the first handoff's settle window instead of firing a second email.
+    await handoff({ thread_key: key, message: 'Actually make it 12:30 Friday.' }, undefined, 'act-second');
+    const allRows = rows(session);
+    expect(allRows).toHaveLength(2);
+    expect(allRows[1].process_after).toBe(allRows[0].process_after);
+
+    // Once an outbound email has actually gone out on a thread with no reply, handoff warns both sides.
+    await recordThreadMessage({ threadKey: key, side: 'outside', gmailMessageId: 'gm-sent-1', origin: 'sent' }, now());
+    const afterSend = await handoff({ thread_key: key, message: 'Bump to 1pm instead.' }, undefined, 'act-third');
+    expect(String(data(afterSend).message)).toContain('an email already went out on this thread');
+    expect(rows(session)[2].content.text).toContain('you already sent the latest email on this thread');
   });
 
   it('lands each handoff in its own thread’s session, with two concurrent threads to the same person', async () => {
@@ -442,9 +496,10 @@ describe('email_handoff', () => {
     expect(data(frame).thread_key).toBe(key);
     expect(await externalEmailSessions()).toBe(1);
     expect(texts(session)).toEqual(['From main, about this conversation:\nPat is glad to meet Jane; offer next week.']);
-    // Nothing waits in the thread's session, so main's words are due now.
-    expect(rows(session)[0]).toMatchObject({ platform_id: INBOX_PLATFORM_ID, thread_id: key, process_after: null });
-    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
+    // Nothing waits in the thread's session, so main's handoff starts the settle window.
+    expect(rows(session)[0]).toMatchObject({ platform_id: INBOX_PLATFORM_ID, thread_id: key });
+    expect(rows(session)[0].process_after).not.toBeNull();
+    expect(requestWake).not.toHaveBeenCalled();
   });
 
   it("joins main's words to the wait the thread's mail already set, so both are worked together", async () => {
@@ -747,12 +802,15 @@ describe('email_handoff and placement', () => {
 
     data(await handoff({ thread_key: key, message: 'Offer Tuesday at 10.' }, undefined, 'act-release'));
 
-    expect(rows(session).map((row) => [row.id, row.status, row.trigger, row.process_after])).toEqual([
-      ['jane-1', 'pending', 1, null],
-      ['jane-2', 'pending', 1, null],
-      ['handoff-act-release', 'pending', 1, null],
+    const settledRows = rows(session);
+    const settleDeadline = settledRows[2]?.process_after;
+    expect(settleDeadline).not.toBeNull();
+    expect(settledRows.map((row) => [row.id, row.status, row.trigger, row.process_after])).toEqual([
+      ['jane-1', 'pending', 1, settleDeadline],
+      ['jane-2', 'pending', 1, settleDeadline],
+      ['handoff-act-release', 'pending', 1, settleDeadline],
     ]);
-    expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([session.id]);
+    expect(requestWake).not.toHaveBeenCalled();
     expect(await threadPlacement(key)).toEqual({ placement: 'matter', released: true });
     expect(await handlerOf(key)).toBe('external-email');
 

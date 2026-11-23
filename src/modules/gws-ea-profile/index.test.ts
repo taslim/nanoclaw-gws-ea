@@ -80,6 +80,7 @@ describe('GWS-EA profile module', () => {
       principal_first_name: null,
       principal_last_name: null,
       principal_display_name: null,
+      principal_pronouns: null,
       principal_timezone: null,
       main_agent_group_id: null,
       external_email_agent_group_id: null,
@@ -978,12 +979,45 @@ describe("the principal's name and timezone", () => {
     expect(lookup('gws-ea-profile-reconcile')).toMatchObject({ access: 'hidden', hostOnly: true });
   });
 
-  it('gives main the name and timezone only', async () => {
+  it('gives main the name, pronouns and timezone only', async () => {
     expect(await run('principal-profile-get', {}, agent(main.id))).toEqual({
       id: 'principal-profile-get',
       ok: true,
-      data: { name: 'Morgan Ellery', first_name: 'Morgan', last_name: 'Ellery', timezone: 'America/Los_Angeles' },
+      data: {
+        name: 'Morgan Ellery',
+        first_name: 'Morgan',
+        last_name: 'Ellery',
+        pronouns: null,
+        timezone: 'America/Los_Angeles',
+      },
     });
+  });
+
+  it('sets and clears principal pronouns with validation and a receipt', async () => {
+    expect(await run('principal-profile-set', { pronouns: 'he/him' }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { pronouns: 'he/him', changed: ['pronouns'] },
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('your pronouns are now he/him (they were not set)');
+    expect((await getGwsEaProfile()).principal_pronouns).toBe('he/him');
+
+    expect(
+      await run('principal-profile-set', { pronouns: 'he/him', clear_pronouns: true }, agent(main.id)),
+    ).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/never both/u) },
+    });
+    expect(await run('principal-profile-set', { pronouns: 'https://bad.example' }, agent(main.id))).toMatchObject({
+      ok: false,
+      error: { message: expect.stringMatching(/pronouns/iu) },
+    });
+    expect(await run('principal-profile-set', { clear_pronouns: true }, agent(main.id))).toMatchObject({
+      ok: true,
+      data: { pronouns: null, changed: ['pronouns'] },
+    });
+    expect(sent[1]).toContain('your pronouns are now not set (they were he/him)');
+    expect((await getGwsEaProfile()).principal_pronouns).toBeNull();
   });
 
   it("changes the name on main's word: live readers use it at once, and the principal gets one receipt", async () => {
@@ -1265,6 +1299,7 @@ describe("the principal's name and timezone", () => {
         'principal_display_name',
         'principal_first_name',
         'principal_last_name',
+        'principal_pronouns',
         'principal_emails',
         'principal_timezone',
         'updated_at',

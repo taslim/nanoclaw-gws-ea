@@ -72,3 +72,36 @@ it('writes no other chat’s context into a peer session', async () => {
   await writeChatContext({ ...session, agent_group_id: 'peer' });
   expect(fs.existsSync(inboundDbPath('peer', session.id))).toBe(false);
 });
+
+it('notes when a non-principal chat member has previously exchanged email with the assistant', async () => {
+  const { chat } = await seedContext();
+  await import('../gws-ea-inbox/index.js');
+  const { runMigrations } = await import('../../db/migrations/index.js');
+  await runMigrations(getDb());
+  const { createThread, placeThread, recordThreadAddresses, recordThreadMessage, releaseThread } =
+    await import('../gws-ea-inbox/thread-map.js');
+  const now = new Date().toISOString();
+  await getDb().run(
+    "UPDATE gws_ea_chat_members SET email='mira@example.test', email_source='main' WHERE messaging_group_id=? AND member_key='whatsapp:22'",
+    chat.messaging_group_id,
+  );
+  const prior = await createThread('g-mira', now, 'mail-mira-prior');
+  await placeThread(prior.threadKey, 'nowhere');
+  await releaseThread(prior.threadKey);
+  await recordThreadAddresses(prior.threadKey, ['mira@example.test'], 'message', now);
+  await recordThreadMessage(
+    { threadKey: prior.threadKey, side: 'outside', gmailMessageId: 'gm-mira-1', origin: 'sent' },
+    now,
+  );
+  // Another address added by main after that earlier exchange has not been emailed yet.
+  const later = new Date(Date.parse(now) + 60_000).toISOString();
+  await recordThreadAddresses(prior.threadKey, ['later@example.test'], 'main', later);
+  const text = await renderChatContext(chat.messaging_group_id);
+  expect(text).toContain('Member whatsapp:22; verified principal: false; level: close; met before by email: true.');
+
+  await getDb().run(
+    "UPDATE gws_ea_chat_members SET email='later@example.test', email_source='main' WHERE messaging_group_id=? AND member_key='whatsapp:22'",
+    chat.messaging_group_id,
+  );
+  expect(await renderChatContext(chat.messaging_group_id)).not.toContain('met before by email: true');
+});

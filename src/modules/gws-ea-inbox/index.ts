@@ -50,6 +50,7 @@ import {
   gwsEaInboxCalendarAccessMigration,
   gwsEaInboxDropThreadHoldsMigration,
   gwsEaInboxEmailChannelMigration,
+  gwsEaInboxMessageOriginMigration,
   gwsEaInboxMigration,
   gwsEaInboxRelativeFilePathsMigration,
   gwsEaInboxThreadAccountsMigration,
@@ -81,6 +82,7 @@ registerMigration(gwsEaInboxCalendarAccessMigration);
 registerMigration(gwsEaInboxThreadAccountsMigration);
 registerMigration(gwsEaInboxThreadPlacementMigration);
 registerMigration(threadAuthenticationMigration);
+registerMigration(gwsEaInboxMessageOriginMigration);
 
 let live: Inbox | undefined;
 

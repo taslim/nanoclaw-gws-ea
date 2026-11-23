@@ -52,6 +52,7 @@ import { isUniqueViolation } from '../../db/errors.js';
 import { getDb } from '../../db/connection.js';
 import { findSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
+import { scheduleSessionReconcile } from '../../reconcile-feeds.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSystemSession, writeSessionMessage, withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
@@ -597,11 +598,14 @@ async function settleHeldMail(threadKey: string): Promise<void> {
 
 /**
  * As main's handoff does: what is held joins the mail already waiting there,
- * or is due now when none is. Returns when it is due; null means now, and
- * nothing wakes the session until the caller does.
+ * or `fallbackDeadline` (default null, due now) when none is. Returns when it
+ * is due; null means now, and nothing wakes the session until the caller does.
  */
-export async function releaseHeldMail(session: Session): Promise<string | null> {
-  const processAfter = await pendingDeadline(session);
+export async function releaseHeldMail(
+  session: Session,
+  fallbackDeadline: string | null = null,
+): Promise<string | null> {
+  const processAfter = (await pendingDeadline(session)) ?? fallbackDeadline;
   await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.releaseHeldMessages(processAfter),
   );
@@ -739,8 +743,13 @@ async function toThread(
   const released = (await threadPlacement(threadKey))?.released === true;
   if (released !== (awaiting === undefined)) {
     const session = await threadSession(threadKey);
-    if (session !== undefined && (await releaseHeldMail(session)) === null) {
-      await requestWake(session, 'inbound-message');
+    if (session !== undefined) {
+      const processAfter = await releaseHeldMail(session);
+      if (processAfter === null) {
+        await requestWake(session, 'inbound-message');
+      } else {
+        scheduleSessionReconcile(session.id, Math.max(0, Date.parse(processAfter) - Date.now()));
+      }
     }
     return settled('outside');
   }

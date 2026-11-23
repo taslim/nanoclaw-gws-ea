@@ -59,13 +59,19 @@ async function releaseChat(chatId: string, principalUserId?: string): Promise<Ch
  * The active state is the durable admission, so the sweep can repeat an interrupted release. A released
  * batch with no triggering message wakes no one.
  */
-export async function releaseChatMessages(chatId: string, options: { readonly wake?: boolean } = {}): Promise<void> {
+export async function releaseChatMessages(
+  chatId: string,
+  options: { readonly wake?: boolean; readonly processAfter?: string | null } = {},
+): Promise<void> {
   const chat = await getChat(chatId);
   if (!chat || !chatIsActive(chat)) return;
   for (const session of await sessions(chatId)) {
     if (session.agent_group_id !== chat.serving_agent_group_id || session.status !== 'active') continue;
     const releasedDue = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-      const released = mailbox.releaseHeldMessages(null, { preserveTriggers: true, preserveProcessAfter: true });
+      const released =
+        options.processAfter !== undefined && options.processAfter !== null
+          ? mailbox.releaseHeldMessages(options.processAfter, { preserveTriggers: true, preserveProcessAfter: false })
+          : mailbox.releaseHeldMessages(null, { preserveTriggers: true, preserveProcessAfter: true });
       return released > 0 && mailbox.countDueMessages() > 0;
     });
     if (releasedDue && options.wake !== false) await requestWake(session, 'due-message');

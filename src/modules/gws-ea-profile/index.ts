@@ -50,6 +50,7 @@ import {
   gwsEaWebAliasMigration,
   gwsEaPrincipalMessagesMigration,
   gwsEaPrincipalDmRoutingMigration,
+  gwsEaPrincipalPronounsMigration,
 } from './migration.js';
 import { preparePrincipalMessageContent } from './marks.js';
 import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
@@ -65,6 +66,7 @@ registerMigration(gwsEaExternalChatPointerMigration);
 registerMigration(gwsEaPrincipalMessagesMigration);
 registerMigration(gwsEaPrincipalDmRoutingMigration);
 registerMigration(gwsEaAliasConfirmationMigration);
+registerMigration(gwsEaPrincipalPronounsMigration);
 registerInboundPreparer(preparePrincipalMessageContent);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
@@ -477,13 +479,13 @@ registerResource({
 const NAME_AND_TIMEZONE = 'name and timezone';
 
 interface ProfileChange {
-  readonly field: 'first_name' | 'last_name' | 'timezone';
+  readonly field: 'first_name' | 'last_name' | 'pronouns' | 'timezone';
   readonly from: string | null;
   readonly to: string | null;
 }
 
 function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAndTimezone): ProfileChange[] {
-  return (['first_name', 'last_name', 'timezone'] as const)
+  return (['first_name', 'last_name', 'pronouns', 'timezone'] as const)
     .filter((field) => after[field] !== before[field])
     .map((field) => ({ field, from: before[field], to: after[field] }));
 }
@@ -491,6 +493,7 @@ function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAn
 /** Every change, old and new, so a change the principal did not ask for cannot pass unseen. */
 function receiptText(changes: readonly ProfileChange[]): string {
   const described = changes.map(({ field, from, to }) => {
+    if (field === 'pronouns') return `your pronouns are now ${to ?? 'not set'} (they were ${from ?? 'not set'})`;
     const label = field === 'first_name' ? 'first name' : field === 'last_name' ? 'last name' : 'home time zone';
     return `your ${label} is now ${to ?? 'not set'} (it was ${from ?? 'not set'})`;
   });
@@ -506,14 +509,25 @@ async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerCon
   const firstName = typeof args.first_name === 'string' ? args.first_name : undefined;
   const lastName = typeof args.last_name === 'string' ? args.last_name : undefined;
   const clearLastName = args.clear_last_name === true;
+  const pronouns = typeof args.pronouns === 'string' ? args.pronouns : undefined;
+  const clearPronouns = args.clear_pronouns === true;
   const timezone = typeof args.timezone === 'string' ? args.timezone : undefined;
   if (lastName !== undefined && clearLastName) throw new Error('Use --last-name or --clear-last-name, never both');
-  if (firstName === undefined && lastName === undefined && !clearLastName && timezone === undefined) {
-    throw new Error('Give --first-name, --last-name, --clear-last-name, or --timezone');
+  if (pronouns !== undefined && clearPronouns) throw new Error('Use --pronouns or --clear-pronouns, never both');
+  if (
+    firstName === undefined &&
+    lastName === undefined &&
+    !clearLastName &&
+    pronouns === undefined &&
+    !clearPronouns &&
+    timezone === undefined
+  ) {
+    throw new Error('Give --first-name, --last-name, --clear-last-name, --pronouns, --clear-pronouns, or --timezone');
   }
   const { before, after } = await setPrincipalNameAndTimezone({
     firstName,
     lastName: clearLastName ? null : lastName,
+    pronouns: clearPronouns ? null : pronouns,
     timezone,
   });
   const changes = profileChanges(before, after);
@@ -548,6 +562,19 @@ const CLEAR_LAST_NAME_ARGUMENT = {
   description: "Remove the principal's last name.",
 } as const;
 
+const PRONOUNS_ARGUMENT = {
+  name: 'pronouns',
+  type: 'string',
+  description:
+    "The principal's pronouns (for example he/him, she/her, they/them), shared with outward email and chat agents. Omit to keep them; use --clear-pronouns to remove them.",
+} as const;
+
+const CLEAR_PRONOUNS_ARGUMENT = {
+  name: 'clear_pronouns',
+  type: 'boolean',
+  description: "Remove the principal's pronouns.",
+} as const;
+
 const TIMEZONE_ARGUMENT = {
   name: 'timezone',
   type: 'string',
@@ -561,13 +588,13 @@ registerResource({
   // Custom verbs only: the generic CRUD handlers that read `table` and `idColumn` are not enabled.
   table: 'gws_ea_profile',
   idColumn: 'singleton',
-  description: "The principal's name and home time zone, as the assistant uses them. Only main may use them.",
-  columns: [FIRST_NAME_ARGUMENT, LAST_NAME_ARGUMENT, TIMEZONE_ARGUMENT],
+  description: "The principal's name, pronouns and home time zone, as the assistant uses them. Only main may use them.",
+  columns: [FIRST_NAME_ARGUMENT, LAST_NAME_ARGUMENT, PRONOUNS_ARGUMENT, TIMEZONE_ARGUMENT],
   operations: {},
   customOperations: {
     get: {
       access: 'open',
-      description: "Read the principal's name and home time zone.",
+      description: "Read the principal's name, pronouns and home time zone.",
       args: [],
       handler: async (_args, ctx) => {
         await assertMainCaller(ctx, NAME_AND_TIMEZONE);
@@ -577,10 +604,18 @@ registerResource({
     set: {
       access: 'open',
       description:
-        "Change the principal's name, home time zone, or both, when the principal tells you to. No confirmation is needed; the principal is sent a receipt giving the old and new values. The host uses the new values at once; your own clock and the identity text in your instructions follow on your next start.",
-      args: [FIRST_NAME_ARGUMENT, LAST_NAME_ARGUMENT, CLEAR_LAST_NAME_ARGUMENT, TIMEZONE_ARGUMENT],
+        "Change the principal's name, pronouns, home time zone, or any combination, when the principal tells you to. No confirmation is needed; the principal is sent a receipt giving the old and new values. The host uses the new values at once; your own clock and the identity text in your instructions follow on your next start.",
+      args: [
+        FIRST_NAME_ARGUMENT,
+        LAST_NAME_ARGUMENT,
+        CLEAR_LAST_NAME_ARGUMENT,
+        PRONOUNS_ARGUMENT,
+        CLEAR_PRONOUNS_ARGUMENT,
+        TIMEZONE_ARGUMENT,
+      ],
       examples: [
         'ncl principal-profile set --first-name Juno --last-name Hale',
+        'ncl principal-profile set --pronouns he/him',
         'ncl principal-profile set --timezone Europe/London',
       ],
       handler: setPrincipalProfile,

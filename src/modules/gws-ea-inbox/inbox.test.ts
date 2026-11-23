@@ -682,6 +682,7 @@ interface Row extends Content {
   row: {
     id: string;
     status: string;
+    process_after: string | null;
     trigger: number;
     channel_type: string | null;
     platform_id: string | null;
@@ -698,10 +699,24 @@ function rows(session: Session): Row[] {
   if (!fs.existsSync(file)) return [];
   const db = new Database(file, { readonly: true });
   const found = db
-    .prepare('SELECT id, status, trigger, channel_type, platform_id, thread_id, content FROM messages_in ORDER BY seq')
+    .prepare(
+      'SELECT id, status, process_after, trigger, channel_type, platform_id, thread_id, content FROM messages_in ORDER BY seq',
+    )
     .all() as Array<Row['row'] & { content: string }>;
   db.close();
   return found.map(({ content, ...row }) => ({ ...(JSON.parse(content) as Content), row }));
+}
+
+/** Move a session's waiting settle deadlines into the past so `reconcileSession` and `runnerPoll` see them due. */
+function reachSettle(session: Session): void {
+  const db = new Database(inboundDbPath(session.agent_group_id, session.id));
+  try {
+    db.prepare("UPDATE messages_in SET process_after = ? WHERE status = 'pending' AND process_after IS NOT NULL").run(
+      new Date(Date.now() - 1_000).toISOString(),
+    );
+  } finally {
+    db.close();
+  }
 }
 
 /** The host's notes in main's session, all of them or those whose text says `about`. */
@@ -2210,6 +2225,13 @@ describe('placement before action', () => {
       ['pending', remyEmail.text],
       ['pending', handedOver],
     ]);
+    // Both rows share the handoff settle window, so external-email reads them together once it elapses.
+    expect(new Set(rows(remySession).map((row) => row.row.process_after)).size).toBe(1);
+    expect(rows(remySession)[0]?.row.process_after).not.toBeNull();
+    expect(runnerPoll(remySession)).toEqual([]);
+    expect(woken()).toEqual([]);
+    reachSettle(remySession);
+    await reconcileSession(remySession.id);
     expect(runnerPoll(remySession)).toEqual(expect.arrayContaining(rows(remySession).map((row) => row.row.id)));
     expect(woken()).toEqual([remySession.id]);
     expect((await getMatter(matter.id))?.links.filter((link) => link.kind === 'thread')).toEqual([
@@ -2415,8 +2437,14 @@ describe('placement before action', () => {
     // main hears nothing of the email it handed over: only the first email's note asked it to place the thread.
     expect(notes(PLACEMENT)).toHaveLength(1);
     expect(notes(/Thursday at 10 works for Noel\./u)).toEqual([]);
-    // The handoff wakes the thread's session for main's words, and the release again for Remy's email.
-    expect(woken()).toEqual([session.id, session.id]);
+    // All three rows join the handoff's settle window and wake the thread's session once together.
+    expect(new Set(rows(session).map((row) => row.row.process_after)).size).toBe(1);
+    expect(rows(session)[0]?.row.process_after).not.toBeNull();
+    expect(woken()).toEqual([]);
+    reachSettle(session);
+    await reconcileSession(session.id);
+    expect(runnerPoll(session)).toEqual(expect.arrayContaining(rows(session).map((row) => row.row.id)));
+    expect(woken()).toEqual([session.id]);
   });
 
   it('settles what a thread placed nowhere and never handed over held, and asks main to place it again when new mail comes', async () => {
@@ -2535,6 +2563,9 @@ describe('placement before action', () => {
     ]);
     expect(notes(/Thursday works\./u)).toEqual([]);
     expect(notes(PLACEMENT)).toHaveLength(1);
+    expect(new Set(rows(session).map((row) => row.row.process_after)).size).toBe(1);
+    reachSettle(session);
+    await reconcileSession(session.id);
     expect(woken()).toEqual([session.id]);
 
     // Remy's next email finds the thread in no matter: it waits for main to place it, and his last stays read.

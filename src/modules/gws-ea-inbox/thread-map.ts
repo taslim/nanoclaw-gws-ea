@@ -161,26 +161,85 @@ function toMessage(row: MessageRow): ThreadMessage {
   };
 }
 
+export type MessageOrigin = 'received' | 'sent';
+
 export interface NewThreadMessage {
   readonly threadKey: string;
   readonly side: ThreadSide;
   readonly gmailMessageId: string;
   readonly rfcMessageId?: string;
+  readonly origin?: MessageOrigin;
 }
 
 /** After every message the thread learned of before; one already recorded keeps its thread, side, and place. */
 export async function recordThreadMessage(message: NewThreadMessage, at: string): Promise<void> {
   await getDb().run(
-    `INSERT INTO gws_ea_thread_messages (thread_key, position, side, gmail_message_id, rfc_message_id, recorded_at)
-       SELECT ?, COALESCE(MAX(position), 0) + 1, ?, ?, ?, ? FROM gws_ea_thread_messages WHERE thread_key = ?
+    `INSERT INTO gws_ea_thread_messages (thread_key, position, side, gmail_message_id, rfc_message_id, recorded_at, origin)
+       SELECT ?, COALESCE(MAX(position), 0) + 1, ?, ?, ?, ?, ? FROM gws_ea_thread_messages WHERE thread_key = ?
        ON CONFLICT (gmail_message_id) DO NOTHING`,
     message.threadKey,
     message.side,
     message.gmailMessageId,
     message.rfcMessageId ?? null,
     at,
+    message.origin ?? 'received',
     message.threadKey,
   );
+}
+
+/**
+ * The subset of `addresses` (preserving input order, normalized) to whom the
+ * assistant has already sent outside mail on another released thread.
+ * Excludes addresses only mentioned in prose (`written`), unplaced threads
+ * (`released = 0`), incoming-only threads with no outbound email, and addresses
+ * added to a thread only after its latest sent message.
+ */
+export async function previouslyContactedAddresses(
+  addresses: readonly string[],
+  excludeThreadKey?: string,
+): Promise<string[]> {
+  const normalized = [
+    ...new Set(addresses.map((value) => normalizeAddress(value)).filter((a): a is string => a !== undefined)),
+  ];
+  if (normalized.length === 0) return [];
+  const placeholders = normalized.map(() => '?').join(', ');
+  const rows = await getDb().all<{ address: string }>(
+    `SELECT DISTINCT a.address
+       FROM gws_ea_thread_addresses a
+       JOIN gws_ea_threads t ON t.thread_key = a.thread_key
+      WHERE a.address IN (${placeholders})
+        AND a.source IN ('message', 'main')
+        AND t.released = 1
+        ${excludeThreadKey === undefined ? '' : 'AND a.thread_key <> ?'}
+        AND EXISTS (
+          SELECT 1 FROM gws_ea_thread_messages m
+           WHERE m.thread_key = a.thread_key
+             AND m.side = 'outside'
+             AND m.origin = 'sent'
+             AND m.recorded_at >= a.recorded_at
+        )`,
+    ...normalized,
+    ...(excludeThreadKey === undefined ? [] : [excludeThreadKey]),
+  );
+  const found = new Set(rows.map((row) => row.address));
+  return normalized.filter((address) => found.has(address));
+}
+
+/**
+ * ISO timestamp when the assistant sent the latest outside email on `threadKey`,
+ * if no outside email has arrived since; undefined otherwise.
+ * Orders by email chronology (`recorded_at`, which `recordSent` anchors to the
+ * pending send's initiation timestamp) rather than insert position alone, so a
+ * fast reply recorded before `recordSent` completes still marks the send answered.
+ */
+export async function unansweredOutboundAt(threadKey: string): Promise<string | undefined> {
+  const latest = await getDb().get<{ origin: MessageOrigin; recorded_at: string }>(
+    `SELECT origin, recorded_at FROM gws_ea_thread_messages
+      WHERE thread_key = ? AND side = 'outside'
+      ORDER BY recorded_at DESC, position DESC LIMIT 1`,
+    threadKey,
+  );
+  return latest?.origin === 'sent' ? latest.recorded_at : undefined;
 }
 
 export async function threadsWithMessageIds(rfcMessageIds: readonly string[]): Promise<string[]> {
@@ -608,6 +667,11 @@ export async function insertPendingSend(send: NewSend, at: string): Promise<void
 export async function recordSent(send: Pick<NewSend, 'id' | 'scope'>, sent: SentMessage, at: string): Promise<void> {
   const db = getDb();
   await db.transaction(async () => {
+    const existing = await db.get<{ created_at: string }>(
+      'SELECT created_at FROM gws_ea_thread_sends WHERE id = ?',
+      send.id,
+    );
+    const sentAt = existing?.created_at && existing.created_at < at ? existing.created_at : at;
     await db.run(
       "UPDATE gws_ea_thread_sends SET state = 'sent', gmail_message_id = ?, updated_at = ? WHERE id = ?",
       sent.gmailMessageId,
@@ -620,8 +684,9 @@ export async function recordSent(send: Pick<NewSend, 'id' | 'scope'>, sent: Sent
         side: send.scope.side,
         gmailMessageId: sent.gmailMessageId,
         rfcMessageId: sent.rfcMessageId,
+        origin: 'sent',
       },
-      at,
+      sentAt,
     );
     await attachGmailThread(send.scope.threadKey, sent.gmailThreadId);
   });

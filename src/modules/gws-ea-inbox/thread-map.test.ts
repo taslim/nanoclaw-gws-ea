@@ -17,15 +17,19 @@ import {
   findThreadFor,
   getThread,
   insertPendingSend,
+  placeThread,
+  previouslyContactedAddresses,
   recordSent,
   recordThreadAddresses,
   recordAuthenticatedThreadSender,
+  releaseThread,
   threadSchedulingPeople,
   recordThreadMessage,
   setThreadAccount,
   threadAccount,
   threadAddresses,
   threadMessages,
+  unansweredOutboundAt,
   visibleMessageIds,
   type SendScope,
 } from './thread-map.js';
@@ -340,5 +344,93 @@ describe('the send ledger', () => {
     );
     expect(await visibleMessageIds(threadKey, 'principal')).toEqual(['<p1@juno.test>']);
     expect(await visibleMessageIds(threadKey, 'outside')).toEqual([]);
+  });
+
+  it('identifies previously contacted addresses only when an outbound email was sent while they were on a released thread', async () => {
+    const exchanged = await createThread('g-old', AT, 'mail-old');
+    await placeThread(exchanged.threadKey, 'nowhere');
+    await releaseThread(exchanged.threadKey);
+    await recordThreadAddresses(exchanged.threadKey, ['remy@example.test'], 'message', AT);
+    await recordThreadAddresses(exchanged.threadKey, ['mentioned@example.test'], 'written', AT);
+    await recordThreadMessage(
+      { threadKey: exchanged.threadKey, side: 'outside', gmailMessageId: 'gm-old-1', origin: 'sent' },
+      AT,
+    );
+    // Added by main after the earlier sent email: has not been emailed yet.
+    await recordThreadAddresses(exchanged.threadKey, ['added-later@example.test'], 'main', LATER);
+
+    // Released thread with only an incoming email (no outbound email sent by the assistant).
+    const inboundOnly = await createThread('g-inbound', AT, 'mail-inbound-only');
+    await placeThread(inboundOnly.threadKey, 'nowhere');
+    await releaseThread(inboundOnly.threadKey);
+    await recordThreadAddresses(inboundOnly.threadKey, ['inbound@example.test'], 'message', AT);
+    await recordThreadMessage(
+      { threadKey: inboundOnly.threadKey, side: 'outside', gmailMessageId: 'gm-in-1', origin: 'received' },
+      AT,
+    );
+
+    const unplaced = await createThread('g-unplaced', AT, 'mail-unplaced');
+    await recordThreadAddresses(unplaced.threadKey, ['unplaced@example.test'], 'message', AT);
+    await recordThreadMessage(
+      { threadKey: unplaced.threadKey, side: 'outside', gmailMessageId: 'gm-u1', origin: 'sent' },
+      AT,
+    );
+
+    const unsent = await createThread(null, AT, 'mail-unsent');
+    await placeThread(unsent.threadKey, 'nowhere');
+    await releaseThread(unsent.threadKey);
+    await recordThreadAddresses(unsent.threadKey, ['unsent@example.test'], 'main', AT);
+
+    expect(
+      await previouslyContactedAddresses(
+        [
+          'Remy@Example.test',
+          'mentioned@example.test',
+          'added-later@example.test',
+          'inbound@example.test',
+          'unplaced@example.test',
+          'unsent@example.test',
+        ],
+        'mail-current',
+      ),
+    ).toEqual(['remy@example.test']);
+    expect(await previouslyContactedAddresses(['remy@example.test'], exchanged.threadKey)).toEqual([]);
+  });
+
+  it('tracks when the latest outside message on a thread is an unanswered outbound send, even if a reply arrives before recordSent finishes', async () => {
+    const { threadKey } = await createThread(null, AT, 'mail-out');
+    expect(await unansweredOutboundAt(threadKey)).toBeUndefined();
+
+    const scope: SendScope = { threadKey, side: 'outside' };
+    await insertPendingSend({ id: 's-1', scope, contentHash: 'h-1', rfcMessageId: '<s1@juno.test>' }, AT);
+    await recordSent(
+      { id: 's-1', scope },
+      { gmailMessageId: 'gm-s1', gmailThreadId: 'g-out', rfcMessageId: '<s1@juno.test>' },
+      AT,
+    );
+    expect(await unansweredOutboundAt(threadKey)).toBe(AT);
+
+    await recordThreadMessage(
+      { threadKey, side: 'outside', gmailMessageId: 'gm-r1', rfcMessageId: '<r1@acme.test>' },
+      LATER,
+    );
+    expect(await unansweredOutboundAt(threadKey)).toBeUndefined();
+
+    // Fast reply recorded while a second send is still pending, before recordSent completes later.
+    const tSend = '2026-10-04T12:10:00.000Z';
+    const tReply = '2026-10-04T12:11:00.000Z';
+    const tRecordSent = '2026-10-04T12:12:00.000Z';
+    await insertPendingSend({ id: 's-2', scope, contentHash: 'h-2', rfcMessageId: '<s2@juno.test>' }, tSend);
+    await recordThreadMessage(
+      { threadKey, side: 'outside', gmailMessageId: 'gm-r2', rfcMessageId: '<r2@acme.test>', origin: 'received' },
+      tReply,
+    );
+    await recordSent(
+      { id: 's-2', scope },
+      { gmailMessageId: 'gm-s2', gmailThreadId: 'g-out', rfcMessageId: '<s2@juno.test>' },
+      tRecordSent,
+    );
+    await deleteSends(scope, 'h-2', 'sent');
+    expect(await unansweredOutboundAt(threadKey)).toBeUndefined();
   });
 });
