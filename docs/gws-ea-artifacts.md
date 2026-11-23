@@ -42,8 +42,9 @@ restarting its authors.
 Only canonical `/artifacts` routes reach the artifact feature, using GET and
 HEAD. The host separately handles `/logins` for the current principal alone.
 Root, unknown paths, encoded aliases and another Host serve no content.
-Cloudflare Access protects the whole hostname; public artifact snapshots keep
-their explicit public route.
+Cloudflare Access protects the whole hostname. Public artifact snapshots keep
+their explicit public route, and Connections serves client documents on a
+second public route at `/oauth-client`.
 
 Cloudflare credentials and connector tokens are host-only, separate files.
 Management permissions cover the selected account/zones and the required Tunnel,
