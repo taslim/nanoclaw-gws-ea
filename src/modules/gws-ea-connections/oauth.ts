@@ -374,7 +374,7 @@ export function takesClientDocuments(server: AuthorizationServer): boolean {
 export interface DocumentOffer {
   /** An authorization server can fetch the document now. */
   readonly served: boolean;
-  /** The server refused this app's document once, so it is never chosen again and a registration remembers that. */
+  /** The server just refused this app's document, so it is not chosen in its place. */
   readonly refused: boolean;
 }
 
@@ -439,7 +439,6 @@ export async function clientForSignIn(
     clientId: registered.client_id,
     ...(registered.client_secret === undefined ? {} : { clientSecret: registered.client_secret }),
     tokenEndpointAuthMethod: registered.token_endpoint_auth_method ?? method,
-    ...(document?.refused ? { documentRefused: true } : {}),
   };
   sdkClient(client);
   return { client, created: true };

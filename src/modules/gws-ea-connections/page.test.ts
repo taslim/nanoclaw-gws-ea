@@ -913,7 +913,7 @@ describe('apps whose server takes client documents', () => {
   });
 
   describe('a client the server refuses at the exchange', () => {
-    it('replaces a refused document with a registration that remembers it, and never picks the document again', async () => {
+    it('replaces a refused client with the other kind, never one of its own kind', async () => {
       const ledger = fakeLedgerWithDocuments();
       serve(ledger.handle);
       await post('/connections/add', { url: LEDGER, name: 'Ledger' });
@@ -931,9 +931,9 @@ describe('apps whose server takes client documents', () => {
       expect(ledger.registrations).toHaveLength(1);
       const replaced = await onlyApp();
       expect(replaced).toMatchObject({ status: 'not_connected', hasClient: true, clientEntered: false });
-      expect((await store.readClient(replaced.id)).client).toMatchObject({ documentRefused: true });
+      expect((await store.readClient(replaced.id)).client).not.toHaveProperty('kind');
 
-      // That registration is refused too: it is registered again, never replaced by the document.
+      // That registration is refused too: the document takes its place, not another registration.
       const second = await startSignIn(replaced);
       const [registeredId] = [...ledger.clients.keys()].filter((id) => id !== documentUrl(added));
       expect(clientIdOf(second)).toBe(registeredId);
@@ -941,13 +941,12 @@ describe('apps whose server takes client documents', () => {
       expect((await callback('mcp.ledger.example.test', ledger.approve(second).query)).headers.location).toBe(
         '/connections?outcome=assistant_client_refused',
       );
-      expect(ledger.registrations).toHaveLength(2);
-      const third = await startSignIn(await onlyApp());
-      expect(clientIdOf(third)).not.toBe(documentUrl(added));
-      expect((await callback('mcp.ledger.example.test', ledger.approve(third).query)).headers.location).toBe(
-        '/connections?outcome=connected',
-      );
-      expect(ledger.documents).toHaveLength(1);
+      expect(ledger.registrations).toHaveLength(1);
+      expect((await store.readClient((await onlyApp()).id)).client).toEqual({
+        clientId: documentUrl(added),
+        tokenEndpointAuthMethod: 'none',
+        kind: 'document',
+      });
     });
 
     it('falls to client details on a server that only takes documents, and never picks the document again', async () => {

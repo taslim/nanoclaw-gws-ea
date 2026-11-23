@@ -386,9 +386,7 @@ export class ConnectionOperations {
               host: app.host,
               redirectUri,
               // Without a stored client nothing shows the document was never refused, so no document is offered.
-              ...(stored.client === undefined
-                ? {}
-                : { document: this.documentOffer(app, stored.client.documentRefused === true) }),
+              ...(stored.client === undefined ? {} : { document: this.documentOffer(app, false) }),
             },
             this.oauth,
           );
@@ -533,8 +531,8 @@ export class ConnectionOperations {
   }
 
   /**
-   * A refused document is never chosen again, and a registration made after one remembers that. Entered client
-   * details give way to a registration only, since nothing shows whether the document was refused before.
+   * A refused client is never replaced by one of its own kind. Entered client details give way to a registration
+   * only, since nothing shows whether the document was refused before.
    */
   private async replaceRefusedClient(appId: string, refusedClient: ClientRegistration): Promise<SignInReturn> {
     let outcome: SignInReturn = 'assistant_client_refused';
@@ -551,9 +549,7 @@ export class ConnectionOperations {
       )
         return outcome;
       const { signIn } = probe.method;
-      const document = refused.clientEntered
-        ? undefined
-        : this.documentOffer(app, refusedClient.kind === 'document' || refusedClient.documentRefused === true);
+      const document = refused.clientEntered ? undefined : this.documentOffer(app, refusedClient.kind === 'document');
       const { client } = await clientForSignIn(
         signIn,
         { issuer: null, client: undefined },

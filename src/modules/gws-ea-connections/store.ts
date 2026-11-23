@@ -41,8 +41,6 @@ export interface ClientRegistration {
   readonly clientSecret?: string;
   readonly tokenEndpointAuthMethod?: string;
   readonly kind?: 'document';
-  /** Once set, the document is never chosen for this app again. */
-  readonly documentRefused?: true;
 }
 
 export interface ConnectionApp {
@@ -278,14 +276,13 @@ function clientValid(client: ClientRegistration): void {
 function parseClient(json: string): ClientRegistration {
   const value: unknown = JSON.parse(json);
   if (typeof value !== 'object' || value === null) throw new Error('Sealed client is malformed');
-  const { clientId, clientSecret, tokenEndpointAuthMethod, kind, documentRefused } = value as Record<string, unknown>;
+  const { clientId, clientSecret, tokenEndpointAuthMethod, kind } = value as Record<string, unknown>;
   if (typeof clientId !== 'string') throw new Error('Sealed client is malformed');
   return {
     clientId,
     ...(typeof clientSecret === 'string' ? { clientSecret } : {}),
     ...(typeof tokenEndpointAuthMethod === 'string' ? { tokenEndpointAuthMethod } : {}),
     ...(kind === 'document' ? { kind } : {}),
-    ...(documentRefused === true ? { documentRefused } : {}),
   };
 }
 function grantValid(grant: NewGrant): void {
