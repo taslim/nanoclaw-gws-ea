@@ -19,7 +19,6 @@ import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/i
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { createSession, getPendingApprovalsByAction, transitionPendingApprovalStatus } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
-import type { GatewayCredentialTarget } from '../../gateway-providers/credential-connection.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { PendingApproval, Session } from '../../types.js';
 import '../approvals/index.js';
@@ -32,7 +31,6 @@ import '../self-mod/index.js';
 import { ADD_APP_ACTION, DELETE_APP_ACTION, registerAppActions } from './actions.js';
 import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, mainOperatorServers } from './apply.js';
-import type { AppConnection } from './credentials.js';
 import { ConnectionOperations } from './operations.js';
 import type { ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
@@ -68,19 +66,9 @@ function ledgerly(): FakeMcpApp {
   });
 }
 
-/** The gateway seam as the host sees it: credentials by name, listed by exact host. */
+/** The gateway seam as admission sees it: credentials listed by exact host. */
 class FakeGateway {
   readonly held = new Map<string, { readonly id: string; readonly host: string }>();
-  readonly connection: AppConnection = (target: GatewayCredentialTarget) => ({
-    find: async () => (this.held.has(target.name) ? { reusable: true } : null),
-    save: async () => {
-      this.held.set(target.name, { id: randomUUID(), host: target.host });
-    },
-    keep: async () => undefined,
-    remove: async () => {
-      this.held.delete(target.name);
-    },
-  });
   async listForHost(host: string): Promise<{ id: string; name: string }[]> {
     return [...this.held].filter(([, held]) => held.host === host).map(([name, held]) => ({ id: held.id, name }));
   }
@@ -119,7 +107,6 @@ beforeAll(async () => {
           webHostname: HOST,
           fetches: endpoints.fetches,
           admission,
-          connection: () => gateway.connection,
           applyMain: applyMainServers,
           clientDocumentsServed: () => documentsServed,
         }),

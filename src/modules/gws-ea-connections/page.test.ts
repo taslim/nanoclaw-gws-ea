@@ -9,10 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import type {
-  GatewayCredentialRemoval,
-  GatewayCredentialTarget,
-} from '../../gateway-providers/credential-connection.js';
+import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
 import { createWebHandler } from '../gws-ea-web/server.js';
@@ -20,7 +17,6 @@ import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, mainOperatorServers } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
-import { AppCredentialsUnavailableError, type AppConnection } from './credentials.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
@@ -67,38 +63,17 @@ interface HeldCredential {
   readonly value: string;
 }
 
-/** The gateway seam as the host sees it: credentials by name, listed and removed by exact host. */
+/** The gateway seam as admission and operator-disconnect see it: credentials listed and removed by exact host. */
 class FakeGateway implements OperatorCredentials {
   readonly held = new Map<string, HeldCredential>();
   readonly events: string[] = [];
   readonly failingIds = new Set<string>();
-  failRemoval = false;
   /** A credential written into the gateway directly, as an operator does. */
   hold(name: string, host: string): string {
     const id = randomUUID();
     this.held.set(name, { id, host, path: undefined, value: 'operator-written-token' });
     return id;
   }
-  readonly connection: AppConnection = (target: GatewayCredentialTarget) => {
-    let observed: HeldCredential | undefined;
-    return {
-      find: async () => {
-        observed = this.held.get(target.name);
-        return observed ? { reusable: true } : null;
-      },
-      save: async (value) => {
-        if (typeof value !== 'string') throw new Error('App credentials are plain tokens');
-        this.held.set(target.name, { id: observed?.id ?? randomUUID(), host: target.host, path: target.path, value });
-        this.events.push(`publish:${target.name}`);
-      },
-      keep: async () => undefined,
-      remove: async () => {
-        if (this.failRemoval) throw new Error('gateway unreachable');
-        if (observed) this.held.delete(target.name);
-        this.events.push(`remove:${target.name}`);
-      },
-    };
-  };
   async listForHost(host: string): Promise<{ id: string; name: string }[]> {
     return [...this.held].filter(([, held]) => held.host === host).map(([name, held]) => ({ id: held.id, name }));
   }
@@ -119,8 +94,7 @@ let store: ConnectionsStore;
 let keychain: TestKeychain;
 let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let gateway: FakeGateway;
-let gatewaySeam: boolean;
-/** Whether the gateway can also list and remove credentials by host. */
+/** Whether the gateway can list and remove operator credentials by host. */
 let hostSeam: boolean;
 let server: Server;
 let port: number;
@@ -157,10 +131,6 @@ function operations(): ConnectionOperations {
     webHostname: HOST,
     fetches: endpoints.fetches,
     admission,
-    connection: () => {
-      if (!gatewaySeam) throw new AppCredentialsUnavailableError();
-      return gateway.connection;
-    },
     applyMain: async (applied) => {
       const changed = await applyMainServers(applied);
       gateway.events.push('apply');
@@ -182,7 +152,6 @@ beforeEach(async () => {
   directory = await mkdtemp(path.join(os.tmpdir(), 'connections-page-'));
   ({ store, keychain, raw } = testConnectionsStore(path.join(directory, 'connections')));
   gateway = new FakeGateway();
-  gatewaySeam = true;
   hostSeam = true;
   documentsServed = true;
   replies = [];
@@ -217,7 +186,7 @@ beforeEach(async () => {
     },
     operations: async () => operations(),
     operatorDependencies: () => ({
-      credentials: gatewaySeam && hostSeam ? gateway : undefined,
+      credentials: hostSeam ? gateway : undefined,
       protectedHosts: async () => new Set([HOST, 'api.anthropic.com']),
     }),
   });
@@ -453,10 +422,10 @@ describe('adding and connecting an OAuth app that needs a client', () => {
 
     const connected = await onlyApp();
     expect(connected.status).toBe('connected');
-    const credential = gateway.held.get(`gws-ea-app-${connected.id}`);
-    expect(credential).toMatchObject({ host: 'app.ledgerly.example.test', path: '/mcp' });
-    expect(app.accessTokens.has(credential?.value ?? '')).toBe(true);
-    expect(gateway.events).toEqual([`publish:gws-ea-app-${connected.id}`, 'apply']);
+    expect(gateway.held.size).toBe(0);
+    const storedToken = await store.readAccessToken(connected.id, 1);
+    expect(storedToken && app.accessTokens.has(storedToken.token)).toBe(true);
+    expect(gateway.events).toEqual(['apply']);
     expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LEDGERLY } });
     expect(await store.pendingRestart()).toBeDefined();
     expect(signInRow(connected.id)).toBeUndefined();
@@ -772,7 +741,9 @@ describe('apps whose server takes client documents', () => {
     expect(exchange.headers.authorization).toBeUndefined();
     const connected = await onlyApp();
     expect(connected.status).toBe('connected');
-    expect(larder.accessTokens.has(gateway.held.get(`gws-ea-app-${connected.id}`)?.value ?? '')).toBe(true);
+    expect(gateway.held.size).toBe(0);
+    const storedToken = await store.readAccessToken(connected.id, 1);
+    expect(storedToken && larder.accessTokens.has(storedToken.token)).toBe(true);
     expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LARDER } });
   });
 
@@ -1107,12 +1078,14 @@ describe('pasted tokens and servers without sign-in', () => {
     expect(connected.status).toBe(200);
     app = await onlyApp();
     expect(app.status).toBe('connected');
-    expect(gateway.held.get(`gws-ea-app-${app.id}`)?.value).toBe(SENTINEL_TOKEN);
+    expect(gateway.held.size).toBe(0);
+    expect(await store.readGrant(app.id, 1)).toEqual({ kind: 'token', generation: 1, token: SENTINEL_TOKEN });
 
     expect((await post('/connections/disconnect', { id: app.id, version: String(app.version) })).status).toBe(200);
     app = await onlyApp();
     expect(app.status).toBe('not_connected');
     expect(gateway.held.size).toBe(0);
+    expect(await store.readGrant(app.id, 1)).toBeUndefined();
     expect((await request(`/connections/app/${app.id}/connect`)).body).toContain('name="token"');
 
     await post('/connections/connect', { id: app.id, version: String(app.version), token: SENTINEL_TOKEN });
@@ -1284,11 +1257,11 @@ describe('managing apps', () => {
     expect(reply.body).toContain('App disconnected.');
     expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
     expect(gateway.held.size).toBe(0);
+    expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
     expect(signInRow(app.id)).toBeUndefined();
     expect(ledgerly.revoked).toEqual([grant.refreshToken]);
     expect(await mainServers()).toEqual({});
     expect(await store.pendingRestart()).toBeDefined();
-    expect(gateway.events.indexOf(`remove:gws-ea-app-${app.id}`)).toBeLessThan(gateway.events.lastIndexOf('apply'));
   });
 
   it('deletes a connected app even when the server refuses revocation', async () => {
@@ -1317,31 +1290,6 @@ describe('managing apps', () => {
 
     expect((await post('/connections/delete', { id: refused.id, version: String(refused.version) })).status).toBe(200);
     expect(await store.apps()).toEqual([]);
-  });
-
-  it('keeps an app listed, Not connected, when its credential cannot be removed, so Delete can run again', async () => {
-    serve(notesServer);
-    await post('/connections/add', { url: NOTES, name: '' });
-    let app = await onlyApp();
-    await post('/connections/connect', { id: app.id, version: String(app.version), token: SENTINEL_TOKEN });
-    app = await onlyApp();
-    gateway.failRemoval = true;
-
-    const reply = await post('/connections/delete', { id: app.id, version: String(app.version) });
-    expect(reply.status).toBe(200);
-    expect(reply.body).toContain('Try deleting it again.');
-    app = await onlyApp();
-    expect(app.status).toBe('not_connected');
-    expect(gateway.held.has(`gws-ea-app-${app.id}`)).toBe(true);
-    expect(await mainServers()).toEqual({});
-
-    gateway.failRemoval = false;
-    expect((await post('/connections/delete', { id: app.id, version: String(app.version) })).body).toContain(
-      'App deleted.',
-    );
-    expect(await store.apps()).toEqual([]);
-    expect(gateway.held.size).toBe(0);
-    assertNoSentinels();
   });
 
   it('asks before Delete, which also forgets entered client details, and not before Disconnect', async () => {
@@ -1472,14 +1420,11 @@ describe('page states', () => {
     assertNoSentinels();
   });
 
-  it.each([
-    ['an unreadable Keychain', () => (keychain.unavailable = true)],
-    ['a gateway without a credential store', () => (gatewaySeam = false)],
-  ])('lists existing apps but hides Add and Connect with %s', async (_case, breakIt) => {
+  it('lists existing apps but hides Add and Connect with an unreadable Keychain', async () => {
     serve(recipesServer);
     await post('/connections/add', { url: RECIPES, name: '' });
     const app = await onlyApp();
-    breakIt();
+    keychain.unavailable = true;
     const list = await request('/connections');
     expect(list.body).toContain('Recipes');
     expect(list.body).toContain('Apps can’t be added or connected right now. Ask your operator.');

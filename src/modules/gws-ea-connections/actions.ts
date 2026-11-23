@@ -103,8 +103,6 @@ const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
   client_unavailable: 'the assistant cannot sign in to it right now',
   unreachable: 'the server did not answer',
   unsupported: "the server's sign-in cannot be used",
-  credentials_unavailable: 'the gateway cannot hold its credential',
-  publish_failed: 'its credential could not be stored',
 };
 
 async function principalHold({ actor, grant }: GuardInput, what: string): Promise<GuardDecision> {
@@ -479,9 +477,8 @@ export function createAppActions(dependencies: AppActionDependencies) {
     );
     if (!app) return `The principal approved deleting the app ${request.app}; it was already gone.`;
     const approved = `The principal approved deleting ${JSON.stringify(app.name)} at ${app.host}`;
-    return (await context.operations.remove(app.id, app.version)) === 'deleted'
-      ? `${approved}. It is deleted, and its tools leave you by their next message.`
-      : `${approved}. It is disconnected, but the gateway still holds its credential, so it stays on their Connections page as Not connected while the host retries the removal.`;
+    await context.operations.remove(app.id, app.version);
+    return `${approved}. It is deleted, and its tools leave you by their next message.`;
   }
 
   const applyDelete: GuardedDeliveryHandler = async (content, session) => {

@@ -160,9 +160,6 @@ function connectMessage(reason: ConnectRefusal): string {
       return UNREACHABLE;
     case 'unsupported':
       return UNSUPPORTED;
-    case 'credentials_unavailable':
-    case 'publish_failed':
-      return OPERATOR_NEEDED;
   }
 }
 
@@ -324,14 +321,8 @@ async function write(
     case 'delete': {
       only(data, ['id', 'version']);
       const { id, version } = appReference(data);
-      if ((await operations.remove(id, version)) === 'deleted') return done({ kind: 'list' }, 'App deleted.');
-      return {
-        ...done(
-          { kind: 'list' },
-          'The app is disconnected, but not all of its saved access could be removed, so it’s still listed. Try deleting it again.',
-        ),
-        failed: true,
-      };
+      await operations.remove(id, version);
+      return done({ kind: 'list' }, 'App deleted.');
     }
     case 'rename': {
       only(data, ['id', 'version', 'name']);

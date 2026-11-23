@@ -80,11 +80,8 @@ export type LiveGrant = GrantFacts &
         readonly renewable: boolean;
         readonly accessIssuedAt: string;
         readonly accessExpiresAt: string;
-        /**
-         * The current access token reached the gateway. Only the refresher holds a renewed token until it is
-         * published, so after a restart an unpublished one is renewed or, with nothing to renew it, ended.
-         */
-        readonly published: boolean;
+        /** Whether a sealed access token for this grant generation sits in the host store. */
+        readonly hasAccessToken: boolean;
       }
     | { readonly kind: 'token' | 'none' }
   );
@@ -93,11 +90,21 @@ export type NewGrant =
   | {
       readonly kind: 'oauth';
       readonly refreshToken?: string;
+      /** Sealed into `access_tokens` atomically with the grant; omitted only for pre-upgrade tests. */
+      readonly accessToken?: string;
       readonly accessIssuedAt: string;
       readonly accessExpiresAt: string;
     }
   | { readonly kind: 'token'; readonly token: string }
   | { readonly kind: 'none' };
+
+/** A sealed OAuth access token held by the host for a live grant generation. */
+export interface StoredAccessToken {
+  readonly generation: number;
+  readonly token: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string;
+}
 
 /** What only the host may hold: a live grant's secret, and for OAuth the app's client. */
 export type GrantCredentials =
@@ -113,6 +120,7 @@ export type GrantCredentials =
 export interface GrantRotation {
   /** Omitted when the server kept the refresh token it had issued. */
   readonly refreshToken?: string;
+  readonly accessToken: string;
   readonly accessIssuedAt: string;
   readonly accessExpiresAt: string;
 }
@@ -182,6 +190,13 @@ CREATE TABLE IF NOT EXISTS grants (
   CHECK((kind = 'oauth' AND state = 'live') = (access_expires_at IS NOT NULL)),
   CHECK((access_issued_at IS NULL) = (access_expires_at IS NULL))
 ) STRICT;
+CREATE TABLE IF NOT EXISTS access_tokens (
+  app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  token BLOB NOT NULL CHECK(length(token) >= ${SEALED_MIN_BYTES}),
+  issued_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS sign_ins (
   app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
   state_hash TEXT NOT NULL UNIQUE CHECK(length(state_hash) = 64),
@@ -217,8 +232,14 @@ interface GrantRow {
   readonly secret: Buffer | null;
   readonly access_issued_at: string | null;
   readonly access_expires_at: string | null;
-  readonly access_published: number;
+  readonly has_access_token: number;
   readonly client: Buffer | null;
+}
+interface AccessTokenRow {
+  readonly generation: number;
+  readonly token: Buffer;
+  readonly issued_at: string;
+  readonly expires_at: string;
 }
 interface SignInRow {
   readonly app_id: string;
@@ -289,6 +310,7 @@ function grantValid(grant: NewGrant): void {
   switch (grant.kind) {
     case 'oauth':
       if (grant.refreshToken !== undefined) secretValid(grant.refreshToken);
+      if (grant.accessToken !== undefined) secretValid(grant.accessToken);
       isoValid(grant.accessIssuedAt);
       isoValid(grant.accessExpiresAt);
       return;
@@ -333,7 +355,9 @@ export class ConnectionsStore {
         db
           .prepare<[], { present: number }>(
             `SELECT EXISTS(SELECT 1 FROM apps WHERE client IS NOT NULL UNION ALL
-              SELECT 1 FROM grants WHERE secret IS NOT NULL UNION ALL SELECT 1 FROM sign_ins) AS present`,
+              SELECT 1 FROM grants WHERE secret IS NOT NULL UNION ALL
+              SELECT 1 FROM access_tokens UNION ALL
+              SELECT 1 FROM sign_ins) AS present`,
           )
           .get()?.present === 1,
       readCheck: () =>
@@ -565,8 +589,12 @@ export class ConnectionsStore {
     return db
       .prepare<[string], GrantRow>(
         `SELECT g.app_id, a.server_key, a.host, a.url, g.generation, g.kind, g.state, g.secret,
-          g.access_issued_at, g.access_expires_at, g.access_published, a.client
-          FROM grants g JOIN apps a ON a.id = g.app_id WHERE g.app_id = ?`,
+          g.access_issued_at, g.access_expires_at,
+          (t.token IS NOT NULL) AS has_access_token, a.client
+          FROM grants g
+          JOIN apps a ON a.id = g.app_id
+          LEFT JOIN access_tokens t ON t.app_id = g.app_id AND t.generation = g.generation
+          WHERE g.app_id = ?`,
       )
       .get(appId);
   }
@@ -587,7 +615,7 @@ export class ConnectionsStore {
       renewable: row.secret !== null,
       accessIssuedAt: row.access_issued_at,
       accessExpiresAt: row.access_expires_at,
-      published: row.access_published === 1,
+      hasAccessToken: row.has_access_token === 1,
     };
   }
 
@@ -607,6 +635,11 @@ export class ConnectionsStore {
       if (!key) throw new ConnectionsStoreError('store_unavailable');
       secret = this.sealText(grant.kind === 'token' ? grant.token : (grant.refreshToken ?? ''), key);
     }
+    let sealedAccess: Buffer | undefined;
+    if (grant.kind === 'oauth' && grant.accessToken !== undefined) {
+      if (!key) throw new ConnectionsStoreError('store_unavailable');
+      sealedAccess = this.sealText(grant.accessToken, key);
+    }
     const at = new Date().toISOString();
     db.prepare(
       `INSERT INTO grants (app_id, generation, kind, state, secret, access_issued_at, access_expires_at,
@@ -624,6 +657,13 @@ export class ConnectionsStore {
       grant.kind === 'oauth' ? grant.accessExpiresAt : null,
       at,
     );
+    db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id);
+    if (grant.kind === 'oauth' && sealedAccess) {
+      db.prepare(
+        `INSERT INTO access_tokens (app_id, generation, token, issued_at, expires_at)
+          VALUES (?, ?, ?, ?, ?)`,
+      ).run(app.id, generation, sealedAccess, grant.accessIssuedAt, grant.accessExpiresAt);
+    }
     if (issuer === undefined) this.touch(db, app.id, app.version, 'auth = ?', grant.kind);
     else this.touch(db, app.id, app.version, 'auth = ?, issuer = ?', grant.kind, issuer);
     return { app: this.app(db, app.id), generation, replaced };
@@ -701,49 +741,72 @@ export class ConnectionsStore {
     });
   }
 
-  /** Persists a renewal, unpublished, before its access token is published; false when the grant moved on meanwhile. */
+  /** The sealed OAuth access token for a live grant at this exact generation, or undefined when none is stored. */
+  async readAccessToken(appId: string, generation: number): Promise<StoredAccessToken | undefined> {
+    const find = (db: Database.Database): AccessTokenRow | undefined =>
+      db
+        .prepare<[string, number, number], AccessTokenRow>(
+          `SELECT t.generation, t.token, t.issued_at, t.expires_at
+            FROM access_tokens t
+            JOIN grants g ON g.app_id = t.app_id
+            WHERE t.app_id = ? AND g.state = 'live' AND g.kind = 'oauth' AND g.generation = ? AND t.generation = ?`,
+        )
+        .get(appId, generation, generation);
+    return this.use(async (db) => {
+      if (!find(db)) return undefined;
+      return this.withKey(db, (key) => {
+        const row = find(db);
+        if (!row) return undefined;
+        return {
+          generation: row.generation,
+          token: this.unsealText(row.token, key),
+          issuedAt: row.issued_at,
+          expiresAt: row.expires_at,
+        };
+      });
+    });
+  }
+
+  /** Persists a renewal and its sealed access token atomically; false when the grant moved on meanwhile. */
   async rotateGrant(appId: string, generation: number, rotation: GrantRotation): Promise<boolean> {
     if (rotation.refreshToken !== undefined) secretValid(rotation.refreshToken);
+    secretValid(rotation.accessToken);
     isoValid(rotation.accessIssuedAt);
     isoValid(rotation.accessExpiresAt);
     return this.use(async (db) => {
       const row = this.grantRow(db, appId);
       if (row?.state !== 'live' || row.generation !== generation || row.kind !== 'oauth') return false;
-      const update = (secret: Buffer | undefined): boolean =>
-        db
-          .prepare(
-            `UPDATE grants SET secret = COALESCE(?, secret), access_issued_at = ?, access_expires_at = ?,
-                access_published = 0, updated_at = ?
-              WHERE app_id = ? AND generation = ? AND state = 'live' AND kind = 'oauth'`,
-          )
-          .run(
-            secret ?? null,
-            rotation.accessIssuedAt,
-            rotation.accessExpiresAt,
-            new Date().toISOString(),
-            appId,
-            generation,
-          ).changes === 1;
-      const refreshToken = rotation.refreshToken;
-      if (refreshToken === undefined) return update(undefined);
-      return this.withKey(db, (key) => update(this.sealText(refreshToken, key)));
+      return this.withKey(db, (key) => {
+        const sealedRefresh = rotation.refreshToken === undefined ? null : this.sealText(rotation.refreshToken, key);
+        const sealedAccess = this.sealText(rotation.accessToken, key);
+        return db
+          .transaction(() => {
+            const changed = db
+              .prepare(
+                `UPDATE grants SET secret = COALESCE(?, secret), access_issued_at = ?, access_expires_at = ?,
+                    access_published = 0, updated_at = ?
+                  WHERE app_id = ? AND generation = ? AND state = 'live' AND kind = 'oauth'`,
+              )
+              .run(
+                sealedRefresh,
+                rotation.accessIssuedAt,
+                rotation.accessExpiresAt,
+                new Date().toISOString(),
+                appId,
+                generation,
+              ).changes;
+            if (changed !== 1) return false;
+            db.prepare(
+              `INSERT INTO access_tokens (app_id, generation, token, issued_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(app_id) DO UPDATE SET generation = excluded.generation, token = excluded.token,
+                  issued_at = excluded.issued_at, expires_at = excluded.expires_at`,
+            ).run(appId, generation, sealedAccess, rotation.accessIssuedAt, rotation.accessExpiresAt);
+            return true;
+          })
+          .immediate();
+      });
     });
-  }
-
-  /**
-   * Records that the OAuth access token expiring at `accessExpiresAt` reached the gateway; false when the grant was
-   * ended, replaced or renewed meanwhile.
-   */
-  async markPublished(appId: string, generation: number, accessExpiresAt: string): Promise<boolean> {
-    return this.use(
-      (db) =>
-        db
-          .prepare(
-            `UPDATE grants SET access_published = 1, updated_at = ?
-              WHERE app_id = ? AND generation = ? AND state = 'live' AND kind = 'oauth' AND access_expires_at = ?`,
-          )
-          .run(new Date().toISOString(), appId, generation, accessExpiresAt).changes === 1,
-    );
   }
 
   /** The server refused renewal: Needs reconnecting. True only for the call that ended this generation. */
@@ -763,6 +826,7 @@ export class ConnectionsStore {
   }
 
   private endGrant(db: Database.Database, appId: string, state: 'disconnected' | 'refused'): void {
+    db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(appId);
     db.prepare(
       `UPDATE grants SET state = ?, secret = NULL, access_issued_at = NULL, access_expires_at = NULL,
           access_published = 0, updated_at = ?

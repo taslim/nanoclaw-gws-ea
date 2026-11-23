@@ -12,6 +12,8 @@ const LEDGER = { name: 'Ledger', url: 'https://mcp.ledger.example/mcp', auth: 'o
 const PRINCIPAL = 'gchat:users/morgan-ellery';
 const SENTINELS = {
   token: 'sentinel-pasted-token-7Qx9',
+  access: 'sentinel-access-token-M4j8',
+  accessRotated: 'sentinel-access-rotated-V9k3',
   refresh: 'sentinel-refresh-token-K2m4',
   rotated: 'sentinel-rotated-token-Z8p1',
   clientSecret: 'sentinel-client-secret-W5r3',
@@ -34,9 +36,10 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-const oauthGrant = (refreshToken?: string) => ({
+const oauthGrant = (refreshToken?: string, accessToken: string | undefined = SENTINELS.access) => ({
   kind: 'oauth' as const,
   ...(refreshToken === undefined ? {} : { refreshToken }),
+  ...(accessToken === undefined ? {} : { accessToken }),
   accessIssuedAt: '2026-11-14T10:00:00.000Z',
   accessExpiresAt: '2026-11-14T11:00:00.000Z',
 });
@@ -228,58 +231,87 @@ describe('grants', () => {
     expect(await store.readGrant(app.id, 2)).toMatchObject({ refreshToken: 'next-refresh' });
   });
 
-  it('persists a rotation only while the grant is live at the same generation', async () => {
+  it('persists a rotation and replaces the sealed access token only while the grant is live at the same generation', async () => {
     const { app } = await connectedOauth();
     const rotation = {
       refreshToken: SENTINELS.rotated,
+      accessToken: SENTINELS.accessRotated,
       accessIssuedAt: '2026-11-14T11:00:00.000Z',
       accessExpiresAt: '2026-11-14T12:00:00.000Z',
     };
     expect(await store.rotateGrant(app.id, 1, rotation)).toBe(true);
     expect(await store.readGrant(app.id, 1)).toMatchObject({ refreshToken: SENTINELS.rotated });
+    expect(await store.readAccessToken(app.id, 1)).toEqual({
+      generation: 1,
+      token: SENTINELS.accessRotated,
+      issuedAt: rotation.accessIssuedAt,
+      expiresAt: rotation.accessExpiresAt,
+    });
     expect(await store.currentGrant(app.id)).toMatchObject({
       kind: 'oauth',
       renewable: true,
+      hasAccessToken: true,
       accessIssuedAt: rotation.accessIssuedAt,
       accessExpiresAt: rotation.accessExpiresAt,
     });
-    const kept = { accessIssuedAt: '2026-11-14T12:00:00.000Z', accessExpiresAt: '2026-11-14T13:00:00.000Z' };
+    const kept = {
+      accessToken: 'sentinel-access-kept-3',
+      accessIssuedAt: '2026-11-14T12:00:00.000Z',
+      accessExpiresAt: '2026-11-14T13:00:00.000Z',
+    };
     expect(await store.rotateGrant(app.id, 1, kept)).toBe(true);
     expect(await store.readGrant(app.id, 1)).toMatchObject({ refreshToken: SENTINELS.rotated });
+    expect(await store.readAccessToken(app.id, 1)).toEqual({
+      generation: 1,
+      token: kept.accessToken,
+      issuedAt: kept.accessIssuedAt,
+      expiresAt: kept.accessExpiresAt,
+    });
     expect(await store.rotateGrant(app.id, 2, kept)).toBe(false);
     await store.disconnect(app.id, (await store.get(app.id)).version);
     expect(await store.rotateGrant(app.id, 1, kept)).toBe(false);
+    expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
   });
 
-  it('records a publish only for the access token it names, until a renewal or reconnect replaces it', async () => {
+  it('stores sealed access tokens keyed by generation, clears them on end/replace, and detects pre-release missing tokens', async () => {
     const { app } = await connectedOauth();
-    const issued = oauthGrant().accessExpiresAt;
-    const published = async () => {
-      const grant = await store.currentGrant(app.id);
-      return grant?.kind === 'oauth' ? grant.published : undefined;
-    };
-    expect(await published()).toBe(false);
-    expect(await store.markPublished(app.id, 1, '2026-11-14T12:00:00.000Z')).toBe(false);
-    expect(await store.markPublished(app.id, 2, issued)).toBe(false);
-    expect(await store.markPublished(app.id, 1, issued)).toBe(true);
-    expect(await published()).toBe(true);
-    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 1, published: true });
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 1, hasAccessToken: true });
+    expect(await store.readAccessToken(app.id, 1)).toEqual({
+      generation: 1,
+      token: SENTINELS.access,
+      issuedAt: '2026-11-14T10:00:00.000Z',
+      expiresAt: '2026-11-14T11:00:00.000Z',
+    });
+    expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
 
-    const rotation = { accessIssuedAt: '2026-11-14T11:00:00.000Z', accessExpiresAt: '2026-11-14T12:00:00.000Z' };
-    expect(await store.rotateGrant(app.id, 1, rotation)).toBe(true);
-    expect(await published()).toBe(false);
-    expect(await store.markPublished(app.id, 1, rotation.accessExpiresAt)).toBe(true);
-
+    // A grant from before this release has no access_tokens row.
     const current = await store.get(app.id);
     const { state } = await store.startSignIn(app.id, current.version, signIn(current));
     const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
     if (!claim) throw new Error('Expected a claim');
-    await store.completeSignIn(claim, oauthGrant('next-refresh'));
-    expect(await published()).toBe(false);
+    await store.completeSignIn(claim, {
+      kind: 'oauth',
+      refreshToken: SENTINELS.refresh,
+      accessIssuedAt: '2026-11-14T10:00:00.000Z',
+      accessExpiresAt: '2026-11-14T11:00:00.000Z',
+    });
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 2, hasAccessToken: false });
+    expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
+    expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
 
-    await store.disconnect(app.id, (await store.get(app.id)).version);
-    expect(await store.markPublished(app.id, 2, issued)).toBe(false);
-    expect(await store.currentGrant(app.id)).toBeUndefined();
+    // Reconnecting stores a generation-3 access token and leaves earlier generations unreadable.
+    const again = await store.get(app.id);
+    const { state: nextState } = await store.startSignIn(app.id, again.version, signIn(again));
+    const nextClaim = await store.claimSignIn(nextState, { host: app.host, principalId: PRINCIPAL });
+    if (!nextClaim) throw new Error('Expected a claim');
+    await store.completeSignIn(nextClaim, oauthGrant('next-refresh', SENTINELS.accessRotated));
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 3, hasAccessToken: true });
+    expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
+    expect(await store.readAccessToken(app.id, 3)).toMatchObject({ generation: 3, token: SENTINELS.accessRotated });
+
+    expect(await store.markRefused(app.id, 3)).toBe(true);
+    expect(await store.readAccessToken(app.id, 3)).toBeUndefined();
+    expect(raw((db) => db.prepare('SELECT COUNT(*) AS n FROM access_tokens').get())).toEqual({ n: 0 });
   });
 
   it('remembers whether the principal entered the client, and forgets it with the client and any pending sign-in', async () => {
@@ -327,9 +359,11 @@ describe('grants', () => {
     expect(await store.apps()).toEqual([]);
     expect(
       raw((db) =>
-        ['apps', 'grants', 'sign_ins'].map((table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()),
+        ['apps', 'grants', 'access_tokens', 'sign_ins'].map((table) =>
+          db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get(),
+        ),
       ),
-    ).toEqual([{ n: 0 }, { n: 0 }, { n: 0 }]);
+    ).toEqual([{ n: 0 }, { n: 0 }, { n: 0 }, { n: 0 }]);
   });
 
   it('keeps client secrets, tokens and verifiers unreadable in the raw file', async () => {
@@ -340,6 +374,7 @@ describe('grants', () => {
     const file = await readFile(path.join(root, 'apps.db'));
     for (const sentinel of [
       SENTINELS.token,
+      SENTINELS.access,
       SENTINELS.refresh,
       SENTINELS.clientSecret,
       SENTINELS.verifier,
@@ -490,6 +525,17 @@ describe('availability', () => {
     await expect(store.readGrant(app.id, 1)).rejects.toMatchObject({ reason: 'store_unavailable' });
     keychain.unavailable = true;
     expect(await store.availability()).toEqual({ available: false, reason: 'keychain_unavailable' });
+  });
+
+  it('counts an access token alone as a secret when reporting a missing key', async () => {
+    const app = await store.create(LEDGER);
+    const { state } = await store.startSignIn(app.id, app.version, signIn(app));
+    const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
+    if (!claim) throw new Error('Expected a claim');
+    await store.completeSignIn(claim, oauthGrant(undefined, SENTINELS.access));
+    keychain.key = undefined;
+    expect(await store.availability()).toEqual({ available: false, reason: 'key_missing' });
+    await expect(store.readAccessToken(app.id, 1)).rejects.toMatchObject({ reason: 'store_unavailable' });
   });
 
   it('uses the connections Keychain service under this assistant', async () => {

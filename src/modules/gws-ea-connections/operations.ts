@@ -2,22 +2,14 @@
  * Adding, connecting, disconnecting, deleting and renaming the principal's apps. The Connections page and main's
  * chat tools both act through these, so an app is changed the same way whoever asked.
  *
- * Every grant change runs under the app's lock and in one order: the store first, then the gateway, then main's
- * servers. A credential is published before main's entry is written, so tools never appear without one; a grant is
- * ended durably before anything is removed, so a failure part way leaves nothing live that the refresher would not
- * clean up. Nothing a server says or a secret the principal entered reaches a result or a log line: failures carry
- * only a code.
+ * Every grant change runs under the app's lock and in one order: the store first, then main's servers. Credentials
+ * stay sealed in the host store and never reach the gateway; a grant is ended durably before revocation and
+ * reconciling main's servers. Nothing a server says or a secret the principal entered reaches a result or a log line:
+ * failures carry only a code.
  */
 import { log } from '../../log.js';
 import { admissionDependencies, admitAppUrl, type AdmissionDependencies, type AdmissionRefusal } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
-import {
-  AppCredentialsUnavailableError,
-  gatewayAppConnection,
-  publishAppCredential,
-  removeAppCredential,
-  type AppConnection,
-} from './credentials.js';
 import { withAppLock } from './locks.js';
 import {
   appClientDocumentUrl,
@@ -73,11 +65,7 @@ export type ConnectRefusal =
   | 'client_refused'
   | 'client_unavailable'
   | 'unreachable'
-  | 'unsupported'
-  /** The gateway cannot hold app credentials. */
-  | 'credentials_unavailable'
-  /** The credential could not be published, so the new grant was ended again. */
-  | 'publish_failed';
+  | 'unsupported';
 
 export type ConnectOutcome =
   | { readonly status: 'connected'; readonly app: ConnectionApp }
@@ -103,9 +91,6 @@ export type SignInReturn =
   | 'client_refused'
   | 'assistant_client_refused';
 
-/** `credential_kept`: the grant is ended but the gateway still holds its credential, so the app stays listed. */
-export type RemoveOutcome = 'deleted' | 'credential_kept';
-
 export interface EnteredClient {
   readonly clientId: string;
   readonly clientSecret?: string;
@@ -118,8 +103,6 @@ export interface ConnectionOperationsOptions {
   readonly fetches?: ConnectionFetches;
   readonly now?: () => number;
   readonly admission?: AdmissionDependencies;
-  /** Throws `AppCredentialsUnavailableError` when the gateway cannot hold app credentials. */
-  readonly connection?: () => AppConnection;
   readonly operatorServers?: () => Promise<readonly OperatorServer[]>;
   readonly applyMain?: (store: ConnectionsStore) => Promise<boolean>;
   readonly clientDocumentsServed: () => boolean;
@@ -129,29 +112,17 @@ export interface ConnectionOperationsOptions {
 export interface ConnectionsListing {
   /** False when the store cannot be read at all, so the principal's apps are unknown. */
   readonly listed: boolean;
-  /** Apps can be added and connected: the store's secrets are readable and the gateway can hold credentials. */
+  /** Apps can be added and connected: the store's secrets and main's servers are readable. */
   readonly canChange: boolean;
   readonly apps: readonly ConnectionApp[];
   readonly operators: readonly OperatorServer[];
 }
 
 export interface ListingSources {
-  readonly gatewayAvailable: () => boolean;
   readonly operatorServers: () => Promise<readonly OperatorServer[]>;
 }
 
-function canConnectWith(connection: () => AppConnection): boolean {
-  try {
-    connection();
-    return true;
-  } catch (error) {
-    if (error instanceof AppCredentialsUnavailableError) return false;
-    throw error;
-  }
-}
-
 export const defaultListingSources: ListingSources = {
-  gatewayAvailable: () => canConnectWith(gatewayAppConnection),
   operatorServers: mainOperatorServers,
 };
 
@@ -175,7 +146,7 @@ export async function readListing(
   try {
     const apps = await store.apps();
     const readable = (await store.availability()).available;
-    return { listed: true, canChange: operatorsRead && readable && sources.gatewayAvailable(), apps, operators };
+    return { listed: true, canChange: operatorsRead && readable, apps, operators };
   } catch (error) {
     if (!(error instanceof ConnectionsStoreError)) throw error;
     return { listed: false, canChange: false, apps: [], operators };
@@ -222,7 +193,6 @@ export class ConnectionOperations {
   private readonly webHostname: string;
   private readonly oauth: ConnectionOAuthOptions;
   private readonly admission: AdmissionDependencies;
-  private readonly connection: () => AppConnection;
   private readonly operators: () => Promise<readonly OperatorServer[]>;
   private readonly applyMain: (store: ConnectionsStore) => Promise<boolean>;
   private readonly documentsServed: () => boolean;
@@ -236,14 +206,9 @@ export class ConnectionOperations {
       ...(options.now ? { now: options.now } : {}),
     };
     this.admission = options.admission ?? admissionDependencies(options.store);
-    this.connection = options.connection ?? gatewayAppConnection;
     this.operators = options.operatorServers ?? mainOperatorServers;
     this.applyMain = options.applyMain ?? applyMainServers;
     this.documentsServed = options.clientDocumentsServed;
-  }
-
-  private gatewayAvailable(): boolean {
-    return canConnectWith(this.connection);
   }
 
   private redirectUri(app: Pick<ConnectionApp, 'host'>): string {
@@ -256,7 +221,6 @@ export class ConnectionOperations {
 
   listing(): Promise<ConnectionsListing> {
     return readListing(this.store, {
-      gatewayAvailable: () => this.gatewayAvailable(),
       operatorServers: this.operators,
     });
   }
@@ -327,17 +291,9 @@ export class ConnectionOperations {
       }
       const token = input.token?.trim();
       if (!token) return refusedConnect('token_missing');
-      let connection: AppConnection;
-      try {
-        connection = this.connection();
-      } catch (error) {
-        if (error instanceof AppCredentialsUnavailableError) return refusedConnect('credentials_unavailable');
-        throw error;
-      }
       const check = await checkPastedToken(app.url, token, this.oauth);
       if (check !== 'valid') return refusedConnect(check === 'refused' ? 'token_refused' : check);
       const result = await this.store.connect(id, version, { kind: 'token', token });
-      if (!(await this.published(result.app, token, connection))) return refusedConnect('publish_failed');
       await this.apply();
       return { status: 'connected', app: result.app };
     });
@@ -361,7 +317,6 @@ export class ConnectionOperations {
       if (app.auth !== 'oauth') return refusedConnect('wrong_method');
       const own = entered && enteredClient(entered);
       if (entered && !own) return refusedConnect('invalid_client');
-      if (!this.gatewayAvailable()) return refusedConnect('credentials_unavailable');
       const probe = await probeApp(app.url, this.oauth);
       if (probe.status !== 'ok') return refusedConnect(probe.status);
       if (probe.method.kind !== 'oauth' || probe.method.issuer !== app.issuer) return refusedConnect('method_changed');
@@ -426,10 +381,8 @@ export class ConnectionOperations {
     return withAppLock(claim.appId, async () => {
       let tokens: IssuedTokens;
       let client: ClientRegistration | undefined;
-      let connection: AppConnection;
       let previousIssuer: string | null;
       try {
-        connection = this.connection();
         ({ issuer: previousIssuer, client } = await this.store.readClient(claim.appId));
         if (!client) throw new ConnectionOAuthError('client_refused');
         tokens = await completeAuthorization(returned, claim, client, this.oauth);
@@ -440,7 +393,6 @@ export class ConnectionOperations {
           if (error.code === 'client_refused' && client) return this.replaceRefusedClient(claim.appId, client);
           return error.code === 'cancelled' ? 'cancelled' : 'failed';
         }
-        if (error instanceof AppCredentialsUnavailableError) return 'failed';
         if (error instanceof ConnectionsStoreError) return error.reason === 'app_not_found' ? 'expired' : 'failed';
         throw error;
       }
@@ -452,6 +404,7 @@ export class ConnectionOperations {
       });
       const completion = await this.store.completeSignIn(claim, {
         kind: 'oauth',
+        accessToken: tokens.accessToken,
         ...(tokens.refreshToken === undefined ? {} : { refreshToken: tokens.refreshToken }),
         accessIssuedAt: tokens.accessIssuedAt,
         accessExpiresAt: tokens.accessExpiresAt,
@@ -461,11 +414,6 @@ export class ConnectionOperations {
         await revokeGrant(claim.issuer, issued(tokens.refreshToken), this.oauth);
         return 'expired';
       }
-      if (!(await this.published(completion.app, tokens.accessToken, connection))) {
-        await revokeGrant(claim.issuer, issued(tokens.refreshToken), this.oauth);
-        return 'failed';
-      }
-      await this.recordPublished(completion.app, completion.generation, tokens.accessExpiresAt);
       await revokeGrant(previousIssuer, completion.replaced, this.oauth);
       await this.apply();
       return 'connected';
@@ -477,28 +425,20 @@ export class ConnectionOperations {
     return withAppLock(id, async () => {
       const before = await this.current(id, version);
       const { app, released } = await this.store.disconnect(id, version);
-      await this.removeCredential(app);
       await revokeGrant(before.issuer, released, this.oauth);
       await this.apply();
       return app;
     });
   }
 
-  /**
-   * Disconnects, then forgets the app and its client; a server that refuses revocation does not stop it. The app is
-   * forgotten only once the gateway no longer holds its credential: a credential left on a host no app uses could
-   * no longer be found, so a failed removal leaves the app listed Not connected for the refresher's sweep and
-   * another Delete.
-   */
-  async remove(id: string, version: number): Promise<RemoveOutcome> {
+  /** Disconnects, then forgets the app and its client; a server that refuses revocation does not stop it. */
+  async remove(id: string, version: number): Promise<void> {
     return withAppLock(id, async () => {
       const before = await this.current(id, version);
       const { app, released } = await this.store.disconnect(id, version);
-      const removed = await this.removeCredential(app);
       await revokeGrant(before.issuer, released, this.oauth);
-      if (removed) await this.store.remove(app.id, app.version);
+      await this.store.remove(app.id, app.version);
       await this.apply();
-      return removed ? 'deleted' : 'credential_kept';
     });
   }
 
@@ -582,53 +522,6 @@ export class ConnectionOperations {
     const app = await this.store.get(id);
     if (app.version !== version) throw new ConnectionsStoreError('app_changed');
     return app;
-  }
-
-  /** A grant whose credential the gateway did not take is ended again, so the app reads as it truly is. */
-  private async published(app: ConnectionApp, token: string, connection: AppConnection): Promise<boolean> {
-    try {
-      await publishAppCredential(app, token, connection);
-      return true;
-      /* eslint-disable no-catch-all/no-catch-all -- Any gateway failure ends the new grant; only its kind is logged, never the token. */
-    } catch (error) {
-      log.warn('App credential not published', {
-        appId: app.id,
-        error: error instanceof Error ? error.name : 'unknown',
-      });
-      /* eslint-enable no-catch-all/no-catch-all */
-      await this.store.disconnect(app.id, app.version);
-      await this.removeCredential(app);
-      return false;
-    }
-  }
-
-  /**
-   * Without the record the refresher cannot tell this token from an older one under the same name, so it renews the
-   * grant, or ends one it cannot renew; the sign-in itself still connected.
-   */
-  private async recordPublished(app: ConnectionApp, generation: number, accessExpiresAt: string): Promise<void> {
-    try {
-      await this.store.markPublished(app.id, generation, accessExpiresAt);
-    } catch (error) {
-      if (!(error instanceof ConnectionsStoreError)) throw error;
-      log.warn('App credential publish not recorded', { appId: app.id, code: error.reason });
-    }
-  }
-
-  /** The grant is already ended, so the refresher's sweep retries a removal that fails here. */
-  private async removeCredential(app: ConnectionApp): Promise<boolean> {
-    try {
-      await removeAppCredential(app, this.connection());
-      return true;
-      /* eslint-disable no-catch-all/no-catch-all -- Any gateway failure leaves the ended grant for the sweep; only the failure's kind is logged. */
-    } catch (error) {
-      log.warn('App credential not removed', {
-        appId: app.id,
-        error: error instanceof Error ? error.name : 'unknown',
-      });
-      return false;
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
   }
 
   /** Main's servers are reconciled again at host start and by the refresher, so an unreadable config only waits. */
