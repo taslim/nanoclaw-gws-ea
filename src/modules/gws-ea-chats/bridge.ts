@@ -337,9 +337,10 @@ export async function flushChatHandoffs(chatId: string, options: { readonly wake
   const processAfter = options.wake === false ? null : await chatCoalesceDeadline(session, group);
   await releaseChatMessages(chatId, { wake: false, ...(processAfter === null ? {} : { processAfter }) });
   const unansweredAt = options.wake === false ? undefined : await chatUnansweredOutboundAt(session, group);
+  const excludeHandoffIds = processAfter === null ? undefined : new Set(pending.map((entry) => entry.id));
   for (const handoff of pending) {
     const files = await filesForHandoff(handoff.id);
-    await writeChatContext(session);
+    await writeChatContext(session, excludeHandoffIds ? { excludeHandoffIds } : undefined);
     const unansweredNote =
       unansweredAt !== undefined && unansweredAt <= handoff.created_at
         ? `Note: your last message in this chat (${elapsedWords(unansweredAt, new Date())}) has no reply yet — only send another if this changes something they need to know now.\n`

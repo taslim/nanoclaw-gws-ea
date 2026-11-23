@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { previouslyContactedAddresses } from '../gws-ea-inbox/thread-map.js';
@@ -55,8 +55,12 @@ async function membersMetByEmail(members: readonly ChatMember[]): Promise<Set<st
   return met;
 }
 
+export interface ChatContextOptions {
+  readonly excludeHandoffIds?: ReadonlySet<string>;
+}
+
 /** Current chat facts, with exactly one field from a resolved person: their level. */
-export async function renderChatContext(chatId: string): Promise<string> {
+export async function renderChatContext(chatId: string, options: ChatContextOptions = {}): Promise<string> {
   const chat = await getChat(chatId);
   const group = await getMessagingGroup(chatId);
   if (!chat || !group) throw new Error('The chat does not exist.');
@@ -92,8 +96,11 @@ export async function renderChatContext(chatId: string): Promise<string> {
   lines.push(
     `Open matter keys: ${matters.length === 0 ? 'none' : matters.join(', ')}. Use a key with tell_main when more than one is open.`,
   );
-  for (const handoff of await listChatHandoffs(chatId))
+  const excluded = options.excludeHandoffIds;
+  for (const handoff of await listChatHandoffs(chatId)) {
+    if (excluded?.has(handoff.id)) continue;
     lines.push(`From main${handoff.matter_id === null ? '' : ` for matter ${handoff.matter_id}`}:\n${handoff.message}`);
+  }
   return lines.join('\n');
 }
 function withoutUntrustedWrapperNonces(text: string): string {
@@ -108,9 +115,9 @@ const contextTails = new Map<string, Promise<void>>();
  * newest context row is always current. Writes for one session run in order,
  * and one repeated after a stop between the row and its record lands once.
  */
-export async function writeChatContext(session: Session): Promise<void> {
+export async function writeChatContext(session: Session, options: ChatContextOptions = {}): Promise<void> {
   const previous = contextTails.get(session.id) ?? Promise.resolve();
-  const result = previous.then(() => writeCurrentChatContext(session));
+  const result = previous.then(() => writeCurrentChatContext(session, options));
   const tail = result.then(
     () => undefined,
     () => undefined,
@@ -123,12 +130,20 @@ export async function writeChatContext(session: Session): Promise<void> {
   }
 }
 
-async function writeCurrentChatContext(session: Session): Promise<void> {
+async function writeCurrentChatContext(session: Session, options: ChatContextOptions = {}): Promise<void> {
   const id = session.messaging_group_id;
   if (id === null) return;
   const chat = await getChat(id);
   if (!chat || chat.serving_agent_group_id !== session.agent_group_id) return;
-  const text = await renderChatContext(id);
+  const waitingIds =
+    (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getWaitingMessages().map((message) => message.id),
+    )) ?? [];
+  const excludeHandoffIds =
+    waitingIds.length === 0 && !options.excludeHandoffIds?.size
+      ? undefined
+      : new Set([...waitingIds, ...(options.excludeHandoffIds ?? [])]);
+  const text = await renderChatContext(id, excludeHandoffIds ? { excludeHandoffIds } : undefined);
   const fingerprint = createHash('sha256').update(withoutUntrustedWrapperNonces(text)).digest('hex');
   const told = await getDb().get<{ fingerprint: string; version: number }>(
     'SELECT fingerprint,version FROM gws_ea_chat_contexts WHERE session_id = ?',

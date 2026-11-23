@@ -95,6 +95,7 @@ import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { getChatCalendar, chatFiles, listChatHandoffs } from './handoffs.js';
 import { CHAT_HANDOFF_COALESCE_MS, flushChatHandoffs, inChatConversation } from './bridge.js';
+import { writeChatContext } from './context.js';
 import { judgeSend } from '../gws-ea-privacy/outbound.js';
 import { WHATSAPP_DIRECTORY_ENV, writeWhatsAppLink } from '../gws-ea-whatsapp/paths.js';
 import { prepareArtifactSource, saveArtifact } from '../gws-ea-artifacts/db.js';
@@ -290,6 +291,26 @@ it('hands main’s words to the exact chat session, coalesces rapid follow-ups i
   const both = rows(session).filter((row) => row.id.startsWith('chat-handoff-'));
   expect(both).toHaveLength(2);
   expect(both[1].process_after).toBe(both[0].process_after);
+  // Not-yet-due handoff text stays out of immediate chat-context rows until its deadline passes.
+  await writeChatContext(session);
+  const contextsWhileWaiting = rows(session).filter((row) => row.id.startsWith('chat-context-'));
+  expect(contextsWhileWaiting.every((row) => !row.content.text?.includes('Plan the trip.'))).toBe(true);
+  expect(contextsWhileWaiting.every((row) => !row.content.text?.includes('Also ask for their email.'))).toBe(true);
+
+  const db = new Database(inboundDbPath('external', session.id));
+  try {
+    db.prepare("UPDATE messages_in SET process_after = ? WHERE id LIKE 'chat-handoff-%'").run(
+      new Date(Date.now() - 1_000).toISOString(),
+    );
+  } finally {
+    db.close();
+  }
+  await writeChatContext(session);
+  const latestContext = rows(session)
+    .filter((row) => row.id.startsWith('chat-context-'))
+    .at(-1);
+  expect(latestContext?.content.text).toContain('Plan the trip.');
+  expect(latestContext?.content.text).toContain('Also ask for their email.');
 });
 
 it('scopes the coalescing window to this chat’s handoffs and ignores unrelated scheduled rows in the mailbox', async () => {
