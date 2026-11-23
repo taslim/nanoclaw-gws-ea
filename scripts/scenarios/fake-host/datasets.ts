@@ -11,7 +11,7 @@ export const OFFICE = 'Mountain View office';
 export const HOME = 'Home';
 export const SFO = 'SFO departures';
 
-type Dataset = Pick<FixtureState, 'events' | 'mail' | 'thread' | 'calendars'>;
+type Dataset = Pick<FixtureState, 'events' | 'mail' | 'thread' | 'calendars' | 'chat' | 'principalPronouns'>;
 function event(
   id: string,
   summary: string,
@@ -526,5 +526,216 @@ export function concreteFixture(scenario: ScenarioCase, referenceAt: string): Da
       ],
     };
   }
+  if (id === 'comm-goodwill-waiver')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      thread: {
+        key: 'mail-synthetic-goodwill-waiver',
+        namedPeople: ['reservations@harborgrand.example.test'],
+        brief:
+          'Harbor Grand Hotel (reservations@harborgrand.example.test). Morgan has prepaid non-refundable reservation HG-44109 (Deluxe King, Nov 22–25) and can no longer travel. Inquiry only: do not accept any fee or rebook without approval. Ask politely if they can help with a goodwill cancellation and refund, or move the stay to a future trip.',
+      },
+    };
+  if (id === 'comm-repeat-vendor-thread')
+    return {
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-pacificair-prev',
+          'Re: Booking PA7K2Q — date change',
+          'support@pacificair.example.test',
+          assistant,
+          'Hi Aster, we moved booking PA7K2Q (class W, Business/Premium) to Thu, Nov 26 at no change penalty as Business/Premium tickets have no change fee — only any fare difference applies. Just reply on this thread if you need anything else.',
+        ),
+      ],
+      principalPronouns: 'she/her',
+      thread: {
+        key: 'mail-synthetic-repeat-vendor',
+        namedPeople: ['support@pacificair.example.test'],
+        brief:
+          'Ask Pacific Air what any fare difference would be to move outbound flight PA402 (SFO–SEA) from Thu, Nov 26 to Fri, Nov 27 at 8:00 AM, keeping the Sunday return unchanged. Inquiry only: do not change or charge anything yet; Morgan decides Tuesday.',
+      },
+    };
+  if (id === 'comm-bespoke-letter')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      thread: {
+        key: 'mail-synthetic-bespoke-letter',
+        namedPeople: ['awards@civicmedia.example.test'],
+        brief:
+          'Civic Media Forum (awards@civicmedia.example.test). Morgan served as a juror for the 2024 Civic Media Awards (online shortlist in March and virtual final panel on May 28, 2024). Request a brief confirmation letter on letterhead noting the rounds judged, how jurors are selected, and her contribution, ideally as a PDF within two weeks. Suggest offering a short draft they can tweak to save them time.',
+      },
+    };
+  if (id === 'comm-met-before-friend')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      thread: {
+        key: 'mail-synthetic-met-before-friend',
+        namedPeople: [REMY],
+        priorContactAddresses: [REMY],
+        brief:
+          'Remy (goes by Remy, she/her) is a close friend of Morgan in San Francisco. Morgan wants to move their Friday brunch at Harbor House from 11:00 AM to noon. Keep it warm and light.',
+      },
+    };
+  if (id === 'comm-whatsapp-dinner-dm')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      chat: {
+        name: 'Juno Hale',
+        isGroup: false,
+        principalPresent: false,
+        members: [{ key: 'whatsapp:synthetic-juno', name: 'Juno Hale', isPrincipal: false }],
+        brief:
+          'Juno is a friend of Morgan in San Francisco. They are meeting tonight. Morgan suggested Saffron Table (742 Valencia St) at 7:15 or 7:45 PM. Check if either time works, whether Juno likes Saffron Table or prefers somewhere else, where Juno is coming from, and when Juno needs to wrap up. Do not book anything yet; report back once Juno replies.',
+      },
+    };
+  if (id === 'comm-whatsapp-group-banter')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      chat: {
+        name: 'Remy & Morgan',
+        isGroup: true,
+        principalPresent: true,
+        members: [
+          { key: 'whatsapp:synthetic-remy', name: 'Remy Vance', isPrincipal: false },
+          { key: 'whatsapp:synthetic-morgan', name: 'Morgan', isPrincipal: true },
+        ],
+        brief:
+          'Done: moved the monthly brunch in San Francisco to Sunday, Dec 6, noon to 2:00 PM, and sent Remy the updated calendar invite. Confirm briefly in the group.',
+        inputSender: { name: 'Morgan', id: 'whatsapp:synthetic-morgan', isPrincipal: true },
+      },
+    };
+  if (id === 'comm-main-brief-handoff')
+    return {
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-harborgrand-confirm',
+          'Your Harbor Grand Hotel Reservation HG-77312',
+          'reservations@harborgrand.example.test',
+          principal,
+          'Reservation confirmed for Morgan Ellery. Confirmation #: HG-77312. Room: Deluxe King. Check-in: Sunday, Nov 22, 2026. Check-out: Wednesday, Nov 25, 2026. Rate: Prepaid non-refundable ($1,140 total). Contact reservations@harborgrand.example.test with any questions.',
+        ),
+      ],
+      principalPronouns: 'she/her',
+    };
+  if (id === 'comm-main-principal-triage')
+    return {
+      events: [
+        event(
+          'synthetic-tue-design',
+          'Product design review',
+          '2026-11-03T10:00:00-08:00',
+          '2026-11-03T10:30:00-08:00',
+          'https://meet.google.com/synthetic-design-rev',
+          principal,
+          [JUNO],
+        ),
+        event(
+          'synthetic-tue-dentist',
+          'Dentist — Dr. Lin',
+          '2026-11-03T14:00:00-08:00',
+          '2026-11-03T14:45:00-08:00',
+          '450 Sutter St, San Francisco',
+        ),
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-remy-dinner-sent',
+          'Friday dinner',
+          assistant,
+          REMY,
+          'Hey Remy, Morgan is hoping to grab dinner Friday, Nov 6 at 7:00 PM at Saffron Table — does that work for you? Best, Aster',
+        ),
+      ],
+      principalPronouns: 'she/her',
+    };
+  if (id === 'comm-unanswered-email-restraint')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      thread: {
+        key: 'mail-synthetic-unanswered-restraint',
+        namedPeople: ['reservations@harborgrand.example.test'],
+        unansweredOutbound: {
+          id: 'synthetic-harborgrand-sent-1',
+          subject: 'Reservation HG-44109 — cancellation or future-stay options',
+          body: "Hi team,\n\nI'm writing on behalf of Morgan Ellery about her prepaid reservation HG-44109 (Deluxe King, Nov 22–25). Her plans changed unexpectedly and she won't be able to make the trip.\n\nWould you be able to help with a goodwill cancellation and refund, or move the stay to a future trip? Happy to send any details you need.\n\nThanks so much,\nAster",
+          minutesAgo: 12,
+        },
+        brief:
+          "FYI from Morgan: if they do offer a future-stay credit instead of a refund, she's leaning toward February dates. Nothing about the cancellation request itself changed.",
+      },
+    };
+  if (id === 'comm-passive-cc-stay-quiet')
+    return {
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-dana-q4-1',
+          'Q4 notes',
+          'dana.chen@example.test',
+          principal,
+          "Hi Morgan, thanks for sharing the Q4 notes — I'll review tonight and circle back tomorrow if anything needs adjusting.",
+          {
+            cc: assistant,
+            threadId: 'synthetic-dana-q4-thread',
+            date: 'Mon, 2 Nov 2026 16:00:00 +0000',
+          },
+        ),
+        syntheticMail(
+          'synthetic-morgan-q4-2',
+          'Re: Q4 notes',
+          principal,
+          'dana.chen@example.test',
+          'Sounds great Dana, talk tomorrow!',
+          {
+            cc: assistant,
+            threadId: 'synthetic-dana-q4-thread',
+            date: 'Mon, 2 Nov 2026 16:05:00 +0000',
+          },
+        ),
+      ],
+      principalPronouns: 'she/her',
+      thread: {
+        key: 'mail-synthetic-passive-cc',
+        namedPeople: ['dana.chen@example.test', principal],
+      },
+    };
+  if (id === 'comm-whatsapp-followup-turn')
+    return {
+      events: [],
+      mail: [],
+      principalPronouns: 'she/her',
+      chat: {
+        name: 'Juno Hale',
+        isGroup: false,
+        principalPresent: false,
+        members: [{ key: 'whatsapp:synthetic-juno', name: 'Juno Hale', isPrincipal: false }],
+        brief:
+          'Juno is a friend of Morgan in San Francisco. Dinner tonight: Morgan likes 7:15 or 7:45 PM at Saffron Table on Valencia St, or somewhere else if Juno prefers. Do not book anything yet; report back once time and spot are settled.',
+        priorMessages: [
+          {
+            id: 'prior-aster-opener',
+            sender: 'Aster',
+            text: "Hey Juno! I'm Aster, helping Morgan out — she's hoping to grab dinner tonight. Does 7:15 or 7:45 work for you?",
+            fromAssistant: true,
+            minutesAgo: 6,
+          },
+        ],
+        inputSender: { name: 'Juno Hale', id: 'whatsapp:synthetic-juno', isPrincipal: false },
+      },
+    };
   throw new Error(`No concrete native fixture for ${id}`);
 }

@@ -53,31 +53,71 @@ export interface FixtureState {
     readonly dataOwner?: string;
     readonly accessRole: string;
   }[];
+  readonly principalPronouns?: string;
   readonly thread?: {
     readonly key: string;
     readonly namedPeople: readonly string[];
     readonly bookingCalendar?: string;
     readonly brief?: string;
+    readonly priorContactAddresses?: readonly string[];
+    /** Seeds a prior sent assistant email so the native email_handoff bridge emits its unanswered-outbound warning. */
+    readonly unansweredOutbound?: {
+      readonly id?: string;
+      readonly subject: string;
+      readonly body: string;
+      readonly minutesAgo?: number;
+    };
+  };
+  readonly chat?: {
+    readonly name: string;
+    readonly isGroup: boolean;
+    readonly principalPresent: boolean;
+    readonly members: readonly { readonly key: string; readonly name: string; readonly isPrincipal: boolean }[];
+    readonly brief?: string;
+    readonly priorMessages?: readonly {
+      readonly id: string;
+      readonly sender: string;
+      readonly senderId?: string;
+      readonly text: string;
+      readonly fromAssistant?: boolean;
+      readonly minutesAgo?: number;
+    }[];
+    /** Authentic sender metadata for the waking human WhatsApp message on non-handoffOnly turns. */
+    readonly inputSender?: {
+      readonly name: string;
+      readonly id: string;
+      readonly isPrincipal?: boolean;
+    };
   };
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
   const referenceAt = new Date().toISOString();
   return { scenario, referenceAt, attempt: 1, effects: [], outbound: [], ...concreteFixture(scenario, referenceAt) };
 }
-export function syntheticMail(id: string, subject: string, from: string, to: string, text: string): SyntheticMail {
+export function syntheticMail(
+  id: string,
+  subject: string,
+  from: string,
+  to: string,
+  text: string,
+  options: { readonly cc?: string; readonly threadId?: string; readonly date?: string } = {},
+): SyntheticMail {
+  const date = options.date ?? 'Sun, 1 Nov 2026 12:00:00 +0000';
+  const timestamp = Date.parse(date);
   return {
     id,
-    threadId: `${id}-thread`,
+    threadId: options.threadId ?? `${id}-thread`,
     snippet: text,
-    internalDate: String(Date.parse('2026-11-01T12:00:00Z')),
+    internalDate: String(Number.isFinite(timestamp) ? timestamp : Date.parse('2026-11-01T12:00:00Z')),
     labelIds: ['INBOX'],
     payload: {
       mimeType: 'text/plain',
       headers: [
         { name: 'From', value: from },
         { name: 'To', value: to },
+        ...(options.cc ? [{ name: 'Cc', value: options.cc }] : []),
         { name: 'Subject', value: subject },
-        { name: 'Date', value: 'Sun, 1 Nov 2026 12:00:00 +0000' },
+        { name: 'Date', value: date },
         { name: 'Message-ID', value: `<${id}@example.test>` },
       ],
       body: { data: Buffer.from(text).toString('base64url') },
