@@ -125,11 +125,14 @@ class TokenEndpoint {
   readonly queued: FakeReply[] = [];
   expiresIn: number | undefined = 3600;
   issued = 0;
+  /** Runs while a token request is in flight, before the reply. */
+  onRequest: (() => void) | undefined;
 
   constructor(readonly host: string) {}
 
   readonly handle: FakeHandler = (request) => {
     if (request.host !== this.host || request.method !== 'POST' || request.path !== '/oauth/token') return undefined;
+    this.onRequest?.();
     this.presented.push(new URLSearchParams(request.body).get('refresh_token') ?? '');
     const queued = this.queued.shift();
     if (queued) return queued;
@@ -711,6 +714,28 @@ describe('refusals', () => {
 
     expect((await store.get(app.id)).status).toBe('needs_reconnecting');
     expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
+  });
+
+  it('keeps a document client’s refused renewal when documents come back while the request is in flight', async () => {
+    const tokens = serveApp(LEDGERLY, documentServer);
+    const app = await publishedOAuthApp(
+      'Ledgerly',
+      LEDGERLY,
+      { refreshToken: 'sentinel-refresh-home', issuedAt: START - 55 * MINUTE, expiresAt: START + 5 * MINUTE },
+      documentClient,
+    );
+    const refresher = createConnectionsRefresher(dependencies());
+    documentsServed = false;
+    tokens.onRequest = () => {
+      documentsServed = true;
+    };
+    tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
+
+    await refresher.tick();
+
+    expect((await store.get(app.id)).status).toBe('connected');
+    expect(gateway.valueFor(app)).toBe('sentinel-access-at-sign-in');
+    expect(refused).toEqual([]);
   });
 
   it('marks a grant without a refresh token Needs reconnecting once its access lapses', async () => {

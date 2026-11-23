@@ -71,8 +71,10 @@ bot-fighting or challenge setting on the zone that covers the assistant's
 hostname blocks sign-in services from fetching client documents, so apps that
 use them cannot connect.
 
-For an existing web install, uninstall web using the **current checkout before
-updating to this release**. Then pull the release, run `bash gws-ea.sh`, run
+Only an install still on the older artifacts-only Cloudflare route, from before
+Access covered the whole hostname, needs a reinstall instead: uninstall web
+using the **current checkout before updating to this release**. Then pull the
+release, run `bash gws-ea.sh`, run
 `gws-ea update --all`, and run `gws-ea connectors install web` with its setup
 options. The old artifacts-only Cloudflare route is deliberately refused; it
 cannot protect the logins page. Uninstall keeps saved HTML and logins, while

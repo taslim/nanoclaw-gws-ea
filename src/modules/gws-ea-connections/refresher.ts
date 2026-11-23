@@ -210,6 +210,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     if (credentials?.kind !== 'oauth' || credentials.refreshToken === undefined) return;
     if (app.issuer === null) throw new ConnectionsStoreError('store_unavailable');
     let issued: Awaited<ReturnType<typeof refreshAccess>>;
+    // The server may fetch the document at any point during the request, so either reading can be the one it saw.
+    const servedBefore = dependencies.clientDocumentsServed();
     try {
       issued = await refreshAccess(
         { url: app.url, issuer: app.issuer },
@@ -227,7 +229,7 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         error instanceof ConnectionOAuthError &&
         error.code === 'client_refused' &&
         credentials.client?.kind === 'document' &&
-        !dependencies.clientDocumentsServed();
+        !(servedBefore && dependencies.clientDocumentsServed());
       if (error instanceof ConnectionOAuthError && refusedForGood(error.code) && !documentUnserved)
         return endRefused(app, grant.generation, error.code);
       throw error;
