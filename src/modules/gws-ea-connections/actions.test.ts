@@ -28,7 +28,8 @@ import { resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { MAIN, mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
 import '../self-mod/index.js';
-import { ADD_APP_ACTION, DELETE_APP_ACTION, registerAppActions } from './actions.js';
+import { ADD_APP_ACTION, APP_TOOL_ASK_ACTION, DELETE_APP_ACTION, registerAppActions } from './actions.js';
+import { normalizeToolDefinition } from './canonical.js';
 import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { ConnectionOperations } from './operations.js';
@@ -427,6 +428,61 @@ describe('delete_app', () => {
     const [note] = notes('connection-delete:');
     expect(note.trigger).toBe(0);
     expect(JSON.parse(note.content)).toMatchObject({ text: expect.stringContaining('It is deleted') });
+  });
+});
+
+describe('app_tool_ask', () => {
+  it('holds a card in both directions, updates the label only on approval, and refuses if the definition changed', async () => {
+    const created = await store.create({ name: 'Food', url: RECIPES, auth: 'token' });
+    await store.connect(created.id, created.version, { kind: 'token', token: 'tok-abc' });
+    const v1 = normalizeToolDefinition({
+      name: 'confirm_checkout',
+      description: 'Place the food order.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [v1] });
+    await store.applyToolLabels(created.id, [
+      {
+        name: 'confirm_checkout',
+        definitionHash: pinned.tools[0]!.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    // Direction 1: ask_first -> just_do (approved)
+    const lower = await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'confirm_checkout',
+      ask_first: false,
+      reason: 'Principal asked to run without asking',
+    });
+    expect(lower.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('just_do');
+
+    // Direction 2: just_do -> ask_first, but definition changes before approval -> refused!
+    const raise = await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'confirm_checkout',
+      ask_first: true,
+    });
+    expect(raise.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    const v2 = normalizeToolDefinition({
+      name: 'confirm_checkout',
+      description: 'Place the food order with tip.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    await store.pinTools(created.id, { instructions: null, tools: [v2] });
+    await approve(APP_TOOL_ASK_ACTION);
+    // Tool stayed unsorted (label null) because definition changed before 👍!
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBeNull();
+    const changeNote = notes('connection-tool-ask:').at(-1);
+    expect(JSON.parse(changeNote!.content)).toMatchObject({
+      text: expect.stringContaining('definition changed'),
+    });
   });
 });
 

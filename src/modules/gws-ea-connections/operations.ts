@@ -11,6 +11,7 @@ import { log } from '../../log.js';
 import { admissionDependencies, admitAppUrl, type AdmissionDependencies, type AdmissionRefusal } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
 import { withAppLock } from './locks.js';
+import { withdrawHeldAppCalls } from './held-calls.js';
 import { getAppRelay } from './relay.js';
 import {
   appClientDocumentUrl,
@@ -227,6 +228,7 @@ export class ConnectionOperations {
       (async (appId) => {
         const relay = getAppRelay();
         if (relay) await relay.closeApp(appId);
+        await withdrawHeldAppCalls(appId);
       });
   }
 
@@ -305,6 +307,7 @@ export class ConnectionOperations {
         if (probe.status !== 'ok') return refusedConnect(probe.status);
         if (probe.method.kind !== 'none') return refusedConnect('method_changed');
         const result = await this.store.connect(id, version, { kind: 'none' });
+        await this.notifyDisconnected(result.app.id);
         await this.pinConnected(result.app);
         await this.apply();
         return { status: 'connected', app: result.app };
@@ -314,6 +317,7 @@ export class ConnectionOperations {
       const check = await checkPastedToken(app.url, token, this.oauth);
       if (check !== 'valid') return refusedConnect(check === 'refused' ? 'token_refused' : check);
       const result = await this.store.connect(id, version, { kind: 'token', token });
+      await this.notifyDisconnected(result.app.id);
       await this.pinConnected(result.app);
       await this.apply();
       return { status: 'connected', app: result.app };

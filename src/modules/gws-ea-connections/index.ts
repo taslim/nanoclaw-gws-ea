@@ -10,11 +10,12 @@ import { registerAppActions } from './actions.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import { connectionsRoot } from './config.js';
 import { clientDocumentsWebMount, connectionsWebMount, operatorAsApp } from './connections-mount.js';
+import { createHoldCallHandler, registerHeldAppCallHandlers } from './held-calls.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
 import { registerRelayAction } from './relay-actions.js';
-import { startAppRelay, stopAppRelay } from './relay.js';
+import { getAppRelay, startAppRelay, stopAppRelay } from './relay.js';
 import { registerSortToolsAction, startAppToolSorter, stopAppToolSorter } from './sorter.js';
 import {
   ConnectionsStoreError,
@@ -88,6 +89,7 @@ registerWebMount(clientDocumentsWebMount);
 registerAppActions();
 registerRelayAction();
 registerSortToolsAction();
+registerHeldAppCallHandlers();
 
 onHostStart(async ({ signal }) => {
   // Only a gws-ea assistant has a store; a plain NanoClaw host has nothing to sweep.
@@ -115,6 +117,7 @@ onHostStart(async ({ signal }) => {
       onToolsNeedSort: (appId, listHash) => {
         void sorter.enqueue(appId, listHash);
       },
+      onHoldCall: createHoldCallHandler({ store, relay: getAppRelay }),
     });
     await applyMainServers(store);
     void (async () => {

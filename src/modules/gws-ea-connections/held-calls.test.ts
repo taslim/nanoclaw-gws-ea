@@ -1,0 +1,544 @@
+/**
+ * Held ask-first calls, 👍/👎 approval cards, once-only execution, expiry, withdrawal, and app_tool_ask label changes.
+ */
+import fs from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const TEST_ROOT = `/tmp/nanoclaw-gws-ea-held-calls-test-${process.pid}`;
+
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  GROUPS_DIR: `/tmp/nanoclaw-gws-ea-held-calls-test-${process.pid}/groups`,
+  DATA_DIR: `/tmp/nanoclaw-gws-ea-held-calls-test-${process.pid}/data`,
+}));
+
+vi.mock('../../log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+}));
+
+vi.mock('../../request-wake.js', () => ({
+  requestWake: vi.fn(async () => true),
+}));
+
+import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
+import {
+  closeDb,
+  createSession,
+  deleteSession,
+  getPendingApprovalsByAction,
+  initTestDb,
+  runMigrations,
+  transitionPendingApprovalStatus,
+} from '../../db/index.js';
+import { setDeliveryAdapter } from '../../delivery.js';
+import { sessionDir } from '../../session-manager.js';
+import type { PendingApproval, Session } from '../../types.js';
+import { expireApproval } from '../approvals/lifecycle.js';
+import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
+import { MAIN, mainSession as getMainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
+import '../gws-ea-profile/index.js';
+import { toolDefinitionHash } from './canonical.js';
+import {
+  createHoldCallHandler,
+  HELD_APP_CALL_ACTION,
+  HELD_CALL_ANSWER,
+  registerHeldAppCallHandlers,
+  withdrawHeldAppCalls,
+} from './held-calls.js';
+import { ConnectionOperations } from './operations.js';
+import { createAppRelay, type AppRelay } from './relay.js';
+import type { ConnectionsStore } from './store.js';
+import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeToolDefinition } from './testing/oauth-server.js';
+import { testConnectionsStore } from './testing/store.js';
+
+const PRINCIPAL_USER = 'gchat:users/morgan';
+const FOOD_URL = 'https://mcp.food.example.test/mcp';
+const HOSTNAME = 'juno.example.test';
+
+const PREPARE_TOOL: FakeToolDefinition = {
+  name: 'prepare_checkout',
+  description: 'Prepare a cart checkout preview.',
+  inputSchema: { type: 'object', properties: { item: { type: 'string' } }, required: ['item'] },
+};
+
+const CONFIRM_TOOL: FakeToolDefinition = {
+  name: 'confirm_checkout',
+  description: 'Confirm and place the food order.',
+  inputSchema: { type: 'object', properties: { checkout_id: { type: 'string' } }, required: ['checkout_id'] },
+};
+
+interface DeliveredCard {
+  readonly questionId: string;
+  readonly title: string;
+  readonly question: string;
+  readonly options: readonly { readonly value: string }[];
+}
+
+let endpoints: FakeEndpoints;
+let directory: string;
+let store: ConnectionsStore;
+let relay: AppRelay | undefined;
+let mainSession: Session;
+let deliveredCards: DeliveredCard[];
+let editedCards: Array<{ messageId: string; text: string }>;
+let nextMsgId: number;
+
+beforeAll(async () => {
+  endpoints = await startFakeEndpoints(['mcp.food.example.test']);
+});
+
+afterAll(async () => {
+  await endpoints.close();
+});
+
+function readMainMessages(): Array<{ id: string; content: Record<string, unknown>; trigger: number }> {
+  const file = path.join(sessionDir(mainSession.agent_group_id, mainSession.id), 'inbound.db');
+  if (!fs.existsSync(file)) return [];
+  const db = new Database(file);
+  try {
+    return db
+      .prepare<[], { id: string; content: string; trigger: number }>(
+        'SELECT id, content, trigger FROM messages_in ORDER BY seq',
+      )
+      .all()
+      .map((row) => ({
+        id: row.id,
+        content: JSON.parse(row.content) as Record<string, unknown>,
+        trigger: row.trigger,
+      }));
+  } finally {
+    db.close();
+  }
+}
+
+async function setupFoodApp(tools: readonly FakeToolDefinition[] = [PREPARE_TOOL, CONFIRM_TOOL]) {
+  const fake = new FakeMcpApp({
+    appUrl: FOOD_URL,
+    issuer: 'https://mcp.food.example.test',
+    tools: [...tools],
+    onToolCall(call) {
+      if (call.name === 'prepare_checkout') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Prepared checkout chk_order_7788: 1x Jollof Rice from Mama Put, total NGN 4,500.',
+            },
+          ],
+        };
+      }
+      return {
+        content: [{ type: 'text', text: `Order confirmed for ${String(call.arguments.checkout_id ?? 'unknown')}` }],
+      };
+    },
+  });
+  fake.accessTokens.add('food-secret-token');
+  endpoints.use(fake.handle);
+
+  const created = await store.create({ name: 'Chowdeck', url: FOOD_URL, auth: 'token' });
+  const connected = await store.connect(created.id, created.version, { kind: 'token', token: 'food-secret-token' });
+
+  relay = createAppRelay({
+    store,
+    egress: endpoints.egress,
+  });
+  const holdHandler = createHoldCallHandler({
+    store,
+    relay: () => relay,
+    webHostname: async () => HOSTNAME,
+  });
+  relay.setHoldCallHandler(holdHandler);
+  registerHeldAppCallHandlers({
+    store,
+    relay: () => relay,
+  });
+
+  const pinned = await relay.pinApp(connected.app.id);
+  const byName = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+  await store.applyToolLabels(connected.app.id, [
+    ...(byName.has('prepare_checkout')
+      ? [
+          {
+            name: 'prepare_checkout',
+            definitionHash: byName.get('prepare_checkout')!,
+            label: 'just_do' as const,
+            source: 'sorter' as const,
+            reason: 'Prepares preview only',
+          },
+        ]
+      : []),
+    ...(byName.has('confirm_checkout')
+      ? [
+          {
+            name: 'confirm_checkout',
+            definitionHash: byName.get('confirm_checkout')!,
+            label: 'ask_first' as const,
+            source: 'floor' as const,
+            reason: 'Places order',
+          },
+        ]
+      : []),
+  ]);
+
+  return { app: connected.app, fake };
+}
+
+async function respondToCard(approvalId: string, value: 'approve' | 'reject', reason?: string): Promise<void> {
+  await handleApprovalsResponse({
+    questionId: approvalId,
+    value,
+    userId: PRINCIPAL_USER,
+    channelType: 'gchat',
+    platformId: 'gchat:spaces/morgan',
+    threadId: null,
+    ...(reason === undefined ? {} : { reason }),
+  });
+}
+
+beforeEach(async () => {
+  endpoints.reset();
+  directory = await mkdtemp(path.join(os.tmpdir(), 'connections-held-calls-'));
+  ({ store } = testConnectionsStore(path.join(directory, 'connections')));
+  deliveredCards = [];
+  editedCards = [];
+  nextMsgId = 1;
+  await runMigrations(await initTestDb());
+  await seedMain('America/Los_Angeles');
+  mainSession = await getMainSession();
+
+  setDeliveryAdapter({
+    deliver: async (_channel, _platformId, _threadId, kind, content) => {
+      if (kind === 'chat-sdk') {
+        const parsed = JSON.parse(content) as DeliveredCard & { operation?: string; messageId?: string; text?: string };
+        if (parsed.operation === 'edit') {
+          editedCards.push({ messageId: parsed.messageId ?? '', text: parsed.text ?? '' });
+        } else {
+          deliveredCards.push(parsed);
+        }
+      }
+      return `msg-${nextMsgId++}`;
+    },
+  });
+});
+
+afterEach(async () => {
+  if (relay) {
+    await relay.closeAll();
+    relay = undefined;
+  }
+  await closeDb();
+  await rm(directory, { recursive: true, force: true });
+  await rm(TEST_ROOT, { recursive: true, force: true });
+});
+
+describe('held ask-first calls', () => {
+  it('holds an ask-first call with one card showing app, tool, args, expiry, earlier app words and assistant summary, then runs once on approve', async () => {
+    const { app, fake } = await setupFoodApp();
+
+    // First run the reversible prepare step silently.
+    const prepared = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'prepare_checkout',
+      args: { item: 'Jollof Rice' },
+      session: mainSession,
+      requestId: 'req-prep-1',
+    });
+    expect(prepared.status).toBe('completed');
+    expect(deliveredCards).toHaveLength(0);
+
+    // Now invoke ask-first confirm_checkout referencing chk_order_7788.
+    const held = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_order_7788' },
+      summary: 'Place Jollof Rice order for NGN 4,500',
+      session: mainSession,
+      requestId: 'req-confirm-1',
+    });
+    expect(held.status).toBe('held');
+    if (held.status !== 'held') throw new Error('Expected held');
+    expect(held.text).toBe(HELD_CALL_ANSWER);
+    expect(fake.toolCalls.map((c) => c.name)).toEqual(['prepare_checkout']);
+
+    expect(deliveredCards).toHaveLength(1);
+    const card = deliveredCards[0]!;
+    expect(card.title).toContain('Chowdeck');
+    expect(card.title).toContain('confirm_checkout');
+    expect(card.question).toContain('chk_order_7788');
+    expect(card.question).toContain('Prepared checkout chk_order_7788: 1x Jollof Rice from Mama Put, total NGN 4,500.');
+    expect(card.question).toContain("Assistant's description:");
+    expect(card.question).toContain('Place Jollof Rice order for NGN 4,500');
+    expect(card.question).toContain('Expires:');
+
+    // Approve -> fake app receives exact stored args once; main receives untrusted result note.
+    await respondToCard(card.questionId, 'approve');
+
+    expect(fake.toolCalls).toHaveLength(2);
+    expect(fake.toolCalls[1]).toMatchObject({
+      name: 'confirm_checkout',
+      arguments: { checkout_id: 'chk_order_7788' },
+      bearer: 'food-secret-token',
+    });
+
+    const notes = readMainMessages().filter((m) => m.id.startsWith('app-call-outcome:'));
+    expect(notes).toHaveLength(1);
+    const noteText = String(notes[0]!.content.text);
+    expect(noteText).toContain('Order confirmed for chk_order_7788');
+    expect(noteText).toContain('<<<EXTERNAL_UNTRUSTED_CONTENT');
+    expect(notes[0]!.trigger).toBe(1);
+  });
+
+  it('dedupes replay of the same request, creates separate cards for separate identical calls, and allows retry after decline', async () => {
+    const { app } = await setupFoodApp();
+
+    const first = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_1' },
+      session: mainSession,
+      requestId: 'req-same',
+    });
+    const replay = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_1' },
+      session: mainSession,
+      requestId: 'req-same',
+    });
+    expect(first.status).toBe('held');
+    expect(replay.status).toBe('held');
+    expect(deliveredCards).toHaveLength(1);
+    expect(deliveredCards[0]!.question).toContain('no summary given');
+
+    // Separate request with identical args produces a second card.
+    const second = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_1' },
+      session: mainSession,
+      requestId: 'req-second',
+    });
+    expect(second.status).toBe('held');
+    expect(deliveredCards).toHaveLength(2);
+
+    // Decline the first card -> main gets plain decline note; retrying gets a new card.
+    await respondToCard(deliveredCards[0]!.questionId, 'reject', 'Too expensive');
+    const rejectNote = readMainMessages().find((m) => m.id.startsWith('appr-reject-'));
+    expect(String(rejectNote?.content.text)).toContain('declined');
+    expect(String(rejectNote?.content.text)).toContain('Too expensive');
+
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_1' },
+      session: mainSession,
+      requestId: 'req-after-decline',
+    });
+    expect(deliveredCards).toHaveLength(3);
+  });
+
+  it('delivers approved outcome to main shared session even when the originating task session was deleted', async () => {
+    const { app, fake } = await setupFoodApp();
+    const taskSession: Session = {
+      id: 'sess-task-ephemeral',
+      agent_group_id: MAIN,
+      messaging_group_id: null,
+      thread_id: 'system:tasks:t1',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: '2026-11-23T12:00:00.000Z',
+    };
+    await createSession(taskSession);
+
+    const held = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_task_1' },
+      summary: 'Confirm scheduled order',
+      session: taskSession,
+      requestId: 'req-task-1',
+    });
+    expect(held.status).toBe('held');
+    expect(deliveredCards).toHaveLength(1);
+
+    // Delete the originating task session BEFORE approval!
+    await deleteSession(taskSession.id);
+
+    await respondToCard(deliveredCards[0]!.questionId, 'approve');
+    expect(fake.toolCalls.map((c) => c.name)).toEqual(['confirm_checkout']);
+    const notes = readMainMessages().filter((m) => m.id.startsWith('app-call-outcome:'));
+    expect(notes).toHaveLength(1);
+    expect(String(notes[0]!.content.text)).toContain('Order confirmed for chk_task_1');
+  });
+
+  it('writes a quiet note on 24h expiry, refuses on definition change or reconnect, and withdraws on remove', async () => {
+    const { app, fake } = await setupFoodApp();
+
+    // 1. Expiry -> quiet note (wake: false)
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_exp' },
+      session: mainSession,
+      requestId: 'req-exp',
+    });
+    const expId = deliveredCards[0]!.questionId;
+    const future = new Date(Date.now() + 25 * 60 * 60_000).toISOString();
+    expect(await expireApproval(expId, future)).toBe(true);
+    const expiredNote = readMainMessages().find((m) => m.id === `app-call-expired:${expId}`);
+    expect(expiredNote).toBeDefined();
+    expect(expiredNote!.trigger).toBe(0);
+    expect(String(expiredNote!.content.text)).toContain('expired');
+
+    // 2. Definition change before approve -> refuses to run, nothing sent
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_changed' },
+      session: mainSession,
+      requestId: 'req-changed',
+    });
+    const changedId = deliveredCards[1]!.questionId;
+    fake.tools = [
+      PREPARE_TOOL,
+      {
+        ...CONFIRM_TOOL,
+        description: 'Confirm and ALSO subscribe to annual plan.',
+      },
+    ];
+    await respondToCard(changedId, 'approve');
+    expect(fake.toolCalls).toHaveLength(0);
+    const changedNote = readMainMessages().find((m) => m.id === `app-call-outcome:${changedId}`);
+    expect(String(changedNote?.content.text)).toContain('nothing was sent');
+
+    // Re-pin & re-label to test withdrawal on remove
+    const repinned = await relay!.pinApp(app.id);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'confirm_checkout',
+        definitionHash: repinned.tools.find((t) => t.name === 'confirm_checkout')!.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    // 3. Reconnect (grant generation bump) before approve -> refuses to run, nothing sent
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_reconn' },
+      session: mainSession,
+      requestId: 'req-reconn',
+    });
+    const reconnId = deliveredCards[2]!.questionId;
+    const beforeReconn = await store.get(app.id);
+    await store.connect(beforeReconn.id, beforeReconn.version, { kind: 'token', token: 'food-secret-token' });
+    await respondToCard(reconnId, 'approve');
+    expect(fake.toolCalls).toHaveLength(0);
+    const reconnNote = readMainMessages().find((m) => m.id === `app-call-outcome:${reconnId}`);
+    expect(String(reconnNote?.content.text)).toContain('disconnected or reconnected');
+    expect(String(reconnNote?.content.text)).toContain('nothing was sent');
+
+    // 4. Withdrawal on remove
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_withdraw' },
+      session: mainSession,
+      requestId: 'req-withdraw',
+    });
+    const withdrawId = deliveredCards[3]!.questionId;
+    expect((await getPendingApprovalsByAction(HELD_APP_CALL_ACTION)).map((r) => r.approval_id)).toContain(withdrawId);
+
+    const ops = new ConnectionOperations({
+      store,
+      webHostname: HOSTNAME,
+      clientDocumentsServed: () => true,
+      applyMain: async () => false,
+      onDisconnected: async (appId) => {
+        await relay?.closeApp(appId);
+        await withdrawHeldAppCalls(appId);
+      },
+    });
+    const latest = await store.get(app.id);
+    await ops.remove(latest.id, latest.version);
+
+    expect(await getPendingApprovalsByAction(HELD_APP_CALL_ACTION)).toEqual([]);
+    expect(editedCards.length).toBeGreaterThan(0);
+  });
+
+  it('produces an outcome-unknown note on host restart after executing was claimed without calling upstream again', async () => {
+    const { app, fake } = await setupFoodApp();
+
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_crash' },
+      session: mainSession,
+      requestId: 'req-crash',
+    });
+    const approvalId = deliveredCards[0]!.questionId;
+    const pending: PendingApproval = (await getPendingApprovalsByAction(HELD_APP_CALL_ACTION))[0]!;
+    const tool = (await store.getTool(app.id, 'confirm_checkout'))!;
+
+    // Simulate host crash right after claiming `executing` and marking approval `approved`.
+    await transitionPendingApprovalStatus(approvalId, 'pending', 'approved');
+    await store.claimApprovedCall({
+      approvalId,
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: tool.definitionHash,
+      argsHash: 'hash',
+    });
+
+    await resumeApprovedApprovals();
+
+    expect(fake.toolCalls).toHaveLength(0);
+    const note = readMainMessages().find((m) => m.id === `app-call-outcome:${pending.approval_id}`);
+    expect(String(note?.content.text)).toContain('outcome is unknown');
+    expect(String(note?.content.text)).toContain('Do not retry automatically');
+  });
+
+  it('links to the held-call view when arguments exceed the 2,000-character card limit and flags invisible characters', async () => {
+    const { app } = await setupFoodApp();
+
+    // Long args test (> 2,000 chars)
+    const longNotes = 'delivery instructions '.repeat(120);
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_long', delivery_notes: longNotes },
+      summary: 'Confirm big catering order',
+      session: mainSession,
+      requestId: 'req-long',
+    });
+    const longCard = deliveredCards[0]!;
+    expect(longCard.title.length + longCard.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
+    expect(longCard.question).toContain(`https://${HOSTNAME}/connections/held/${longCard.questionId}`);
+    expect(longCard.question).toContain('chk_long');
+    expect(longCard.question).toContain('too long');
+
+    // Invisible character flagging test
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_\u200Bhidden\u202E123' },
+      summary: 'Confirm order',
+      session: mainSession,
+      requestId: 'req-invis',
+    });
+    const invisCard = deliveredCards[1]!;
+    expect(invisCard.question).toContain('[U+200B]');
+    expect(invisCard.question).toContain('[U+202E]');
+    expect(invisCard.question.toLowerCase()).toContain('invisible');
+    expect(toolDefinitionHash(CONFIRM_TOOL)).toBeDefined();
+  });
+});
