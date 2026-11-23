@@ -103,7 +103,7 @@ export const emailHandoff = requestTool({
   ...common,
   name: 'email_handoff',
   description:
-    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message and the thread's mail waiting for you, decides who each email goes to and who is copied, and writes the emails. A thread you have not placed is refused until you place it, or name its matter here. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key.",
+    "Hand external-email work in one email thread: an existing one by thread_key, or a new one with the people you name. It reads your message and the thread's mail waiting for you, decides who each email goes to and who is copied, and writes the emails. A thread you have not placed is refused until you place it, or name its matter here. The host refuses a message or text file carrying one of the principal's private details. Answers with the thread_key — the email is queued for external-email and has not been sent yet, so describe it to the principal as queued or heading out, never as already sent.",
   properties: {
     thread_key: { type: 'string', description: 'The mail-… key of an existing thread, as a message about it gave it.' },
     people: {
@@ -114,7 +114,7 @@ export const emailHandoff = requestTool({
     message: {
       type: 'string',
       description:
-        'Your words to external-email, in plain language. The people on the thread may read what it leads to.',
+        'Your words to external-email, in plain language. The people on the thread may read what it leads to. Omit private reasons (health, family, travel, personal or filing context — even vague labels like "family matter") unless the principal explicitly asked to share them; give only the neutral fact needed (e.g. "unable to travel").',
     },
     files: { ...FILES, description: `${FILES.description} external-email may attach them in this thread only.` },
     calendar: {
@@ -158,7 +158,7 @@ export const signInReply = requestTool({
   ...common,
   name: 'sign_in_reply',
   description:
-    'Answer only a host sign-in task in this isolated session. Return the one requested sign-in code or HTTPS sign-in link from its email, or the code or link that verifies a new account’s email, or unavailable if absent or ambiguous. Never return an account-security, lock, reset, revoke, footer or unsubscribe link. The host alone inserts or opens it. End silently after this tool; no email or tell_main.',
+    'Answer only a host sign-in task in this isolated session. Return the one requested sign-in code or HTTPS sign-in link from its email, or the code or link that verifies a new account’s email, or unavailable if absent or ambiguous. Never return an account-security, lock, reset, revoke, footer or unsubscribe link. The host alone inserts or opens it. Never repeat the credential in your output, and end silently after this tool; no email or tell_main.',
   properties: {
     kind: { type: 'string', enum: ['code', 'link', 'unavailable'] },
     value: { type: 'string', description: 'The exact code or complete sign-in URL. Omit for unavailable.' },

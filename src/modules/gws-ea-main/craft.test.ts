@@ -29,7 +29,7 @@ const CRAFT = [
   /in person, the place and no link/iu,
   /video, a link and no address/iu,
   /who calls whom/iu,
-  /hybrid, both, as for a lunch with someone dialling in/iu,
+  /hybrid, both, as for a lunch with someone dialing in/iu,
   /sensible default and say which/iu,
   /so they get it and its changes/iu,
   /usually invite/iu,
