@@ -84,6 +84,7 @@ export class WebRuntime {
       const result = await (this.dependencies.reconcileAccess ?? reconcileWebAccessEmails)({
         ...config.cloudflare,
         emails: this.admissionEmails,
+        publicPaths: config.publicPaths ?? [],
       });
       if (this.stopped || !(await this.coordinatesMatch(config))) throw new Error('Web coordinates changed.');
       this.verified = JSON.stringify([webPolicyDigest(config), result.emails]);

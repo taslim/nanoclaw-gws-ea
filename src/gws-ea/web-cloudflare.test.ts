@@ -6,6 +6,7 @@ import {
   webIngress,
   createWebCloudflareApi,
   parseWebOperatorConfig,
+  WEB_PUBLIC_PATHS,
 } from './web-cloudflare.js';
 
 const instanceId = '00000000-0000-4000-8000-000000000001';
@@ -168,26 +169,53 @@ describe('web Cloudflare boundary', () => {
     });
   });
 
-  it('protects every path with only the public artifact override and refuses the old path-scoped application', () => {
+  it('protects every path except the public artifact and client document paths, and refuses the old path-scoped application', () => {
     const claim = { hostname: 'aya.example.test', listen_port: 41234 };
     const application: Record<string, unknown> = { ...webAccessApplication(claim, 'pin'), id: 'app', aud: 'aud' };
     const assistant = { claim, enabled: true, applicationId: 'app', aud: 'aud' };
     const config = parseWebOperatorConfig({ ...operatorConfig(), pin: { id: 'pin', owned: true } });
+    expect(WEB_PUBLIC_PATHS).toEqual(['/artifacts/public/*', '/oauth-client/*']);
     expect(application.destinations).toEqual([
       {
         type: 'public',
         uri: 'aya.example.test',
-        overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
+        overrides: [
+          { behavior: 'public', path_pattern: '/artifacts/public/*' },
+          { behavior: 'public', path_pattern: '/oauth-client/*' },
+        ],
       },
     ]);
-    expect(() => assertWebApplication(application, assistant, config)).not.toThrow();
+    expect(assertWebApplication(application, assistant, config, 'current')).toBe('current');
     expect(() =>
       assertWebApplication(
         { ...application, destinations: [{ type: 'public', uri: 'aya.example.test/artifacts' }] },
         assistant,
         config,
+        'current-or-legacy',
       ),
     ).toThrow(expect.objectContaining({ code: 'web_application_mismatch' }));
+  });
+
+  it('accepts the artifact-only application only where the legacy shape is allowed', () => {
+    const claim = { hostname: 'aya.example.test', listen_port: 41234 };
+    const legacy: Record<string, unknown> = {
+      ...webAccessApplication(claim, 'pin'),
+      id: 'app',
+      aud: 'aud',
+      destinations: [
+        {
+          type: 'public',
+          uri: 'aya.example.test',
+          overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
+        },
+      ],
+    };
+    const assistant = { claim, enabled: true, applicationId: 'app', aud: 'aud' };
+    const config = parseWebOperatorConfig({ ...operatorConfig(), pin: { id: 'pin', owned: true } });
+    expect(assertWebApplication(legacy, assistant, config, 'current-or-legacy')).toBe('legacy');
+    expect(() => assertWebApplication(legacy, assistant, config, 'current')).toThrow(
+      expect.objectContaining({ code: 'web_access_mismatch' }),
+    );
   });
 
   it('bounds rate-limit retries and never exposes Cloudflare response material', async () => {

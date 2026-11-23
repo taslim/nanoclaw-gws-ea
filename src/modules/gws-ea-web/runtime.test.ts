@@ -41,6 +41,7 @@ let runtime: WebRuntime;
 let blocker: Server | undefined;
 let unavailable: boolean;
 let admitted: readonly string[] = [];
+let checkedPublicPaths: readonly string[] | undefined;
 const emails = ['juno@example.com', 'principal@example.com'];
 beforeEach(async () => {
   root = fs.mkdtempSync(path.join(fs.realpathSync(tmpdir()), 'web-runtime-'));
@@ -93,7 +94,8 @@ beforeEach(async () => {
     reconcileAccess: async (options) => {
       if (unavailable) throw new Error('Admission unavailable');
       admitted = typeof options.emails === 'function' ? await options.emails() : options.emails;
-      return { verified: true, emails, changed: false };
+      checkedPublicPaths = options.publicPaths;
+      return { verified: true, emails, changed: false, clientDocumentPath: false };
     },
   });
 });
@@ -124,6 +126,15 @@ it('serves registered mounts through the same ready origin and closes publicatio
   expect(admitted).toEqual(emails);
   await runtime.stop();
   expect(await runtime.publicationReady(config)).toBe(false);
+});
+it('verifies Access against the public paths its policy records, again whenever they change', async () => {
+  await runtime.reconcile();
+  expect(checkedPublicPaths).toEqual([]);
+  const recorded = { ...config, publicPaths: ['/artifacts/public/*', '/oauth-client/*'] };
+  fs.writeFileSync(path.join(root, 'policy.json'), JSON.stringify(recorded));
+  await runtime.reconcile();
+  expect(checkedPublicPaths).toEqual(['/artifacts/public/*', '/oauth-client/*']);
+  expect(await runtime.publicationReady(recorded)).toBe(true);
 });
 afterEach(async () => {
   await runtime?.stop();

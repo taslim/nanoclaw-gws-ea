@@ -117,7 +117,12 @@ beforeEach(async () => {
   await writePrivateFile(path.join(ROOT, 'web-policy.json'), JSON.stringify(config));
   vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'web-policy.json'));
   runtime = new WebRuntime(webMounts, {
-    reconcileAccess: async () => ({ verified: true, emails: ['morgan@example.com'], changed: false }),
+    reconcileAccess: async () => ({
+      verified: true,
+      emails: ['morgan@example.com'],
+      changed: false,
+      clientDocumentPath: false,
+    }),
   });
   registerPrincipalPageDelivery({ publicationReady: (policy) => runtime.publicationReady(policy) });
   main = await session('main');

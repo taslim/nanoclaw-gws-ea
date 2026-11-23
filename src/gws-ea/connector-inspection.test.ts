@@ -53,7 +53,7 @@ async function assistant(marker: 'compatible' | 'unsupported' | 'unknown' = 'com
   if (marker !== 'unsupported')
     await writeFile(
       path.join(runtime.checkout_root, 'src/gws-ea/web-compatibility.json'),
-      marker === 'unknown' ? '{' : JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-1' }),
+      marker === 'unknown' ? '{' : JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-2' }),
     );
   if (firstName !== undefined) {
     const file = centralDatabaseFile(runtime.state_root);
