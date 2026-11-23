@@ -142,7 +142,7 @@ export const expectReply = requestTool({
   ...common,
   name: 'expect_reply',
   description:
-    'Wait for a person’s next answer in this chat, or anyone when people is omitted. Each expectation closes on their next authenticated message, even a mention. Waits expire within 48 hours.',
+    'Wait for a person’s next answer in this chat so it reaches you without needing your name, or anyone when people is omitted. Each expectation closes on their next authenticated message, even a mention. Waits expire within 48 hours.',
   properties: {
     people: {
       type: 'array',

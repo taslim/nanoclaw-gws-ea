@@ -164,6 +164,18 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
     for (const marker of scenario.privateMarkers ?? [])
       await addPrivateValue({ label: marker, kind: 'other', value: marker });
   }
+  if (scenario.id === 'comm-main-principal-triage') {
+    await openMatterWithLook(
+      {
+        title: 'Dinner with Remy',
+        openLoop:
+          'Emailed Remy about Friday Nov 6 at 7:00 PM at Saffron Table; still waiting on Remy’s reply before booking.',
+        links: [],
+        place: 'Saffron Table, San Francisco',
+      },
+      { kind: 'once', at: '2026-11-04T17:00:00.000Z' },
+    );
+  }
   if (scenario.audience === 'main') ensureMemoryScaffold(agent);
   if (scenario.id === 'trip-zone')
     await addStay({
@@ -188,7 +200,10 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
       : scenario.id === 'principal-does-it' ||
           scenario.id === 'missing-remy' ||
           scenario.id === 'location-field' ||
-          scenario.id === 'friend-dinner-length'
+          scenario.id === 'friend-dinner-length' ||
+          scenario.id === 'comm-met-before-friend' ||
+          scenario.id === 'comm-whatsapp-group-banter' ||
+          scenario.id === 'comm-main-principal-triage'
         ? [
             {
               name: 'Remy Vance',
@@ -204,11 +219,21 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
                 name: 'Juno Hale',
                 level: 'active',
                 identity: 'juno.hale@example.test',
-                basis: 'A new supplier with one straightforward introduction topic.',
+                basis: 'New supplier introduction.',
                 note: 'One-topic supplier introduction; Morgan prefers 20 minutes.',
               },
             ]
-          : [];
+          : scenario.id === 'comm-whatsapp-dinner-dm' || scenario.id === 'comm-whatsapp-followup-turn'
+            ? [
+                {
+                  name: 'Juno Hale',
+                  level: 'active',
+                  identity: 'juno.hale@example.test',
+                  basis: 'A friend and regular contact of Morgan.',
+                  note: 'Friend of Morgan in San Francisco.',
+                },
+              ]
+            : [];
   for (const seed of people) {
     const person = await addPerson({
       name: seed.name,

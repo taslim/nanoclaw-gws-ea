@@ -72,10 +72,10 @@ Arrange the page by the job. These are orders of information, not layouts.
 
 [elements.md](elements.md) has the shapes that need a pattern: key facts, options, comparison tables that stack on phones, day by day, steps, people, figures, sources and callouts. Add CSS only for what this page needs.
 
-**Hierarchy comes from the order first,** then size, weight, grey and space. Colour, boxes and labels carry meaning:
+**Hierarchy comes from the order first,** then size, weight, gray and space. Color, boxes and labels carry meaning:
 
 - the accent marks a link, the recommended option, or focus;
-- a state colour sits beside the word that names the state;
+- a state color sits beside the word that names the state;
 - a box holds the one thing not to miss.
 
 An eyebrow label, a badge, a card, an icon, a large number or a gradient belongs only where it tells the reader something.
@@ -130,8 +130,8 @@ Read it once as the principal on a phone:
 - every number has its unit and basis;
 - every date is absolute;
 - no sentence describes the page;
-- links are few and labelled;
-- nothing depends on colour alone;
+- links are few and labeled;
+- nothing depends on color alone;
 - a page for others reads well to someone outside the conversation.
 
 **Look at the rendered page only when the layout is at risk:** your own CSS or a branch from the house look, a chart, or a table of five or more columns. With `agent-browser`:
@@ -139,6 +139,6 @@ Read it once as the principal on a phone:
 1. Open `file:///workspace/agent/<file>.html`.
 2. Run `set viewport 390 844` and screenshot.
 3. Run `set viewport 1280 800` and screenshot again.
-4. If you set your own colours, also check with `set media dark`.
+4. If you set your own colors, also check with `set media dark`.
 
 Fix what you see. A page built from the starter and its elements needs only the read-through, so it can go straight away.

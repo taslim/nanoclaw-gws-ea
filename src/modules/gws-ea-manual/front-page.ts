@@ -80,6 +80,7 @@ function renderManualSections(snapshot: ManualSnapshot): string[] {
       'Profile',
       [
         profile.principal_display_name ?? 'Principal name not set',
+        ...(profile.principal_pronouns === null ? [] : [`Pronouns: ${profile.principal_pronouns}`]),
         `Home time zone: ${profile.principal_timezone ?? 'zone unknown'}`,
       ],
       350,

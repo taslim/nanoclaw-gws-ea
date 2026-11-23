@@ -167,7 +167,7 @@ function buildDestinationsSection(mode: SessionMode, canReply: boolean): string 
   }
 
   lines.push(
-    'Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered, and `<internal>…</internal>` marks it as scratchpad explicitly. Include several blocks in one response to address several destinations; each block lands as its own message.',
+    'Wrap every reply in a `<message to="name">…</message>` block: text outside a block is not delivered, and `<internal>…</internal>` marks it as scratchpad explicitly. Never leave loose prose outside `<message>` or `<internal>` tags. Include several blocks in one response to address several destinations; each block lands as its own message.',
   );
   lines.push('');
   lines.push(QUIET_ENDING);

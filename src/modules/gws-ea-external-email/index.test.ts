@@ -4,7 +4,6 @@
  * that holds its guidance, two names and the principal's time zone, and
  * nothing else of GWS-EA's.
  */
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -38,7 +37,7 @@ import { composeGroupProjectDoc, DEFAULT_PROJECT_DOC } from '../../project-doc-c
 import { unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
-import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
+import { reconcileGwsEaProfile, setPrincipalNameAndTimezone } from '../gws-ea-profile/db.js';
 import { EXTERNAL_EMAIL_TOOLS_CAPABILITY, MAIN_EMAIL_CAPABILITY } from './group.js';
 import {
   EXTERNAL_EMAIL_CAPABILITIES,
@@ -287,17 +286,29 @@ describe("external-email's project document", () => {
     const escaped = 'Juno \\*Hale\\* \\[Jr\\] \\#1\\_';
     expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose home time zone is Europe/London.`);
     expect(composed.get('# Assistant Identity')).toContain(`${escaped} is the principal.`);
+
+    await setPrincipalNameAndTimezone({ pronouns: 'she/her' });
+    await composeGroupProjectDoc(ee, groupDir, DEFAULT_PROJECT_DOC);
+    const withPronouns = sections(fs.readFileSync(path.join(groupDir, DEFAULT_PROJECT_DOC.fileName), 'utf8'));
+    expect(withPronouns.get('# Principal')).toBe(
+      `You work for ${escaped} (she/her), whose home time zone is Europe/London.`,
+    );
   });
 
-  it('preserves How you write and the three example emails verbatim', () => {
+  it('teaches sharp, warm, US-default email craft with four concrete examples and anti-leakage rules', () => {
     const writing = GUIDANCE_TEXT.slice(
       GUIDANCE_TEXT.indexOf('## How you write\n'),
       GUIDANCE_TEXT.indexOf('## Working with main\n'),
     );
-    // Frozen before the character-core rewrite: wording and examples are the contract.
-    expect(createHash('sha256').update(writing).digest('hex')).toBe(
-      '742e99de37cb6417bbf2b2786d7b8211bdd0ec29c4075afd250d6cfb2376ff3d',
-    );
+    expect(writing).toContain('Default to US spelling and date/time conventions');
+    expect(writing).toContain('Never leak internal boundaries or brief wording into customer prose.');
+    expect(writing).toContain('Never re-ask facts or terms the thread already answered');
+    expect(writing).toContain("when the host notes you've emailed them in an earlier thread — skip the cold intro");
+    expect(writing).toContain('**A first email to a friend.**');
+    expect(writing).toContain('**Copied in with "Juno, can you handle this?"**');
+    expect(writing).toContain('**A "no, and".**');
+    expect(writing).toContain('**Getting something done with a vendor or organization.**');
+    expect(writing).not.toMatch(/\b(?:disorganised|autumn|dialling|finalise|enquiry)\b/iu);
   });
 
   it('names no link, address or emoji', () => {

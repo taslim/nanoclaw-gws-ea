@@ -12,14 +12,19 @@ import {
 } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { getSession } from '../../db/sessions.js';
+import { findSessionForAgent, getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import { hasControlCharacters, isRecord, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
-import { requestWake } from '../../request-wake.js';
+import { scheduleSessionReconcile } from '../../reconcile-feeds.js';
 import { runInConversationTail } from '../../router.js';
-import { readOutboxFiles, resolveSession, writeSessionMessage } from '../../session-manager.js';
-import type { Session } from '../../types.js';
+import {
+  readOutboxFiles,
+  resolveSession,
+  withExistingMailboxSession,
+  writeSessionMessage,
+} from '../../session-manager.js';
+import type { MessagingGroup, Session } from '../../types.js';
 import type { AssistantChatChannel } from '../gws-ea-chat/membership.js';
 import { artifactAudienceForMembers, hasArtifactLinks } from '../gws-ea-artifacts/links.js';
 import { getJobAgent } from '../gws-ea-chat-agents/jobs.js';
@@ -54,6 +59,8 @@ import { setChatMemberEmail, type ChatMember } from './roster.js';
 import { admitChatMove, driveChatMove, pauseMoveReminders, prepareChatMove } from './move.js';
 
 export const CHAT_TELL_MAIN_ACTION = 'chat_tell_main';
+/** Short burst coalesce window on chat handoffs so back-to-back tool calls become one chat message. */
+export const CHAT_HANDOFF_COALESCE_MS = 15_000;
 const MAX_MESSAGE = 8_000;
 const MAX_FILES = 10;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
@@ -232,6 +239,83 @@ async function checkHandoffLinks(
 function handoffId(session: Session, requestId: string): string {
   return `chat-handoff-${createHash('sha256').update(`${session.id}\0${requestId}`).digest('hex')}`;
 }
+function elapsedWords(sinceIso: string, now: Date): string {
+  const minutes = Math.max(0, Math.round((now.getTime() - Date.parse(sinceIso)) / 60_000));
+  if (minutes < 1) return 'under a minute ago';
+  if (minutes === 1) return '1 minute ago';
+  if (minutes < 60) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
+}
+
+function isOutsiderInbound(content: string): boolean {
+  try {
+    const parsed = JSON.parse(content) as { sender?: unknown };
+    return parsed.sender !== 'main' && parsed.sender !== 'system';
+  } catch (error) {
+    if (error instanceof SyntaxError) return true;
+    throw error;
+  }
+}
+
+/** ISO timestamp of the latest delivered outbound message in this chat when no outsider has replied since. */
+async function chatUnansweredOutboundAt(session: Session, group: MessagingGroup): Promise<string | undefined> {
+  return withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+    const delivered = mailbox.getDeliveredIds('delivered');
+    let latestOut: string | undefined;
+    for (const row of mailbox.getOutboundRecords('1970-01-01T00:00:00.000Z')) {
+      if (
+        delivered.has(row.id) &&
+        (row.kind === 'chat' || row.kind === 'chat-sdk') &&
+        row.channelType === group.channel_type &&
+        row.platformId === group.platform_id
+      ) {
+        if (latestOut === undefined || row.timestamp > latestOut) latestOut = row.timestamp;
+      }
+    }
+    if (latestOut === undefined) return undefined;
+    for (const row of mailbox.getInboundRecords({ since: latestOut })) {
+      if (
+        row.status !== 'held' &&
+        row.kind === 'chat' &&
+        row.channelType === group.channel_type &&
+        row.platformId === group.platform_id &&
+        row.timestamp > latestOut &&
+        isOutsiderInbound(row.content)
+      ) {
+        return undefined;
+      }
+    }
+    return latestOut;
+  });
+}
+
+async function chatCoalesceDeadline(session: Session, group: MessagingGroup): Promise<string> {
+  const maxDeadlineMs = Date.now() + CHAT_HANDOFF_COALESCE_MS;
+  const deadline = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+    const waiting = mailbox.getWaitingMessages().filter((message) => message.tries === 0);
+    if (waiting.length === 0) return undefined;
+    const origins = new Map(
+      mailbox.getInboundMessages(waiting.map((message) => message.id)).map((origin) => [origin.id, origin]),
+    );
+    return waiting.find((message) => {
+      const origin = origins.get(message.id);
+      if (
+        !origin ||
+        origin.kind !== 'chat' ||
+        origin.channelType !== group.channel_type ||
+        origin.platformId !== group.platform_id ||
+        !origin.id.startsWith('chat-handoff-')
+      ) {
+        return false;
+      }
+      const dueMs = Date.parse(message.processAfter);
+      return Number.isFinite(dueMs) && dueMs <= maxDeadlineMs;
+    })?.processAfter;
+  });
+  return deadline ?? new Date(maxDeadlineMs).toISOString();
+}
+
 /**
  * Caller owns the chat conversation tail. While a move is pending, handoffs wait for the move's own
  * `wake: false` call, made once the chat's serving agent is final.
@@ -250,10 +334,17 @@ export async function flushChatHandoffs(chatId: string, options: { readonly wake
   const pending = await listChatHandoffs(chatId, true);
   if (pending.length === 0) return;
   const { session } = await resolveSession(chat.serving_agent_group_id, chatId, null, 'shared');
-  await releaseChatMessages(chatId, { wake: false });
+  const processAfter = options.wake === false ? null : await chatCoalesceDeadline(session, group);
+  await releaseChatMessages(chatId, { wake: false, ...(processAfter === null ? {} : { processAfter }) });
+  const unansweredAt = options.wake === false ? undefined : await chatUnansweredOutboundAt(session, group);
+  const excludeHandoffIds = processAfter === null ? undefined : new Set(pending.map((entry) => entry.id));
   for (const handoff of pending) {
     const files = await filesForHandoff(handoff.id);
-    await writeChatContext(session);
+    await writeChatContext(session, excludeHandoffIds ? { excludeHandoffIds } : undefined);
+    const unansweredNote =
+      unansweredAt !== undefined && unansweredAt <= handoff.created_at
+        ? `Note: your last message in this chat (${elapsedWords(unansweredAt, new Date())}) has no reply yet — only send another if this changes something they need to know now.\n`
+        : '';
     let written = false;
     try {
       await writeSessionMessage(session.agent_group_id, session.id, {
@@ -263,9 +354,10 @@ export async function flushChatHandoffs(chatId: string, options: { readonly wake
         channelType: group.channel_type,
         platformId: group.platform_id,
         threadId: null,
+        processAfter,
         content: JSON.stringify({
           sender: 'main',
-          text: `From main${handoff.matter_id === null ? '' : ` for matter ${handoff.matter_id}`}:\n${handoff.message}`,
+          text: `${unansweredNote}From main${handoff.matter_id === null ? '' : ` for matter ${handoff.matter_id}`}:\n${handoff.message}`,
           attachments: files.map((file) => ({
             name: file.filename,
             size: file.data.length,
@@ -280,7 +372,9 @@ export async function flushChatHandoffs(chatId: string, options: { readonly wake
       if (!isDuplicateNote(error)) throw error;
     }
     await getDb().run('UPDATE gws_ea_chat_handoffs SET delivered_session_id=? WHERE id=?', session.id, handoff.id);
-    if (written && options.wake !== false) await requestWake(session, 'inbound-message');
+    if (written && options.wake !== false && processAfter !== null) {
+      scheduleSessionReconcile(session.id, Math.max(0, Date.parse(processAfter) - Date.now()));
+    }
   }
 }
 
@@ -368,8 +462,16 @@ const handoff: ActionAnswer = async (content, session, requestId) => {
       await pauseMoveReminders(chatId);
       driveChatMove(chatId);
     }
+    const existingSession = group ? await findSessionForAgent(chat.serving_agent_group_id, chatId, null) : undefined;
+    const unansweredAt = existingSession && group ? await chatUnansweredOutboundAt(existingSession, group) : undefined;
     await flushChatHandoffs(chatId);
-    return { chat: chatId, message: 'Your words are kept for this chat.' };
+    return {
+      chat: chatId,
+      message:
+        unansweredAt === undefined
+          ? 'Your words are kept for this chat.'
+          : `Your words are kept for this chat. Note: a message already went out here (${elapsedWords(unansweredAt, new Date())}) with no reply yet.`,
+    };
   });
 };
 const tellMain: ActionAnswer = async (content, session, requestId) => {

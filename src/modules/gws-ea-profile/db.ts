@@ -32,6 +32,7 @@ export interface GwsEaProfile {
   /** The web alias the operator confirmed adding, one of the assistant's own addresses; null until confirmed. */
   readonly assistant_alias: string | null;
   readonly principal_display_name: string | null;
+  readonly principal_pronouns: string | null;
   readonly principal_timezone: string | null;
   readonly main_agent_group_id: string | null;
   readonly external_email_agent_group_id: string | null;
@@ -74,19 +75,21 @@ export interface PrincipalAddress {
   readonly added_at: string;
 }
 
-/** The principal's name and home timezone, as the profile holds them; null until create seeds them. */
+/** The principal's name, pronouns and home timezone, as the profile holds them; null until set. */
 export interface PrincipalNameAndTimezone {
   readonly first_name: string | null;
   readonly last_name: string | null;
   readonly name: string | null;
+  readonly pronouns: string | null;
   readonly timezone: string | null;
 }
 
-/** The principal's name and home timezone once main is published, when the profile holds both. */
+/** The principal's name, pronouns and home timezone once main is published, when the profile holds name and timezone. */
 export interface PublishedNameAndTimezone {
   readonly first_name: string;
   readonly last_name: string | null;
   readonly name: string;
+  readonly pronouns: string | null;
   readonly timezone: string;
 }
 
@@ -115,6 +118,18 @@ function principalTimezone(value: string): string {
     throw new Error(`Principal timezone is not an IANA time zone such as Europe/London: ${JSON.stringify(value)}`);
   }
   return zone;
+}
+
+const PRONOUNS_PATTERN = /^[\p{L}][\p{L}/ -]{0,39}$/u;
+
+function principalPronouns(value: string): string {
+  const cleaned = value.replace(/\s+/gu, ' ').trim();
+  if (!cleaned || hasControlCharacters(cleaned) || !PRONOUNS_PATTERN.test(cleaned)) {
+    throw new Error(
+      `Principal pronouns must be short pronoun text such as he/him, she/her, or they/them: ${JSON.stringify(value)}`,
+    );
+  }
+  return cleaned;
 }
 
 function identifier(value: string, label: string): string {
@@ -328,7 +343,7 @@ export async function getGwsEaProfile(): Promise<GwsEaProfile> {
     Omit<GwsEaProfile, 'principal_emails' | 'assistant_display_name' | 'principal_display_name'>
   >(
     `SELECT assistant_first_name, assistant_last_name, assistant_workspace_email, assistant_alias, principal_first_name, principal_last_name,
-            principal_timezone, main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id, updated_at
+            principal_pronouns, principal_timezone, main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );
@@ -466,8 +481,10 @@ export async function nameAssistantAgent(agentGroupId: string): Promise<void> {
 
 export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezone> {
   const profile = await getDb().get<
-    Pick<GwsEaProfile, 'principal_first_name' | 'principal_last_name' | 'principal_timezone'>
-  >('SELECT principal_first_name, principal_last_name, principal_timezone FROM gws_ea_profile WHERE singleton = 1');
+    Pick<GwsEaProfile, 'principal_first_name' | 'principal_last_name' | 'principal_pronouns' | 'principal_timezone'>
+  >(
+    'SELECT principal_first_name, principal_last_name, principal_pronouns, principal_timezone FROM gws_ea_profile WHERE singleton = 1',
+  );
   if (!profile) throw new Error('GWS-EA profile singleton is missing');
   return {
     name:
@@ -476,6 +493,7 @@ export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezo
         : displayPersonName({ firstName: profile.principal_first_name, lastName: profile.principal_last_name }),
     first_name: profile.principal_first_name,
     last_name: profile.principal_last_name,
+    pronouns: profile.principal_pronouns,
     timezone: profile.principal_timezone,
   };
 }
@@ -548,11 +566,17 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
 export async function setPrincipalNameAndTimezone(change: {
   readonly firstName?: string;
   readonly lastName?: string | null;
+  readonly pronouns?: string | null;
   readonly timezone?: string;
 }): Promise<{ readonly before: PublishedNameAndTimezone; readonly after: PublishedNameAndTimezone }> {
   if (typeof change.lastName === 'string' && !change.lastName.trim()) {
     throw new Error('Use --clear-last-name to remove the last name');
   }
+  if (typeof change.pronouns === 'string' && !change.pronouns.trim()) {
+    throw new Error('Use --clear-pronouns to remove pronouns');
+  }
+  const pronouns =
+    change.pronouns === undefined ? undefined : change.pronouns === null ? null : principalPronouns(change.pronouns);
   const timezone = change.timezone === undefined ? undefined : principalTimezone(change.timezone);
   const db = getDb();
   return db.transaction(async () => {
@@ -572,23 +596,27 @@ export async function setPrincipalNameAndTimezone(change: {
       name: held.name,
       first_name: held.first_name,
       last_name: held.last_name,
+      pronouns: held.pronouns,
       timezone: held.timezone,
     };
     const after: PublishedNameAndTimezone = {
       name: displayPersonName(name),
       first_name: name.firstName,
       last_name: name.lastName,
+      pronouns: pronouns === undefined ? before.pronouns : pronouns,
       timezone: timezone ?? before.timezone,
     };
     if (
       after.first_name !== before.first_name ||
       after.last_name !== before.last_name ||
+      after.pronouns !== before.pronouns ||
       after.timezone !== before.timezone
     ) {
       await db.run(
-        `UPDATE gws_ea_profile SET principal_first_name = ?, principal_last_name = ?, principal_timezone = ?, updated_at = ? WHERE singleton = 1`,
+        `UPDATE gws_ea_profile SET principal_first_name = ?, principal_last_name = ?, principal_pronouns = ?, principal_timezone = ?, updated_at = ? WHERE singleton = 1`,
         after.first_name,
         after.last_name,
+        after.pronouns,
         after.timezone,
         new Date().toISOString(),
       );

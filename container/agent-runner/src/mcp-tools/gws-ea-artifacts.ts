@@ -100,7 +100,7 @@ export const artifactSave = requestTool({
   ...common,
   name: 'artifact_save',
   description:
-    'Save one self-contained HTML file as a private artifact. Create with a stable create_key; revise with artifact_id and the current expected_revision. Optionally supply expected_hash to require exact source bytes. This never shares content. After timeout use request_status.',
+    'Save one self-contained HTML file as a private artifact. Create with a stable create_key; revise with artifact_id and the current expected_revision. Optionally supply expected_hash to require exact source bytes. Artifacts stay until explicitly deleted or until requested expiry; a one-off view has no default expiry or recurring upkeep. This never shares content. After timeout use request_status.',
   properties: {
     create_key: identifier,
     artifact_id: identifier,
@@ -159,7 +159,7 @@ export const artifactShare = requestTool({
   ...common,
   name: 'artifact_share',
   description:
-    'Canonical main only: publish an exact saved revision to named email recipients or publicly, explicitly replace a share, or revoke it. Cite the principal’s own authenticated recent message authorizing this exact revision, audience and expiry; a message mark proves provenance, not meaning. private_value_ids asserts that the instruction explicitly permits those exact registered private details. Other detected private values require the principal’s card. Private edits never update a share. After timeout use request_status.',
+    'Canonical main only: publish an exact saved revision to named email recipients or publicly, explicitly replace a share, or revoke it. Cite the principal’s own authenticated recent message authorizing this exact revision, audience and expiry; a message mark proves provenance, not meaning. private_value_ids asserts that the instruction explicitly permits those exact registered private details. Other detected private values require the principal’s card. Private edits never update a share. Report pending, refused and withdrawn outcomes accurately. After timeout use request_status.',
   properties: {
     operation: {
       type: 'string',

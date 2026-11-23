@@ -27,10 +27,8 @@ import {
   createThread,
   findSend,
   insertPendingSend,
-  recordSent,
   recordThreadAddresses,
   recordThreadFile,
-  recordThreadMessage,
   threadAccount,
   threadPlacement,
   type SendScope,
@@ -45,6 +43,7 @@ const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
 const THREAD_ACCOUNTS = 'module:gws-ea-inbox:thread-accounts';
 const THREAD_PLACEMENT = 'module:gws-ea-inbox:thread-placement';
 const THREAD_AUTHENTICATION = 'module:gws-ea-inbox:thread-sender-authentication';
+const MESSAGE_ORIGIN = 'module:gws-ea-inbox:message-origin';
 
 /** The inbox's tables and its thread map's after the squash, with none of the scheduling tables the earlier chain dropped. */
 const INBOX_TABLES = [
@@ -175,8 +174,13 @@ async function writeSlice4Work(db: DbDriver): Promise<void> {
   await replacePrincipalCalendars([CALENDAR], AT);
 
   await createThread(GMAIL_THREAD, AT, THREAD);
-  await recordThreadMessage(
-    { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-1', rfcMessageId: '<q1@acme.example>' },
+  await db.run(
+    'INSERT INTO gws_ea_thread_messages (thread_key, position, side, gmail_message_id, rfc_message_id, recorded_at) VALUES (?, ?, ?, ?, ?, ?)',
+    THREAD,
+    1,
+    'outside',
+    'g-1',
+    '<q1@acme.example>',
     AT,
   );
   await recordThreadAddresses(THREAD, ['juno@acme.example'], 'message', AT);
@@ -190,9 +194,19 @@ async function writeSlice4Work(db: DbDriver): Promise<void> {
     AT,
   );
   await insertPendingSend({ id: 'send-1', scope: OUTSIDE, contentHash: 'hash-1', rfcMessageId: '<s1@n.example>' }, AT);
-  await recordSent(
-    { id: 'send-1', scope: OUTSIDE },
-    { gmailMessageId: 'g-2', gmailThreadId: GMAIL_THREAD, rfcMessageId: '<s1@n.example>' },
+  await db.run(
+    "UPDATE gws_ea_thread_sends SET state = 'sent', gmail_message_id = ?, updated_at = ? WHERE id = ?",
+    'g-2',
+    AT,
+    'send-1',
+  );
+  await db.run(
+    'INSERT INTO gws_ea_thread_messages (thread_key, position, side, gmail_message_id, rfc_message_id, recorded_at) VALUES (?, ?, ?, ?, ?, ?)',
+    THREAD,
+    2,
+    'outside',
+    'g-2',
+    '<s1@n.example>',
     AT,
   );
   await insertPendingSend({ id: 'send-2', scope: OUTSIDE, contentHash: 'hash-2', rfcMessageId: '<s2@n.example>' }, AT);
@@ -221,6 +235,7 @@ describe('the inbox migrations', () => {
       THREAD_ACCOUNTS,
       THREAD_PLACEMENT,
       THREAD_AUTHENTICATION,
+      MESSAGE_ORIGIN,
     ]);
     expect(
       getRegisteredMigrations()
@@ -275,6 +290,7 @@ describe('squashed migrations', () => {
       THREAD_ACCOUNTS,
       THREAD_PLACEMENT,
       THREAD_AUTHENTICATION,
+      MESSAGE_ORIGIN,
       bookingsMigration.name,
     ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
@@ -284,6 +300,13 @@ describe('squashed migrations', () => {
         ...(address as object),
         sender_authenticated: 0,
       })),
+      gws_ea_thread_messages: before.gws_ea_thread_messages.map((message) => {
+        const record = message as { gmail_message_id: string | null };
+        return {
+          ...(message as object),
+          origin: record.gmail_message_id === 'g-2' ? 'sent' : 'received',
+        };
+      }),
       gws_ea_threads: before.gws_ea_threads.map((thread) => ({
         ...(thread as object),
         account: null,

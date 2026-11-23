@@ -9,10 +9,10 @@
  * reads a row before it is due, and the host sweep wakes the session once it
  * is, so everything that arrived meanwhile reaches the agent in one turn.
  * The router asks for the deadline as it writes each email, the principal's
- * on an outside thread included (index.ts). `main`'s handoff starts no wait
- * of its own: it joins the pending deadline when there is one, so it is
- * worked with the mail already waiting, and is otherwise due as written
- * (`pendingDeadline`).
+ * on an outside thread included (index.ts). `main`'s handoff joins any
+ * pending deadline already ahead on the thread, or starts a short settle
+ * window (`HANDOFF_SETTLE_MS`) so rapid corrections merge into one outbound
+ * email (`handoffDeadline`).
  *
  * A deadline is pending only while it is ahead and pace set it: a retried
  * message waits out its backoff, which holds no new mail. Once the agent has
@@ -30,6 +30,8 @@ import { threadPlacement } from './thread-map.js';
 
 const PACE_MIN_MS = 3 * 60_000;
 const PACE_MAX_MS = 6 * 60_000;
+/** Short settle window on `main`'s email handoffs so rapid corrections coalesce into one outbound email. */
+export const HANDOFF_SETTLE_MS = 90_000;
 
 async function isOutsideThread(session: Session): Promise<boolean> {
   const { inbox } = await emailMessagingGroupIds();
@@ -76,4 +78,13 @@ export async function inboundPace(session: Session): Promise<InboundPace | undef
 /** The deadline a row written now joins; null when none is ahead, and for every session but an outside thread's. */
 export async function pendingDeadline(session: Session): Promise<string | null> {
   return (await isOutsideThread(session)) ? waitingDeadline(session) : null;
+}
+
+/**
+ * The deadline for `main`'s email handoff: joins any waiting pace or settle
+ * window already ahead on the thread, or starts a short settle window so a
+ * rapid correction merges into the same turn instead of sending two emails.
+ */
+export async function handoffDeadline(session: Session): Promise<string> {
+  return (await waitingDeadline(session)) ?? new Date(Date.now() + HANDOFF_SETTLE_MS).toISOString();
 }

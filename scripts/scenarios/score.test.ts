@@ -176,6 +176,79 @@ describe('hard-fact scoring', () => {
     expect(attemptsSettled([false, false], 3)).toBe(true);
     expect(attemptsSettled([false], 1)).toBe(true);
   });
+  it('enforces mechanical communication hygiene and unwrapped bare text on outward roles', () => {
+    const commCase = cases.find((entry) => entry.id === 'comm-goodwill-waiver')!;
+    const cleanOut: Effect = {
+      kind: 'message',
+      operation: 'send',
+      target: 'outward',
+      payload: {
+        subject: 'Reservation HG-44109',
+        text: 'Hi team, could you help with a goodwill cancellation on HG-44109?',
+      },
+      actor: 'external-email',
+      attempt: 1,
+    };
+    expect(
+      mechanicalScore(commCase, [cleanOut], [], [], '<internal>Sent opening email and updated main.</internal>'),
+    ).toEqual({ pass: true, violations: [] });
+    expect(
+      mechanicalScore(
+        commCase,
+        [cleanOut],
+        [],
+        [],
+        '<message to="inbox">Hi team</message>\nI replied on the thread and updated main.',
+      ).violations,
+    ).toEqual(['unwrapped bare text outside <message>/<internal>: "I replied on the thread and updated main."']);
+    expect(
+      mechanicalScore({ ...commCase, maxOutwardMessages: 0 }, [cleanOut], [], [], '<internal>Quiet.</internal>')
+        .violations,
+    ).toEqual(['outward messages (1) exceeded max (0)']);
+    expect(
+      mechanicalScore(commCase, [
+        {
+          ...cleanOut,
+          payload: {
+            text: 'This is inquiry only — please do not charge anything, apologies to bother, see you tonight!',
+          },
+        },
+      ]).violations,
+    ).toEqual([
+      'internal guardrail phrase leaked in outward message: "inquiry only"',
+      'internal guardrail phrase leaked in outward message: "do not charge"',
+      'attending-persona sign-off in outward message: "see you tonight"',
+    ]);
+    expect(
+      mechanicalScore(commCase, [
+        { ...cleanOut, payload: { text: 'Happy to help organise and finalise this favour.' } },
+      ]).violations,
+    ).toEqual(['UK spelling in default-US outward message: "organise"']);
+    expect(
+      mechanicalScore({ ...commCase, allowUkSpelling: true }, [
+        { ...cleanOut, payload: { text: 'Happy to help organise this.' } },
+      ]).pass,
+    ).toBe(true);
+  });
+  it('validates optional judge craft dimensions', () => {
+    const parsed = parseJudge({
+      pass: true,
+      score: 5,
+      rationale: 'Crisp, warm, accurate.',
+      observedOutcome: 'Sent one clean email.',
+      dimensions: { outcome: 5, voice: 5, conciseness: 4, guardrails: 5 },
+    });
+    expect(parsed.dimensions).toEqual({ outcome: 5, voice: 5, conciseness: 4, guardrails: 5 });
+    expect(() =>
+      parseJudge({
+        pass: true,
+        score: 5,
+        rationale: 'ok',
+        observedOutcome: 'ok',
+        dimensions: { outcome: 6, voice: 5, conciseness: 5, guardrails: 5 },
+      }),
+    ).toThrow('dimensions');
+  });
 });
 
 describe('inference cost ledger', () => {

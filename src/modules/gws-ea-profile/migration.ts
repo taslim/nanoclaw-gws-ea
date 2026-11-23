@@ -129,3 +129,14 @@ export const gwsEaAliasConfirmationMigration: ModuleMigration = {
     await db.exec('ALTER TABLE gws_ea_profile DROP COLUMN alias_probe_message_id;');
   },
 };
+
+/** Optional principal pronouns (for example `he/him`, `she/her`, `they/them`), shown to outward roles once known. */
+export const gwsEaPrincipalPronounsMigration: ModuleMigration = {
+  version: 10,
+  name: 'module:gws-ea-profile:principal-pronouns',
+  async up(db) {
+    await db.exec(
+      'ALTER TABLE gws_ea_profile ADD COLUMN principal_pronouns TEXT CHECK (principal_pronouns IS NULL OR length(trim(principal_pronouns)) > 0);',
+    );
+  },
+};

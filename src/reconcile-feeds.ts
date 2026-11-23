@@ -12,10 +12,18 @@
 import { log } from './log.js';
 
 let enqueue: ((sessionId: string) => void) | null = null;
+const scheduled = new Map<string, { readonly at: number; readonly timer: NodeJS.Timeout }>();
+
+/** Cancel every pending delayed reconcile enqueue. */
+export function clearScheduledReconciles(): void {
+  for (const entry of scheduled.values()) clearTimeout(entry.timer);
+  scheduled.clear();
+}
 
 /** The sweep's hook. Last registration wins; null clears. */
 export function registerReconcileEnqueue(fn: ((sessionId: string) => void) | null): void {
   enqueue = fn;
+  if (fn === null) clearScheduledReconciles();
 }
 
 /**
@@ -31,4 +39,27 @@ export function enqueueSessionReconcile(sessionId: string): void {
     log.warn('Reconcile enqueue failed', { sessionId, err });
   }
   /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * Ask for a prompt reconcile of one session once `delayMs` has elapsed.
+ * Keeps the earliest pending wake for a session, unrefs the timer so shutdown
+ * never hangs, and relies on the periodic sweep as the durable fallback.
+ */
+export function scheduleSessionReconcile(sessionId: string, delayMs: number): void {
+  if (delayMs <= 0) {
+    enqueueSessionReconcile(sessionId);
+    return;
+  }
+  const wait = Math.ceil(delayMs) + 50;
+  const at = Date.now() + wait;
+  const existing = scheduled.get(sessionId);
+  if (existing && existing.at <= at) return;
+  if (existing) clearTimeout(existing.timer);
+  const timer = setTimeout(() => {
+    scheduled.delete(sessionId);
+    enqueueSessionReconcile(sessionId);
+  }, wait);
+  timer.unref();
+  scheduled.set(sessionId, { at, timer });
 }

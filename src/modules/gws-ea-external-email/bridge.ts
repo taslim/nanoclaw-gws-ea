@@ -42,6 +42,7 @@ import { getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
+import { scheduleSessionReconcile } from '../../reconcile-feeds.js';
 import { requestWake } from '../../request-wake.js';
 import { readOutboxFiles, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -49,6 +50,7 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { isBookableCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { calendarAccessOf, emailMessagingGroupIds } from '../gws-ea-inbox/db.js';
 import { normalizeAddress } from '../gws-ea-inbox/mime.js';
+import { handoffDeadline } from '../gws-ea-inbox/pace.js';
 import {
   listed,
   loadRoutingContext,
@@ -61,6 +63,7 @@ import {
   createThread,
   getThread,
   placeThread,
+  previouslyContactedAddresses,
   recordThreadAddresses,
   recordThreadFile,
   releaseThread,
@@ -70,6 +73,7 @@ import {
   threadAddresses,
   threadMessages,
   threadPlacement,
+  unansweredOutboundAt,
   type AddressSource,
   type ThreadAddress,
 } from '../gws-ea-inbox/thread-map.js';
@@ -276,15 +280,53 @@ function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
+interface HandoffHints {
+  readonly metBefore: readonly string[];
+  readonly unansweredAge?: string;
+}
+
+function elapsedWords(sinceIso: string, now: Date): string {
+  const minutes = Math.max(0, Math.round((now.getTime() - Date.parse(sinceIso)) / 60_000));
+  if (minutes < 1) return 'under a minute ago';
+  if (minutes === 1) return '1 minute ago';
+  if (minutes < 60) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
+}
+
 /** No thread key: `external-email` works only in this one conversation. */
-function handoffText(target: Target, message: string, files: readonly OutboundFile[], context: RoutingContext): string {
+function handoffText(
+  target: Target,
+  message: string,
+  files: readonly OutboundFile[],
+  context: RoutingContext,
+  hints: HandoffHints,
+): string {
   const people = listed(target.people.map((address) => marked(address, context)));
   const sendable = files.length === 0 ? [] : [`You may send ${listed(files.map((file) => file.filename))} in it.`];
+  const metBeforeLine =
+    target.kind === 'new' && hints.metBefore.length > 0
+      ? [
+          `You have emailed ${listed(hints.metBefore)} in an earlier thread, so they already know who you are — skip the cold introduction.`,
+        ]
+      : [];
+  const unansweredLine =
+    target.kind === 'thread' && hints.unansweredAge !== undefined
+      ? [
+          `Note: you already sent the latest email on this thread (${hints.unansweredAge}) with no reply yet — only send another if this changes something they need to know now.`,
+        ]
+      : [];
   return (
     target.kind === 'new'
-      ? [`From main: a new conversation with ${people} — nothing has been sent yet.`, ...sendable, "main's words:"]
+      ? [
+          `From main: a new conversation with ${people} — nothing has been sent yet.`,
+          ...metBeforeLine,
+          ...sendable,
+          "main's words:",
+        ]
       : [
           ...(target.people.length === 0 ? [] : [`You may now write to ${people} here.`]),
+          ...unansweredLine,
           ...sendable,
           'From main, about this conversation:',
         ]
@@ -390,13 +432,14 @@ async function writeHandoff(
   thread: Session,
   threadKey: string,
   handoff: Admitted,
+  hints: HandoffHints,
   requestId: string,
   at: string,
 ): Promise<void> {
   const { target, message, files, context } = handoff;
   const id = `handoff-${requestId}`;
   const content = JSON.stringify({
-    text: handoffText(target, message, files, context),
+    text: handoffText(target, message, files, context, hints),
     sender: 'main',
     ...(files.length === 0
       ? {}
@@ -419,7 +462,7 @@ async function writeHandoff(
       at,
     );
   }
-  const processAfter = await releaseHeldMail(thread);
+  const processAfter = await releaseHeldMail(thread, await handoffDeadline(thread));
   try {
     await writeSessionMessage(thread.agent_group_id, thread.id, {
       id,
@@ -436,10 +479,12 @@ async function writeHandoff(
     // A replayed request: its handoff is already there.
     if (!isDuplicateNote(error)) throw error;
   }
-  // Mail already waiting wakes the session when it comes due; words and mail due now wake it here.
+  // Mail or a settle window already waiting wakes the session when it comes due; immediate rows wake it here.
   if (processAfter === null) {
     const fresh = await getSession(thread.id);
     if (fresh) await requestWake(fresh, 'inbound-message');
+  } else {
+    scheduleSessionReconcile(thread.id, Math.max(0, Date.parse(processAfter) - Date.now()));
   }
 }
 
@@ -450,9 +495,13 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
   const { target, files, bookingCalendar, matter } = handoff;
   const at = handoff.context.at.toISOString();
   const threadKey = target.kind === 'thread' ? target.threadKey : newThreadKey(session, requestId);
+  const outsidePeople = target.people.filter((address) => !handoff.context.auth.principalAddresses.has(address));
+  const metBefore = target.kind === 'new' ? await previouslyContactedAddresses(outsidePeople, threadKey) : [];
+  const unansweredAt = target.kind === 'thread' ? await unansweredOutboundAt(threadKey) : undefined;
+  const unansweredAge = unansweredAt === undefined ? undefined : elapsedWords(unansweredAt, handoff.context.at);
   await recordHandoff(threadKey, handoff, at);
   const { session: thread } = await resolveSession(externalEmail, inbox, threadKey, 'per-thread');
-  await writeHandoff(thread, threadKey, handoff, requestId, at);
+  await writeHandoff(thread, threadKey, handoff, { metBefore, unansweredAge }, requestId, at);
   const joined =
     matter === undefined ? [] : [await joinRequestedMatter(matter, { kind: 'thread', reference: threadKey })];
   return {
@@ -463,6 +512,9 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
         : `external-email has your words for thread ${threadKey} and takes them up within a few minutes.${
             target.people.length === 0 ? '' : ` It may write to ${target.people.join(', ')} there.`
           }`,
+      ...(unansweredAge === undefined
+        ? []
+        : [`Note: an email already went out on this thread (${unansweredAge}) with no reply yet.`]),
       ...(files.length === 0 ? [] : [`It may send ${files.map((file) => file.filename).join(', ')} in that thread.`]),
       ...(bookingCalendar === undefined ? [] : [`Its bookings go on calendar ${bookingCalendar}.`]),
       ...joined,

@@ -75,7 +75,15 @@ import { findSessionForAgent } from '../../db/sessions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { registerReconcileEnqueue } from '../../reconcile-feeds.js';
+import { reconcileSession } from '../../reconcile-session.js';
+import {
+  resolveSession,
+  sessionDir,
+  withExistingMailboxSession,
+  writeOutboundDirect,
+  writeSessionMessage,
+} from '../../session-manager.js';
 import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import { openMatter, getMatter } from '../gws-ea-matters/db.js';
@@ -86,7 +94,8 @@ import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { getChatCalendar, chatFiles, listChatHandoffs } from './handoffs.js';
-import { flushChatHandoffs, inChatConversation } from './bridge.js';
+import { CHAT_HANDOFF_COALESCE_MS, flushChatHandoffs, inChatConversation } from './bridge.js';
+import { writeChatContext } from './context.js';
 import { judgeSend } from '../gws-ea-privacy/outbound.js';
 import { WHATSAPP_DIRECTORY_ENV, writeWhatsAppLink } from '../gws-ea-whatsapp/paths.js';
 import { prepareArtifactSource, saveArtifact } from '../gws-ea-artifacts/db.js';
@@ -252,13 +261,14 @@ beforeEach(async () => {
   vi.mocked(requestWake).mockResolvedValue(true);
 });
 afterEach(async () => {
+  registerReconcileEnqueue(null);
   await teardownChannelAdapters();
   await closeDb();
   vi.unstubAllEnvs();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
-it('hands main’s words to the exact chat session and replays a request only once', async () => {
+it('hands main’s words to the exact chat session, coalesces rapid follow-ups into one window, and replays once', async () => {
   const id = await chat();
   const fields = { chat: id, message: 'Plan the trip.', matter: 'nowhere' };
   const first = await request(main, 'chat_handoff', fields, {}, 'same-handoff');
@@ -268,8 +278,103 @@ it('hands main’s words to the exact chat session and replays a request only on
   const handoffs = rows(session).filter((row) => row.id.startsWith('chat-handoff-'));
   expect(handoffs).toHaveLength(1);
   expect(handoffs[0].content.text).toContain('Plan the trip.');
+  expect(handoffs[0].process_after).not.toBeNull();
+  const waitMs = Date.parse(handoffs[0].process_after ?? '') - Date.now();
+  expect(waitMs).toBeGreaterThan(CHAT_HANDOFF_COALESCE_MS - 5_000);
+  expect(waitMs).toBeLessThanOrEqual(CHAT_HANDOFF_COALESCE_MS + 1_000);
   expect(JSON.stringify(first)).not.toMatch(/external|agent/);
-  expect(vi.mocked(requestWake).mock.calls.filter(([woken]) => woken.id === session.id)).toHaveLength(1);
+  expect(requestWake).not.toHaveBeenCalled();
+
+  accepted(
+    await request(main, 'chat_handoff', { chat: id, message: 'Also ask for their email.' }, {}, 'second-handoff'),
+  );
+  const both = rows(session).filter((row) => row.id.startsWith('chat-handoff-'));
+  expect(both).toHaveLength(2);
+  expect(both[1].process_after).toBe(both[0].process_after);
+  // Not-yet-due handoff text stays out of immediate chat-context rows until its deadline passes.
+  await writeChatContext(session);
+  const contextsWhileWaiting = rows(session).filter((row) => row.id.startsWith('chat-context-'));
+  expect(contextsWhileWaiting.every((row) => !row.content.text?.includes('Plan the trip.'))).toBe(true);
+  expect(contextsWhileWaiting.every((row) => !row.content.text?.includes('Also ask for their email.'))).toBe(true);
+
+  const db = new Database(inboundDbPath('external', session.id));
+  try {
+    db.prepare("UPDATE messages_in SET process_after = ? WHERE id LIKE 'chat-handoff-%'").run(
+      new Date(Date.now() - 1_000).toISOString(),
+    );
+  } finally {
+    db.close();
+  }
+  await writeChatContext(session);
+  const latestContext = rows(session)
+    .filter((row) => row.id.startsWith('chat-context-'))
+    .at(-1);
+  expect(latestContext?.content.text).toContain('Plan the trip.');
+  expect(latestContext?.content.text).toContain('Also ask for their email.');
+});
+
+it('scopes the coalescing window to this chat’s handoffs and ignores unrelated scheduled rows in the mailbox', async () => {
+  const id = await chat();
+  const { session } = await resolveSession('external', id, null, 'shared');
+  const farFuture = new Date(Date.now() + 3_600_000).toISOString();
+  await writeSessionMessage('external', session.id, {
+    id: 'scheduled-reminder-1',
+    kind: 'task',
+    timestamp: new Date().toISOString(),
+    channelType: null,
+    platformId: null,
+    threadId: null,
+    processAfter: farFuture,
+    content: JSON.stringify({ prompt: 'Later reminder.' }),
+    trigger: true,
+  });
+
+  accepted(await request(main, 'chat_handoff', { chat: id, message: 'Plan the trip.', matter: 'nowhere' }, {}, 'h-1'));
+  const handoff = rows(session).find((row) => row.id.startsWith('chat-handoff-'));
+  expect(handoff?.process_after).not.toBeNull();
+  expect(handoff?.process_after).not.toBe(farFuture);
+  const waitMs = Date.parse(handoff?.process_after ?? '') - Date.now();
+  expect(waitMs).toBeGreaterThan(CHAT_HANDOFF_COALESCE_MS - 5_000);
+  expect(waitMs).toBeLessThanOrEqual(CHAT_HANDOFF_COALESCE_MS + 1_000);
+});
+
+it('notes an unanswered delivered outbound chat message on subsequent handoffs until an outsider replies', async () => {
+  const id = await chat();
+  accepted(await request(main, 'chat_handoff', { chat: id, message: 'Offer 6:30pm.', matter: 'nowhere' }, {}, 'h1'));
+  const session = await serving(id);
+  const group = await getMessagingGroup(id);
+  if (!group) throw new Error('Missing group');
+  await writeOutboundDirect('external', session.id, {
+    id: 'out-1',
+    kind: 'chat',
+    channelType: group.channel_type,
+    platformId: group.platform_id,
+    threadId: null,
+    content: JSON.stringify({ text: 'Does 6:30pm work?' }),
+  });
+  await withExistingMailboxSession('external', session.id, (mailbox) => mailbox.markDelivered('out-1', null));
+
+  const followUp = await request(main, 'chat_handoff', { chat: id, message: 'Switch to 7pm.' }, {}, 'h2');
+  expect(String((accepted(followUp) as { message?: string }).message)).toContain('a message already went out here');
+  const h2Row = rows(session)
+    .filter((row) => row.id.startsWith('chat-handoff-'))
+    .at(-1);
+  expect(h2Row?.content.text).toContain('your last message in this chat');
+
+  await writeSessionMessage('external', session.id, {
+    id: 'mira-reply',
+    kind: 'chat',
+    timestamp: new Date(Date.now() + 1_000).toISOString(),
+    channelType: group.channel_type,
+    platformId: group.platform_id,
+    threadId: null,
+    content: JSON.stringify({ sender: 'Mira', text: '7 works!' }),
+    trigger: true,
+  });
+  const afterReply = await request(main, 'chat_handoff', { chat: id, message: 'Lock in 7pm.' }, {}, 'h3');
+  expect(String((accepted(afterReply) as { message?: string }).message)).not.toContain(
+    'a message already went out here',
+  );
 });
 it('refuses unplaced chats and private details until the principal’s own exact-chat message clears them', async () => {
   const id = await chat();
@@ -481,6 +586,22 @@ it('writes main’s words before the one wake that releases a held batch', async
     return true;
   });
   accepted(await request(main, 'chat_handoff', { chat: id, message: 'Find the venue.', matter: 'nowhere' }));
+  // Held mail and main's handoff share the same short coalesce window before waking once together.
+  const pending = rows(session).filter((row) => row.id === 'held-work' || row.id.startsWith('chat-handoff-'));
+  expect(pending).toHaveLength(2);
+  expect(pending[0]?.process_after).not.toBeNull();
+  expect(pending[1]?.process_after).toBe(pending[0]?.process_after);
+  expect(vi.mocked(requestWake).mock.calls.filter(([woken]) => woken.id === session.id)).toHaveLength(0);
+
+  const db = new Database(inboundDbPath('external', session.id));
+  try {
+    db.prepare("UPDATE messages_in SET process_after = ? WHERE status = 'pending'").run(
+      new Date(Date.now() - 1_000).toISOString(),
+    );
+  } finally {
+    db.close();
+  }
+  await reconcileSession(session.id);
   expect(vi.mocked(requestWake).mock.calls.filter(([woken]) => woken.id === session.id)).toHaveLength(1);
 });
 

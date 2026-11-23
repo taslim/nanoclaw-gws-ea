@@ -125,6 +125,26 @@ const STORED: Readonly<Record<string, readonly (readonly [Store, string])[]>> = 
     ['manual', 'EMBER_PRIVATE_TRIP'],
   ],
   'planner-limits': [['whereabouts', 'Mountain View']],
+  'comm-goodwill-waiver': [['mailboxes', 'HG-44109']],
+  'comm-repeat-vendor-thread': [
+    ['mail', 'PA7K2Q'],
+    ['mailboxes', 'PA402'],
+  ],
+  'comm-bespoke-letter': [['mailboxes', 'Civic Media Awards']],
+  'comm-met-before-friend': [['mailboxes', 'emailed remy.vance@example.test in an earlier thread']],
+  'comm-whatsapp-dinner-dm': [['people', 'Juno Hale']],
+  'comm-whatsapp-group-banter': [['people', 'Remy Vance']],
+  'comm-main-brief-handoff': [['mail', 'HG-77312']],
+  'comm-main-principal-triage': [
+    ['events', 'Dentist — Dr. Lin'],
+    ['matters', 'Dinner with Remy'],
+  ],
+  'comm-unanswered-email-restraint': [
+    ['mail', 'HG-44109'],
+    ['mailboxes', 'with no reply yet'],
+  ],
+  'comm-passive-cc-stay-quiet': [['mail', 'Sounds great Dana']],
+  'comm-whatsapp-followup-turn': [['people', 'Juno Hale']],
 };
 
 const file = process.argv[2];

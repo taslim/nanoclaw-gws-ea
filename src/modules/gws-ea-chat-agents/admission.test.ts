@@ -189,6 +189,9 @@ it.each(['external-chat', 'job'] as const)(
     ]);
     expect(doc).toContain(fs.readFileSync(path.resolve('src/modules/gws-ea-profile/character.md'), 'utf8').trim());
     expect(doc).toMatch(/^You work for .+, whose home time zone is /mu);
+    await getDb().run("UPDATE gws_ea_profile SET principal_pronouns = 'he/him' WHERE singleton = 1");
+    expect(await documentFor(group)).toMatch(/^You work for .+ \(he\/him\), whose home time zone is /mu);
+    await getDb().run('UPDATE gws_ea_profile SET principal_pronouns = NULL WHERE singleton = 1');
     const file = path.resolve('src/modules/gws-ea-chat-agents', `${kind === 'job' ? 'job' : kind}.guidance.md`);
     expect(doc).toContain(fs.readFileSync(file, 'utf8').trim());
     expect(doc).toContain('# NanoClaw Skill: whatsapp-formatting');

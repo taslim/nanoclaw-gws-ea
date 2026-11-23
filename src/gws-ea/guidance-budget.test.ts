@@ -50,29 +50,29 @@ type Agent = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser';
 /** A raise needs its reason here; each reason records the size its budget was set from. */
 const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason: string }>> = {
   main: {
-    tokens: 10_200,
+    tokens: 8_600,
     reason:
-      "10,172 tokens (40,688 characters): main's whole document with the original browser guidance, saved-login account intent, when to send a link to one of the principal's pages, the distinction between host refusals and site-rejected credentials, and follow-through on deadlines (promised work starts in the turn, unsent words are unsaid, due times, near-deadline pace) with settled-only outside updates and booking calendars for meeting chats, and what a failing app tool means and when an app's Connections link is sent; rounded up. The front page is rendered for an empty install and grows only within its own budget.",
+      "8,558 tokens (34,229 characters): main's whole document with web connector enabled after trimming resident tool-schema repetition (interactive, artifacts, whatsapp-formatting) to deferred MCP descriptions and on-demand SKILL.md while preserving verbatim Google skill post-compaction trigger lines, all doctrine, communication craft, briefing privacy rules, browser/web/Connections guidance, and front-page budget; rounded up.",
   },
   'external-email': {
-    tokens: 4_300,
-    reason:
-      '4,234 tokens: the character, the email examples, sealed-thread authority, and the calendar craft and meeting shaping it holds resident because it reads no calendar skill; rounded up.',
-  },
-  'external-chat': {
     tokens: 4_100,
     reason:
-      '4,013 tokens: the character, chat role and privacy, chat scheduling with the resident calendar craft and meeting shaping, and WhatsApp formatting; rounded up.',
+      '4,051 tokens (16,203 characters): character, scannable email craft with four examples (friend, copied-in, no-and, vendor goodwill), pronouns, met-before cold-intro skip, unanswered-outbound restraint, sealed-thread authority, and trimmed resident sign-in/calendar guidance; rounded up.',
+  },
+  'external-chat': {
+    tokens: 3_650,
+    reason:
+      '3,587 tokens (14,348 characters): character, punchy chat craft (1-2 sentences, room warmth, US conventions, pronouns, met-before intro skip, unanswered-outbound restraint, disjoint friend/vendor examples), chat role and privacy, trimmed WhatsApp formatting stub, and calendar craft; rounded up.',
   },
   job: {
-    tokens: 4_650,
+    tokens: 4_000,
     reason:
-      "4,626 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority, and the rule that members hear only settled plans, one question at a time and no corrections; rounded up.",
+      "3,958 tokens (15,831 characters): external-chat's scheduling and trimmed WhatsApp formatting stub, job memory/documents/authority, and scannable communication craft; rounded up.",
   },
   browser: {
-    tokens: 4_800,
+    tokens: 2_350,
     reason:
-      '4,793 tokens (19,172 characters): the sealed errand, its safety boundaries and restored host browser tool protocols, including which typed codes a masked field takes, with duplicated account guidance removed; rounded up.',
+      '2,289 tokens (9,153 characters): sealed browser errand, proactive recipe saving, safety boundaries, and compact host-browser guidance with full action/status schemas and cookie/code/download details deferred to MCP tool descriptions; rounded up.',
   },
 };
 

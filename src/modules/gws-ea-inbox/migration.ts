@@ -291,3 +291,31 @@ export const gwsEaInboxThreadPlacementMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * Whether a recorded thread message arrived from outside or was sent by the
+ * assistant. Lets the bridge tell whether the assistant's latest outbound
+ * email on a thread is still awaiting a reply.
+ */
+export const gwsEaInboxMessageOriginMigration: ModuleMigration = {
+  version: 9,
+  name: 'module:gws-ea-inbox:message-origin',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_thread_messages ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'
+        CHECK (origin IN ('received', 'sent'));
+      UPDATE gws_ea_thread_messages
+         SET origin = 'sent'
+       WHERE EXISTS (
+         SELECT 1 FROM gws_ea_thread_sends s
+          WHERE s.thread_key = gws_ea_thread_messages.thread_key
+            AND s.side = gws_ea_thread_messages.side
+            AND s.state = 'sent'
+            AND (
+              (gws_ea_thread_messages.gmail_message_id IS NOT NULL AND s.gmail_message_id = gws_ea_thread_messages.gmail_message_id)
+              OR (gws_ea_thread_messages.rfc_message_id IS NOT NULL AND s.rfc_message_id = gws_ea_thread_messages.rfc_message_id)
+            )
+       );
+    `);
+  },
+};

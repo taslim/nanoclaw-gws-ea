@@ -13,6 +13,12 @@ export interface ScenarioCase {
   readonly task?: boolean;
   readonly retry?: boolean;
   readonly privateMarkers?: readonly string[];
+  /** When true, the turn wakes solely on seeded prior messages and/or main's handoff — no synthetic outsider input is appended. */
+  readonly handoffOnly?: boolean;
+  /** Optional mechanical cap on outward messages sent during the scenario (0 for restraint/stay-quiet cases, 1 for single-message outreach). */
+  readonly maxOutwardMessages?: number;
+  /** Opt out of the default US-English spelling hygiene check when a case explicitly requests UK spelling. */
+  readonly allowUkSpelling?: boolean;
 }
 
 export interface Effect {
@@ -29,11 +35,29 @@ export interface MechanicalScore {
   readonly violations: readonly string[];
 }
 
+export interface JudgeDimensions {
+  readonly outcome: number;
+  readonly voice: number;
+  readonly conciseness: number;
+  readonly guardrails: number;
+}
+
 export interface JudgeVerdict {
   readonly pass: boolean;
   readonly score: number;
   readonly rationale: string;
   readonly observedOutcome: string;
+  readonly dimensions?: JudgeDimensions;
+}
+
+export interface PriorMessage {
+  readonly id: string;
+  readonly timestamp: string;
+  readonly channelType: string;
+  readonly platformId: string;
+  readonly threadId: string | null;
+  readonly content: string;
+  readonly trigger?: 0 | 1;
 }
 
 export interface PlannerPolicy {
@@ -69,7 +93,15 @@ export interface ScenarioComposition {
     };
   };
   readonly context?: string;
-  readonly handoff?: { readonly id: string; readonly timestamp: string; readonly content: string };
+  readonly priorMessages?: readonly PriorMessage[];
+  readonly handoff?: {
+    readonly id: string;
+    readonly timestamp: string;
+    readonly content: string;
+    readonly channelType?: string;
+    readonly platformId?: string;
+    readonly threadId?: string | null;
+  };
   readonly weekViewFile?: string;
   /** The model, effort and speed the materialized container.json gives the runner. */
   readonly inference: RuntimeInferenceInput;

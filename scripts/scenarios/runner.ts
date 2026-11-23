@@ -19,13 +19,16 @@ import type { ScenarioComposition } from './types.js';
 import { scenarioRuntime } from './runtime.js';
 import { nativeScenarioHooks } from './fake-host/native-hooks.js';
 
-const JUDGE_MODEL = 'claude-opus-5-5';
+const JUDGE_MODEL = process.env.SCENARIO_JUDGE_MODEL || 'claude-opus-5-5';
 const [directory, kind, cli, phase, resume] = process.argv.slice(2);
 if (!directory || !cli || !['agent', 'judge'].includes(kind ?? ''))
   throw new Error('runner <directory> <agent|judge> <claude> [phase] [resume]');
 const tree = path.resolve(import.meta.dir, '../..');
 const file = path.join(directory, 'fixture.json');
-const scenario = readState(file).scenario;
+const fixtureState = readState(file);
+const scenario = fixtureState.scenario;
+const judgeRubric =
+  kind === 'judge' ? fs.readFileSync(path.join(tree, 'scripts', 'scenarios', 'rubric.md'), 'utf8') : '';
 const evidence = path.join(directory, phase || kind);
 fs.mkdirSync(evidence, { recursive: true });
 const agent = path.join(directory, 'agent');
@@ -51,32 +54,72 @@ resetAgentMailboxForTesting();
 const mailbox = new FixtureMailbox(file);
 registerAgentMailbox(() => mailbox);
 
-let messages: MessageInRow[] = [
-  ...(composition.handoff
-    ? [
-        {
-          id: composition.handoff.id,
-          seq: 0,
-          kind: 'chat' as const,
-          timestamp: composition.handoff.timestamp,
-          status: 'pending',
-          process_after: null,
-          recurrence: null,
-          series_id: null,
-          tries: 0,
-          trigger: 1,
-          platform_id: 'email:inbox',
-          channel_type: 'email',
-          thread_id: readState(file).thread?.key ?? 'mail-synthetic-identity',
-          content: composition.handoff.content,
-          source_session_id: null,
-          on_wake: 0,
-        },
-      ]
-    : []),
-  {
+let nextSeq = 0;
+let messages: MessageInRow[] = [];
+if (!scenario.task) {
+  for (const prior of composition.priorMessages ?? []) {
+    messages.push({
+      id: prior.id,
+      seq: nextSeq,
+      kind: 'chat' as const,
+      timestamp: prior.timestamp,
+      status: 'pending',
+      process_after: null,
+      recurrence: null,
+      series_id: null,
+      tries: 0,
+      trigger: prior.trigger ?? 1,
+      platform_id: prior.platformId,
+      channel_type: prior.channelType,
+      thread_id: prior.threadId,
+      content: prior.content,
+      source_session_id: null,
+      on_wake: 0,
+    });
+    nextSeq += 2;
+  }
+  if (composition.handoff) {
+    messages.push({
+      id: composition.handoff.id,
+      seq: nextSeq,
+      kind: 'chat' as const,
+      timestamp: composition.handoff.timestamp,
+      status: 'pending',
+      process_after: null,
+      recurrence: null,
+      series_id: null,
+      tries: 0,
+      trigger: 1,
+      platform_id: composition.handoff.platformId ?? 'email:inbox',
+      channel_type: composition.handoff.channelType ?? 'email',
+      thread_id:
+        composition.handoff.threadId !== undefined
+          ? composition.handoff.threadId
+          : (fixtureState.thread?.key ?? 'mail-synthetic-identity'),
+      content: composition.handoff.content,
+      source_session_id: null,
+      on_wake: 0,
+    });
+    nextSeq += 2;
+  }
+}
+const hasPriorChatContext = (composition.priorMessages ?? []).some((entry) => entry.id === 'chat-context-1-synthetic');
+if (!scenario.handoffOnly || messages.length === 0) {
+  const chatInputSender = scenario.audience === 'external-chat' ? fixtureState.chat?.inputSender : undefined;
+  const sender =
+    scenario.audience === 'main'
+      ? 'Morgan Ellery'
+      : chatInputSender
+        ? chatInputSender.name
+        : scenario.id === 'friend-dinner-length'
+          ? 'Remy Vance'
+          : 'Juno Hale';
+  const senderId =
+    scenario.audience === 'main' ? 'synthetic-morgan' : chatInputSender ? chatInputSender.id : 'synthetic-juno';
+  const principalMessage = scenario.audience === 'main' || chatInputSender?.isPrincipal === true;
+  messages.push({
     id: 'synthetic-input',
-    seq: 2,
+    seq: nextSeq,
     kind: scenario.task ? ('task' as const) : ('chat' as const),
     timestamp: new Date().toISOString(),
     status: 'pending',
@@ -92,28 +135,24 @@ let messages: MessageInRow[] = [
           ? 'synthetic-juno-chat'
           : 'email:inbox',
     channel_type: scenario.audience === 'main' ? 'gchat' : scenario.audience === 'external-chat' ? 'whatsapp' : 'email',
-    thread_id:
-      scenario.audience === 'external-email' ? (readState(file).thread?.key ?? 'mail-synthetic-identity') : null,
+    thread_id: scenario.audience === 'external-email' ? (fixtureState.thread?.key ?? 'mail-synthetic-identity') : null,
     content: JSON.stringify(
       scenario.task
         ? { prompt: scenario.input }
         : {
-            sender:
-              scenario.audience === 'main'
-                ? 'Morgan Ellery'
-                : scenario.id === 'friend-dinner-length'
-                  ? 'Remy Vance'
-                  : 'Juno Hale',
-            senderId: scenario.audience === 'main' ? 'synthetic-morgan' : 'synthetic-juno',
-            text: [composition.context, scenario.input].filter(Boolean).join('\n\n'),
-            principalMessage: scenario.audience === 'main',
+            sender,
+            senderId,
+            text: hasPriorChatContext
+              ? scenario.input
+              : [composition.context, scenario.input].filter(Boolean).join('\n\n'),
+            principalMessage,
             inConversation: true,
           },
     ),
     source_session_id: null,
     on_wake: 0,
-  },
-];
+  });
+}
 const shell = prepareSyntheticShell(directory, tree);
 if (kind === 'agent' && composition.close) {
   const task = composition.close.task;
@@ -216,7 +255,7 @@ const options: Options = {
   settingSources: ['project'],
   systemPrompt:
     kind === 'judge'
-      ? 'You are a careful independent evaluator of an executive assistant. Return only the required JSON verdict.'
+      ? `You are a careful independent evaluator of an executive assistant. Return only the required JSON verdict.\n\n${judgeRubric}`
       : { type: 'preset', preset: 'claude_code', append: addendum, snapshot: false },
   ...(kind === 'judge'
     ? {
