@@ -24,7 +24,19 @@ export type AppStatus = 'connected' | 'needs_reconnecting' | 'not_connected';
 export type ToolLabel = 'ask_first' | 'just_do';
 export type ToolLabelSource = 'sorter' | 'floor' | 'principal' | 'approved_request' | 'fallback';
 export type RelayCallState = 'executing' | 'completed' | 'unsent' | 'too_large' | 'unknown';
+export type ToolSortStatus = 'pending' | 'completed' | 'failed' | 'timed_out';
 export type ConnectionsStoreAvailability = SealAvailability;
+
+export interface ToolSortRecord {
+  readonly id: string;
+  readonly appId: string;
+  readonly listHash: string;
+  readonly sorterVersion: string;
+  readonly status: ToolSortStatus;
+  readonly attempt: number;
+  readonly createdAt: string;
+  readonly completedAt: string | null;
+}
 
 export interface AppPin {
   readonly appId: string;
@@ -299,6 +311,16 @@ CREATE TABLE IF NOT EXISTS app_tools (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (app_id, name)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS app_tool_sorts (
+  id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  list_hash TEXT NOT NULL,
+  sorter_version TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','completed','failed','timed_out')),
+  attempt INTEGER NOT NULL CHECK(attempt > 0),
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+) STRICT;
 CREATE TABLE IF NOT EXISTS relay_calls (
   id TEXT PRIMARY KEY,
   approval_id TEXT UNIQUE,
@@ -384,6 +406,16 @@ interface AppToolRow {
   readonly sort_attempts: number;
   readonly updated_at: string;
 }
+interface ToolSortRow {
+  readonly id: string;
+  readonly app_id: string;
+  readonly list_hash: string;
+  readonly sorter_version: string;
+  readonly status: ToolSortStatus;
+  readonly attempt: number;
+  readonly created_at: string;
+  readonly completed_at: string | null;
+}
 interface RelayCallRow {
   readonly id: string;
   readonly approval_id: string | null;
@@ -425,6 +457,19 @@ function toPinnedTool(row: AppToolRow): PinnedAppTool {
     unsettled: row.unsettled === 1,
     sortAttempts: row.sort_attempts,
     updatedAt: row.updated_at,
+  };
+}
+
+function toToolSort(row: ToolSortRow): ToolSortRecord {
+  return {
+    id: row.id,
+    appId: row.app_id,
+    listHash: row.list_hash,
+    sorterVersion: row.sorter_version,
+    status: row.status,
+    attempt: row.attempt,
+    createdAt: row.created_at,
+    completedAt: row.completed_at,
   };
 }
 
@@ -1482,6 +1527,44 @@ export class ConnectionsStore {
           .run(at, appId).changes === 1
       );
     });
+  }
+
+  async recordToolSortStart(input: {
+    readonly id: string;
+    readonly appId: string;
+    readonly listHash: string;
+    readonly sorterVersion: string;
+    readonly attempt: number;
+    readonly at?: string;
+  }): Promise<void> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    await this.use((db) => {
+      db.prepare(
+        `INSERT INTO app_tool_sorts (id, app_id, list_hash, sorter_version, status, attempt, created_at, completed_at)
+          VALUES (?, ?, ?, ?, 'pending', ?, ?, NULL)`,
+      ).run(input.id, input.appId, input.listHash, input.sorterVersion, input.attempt, at);
+    });
+  }
+
+  async finishToolSort(
+    id: string,
+    status: Exclude<ToolSortStatus, 'pending'>,
+    at = new Date().toISOString(),
+  ): Promise<void> {
+    isoValid(at);
+    await this.use((db) => {
+      db.prepare('UPDATE app_tool_sorts SET status = ?, completed_at = ? WHERE id = ?').run(status, at, id);
+    });
+  }
+
+  async listToolSorts(appId: string): Promise<readonly ToolSortRecord[]> {
+    return this.use((db) =>
+      db
+        .prepare<[string], ToolSortRow>('SELECT * FROM app_tool_sorts WHERE app_id = ? ORDER BY created_at, id')
+        .all(appId)
+        .map(toToolSort),
+    );
   }
 
   /** Connected apps whose pinned tools still have unsorted or unsettled rows. */

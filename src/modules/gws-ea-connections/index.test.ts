@@ -35,6 +35,20 @@ vi.mock('./refresher.js', async (original) => ({
   ...(await original<typeof import('./refresher.js')>()),
   startConnectionsRefresher: vi.fn(() => host.started.push('refresher')),
 }));
+vi.mock('./relay.js', async (original) => ({
+  ...(await original<typeof import('./relay.js')>()),
+  startAppRelay: vi.fn(() => {
+    host.started.push('relay');
+    return { pinUnpinnedApps: vi.fn(async () => undefined) };
+  }),
+}));
+vi.mock('./sorter.js', async (original) => ({
+  ...(await original<typeof import('./sorter.js')>()),
+  startAppToolSorter: vi.fn(() => {
+    host.started.push('sorter');
+    return { enqueue: vi.fn(async () => undefined), enqueuePending: vi.fn(async () => undefined) };
+  }),
+}));
 vi.mock('./apply.js', async (original) => ({
   ...(await original<typeof import('./apply.js')>()),
   applyMainServers: vi.fn(async () => {
@@ -191,7 +205,15 @@ describe('the host-start hook', () => {
     await start();
 
     expect(sweep).toHaveBeenCalledOnce();
-    expect(host.started).toEqual(['sweep', 'restart checks', 'reconnect notes', 'refresher', 'apply']);
+    expect(host.started).toEqual([
+      'sweep',
+      'restart checks',
+      'reconnect notes',
+      'sorter',
+      'refresher',
+      'relay',
+      'apply',
+    ]);
   });
 
   it('still arms everything and applies when the sign-in sweep finds the store unavailable', async () => {
@@ -199,7 +221,7 @@ describe('the host-start hook', () => {
 
     await start();
 
-    expect(host.started).toEqual(['restart checks', 'reconnect notes', 'refresher', 'apply']);
+    expect(host.started).toEqual(['restart checks', 'reconnect notes', 'sorter', 'refresher', 'relay', 'apply']);
     expect(log.warn).toHaveBeenCalledWith(expect.any(String), { reason: 'store_unavailable' });
   });
 

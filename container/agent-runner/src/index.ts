@@ -24,9 +24,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { trustGatewayCaForChromium } from './browser-trust.js';
-import { loadConfig } from './config.js';
+import { applySessionCapabilities, loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
-import { getTaskSeriesId } from './db/session-routing.js';
+import { getSessionRouting, getTaskSeriesId } from './db/session-routing.js';
 import { prepareSessionMemory, sessionsSealed } from './memory/sealed.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import './modules/index.js';
@@ -56,6 +56,7 @@ async function main(): Promise<void> {
   const providerName = requireProviderName(config.provider);
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
+  const sessionCapabilities = applySessionCapabilities(getSessionRouting().thread_id);
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
@@ -63,7 +64,7 @@ async function main(): Promise<void> {
   // operator-run migration and never happen in this normal startup path. A
   // sealed session (one whose group lacks conversation-context) keeps no
   // group memory and archives no conversation: see memory/sealed.ts.
-  const sealed = sessionsSealed(config.capabilities);
+  const sealed = sessionsSealed(sessionCapabilities);
   const memoryHook = prepareSessionMemory(sealed);
 
   // The agent browser trusts only NSS, not the gateway CA env vars.
@@ -80,7 +81,7 @@ async function main(): Promise<void> {
   const instructions = buildSystemPromptAddendum(
     config.assistantName || undefined,
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
-    config.capabilities,
+    sessionCapabilities,
   );
 
   // Discover additional directories mounted at /workspace/extra/*

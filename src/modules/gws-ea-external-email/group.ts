@@ -38,6 +38,7 @@ import { sealedGatewayDrift } from '../gws-ea-sealed-gateway/gateway.js';
  */
 export const MAIN_EMAIL_CAPABILITY = 'gws-ea-email';
 export const EXTERNAL_EMAIL_TOOLS_CAPABILITY = 'gws-ea-email-external';
+export const APP_TOOL_SORT_CAPABILITY = 'gws-ea-app-sort';
 
 registerCapability(MAIN_EMAIL_CAPABILITY, {
   description:
@@ -50,6 +51,10 @@ registerCapability(EXTERNAL_EMAIL_TOOLS_CAPABILITY, {
     "email_send, tell_main, free_time, book, change_booking, cancel_booking, sign_in_reply: external-email's email and scheduling in its own thread, word to main, and host sign-in answers",
   default: 'off',
   instructions: [EXTERNAL_EMAIL_TOOLS_CAPABILITY],
+});
+registerCapability(APP_TOOL_SORT_CAPABILITY, {
+  description: 'sort_tools: isolated one-shot app tool classifier in external-email system sort sessions',
+  default: 'off',
 });
 // Main's shorter system prompt, for the same character.
 registerContainerEnv(

@@ -32,8 +32,31 @@ export interface RunnerConfig {
 const DEFAULT_MAX_MESSAGES = 10;
 
 const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+export const APP_SORT_THREAD_PREFIX = 'system:gws-ea-app-sort:';
+export const APP_TOOL_SORT_CAPABILITY = 'gws-ea-app-sort';
 
 let _config: RunnerConfig | null = null;
+let _sessionCapabilities: ReadonlySet<string> | null = null;
+
+/**
+ * Narrows a group's capability set for a single isolated system session. An app-tool sorting session in
+ * external-email receives only `gws-ea-app-sort` so it holds no tools except `sort_tools`.
+ */
+export function resolveSessionCapabilities(
+  groupCapabilities: ReadonlySet<string>,
+  threadId: string | null | undefined,
+): ReadonlySet<string> {
+  if (threadId?.startsWith(APP_SORT_THREAD_PREFIX) && groupCapabilities.has('gws-ea-email-external')) {
+    return new Set([APP_TOOL_SORT_CAPABILITY]);
+  }
+  return groupCapabilities;
+}
+
+export function applySessionCapabilities(threadId: string | null | undefined): ReadonlySet<string> {
+  const base = _config?.capabilities ?? NO_CAPABILITIES;
+  _sessionCapabilities = resolveSessionCapabilities(base, threadId);
+  return _sessionCapabilities;
+}
 
 /**
  * Load config from container.json. Called once at startup.
@@ -84,7 +107,7 @@ function readCapabilities(raw: Record<string, unknown>): ReadonlySet<string> {
  * was given.
  */
 export function runnerCapabilities(): ReadonlySet<string> {
-  return _config?.capabilities ?? NO_CAPABILITIES;
+  return _sessionCapabilities ?? _config?.capabilities ?? NO_CAPABILITIES;
 }
 
 /** The host grants this capability to canonical main alone. */

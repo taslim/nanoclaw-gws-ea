@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
+import { resolveSessionCapabilities } from '../config.js';
 import { closeSessionDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { sessionsSealed } from '../memory/sealed.js';
 import { allowsBuiltinTool, resolveClaudeCapabilityPolicy } from '../providers/claude-config.js';
@@ -166,6 +167,7 @@ describe('NanoClaw tool server capabilities', () => {
     ['gws-ea-chat-external', ['gws-ea-chat-external'], EXTERNAL_CHAT_TOOLS],
     ['gws-ea-chat-documents', ['gws-ea-chat-documents'], JOB_DOCUMENT_TOOLS],
     ['gws-ea-email-external', ['gws-ea-email-external'], EXTERNAL_EMAIL_TOOLS],
+    ['gws-ea-app-sort', ['gws-ea-app-sort'], ['sort_tools']],
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     ['browser', ['browser'], BROWSER_TOOLS],
     [
@@ -285,6 +287,25 @@ describe('NanoClaw tool server capabilities', () => {
       expect(allowsBuiltinTool(policy, tool), tool).toBe(false);
     }
     for (const tool of ['Read', 'Glob', 'Grep']) expect(allowsBuiltinTool(policy, tool), tool).toBe(true);
+  });
+
+  it('gives an app-tool sort session no built-ins, no external MCP servers, and no tool except sort_tools', async () => {
+    const externalEmailGrants = new Set(EXTERNAL_EMAIL);
+    const sortGrants = resolveSessionCapabilities(externalEmailGrants, 'system:gws-ea-app-sort:app-1:hash-1');
+    expect([...sortGrants]).toEqual(['gws-ea-app-sort']);
+    expect(sessionsSealed(sortGrants)).toBe(true);
+    expect(await served([...sortGrants])).toEqual(['sort_tools']);
+
+    const policy = resolveClaudeCapabilityPolicy(sortGrants);
+    expect(policy.tools).toEqual([]);
+    expect(policy.externalMcpServers).toBe(false);
+    for (const tool of ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'WebSearch', 'Skill', 'ToolSearch', 'TodoWrite']) {
+      expect(allowsBuiltinTool(policy, tool), tool).toBe(false);
+    }
+
+    // Ordinary external-email sessions never receive sort_tools.
+    const emailGrants = resolveSessionCapabilities(externalEmailGrants, 'mail-thread-1');
+    expect(await served([...emailGrants])).not.toContain('sort_tools');
   });
 
   it('refuses a call to a tool outside the held keys as unknown', async () => {

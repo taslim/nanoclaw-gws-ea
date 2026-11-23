@@ -15,6 +15,7 @@ import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './not
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
 import { registerRelayAction } from './relay-actions.js';
 import { startAppRelay, stopAppRelay } from './relay.js';
+import { registerSortToolsAction, startAppToolSorter, stopAppToolSorter } from './sorter.js';
 import {
   ConnectionsStoreError,
   getConnectionsStore,
@@ -86,6 +87,7 @@ registerWebMount(connectionsWebMount);
 registerWebMount(clientDocumentsWebMount);
 registerAppActions();
 registerRelayAction();
+registerSortToolsAction();
 
 onHostStart(async ({ signal }) => {
   // Only a gws-ea assistant has a store; a plain NanoClaw host has nothing to sweep.
@@ -102,10 +104,29 @@ onHostStart(async ({ signal }) => {
     // Armed first, so a restart a previous host left pending and one this apply records are both served.
     startRestartChecks(store, signal);
     await startReconnectNotes(store, signal);
-    startConnectionsRefresher(store, signal, { onRefused: oweReconnectNote, clientDocumentsServed });
-    const relay = startAppRelay({ store });
+    const sorter = startAppToolSorter({ store, signal });
+    startConnectionsRefresher(store, signal, {
+      onRefused: oweReconnectNote,
+      onTick: () => sorter.enqueuePending(),
+      clientDocumentsServed,
+    });
+    const relay = startAppRelay({
+      store,
+      onToolsNeedSort: (appId, listHash) => {
+        void sorter.enqueue(appId, listHash);
+      },
+    });
     await applyMainServers(store);
-    void relay.pinUnpinnedApps();
+    void (async () => {
+      if (signal.aborted) return;
+      await relay.pinUnpinnedApps();
+      if (signal.aborted) return;
+      await sorter.enqueuePending();
+    })().catch((err: unknown) => {
+      log.warn('Initial app tool pin/sort failed', {
+        reason: err instanceof ConnectionsStoreError ? err.reason : 'failed',
+      });
+    });
   } catch (error) {
     if (error instanceof ConnectionsStoreError) log.warn('Connections store unavailable', { reason: error.reason });
     else if (error instanceof MainServersUnreadableError) log.error('Main apps not applied', { reason: error.message });
@@ -113,6 +134,7 @@ onHostStart(async ({ signal }) => {
   }
 });
 
+onHostShutdown(stopAppToolSorter);
 onHostShutdown(stopAppRelay);
 onHostShutdown(stopConnectionsRefresher);
 onHostShutdown(stopReconnectNotes);

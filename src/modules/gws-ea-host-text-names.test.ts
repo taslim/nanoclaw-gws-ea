@@ -55,7 +55,7 @@ import { runnerToolCapabilities, runnerToolVocabulary } from '../test-utils/runn
 import { BROWSER_CAPABILITIES } from './gws-ea-browser/group.js';
 import { BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY } from './gws-ea-browser/guidance.js';
 import { OPERATIONAL_CODES } from './gws-ea-browser/operational-codes.js';
-import { EXTERNAL_EMAIL_CAPABILITIES } from './gws-ea-external-email/group.js';
+import { APP_TOOL_SORT_CAPABILITY, EXTERNAL_EMAIL_CAPABILITIES } from './gws-ea-external-email/group.js';
 import { CHAT_SHARED_SKILLS, EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } from './gws-ea-chat-agents/shape.js';
 import { GOG_COMMANDS } from './gws-ea-google/index.js';
 import { PRINCIPAL_PAGES_CAPABILITY } from './gws-ea-web/page-link.js';
@@ -73,7 +73,16 @@ import './index.js';
 const MODULES = path.resolve(import.meta.dirname);
 const ROOT = path.resolve(MODULES, '../..');
 
-const READERS = ['main', 'external-email', 'external-chat', 'job', 'browser', 'delegator', 'principal'] as const;
+const READERS = [
+  'main',
+  'external-email',
+  'app-sorter',
+  'external-chat',
+  'job',
+  'browser',
+  'delegator',
+  'principal',
+] as const;
 type Reader = (typeof READERS)[number];
 
 function isReader(name: string): name is Reader {
@@ -97,6 +106,7 @@ const HOLDINGS: Readonly<Record<Reader, Holdings>> = {
     ncl: 'global',
   },
   'external-email': { keys: new Set(EXTERNAL_EMAIL_CAPABILITIES), ncl: 'none' },
+  'app-sorter': { keys: new Set([APP_TOOL_SORT_CAPABILITY]), ncl: 'none' },
   'external-chat': { keys: new Set(EXTERNAL_CHAT_CAPABILITIES), ncl: 'none' },
   job: { keys: new Set(JOB_CHAT_CAPABILITIES), ncl: 'none' },
   browser: { keys: new Set(BROWSER_CAPABILITIES), ncl: 'none' },
@@ -129,6 +139,8 @@ const POLICY: Policy = {
     'gws-ea-chat-agents/docs.ts': 'job',
     // The answers and notes of main's app tools; their cards name no tool.
     'gws-ea-connections/actions.ts': 'main',
+    // Isolated app-tool sort session prompt and sort_tools action answers.
+    'gws-ea-connections/sorter.ts': 'app-sorter',
     // `ncl people` and `ncl preferences` help, answers and guidance.
     'gws-ea-people/index.ts': 'main',
     'gws-ea-preferences/index.ts': 'main',

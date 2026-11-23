@@ -68,6 +68,8 @@ export interface ConnectionsRefresherDependencies {
   readonly apply?: (store: ConnectionsStore) => Promise<boolean>;
   /** Heard once per refused generation, under the app's lock, so it records what is owed and returns. */
   readonly onRefused?: (app: RefusedApp) => void | Promise<void>;
+  /** Called at the end of each tick when not aborted (e.g. retrying unsettled tool sorts). */
+  readonly onTick?: () => void | Promise<void>;
   /** The assistant's own web hostname, on which no sign-in endpoint may sit. */
   readonly assistantHost?: () => Promise<string | undefined>;
   readonly clientDocumentsServed: () => boolean;
@@ -317,7 +319,10 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         if (dependencies.signal?.aborted) return;
         await reconcileApp(app.id, host);
       }
-      if (!dependencies.signal?.aborted) await applyStore();
+      if (!dependencies.signal?.aborted) {
+        await applyStore();
+        await dependencies.onTick?.();
+      }
     },
 
     async ensureToken(
