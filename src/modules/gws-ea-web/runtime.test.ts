@@ -192,6 +192,12 @@ it('closes a listening origin on invalid policy or failed admission, without thr
   expect(await runtime.publicationReady(config)).toBe(false);
   controller.abort();
 });
+it('reports client documents unserved while the policy records no public paths, even once Access lets them through', async () => {
+  documentPath = true;
+  await runtime.reconcile();
+  expect(await runtime.health()).toMatchObject({ availability: 'available' });
+  expect(runtime.clientDocumentsServed()).toBe(false);
+});
 it('reports client documents served only while a ready origin verified them under a policy recording their path', async () => {
   // The host first verifies the artifact-only Access app under a policy that records no public paths.
   await runtime.reconcile();

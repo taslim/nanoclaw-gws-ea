@@ -1622,6 +1622,12 @@ describe('Access public paths across the client-document update', () => {
       remote: 'mismatch',
       reason_code: 'web_access_mismatch',
     });
+    // The live Access check alone, under a policy that already records the public paths.
+    const recorded = await readyAssistant();
+    setOverrides(recorded, [ARTIFACTS]);
+    expect(
+      await inspectWebCapability(recorded.paths, recorded.a.instanceId, { ...recorded.dependencies, check: true }),
+    ).toMatchObject({ ready: false, remote: 'mismatch', reason_code: 'web_access_mismatch' });
   });
 
   it('updates an artifact-only Access app in place with its recorded policy and keeps web enabled', async () => {
@@ -1700,31 +1706,30 @@ describe('Access public paths across the client-document update', () => {
     expect(await readFile(policyFile, 'utf8')).toBe(converged);
   });
 
-  it.each(['still artifact-only', 'gained a policy'] as const)(
-    'fails provisioning when the updated Access app read back %s',
-    async (outcome) => {
-      const f = await previousReleaseAssistant();
-      const before = await readWebOperatorConfig(f.files.configFile);
-      const dependencies = {
-        ...f.dependencies,
-        fetch: (async (input, init) => {
-          if (init?.method !== 'PUT' || !String(input).endsWith(f.appPath)) return f.api.transport(input, init);
-          if (outcome === 'still artifact-only')
-            return new Response(JSON.stringify({ success: true, result: f.api.apps[0] }), { status: 200 });
-          const response = await f.api.transport(input, init);
-          f.api.policies.get(String(f.owned.applicationId))?.push({ id: 'unrecorded-policy' });
-          return response;
-        }) satisfies typeof fetch,
-      };
-      const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-        provisionAssistantWeb(operation, dependencies),
-      );
-      expect(result).toMatchObject({ outcome: 'pending' });
-      expect(result?.reason).toMatch(/^web_access_(mismatch|unverified)$/u);
-      expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(f.policy);
-      expect(await readWebOperatorConfig(f.files.configFile)).toEqual(before);
-    },
-  );
+  it.each([
+    { outcome: 'still artifact-only', reason: 'web_access_mismatch' },
+    { outcome: 'gained a policy', reason: 'web_access_unverified' },
+  ] as const)('fails provisioning when the updated Access app read back $outcome', async ({ outcome, reason }) => {
+    const f = await previousReleaseAssistant();
+    const before = await readWebOperatorConfig(f.files.configFile);
+    const dependencies = {
+      ...f.dependencies,
+      fetch: (async (input, init) => {
+        if (init?.method !== 'PUT' || !String(input).endsWith(f.appPath)) return f.api.transport(input, init);
+        if (outcome === 'still artifact-only')
+          return new Response(JSON.stringify({ success: true, result: f.api.apps[0] }), { status: 200 });
+        const response = await f.api.transport(input, init);
+        f.api.policies.get(String(f.owned.applicationId))?.push({ id: 'unrecorded-policy' });
+        return response;
+      }) satisfies typeof fetch,
+    };
+    const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantWeb(operation, dependencies),
+    );
+    expect(result).toMatchObject({ outcome: 'pending', reason });
+    expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(f.policy);
+    expect(await readWebOperatorConfig(f.files.configFile)).toEqual(before);
+  });
 
   it('leaves the Access app of an assistant on the previous web contract untouched', async () => {
     const f = await previousReleaseAssistant();

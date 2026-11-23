@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -1057,12 +1058,18 @@ describe('apps whose server takes client documents', () => {
     const state = query.get('state') ?? '';
     const unknown = new URLSearchParams({ code: 'sentinel-code-U8f1', state: 'sentinel-state-K3n7', iss: 'x' });
     query.set('code', 'sentinel-code-W5p2');
+    // Everything each call carries, deeper than the logger prints it: an error's message and stack included.
+    const carried: string[] = [];
+    for (const level of ['debug', 'info', 'warn', 'error', 'fatal'] as const)
+      vi.spyOn(log, level).mockImplementation((...args: unknown[]) => {
+        carried.push(inspect(args, { depth: null, breakLength: Infinity }));
+      });
 
     expect((await callback('mcp.larder.example.test', unknown)).headers.location).toBe('/connections?outcome=expired');
     expect((await callback('mcp.larder.example.test', query)).headers.location).toBe('/connections?outcome=failed');
 
-    expect(logged.length).toBeGreaterThan(0);
-    for (const line of logged)
+    expect(carried.length).toBeGreaterThan(0);
+    for (const line of carried)
       for (const value of [
         'sentinel-code-U8f1',
         'sentinel-state-K3n7',

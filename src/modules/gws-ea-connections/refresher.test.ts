@@ -640,20 +640,24 @@ describe('refusals', () => {
     ]);
   });
 
-  it('ends a grant whose client the server refuses', async () => {
-    const tokens = serveApp(LEDGERLY);
-    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
-      refreshToken: 'sentinel-refresh-home',
-      issuedAt: START - 55 * MINUTE,
-      expiresAt: START + 5 * MINUTE,
-    });
-    tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
+  it.each([true, false])(
+    'ends a grant whose client the server refuses, with client documents served: %s',
+    async (served) => {
+      const tokens = serveApp(LEDGERLY);
+      const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
+        refreshToken: 'sentinel-refresh-home',
+        issuedAt: START - 55 * MINUTE,
+        expiresAt: START + 5 * MINUTE,
+      });
+      documentsServed = served;
+      tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
 
-    await createConnectionsRefresher(dependencies()).tick();
+      await createConnectionsRefresher(dependencies()).tick();
 
-    expect((await store.get(app.id)).status).toBe('needs_reconnecting');
-    expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
-  });
+      expect((await store.get(app.id)).status).toBe('needs_reconnecting');
+      expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
+    },
+  );
 
   it('keeps the grant live and Connected through a 503', async () => {
     const tokens = serveApp(LEDGERLY);
