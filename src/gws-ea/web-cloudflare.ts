@@ -445,9 +445,7 @@ export function verifiedPolicyEmails(value: unknown): string[] {
   );
   return webEmails(emails);
 }
-/** Every path the Access app lets through without identity. */
 export const WEB_PUBLIC_PATHS = ['/artifacts/public/*', '/oauth-client/*'] as const;
-// Access apps created before client documents still carry only this override until provisioning updates them.
 const LEGACY_PUBLIC_PATHS = ['/artifacts/public/*'] as const;
 
 export function webAccessApplication(claim: WebNamespaceClaim, pinId: string): Record<string, unknown> {
@@ -473,7 +471,6 @@ function samePaths(observed: readonly string[], expected: readonly string[]): bo
   return observed.length === sorted.length && observed.every((pattern, index) => pattern === sorted[index]);
 }
 
-/** Order-insensitive public override paths, or undefined when any override is not a plain public path. */
 function publicOverridePaths(destination: Record<string, unknown>): string[] | undefined {
   if (!Array.isArray(destination.overrides)) return undefined;
   const paths: string[] = [];
@@ -486,7 +483,6 @@ function publicOverridePaths(destination: Record<string, unknown>): string[] | u
 }
 
 export type WebAccessShape = 'current' | 'legacy';
-/** Accepts the artifact-only shape only where the caller can still bring it to the current one. */
 export function assertWebApplication(
   value: unknown,
   assistant: WebRemoteAssistant,
@@ -547,7 +543,6 @@ export interface WebAccessReconciliation {
   readonly applicationId: string;
   /** A callback is read once the machine lock is held, so it sees current local admission. */
   readonly emails: readonly string[] | (() => Promise<readonly string[]>);
-  /** The public paths the web policy records; once recorded, the artifact-only Access shape is refused. */
   readonly publicPaths: readonly string[];
 }
 /** Call outside DB transactions. Removing an admitted email revokes the app's existing sessions. */

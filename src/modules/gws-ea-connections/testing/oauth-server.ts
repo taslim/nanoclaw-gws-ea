@@ -149,10 +149,6 @@ export interface FakeAppOptions {
   /** A client registered by hand with the server, as a principal would. */
   readonly client?: { readonly id: string; readonly secret: string; readonly redirectUri: string };
   readonly serverName?: string;
-  /**
-   * Advertises client metadata documents and fetches each URL `client_id` through this, as a server fetches it from
-   * the assistant's hostname.
-   */
   readonly fetchClientDocument?: (url: string) => Promise<FakeReply>;
 }
 
@@ -179,7 +175,6 @@ export class FakeMcpApp {
   readonly serverMetadata: Record<string, unknown>;
   readonly clients = new Map<string, Client>();
   readonly registrations: Record<string, unknown>[] = [];
-  /** Every client document fetched, as the server read it. */
   readonly documents: Record<string, unknown>[] = [];
   readonly revoked: string[] = [];
   readonly accessTokens = new Set<string>();
@@ -253,11 +248,6 @@ export class FakeMcpApp {
     return { redirectUri, query };
   }
 
-  /**
-   * Plays the principal approving a sign-in whose `client_id` is a URL: the server fetches that document, takes it
-   * only when its `client_id` is the URL it fetched and it is a `none` client, and then knows the client by the
-   * redirect URIs the document lists.
-   */
   async approveWithDocument(
     authorizationUrl: string,
   ): Promise<{ readonly redirectUri: string; readonly query: URLSearchParams }> {

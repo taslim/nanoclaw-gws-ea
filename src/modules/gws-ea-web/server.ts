@@ -102,7 +102,7 @@ function requireSandbox(response: ServerResponse, mount: ArtifactReadersMount): 
 
 /**
  * The hostname serves only registered mounts. A principal mount is reached only after the principal is
- * verified for this request, so its handler never sees anyone else; a public mount never consults identity.
+ * verified for this request, so its handler never sees anyone else.
  */
 export function createWebHandler(
   hostname: string,

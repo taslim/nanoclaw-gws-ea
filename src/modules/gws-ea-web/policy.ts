@@ -22,7 +22,6 @@ export interface WebPolicyFile {
     readonly applicationId: string;
     readonly operatorConfigFile: string;
   };
-  /** Public paths provisioning verified on the Access app; absent until the app has every one of them. */
   readonly publicPaths?: readonly string[];
 }
 export type WebPolicy =

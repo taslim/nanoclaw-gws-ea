@@ -155,10 +155,7 @@ export function appRedirectUri(webHostname: string, appHost: string): string {
 
 export const CLIENT_DOCUMENT_PATH = '/oauth-client';
 
-/**
- * A document client's ID is the address its metadata document is served from, so it changes only with the web
- * hostname: the app ID is opaque and survives renames, and the address never reveals which apps are connected.
- */
+// The app ID is opaque, so the address survives renames and never reveals which apps are connected.
 export function appClientDocumentUrl(webHostname: string, appId: string): string {
   return `https://${webHostname}${CLIENT_DOCUMENT_PATH}/${appId}`;
 }
@@ -368,10 +365,7 @@ function registrationAuthMethod(server: AuthorizationServer): string {
   return 'none';
 }
 
-/**
- * A document client is a public PKCE client, so a server must advertise documents and take clients without a
- * secret. An empty method list means `client_secret_basic` alone.
- */
+/** An empty method list means `client_secret_basic` alone. */
 export function takesClientDocuments(server: AuthorizationServer): boolean {
   return server.clientDocumentsSupported && server.tokenAuthMethods.includes('none');
 }
@@ -392,12 +386,8 @@ export function documentClient(url: string): ClientRegistration {
   return { clientId: url, tokenEndpointAuthMethod: 'none', kind: 'document' };
 }
 
-/**
- * The kind of client an app without a usable one gets, in the MCP specification's order: the app's document, then
- * a registration, then the principal's client details (`needs_client`). Without an offer the document is skipped.
- * Choosing a document needs no request, but one no server can fetch now would fail at the sign-in page, so a
- * registration stands in, or the choice waits (`client_unavailable`).
- */
+// MCP specification order: document, then registration, then the principal's client details. An unserved document
+// would fail at the sign-in page, so a registration stands in or the choice waits.
 export function newClientKind(
   server: AuthorizationServer,
   document: DocumentOffer | undefined,
@@ -409,12 +399,7 @@ export function newClientKind(
   return server.registrationEndpoint === undefined ? fail('needs_client') : 'registration';
 }
 
-/**
- * The client this app signs in with: the one stored for this issuer, else a new one by `newClientKind`, made for
- * this app alone. A stored document client is kept only while it names the app's current document address and the
- * server still takes documents, and is used only while the document is served. A client is never borrowed from
- * another app, even one on the same authorization server; `created` asks the caller to store the new one.
- */
+/** A client is never borrowed from another app, even one on the same authorization server. */
 export async function clientForSignIn(
   signIn: SignInServer,
   stored: { readonly issuer: string | null; readonly client: ClientRegistration | undefined },

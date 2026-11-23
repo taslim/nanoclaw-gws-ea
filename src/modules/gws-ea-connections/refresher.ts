@@ -69,7 +69,6 @@ export interface ConnectionsRefresherDependencies {
   readonly onRefused?: (app: RefusedApp) => void | Promise<void>;
   /** The assistant's own web hostname, on which no sign-in endpoint may sit. */
   readonly assistantHost?: () => Promise<string | undefined>;
-  /** Whether an authorization server can fetch the apps' client documents now. */
   readonly clientDocumentsServed: () => boolean;
   readonly fetches?: ConnectionFetches;
   readonly now?: () => number;

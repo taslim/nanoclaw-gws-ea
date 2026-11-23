@@ -51,7 +51,6 @@ export type AddRefusal =
   | 'unreachable'
   /** The server's sign-in cannot be used. */
   | 'unsupported'
-  /** The server takes only the app's client document, which no server can fetch right now. */
   | 'client_unavailable'
   | 'duplicate_name'
   | 'invalid_name';
@@ -72,7 +71,6 @@ export type ConnectRefusal =
   /** The server registers no clients itself and no client details are stored or were entered. */
   | 'needs_client'
   | 'client_refused'
-  /** The app's client document would be used, but no server can fetch it right now. */
   | 'client_unavailable'
   | 'unreachable'
   | 'unsupported'
@@ -95,9 +93,7 @@ export type SignInStartOutcome =
 
 /**
  * The only facts a sign-in's return reports; anything more could tell a forged return apart from a real one. A
- * refused client is reported only after a sign-in this host started was claimed, so a forged return never reaches it:
- * `client_refused` for client details the principal entered, `assistant_client_refused` for a client the assistant
- * chose itself.
+ * refused client is reported only after a sign-in this host started was claimed, so a forged return never reaches it.
  */
 export type SignInReturn =
   | 'connected'
@@ -126,7 +122,6 @@ export interface ConnectionOperationsOptions {
   readonly connection?: () => AppConnection;
   readonly operatorServers?: () => Promise<readonly OperatorServer[]>;
   readonly applyMain?: (store: ConnectionsStore) => Promise<boolean>;
-  /** Whether an authorization server can fetch the apps' client documents now. */
   readonly clientDocumentsServed: () => boolean;
 }
 
@@ -267,9 +262,8 @@ export class ConnectionOperations {
   }
 
   /**
-   * Admits and probes the URL, then stores the app Not connected, with the client it will sign in with when the
-   * assistant can provide one: the app's client document, whose address needs the stored app's ID, or a
-   * registration made now for this app alone. The app records whether the principal must enter client details.
+   * Admits and probes the URL, then stores the app Not connected. The document's address needs the stored app's ID,
+   * so a document client is set after the store.
    */
   async add(input: { readonly url: string; readonly name?: string }): Promise<AddOutcome> {
     const admission = await admitAppUrl(input.url, this.admission);
@@ -391,8 +385,7 @@ export class ConnectionOperations {
             {
               host: app.host,
               redirectUri,
-              // An app holding no client asks for client details, as it did before documents: nothing shows its
-              // document was never refused.
+              // Without a stored client nothing shows the document was never refused, so no document is offered.
               ...(stored.client === undefined
                 ? {}
                 : { document: this.documentOffer(app, stored.client.documentRefused === true) }),
@@ -540,10 +533,8 @@ export class ConnectionOperations {
   }
 
   /**
-   * The server refused the app's client at the code exchange, so it is forgotten and the next kind in order takes
-   * its place now, so the next Connect signs in again: a refused document is never chosen again, and a registration
-   * made after one remembers that. Client details the principal entered give way to a registration only, since
-   * nothing shows whether the app's document was refused before; without one the next Connect asks the principal.
+   * A refused document is never chosen again, and a registration made after one remembers that. Entered client
+   * details give way to a registration only, since nothing shows whether the document was refused before.
    */
   private async replaceRefusedClient(appId: string, refusedClient: ClientRegistration): Promise<SignInReturn> {
     let outcome: SignInReturn = 'assistant_client_refused';
@@ -580,7 +571,7 @@ export class ConnectionOperations {
     return outcome;
   }
 
-  /** A new registration for this app alone. */
+  /** A new registration for this app alone, whatever client it held before. */
   private async registerClient(signIn: SignInServer, app: Pick<ConnectionApp, 'host'>): Promise<ClientRegistration> {
     const { client } = await clientForSignIn(
       signIn,

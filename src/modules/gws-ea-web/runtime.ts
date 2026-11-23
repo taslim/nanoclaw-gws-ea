@@ -41,7 +41,6 @@ export class WebRuntime {
   private server: Server | undefined;
   private config: WebPolicyFile | undefined;
   private verified: string | undefined;
-  /** The policy digest whose last verification saw the client-document override. */
   private clientDocumentsVerified: string | undefined;
   private verifying: Promise<void> | undefined;
   private ready = false;
@@ -121,10 +120,7 @@ export class WebRuntime {
       this.verifying = undefined;
     }
   }
-  /**
-   * Whether an authorization server can fetch client documents now: a recorded path alone could precede the Access
-   * app's update, and a verified override alone could outlive the origin that serves it.
-   */
+  // A recorded path alone could precede the Access app's update; a verified override alone could outlive the origin.
   clientDocumentsServed(): boolean {
     return (
       this.ready &&

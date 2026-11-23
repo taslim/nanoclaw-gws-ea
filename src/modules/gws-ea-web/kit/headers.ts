@@ -40,10 +40,7 @@ export function sendJson(response: ServerResponse, status: number, data: Readonl
   response.end(JSON.stringify(data));
 }
 
-/**
- * A JSON document anyone may fetch and cache. Its length is sent explicitly so a HEAD answer carries exactly the
- * headers its GET would.
- */
+// The length is explicit so a HEAD answer carries the same headers as its GET.
 export function sendPublicJson(
   response: ServerResponse,
   document: Readonly<Record<string, unknown>>,

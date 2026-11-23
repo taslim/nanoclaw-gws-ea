@@ -40,9 +40,8 @@ export interface ClientRegistration {
   readonly clientId: string;
   readonly clientSecret?: string;
   readonly tokenEndpointAuthMethod?: string;
-  /** The app's client metadata document, whose address is the client ID; otherwise registered or entered. */
   readonly kind?: 'document';
-  /** The server refused this app's document, so the document is never chosen for it again. */
+  /** Once set, the document is never chosen for this app again. */
   readonly documentRefused?: true;
 }
 
@@ -153,7 +152,6 @@ export interface ConnectionsStoreOptions {
   readonly runCommand?: SanitizedCommandOutcomeRunner;
 }
 
-/** Every app ID the store issues is a lowercase random UUID. */
 export const APP_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const SIGN_IN_TTL_MS = 10 * 60_000;
 export const NAME_MAX = 100;

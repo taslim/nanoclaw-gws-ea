@@ -26,7 +26,6 @@ export type SignInMethod =
       readonly issuer: string;
       /** The server registers clients itself, so the principal enters no client details. */
       readonly dynamicRegistration: boolean;
-      /** The server takes the app's client document, so the principal enters no client details. */
       readonly clientDocuments: boolean;
       /** How the token endpoint takes client credentials, `client_secret_basic` when the server names none. */
       readonly clientAuthMethods: readonly string[];

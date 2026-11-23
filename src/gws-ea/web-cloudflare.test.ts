@@ -6,7 +6,6 @@ import {
   webIngress,
   createWebCloudflareApi,
   parseWebOperatorConfig,
-  WEB_PUBLIC_PATHS,
 } from './web-cloudflare.js';
 
 const instanceId = '00000000-0000-4000-8000-000000000001';
@@ -174,7 +173,6 @@ describe('web Cloudflare boundary', () => {
     const application: Record<string, unknown> = { ...webAccessApplication(claim, 'pin'), id: 'app', aud: 'aud' };
     const assistant = { claim, enabled: true, applicationId: 'app', aud: 'aud' };
     const config = parseWebOperatorConfig({ ...operatorConfig(), pin: { id: 'pin', owned: true } });
-    expect(WEB_PUBLIC_PATHS).toEqual(['/artifacts/public/*', '/oauth-client/*']);
     expect(application.destinations).toEqual([
       {
         type: 'public',

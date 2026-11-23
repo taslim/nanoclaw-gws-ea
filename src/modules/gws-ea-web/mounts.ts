@@ -41,10 +41,7 @@ export interface ArtifactReadersMount extends WebMountBase {
   readonly authoredContent: (pathname: string) => boolean;
 }
 
-/**
- * Answers anyone Access lets through on its path, so its handler is never given a way to identify the caller and
- * its path must be one the Access app serves publicly.
- */
+// A public mount never receives identity.
 export interface PublicMount extends WebMountBase {
   readonly audience: 'public';
   readonly handler: (config: WebPolicyFile) => RequestListener;

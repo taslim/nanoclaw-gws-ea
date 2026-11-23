@@ -19,10 +19,8 @@ interface ClientDocumentOptions {
   readonly openStore?: () => Promise<ConnectionsStore>;
 }
 
-/**
- * An unreadable store answers unavailable rather than not-found, because an authorization server may end the
- * app's refresh tokens once its client document is gone.
- */
+// An unreadable store answers unavailable, not not-found: an authorization server may end the app's refresh
+// tokens once its client document is gone.
 async function readApp(openStore: () => Promise<ConnectionsStore>, id: string): Promise<ConnectionApp | undefined> {
   try {
     return await (await openStore()).get(id);
@@ -32,10 +30,7 @@ async function readApp(openStore: () => Promise<ConnectionsStore>, id: string): 
   }
 }
 
-/**
- * Serves each OAuth app's client metadata document to anyone. Nothing in it comes from the request, and the app's
- * sealed client is never read, so it is served while Keychain is unavailable.
- */
+// The app's sealed client is never read, so the document is served while Keychain is unavailable.
 export function createClientDocumentHandler(options: ClientDocumentOptions): RequestListener {
   const openStore = options.openStore ?? getConnectionsStore;
   return (request, response) => {
