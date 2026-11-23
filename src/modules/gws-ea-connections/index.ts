@@ -13,6 +13,8 @@ import { clientDocumentsWebMount, connectionsWebMount, operatorAsApp } from './c
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
+import { registerRelayAction } from './relay-actions.js';
+import { startAppRelay, stopAppRelay } from './relay.js';
 import {
   ConnectionsStoreError,
   getConnectionsStore,
@@ -83,6 +85,7 @@ register({
 registerWebMount(connectionsWebMount);
 registerWebMount(clientDocumentsWebMount);
 registerAppActions();
+registerRelayAction();
 
 onHostStart(async ({ signal }) => {
   // Only a gws-ea assistant has a store; a plain NanoClaw host has nothing to sweep.
@@ -100,7 +103,9 @@ onHostStart(async ({ signal }) => {
     startRestartChecks(store, signal);
     await startReconnectNotes(store, signal);
     startConnectionsRefresher(store, signal, { onRefused: oweReconnectNote, clientDocumentsServed });
+    const relay = startAppRelay({ store });
     await applyMainServers(store);
+    void relay.pinUnpinnedApps();
   } catch (error) {
     if (error instanceof ConnectionsStoreError) log.warn('Connections store unavailable', { reason: error.reason });
     else if (error instanceof MainServersUnreadableError) log.error('Main apps not applied', { reason: error.message });
@@ -108,6 +113,7 @@ onHostStart(async ({ signal }) => {
   }
 });
 
+onHostShutdown(stopAppRelay);
 onHostShutdown(stopConnectionsRefresher);
 onHostShutdown(stopReconnectNotes);
 onHostShutdown(stopRestartChecks);

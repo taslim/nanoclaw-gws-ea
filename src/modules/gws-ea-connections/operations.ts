@@ -11,6 +11,7 @@ import { log } from '../../log.js';
 import { admissionDependencies, admitAppUrl, type AdmissionDependencies, type AdmissionRefusal } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
 import { withAppLock } from './locks.js';
+import { getAppRelay } from './relay.js';
 import {
   appClientDocumentUrl,
   appRedirectUri,
@@ -106,6 +107,10 @@ export interface ConnectionOperationsOptions {
   readonly operatorServers?: () => Promise<readonly OperatorServer[]>;
   readonly applyMain?: (store: ConnectionsStore) => Promise<boolean>;
   readonly clientDocumentsServed: () => boolean;
+  /** Runs after a grant is stored and before main's servers update, e.g. to pin tool definitions. */
+  readonly onConnected?: (app: ConnectionApp) => Promise<void>;
+  /** Runs when an app is disconnected, removed or reconnected, e.g. to close its relay client and withdraw cards. */
+  readonly onDisconnected?: (appId: string) => Promise<void>;
 }
 
 /** What the page and the home summary show; it holds no URL and nothing sealed. */
@@ -196,6 +201,8 @@ export class ConnectionOperations {
   private readonly operators: () => Promise<readonly OperatorServer[]>;
   private readonly applyMain: (store: ConnectionsStore) => Promise<boolean>;
   private readonly documentsServed: () => boolean;
+  private readonly onConnected: (app: ConnectionApp) => Promise<void>;
+  private readonly onDisconnected: (appId: string) => Promise<void>;
 
   constructor(options: ConnectionOperationsOptions) {
     this.store = options.store;
@@ -209,6 +216,18 @@ export class ConnectionOperations {
     this.operators = options.operatorServers ?? mainOperatorServers;
     this.applyMain = options.applyMain ?? applyMainServers;
     this.documentsServed = options.clientDocumentsServed;
+    this.onConnected =
+      options.onConnected ??
+      (async (app) => {
+        const relay = getAppRelay();
+        if (relay) await relay.pinApp(app.id);
+      });
+    this.onDisconnected =
+      options.onDisconnected ??
+      (async (appId) => {
+        const relay = getAppRelay();
+        if (relay) await relay.closeApp(appId);
+      });
   }
 
   private redirectUri(app: Pick<ConnectionApp, 'host'>): string {
@@ -286,6 +305,7 @@ export class ConnectionOperations {
         if (probe.status !== 'ok') return refusedConnect(probe.status);
         if (probe.method.kind !== 'none') return refusedConnect('method_changed');
         const result = await this.store.connect(id, version, { kind: 'none' });
+        await this.pinConnected(result.app);
         await this.apply();
         return { status: 'connected', app: result.app };
       }
@@ -294,6 +314,7 @@ export class ConnectionOperations {
       const check = await checkPastedToken(app.url, token, this.oauth);
       if (check !== 'valid') return refusedConnect(check === 'refused' ? 'token_refused' : check);
       const result = await this.store.connect(id, version, { kind: 'token', token });
+      await this.pinConnected(result.app);
       await this.apply();
       return { status: 'connected', app: result.app };
     });
@@ -414,7 +435,9 @@ export class ConnectionOperations {
         await revokeGrant(claim.issuer, issued(tokens.refreshToken), this.oauth);
         return 'expired';
       }
+      await this.notifyDisconnected(completion.app.id);
       await revokeGrant(previousIssuer, completion.replaced, this.oauth);
+      await this.pinConnected(completion.app);
       await this.apply();
       return 'connected';
     });
@@ -425,6 +448,7 @@ export class ConnectionOperations {
     return withAppLock(id, async () => {
       const before = await this.current(id, version);
       const { app, released } = await this.store.disconnect(id, version);
+      await this.notifyDisconnected(app.id);
       await revokeGrant(before.issuer, released, this.oauth);
       await this.apply();
       return app;
@@ -436,6 +460,7 @@ export class ConnectionOperations {
     return withAppLock(id, async () => {
       const before = await this.current(id, version);
       const { app, released } = await this.store.disconnect(id, version);
+      await this.notifyDisconnected(app.id);
       await revokeGrant(before.issuer, released, this.oauth);
       await this.store.remove(app.id, app.version);
       await this.apply();
@@ -522,6 +547,24 @@ export class ConnectionOperations {
     const app = await this.store.get(id);
     if (app.version !== version) throw new ConnectionsStoreError('app_changed');
     return app;
+  }
+
+  private async pinConnected(app: ConnectionApp): Promise<void> {
+    try {
+      await this.onConnected(app);
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- pinning is retried on first list or host start if the app hiccups */
+    } catch {
+      log.warn('Could not pin app tools on connect', { appId: app.id });
+    }
+  }
+
+  private async notifyDisconnected(appId: string): Promise<void> {
+    try {
+      await this.onDisconnected(appId);
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- closing cached relay clients or withdrawing holds must not block disconnect */
+    } catch {
+      log.warn('Post-disconnect hook did not finish cleanly', { appId });
+    }
   }
 
   /** Main's servers are reconciled again at host start and by the refresher, so an unreadable config only waits. */

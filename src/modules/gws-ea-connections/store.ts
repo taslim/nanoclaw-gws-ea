@@ -16,11 +16,82 @@ import {
   type SealedFile,
 } from '../gws-ea-vault/seal.js';
 import { connectionsRoot } from './config.js';
+import { normalizeToolDefinition, toolDefinitionHash, toolListHash, type ToolDefinition } from './canonical.js';
 import { ConnectionsKey } from './key.js';
 
 export type AppAuth = 'none' | 'oauth' | 'token';
 export type AppStatus = 'connected' | 'needs_reconnecting' | 'not_connected';
+export type ToolLabel = 'ask_first' | 'just_do';
+export type ToolLabelSource = 'sorter' | 'floor' | 'principal' | 'approved_request' | 'fallback';
+export type RelayCallState = 'executing' | 'completed' | 'unsent' | 'too_large' | 'unknown';
 export type ConnectionsStoreAvailability = SealAvailability;
+
+export interface AppPin {
+  readonly appId: string;
+  readonly instructions: string | null;
+  readonly listHash: string;
+  readonly pinnedAt: string;
+  readonly confirmedAt: string;
+  readonly reviewedListHash: string | null;
+  readonly reviewedAt: string | null;
+  readonly needsReview: boolean;
+}
+
+export interface PinnedAppTool {
+  readonly appId: string;
+  readonly name: string;
+  readonly definitionHash: string;
+  readonly definition: ToolDefinition;
+  readonly label: ToolLabel | null;
+  readonly labelSource: ToolLabelSource | null;
+  readonly reason: string | null;
+  readonly sorterVersion: string | null;
+  readonly principalFloor: boolean;
+  readonly unsettled: boolean;
+  readonly sortAttempts: number;
+  readonly updatedAt: string;
+}
+
+export interface PinToolsResult {
+  readonly pin: AppPin;
+  readonly tools: readonly PinnedAppTool[];
+  readonly changed: boolean;
+  readonly unsortedCount: number;
+}
+
+export interface ToolLabelUpdate {
+  readonly name: string;
+  readonly definitionHash: string;
+  readonly label: ToolLabel;
+  readonly source: ToolLabelSource;
+  readonly reason: string;
+}
+
+export interface RelayCallRecord {
+  readonly id: string;
+  readonly approvalId: string | null;
+  readonly appId: string;
+  readonly grantGeneration: number;
+  readonly toolName: string;
+  readonly definitionHash: string;
+  readonly argsHash: string;
+  readonly state: RelayCallState;
+  readonly outcomeJson: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export type ClaimApprovedCallResult =
+  | { readonly status: 'claimed' }
+  | { readonly status: 'already_executing'; readonly record: RelayCallRecord }
+  | { readonly status: 'already_settled'; readonly record: RelayCallRecord };
+
+export interface RecentRelayResult {
+  readonly id: string;
+  readonly toolName: string;
+  readonly outcomeJson: string;
+  readonly updatedAt: string;
+}
 export type ConnectionsStoreReason =
   | 'store_unavailable'
   | 'app_not_found'
@@ -204,6 +275,43 @@ CREATE TABLE IF NOT EXISTS sign_ins (
   issuer TEXT NOT NULL, redirect_uri TEXT NOT NULL, resource TEXT NOT NULL,
   expires_at TEXT NOT NULL, claimed_at TEXT
 ) STRICT;
+CREATE TABLE IF NOT EXISTS app_pins (
+  app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
+  instructions TEXT,
+  list_hash TEXT NOT NULL,
+  pinned_at TEXT NOT NULL,
+  confirmed_at TEXT NOT NULL,
+  reviewed_list_hash TEXT,
+  reviewed_at TEXT
+) STRICT;
+CREATE TABLE IF NOT EXISTS app_tools (
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  definition_hash TEXT NOT NULL,
+  definition_json TEXT NOT NULL,
+  label TEXT CHECK(label IS NULL OR label IN ('ask_first','just_do')),
+  label_source TEXT CHECK(label_source IS NULL OR label_source IN ('sorter','floor','principal','approved_request','fallback')),
+  reason TEXT,
+  sorter_version TEXT,
+  principal_floor INTEGER NOT NULL DEFAULT 0 CHECK(principal_floor IN (0,1)),
+  unsettled INTEGER NOT NULL DEFAULT 0 CHECK(unsettled IN (0,1)),
+  sort_attempts INTEGER NOT NULL DEFAULT 0 CHECK(sort_attempts >= 0),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (app_id, name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS relay_calls (
+  id TEXT PRIMARY KEY,
+  approval_id TEXT UNIQUE,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  grant_generation INTEGER NOT NULL CHECK(grant_generation > 0),
+  tool_name TEXT NOT NULL,
+  definition_hash TEXT NOT NULL,
+  args_hash TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('executing','completed','unsent','too_large','unknown')),
+  outcome_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS restart_request (
   id INTEGER PRIMARY KEY CHECK(id = 1), applied_at TEXT NOT NULL
 ) STRICT;
@@ -252,6 +360,88 @@ interface SignInRow {
   readonly expires_at: string;
   readonly claimed_at: string | null;
   readonly host: string;
+}
+interface AppPinRow {
+  readonly app_id: string;
+  readonly instructions: string | null;
+  readonly list_hash: string;
+  readonly pinned_at: string;
+  readonly confirmed_at: string;
+  readonly reviewed_list_hash: string | null;
+  readonly reviewed_at: string | null;
+}
+interface AppToolRow {
+  readonly app_id: string;
+  readonly name: string;
+  readonly definition_hash: string;
+  readonly definition_json: string;
+  readonly label: ToolLabel | null;
+  readonly label_source: ToolLabelSource | null;
+  readonly reason: string | null;
+  readonly sorter_version: string | null;
+  readonly principal_floor: number;
+  readonly unsettled: number;
+  readonly sort_attempts: number;
+  readonly updated_at: string;
+}
+interface RelayCallRow {
+  readonly id: string;
+  readonly approval_id: string | null;
+  readonly app_id: string;
+  readonly grant_generation: number;
+  readonly tool_name: string;
+  readonly definition_hash: string;
+  readonly args_hash: string;
+  readonly state: RelayCallState;
+  readonly outcome_json: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+function toAppPin(row: AppPinRow): AppPin {
+  return {
+    appId: row.app_id,
+    instructions: row.instructions,
+    listHash: row.list_hash,
+    pinnedAt: row.pinned_at,
+    confirmedAt: row.confirmed_at,
+    reviewedListHash: row.reviewed_list_hash,
+    reviewedAt: row.reviewed_at,
+    needsReview: row.reviewed_list_hash !== row.list_hash,
+  };
+}
+
+function toPinnedTool(row: AppToolRow): PinnedAppTool {
+  return {
+    appId: row.app_id,
+    name: row.name,
+    definitionHash: row.definition_hash,
+    definition: normalizeToolDefinition(JSON.parse(row.definition_json)),
+    label: row.label,
+    labelSource: row.label_source,
+    reason: row.reason,
+    sorterVersion: row.sorter_version,
+    principalFloor: row.principal_floor === 1,
+    unsettled: row.unsettled === 1,
+    sortAttempts: row.sort_attempts,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toRelayCall(row: RelayCallRow): RelayCallRecord {
+  return {
+    id: row.id,
+    approvalId: row.approval_id,
+    appId: row.app_id,
+    grantGeneration: row.grant_generation,
+    toolName: row.tool_name,
+    definitionHash: row.definition_hash,
+    argsHash: row.args_hash,
+    state: row.state,
+    outcomeJson: row.outcome_json,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 function toApp(row: AppRow): ConnectionApp {
@@ -439,6 +629,14 @@ export class ConnectionsStore {
   async byHost(host: string): Promise<ConnectionApp | undefined> {
     return this.use((db) => {
       const row = db.prepare<[string], AppRow>(`SELECT ${APP_COLUMNS} FROM ${APP_FROM} WHERE a.host = ?`).get(host);
+      return row && toApp(row);
+    });
+  }
+  async byServerKey(serverKey: string): Promise<ConnectionApp | undefined> {
+    return this.use((db) => {
+      const row = db
+        .prepare<[string], AppRow>(`SELECT ${APP_COLUMNS} FROM ${APP_FROM} WHERE a.server_key = ?`)
+        .get(serverKey);
       return row && toApp(row);
     });
   }
@@ -658,6 +856,7 @@ export class ConnectionsStore {
       at,
     );
     db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id);
+    db.prepare('DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL').run(app.id);
     if (grant.kind === 'oauth' && sealedAccess) {
       db.prepare(
         `INSERT INTO access_tokens (app_id, generation, token, issued_at, expires_at)
@@ -827,6 +1026,7 @@ export class ConnectionsStore {
 
   private endGrant(db: Database.Database, appId: string, state: 'disconnected' | 'refused'): void {
     db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(appId);
+    db.prepare('DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL').run(appId);
     db.prepare(
       `UPDATE grants SET state = ?, secret = NULL, access_issued_at = NULL, access_expires_at = NULL,
           access_published = 0, updated_at = ?
@@ -1018,6 +1218,429 @@ export class ConnectionsStore {
   async clearRestart(appliedAt: string): Promise<boolean> {
     return this.use(
       (db) => db.prepare('DELETE FROM restart_request WHERE id = 1 AND applied_at = ?').run(appliedAt).changes === 1,
+    );
+  }
+
+  async getPin(appId: string): Promise<AppPin | undefined> {
+    return this.use((db) => {
+      const row = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
+      return row && toAppPin(row);
+    });
+  }
+
+  async listPins(): Promise<readonly AppPin[]> {
+    return this.use((db) => db.prepare<[], AppPinRow>('SELECT * FROM app_pins ORDER BY app_id').all().map(toAppPin));
+  }
+
+  async listTools(appId: string): Promise<readonly PinnedAppTool[]> {
+    return this.use((db) =>
+      db
+        .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? ORDER BY name')
+        .all(appId)
+        .map(toPinnedTool),
+    );
+  }
+
+  async getTool(appId: string, name: string): Promise<PinnedAppTool | undefined> {
+    return this.use((db) => {
+      const row = db
+        .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+        .get(appId, name);
+      return row && toPinnedTool(row);
+    });
+  }
+
+  /**
+   * Pins an app's current tool definitions and server instructions. Unchanged definitions keep their labels;
+   * changed or new definitions become unsorted while preserving any principal-set Ask-first floor.
+   */
+  async pinTools(
+    appId: string,
+    input: { readonly instructions: string | null; readonly tools: readonly ToolDefinition[]; readonly at?: string },
+  ): Promise<PinToolsResult> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    const normalized = input.tools.map((tool) => {
+      const definition = normalizeToolDefinition(tool);
+      return { definition, hash: toolDefinitionHash(definition) };
+    });
+    const nextListHash = toolListHash(
+      normalized.map(({ definition, hash }) => ({ name: definition.name, definitionHash: hash })),
+    );
+    return this.use((db) =>
+      db
+        .transaction((): PinToolsResult => {
+          this.app(db, appId);
+          const existingPin = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
+          const existingTools = new Map(
+            db
+              .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ?')
+              .all(appId)
+              .map((row) => [row.name, row]),
+          );
+          const incomingNames = new Set(normalized.map(({ definition }) => definition.name));
+          let changed = existingPin?.list_hash !== nextListHash;
+
+          for (const oldName of existingTools.keys()) {
+            if (!incomingNames.has(oldName)) {
+              db.prepare('DELETE FROM app_tools WHERE app_id = ? AND name = ?').run(appId, oldName);
+              changed = true;
+            }
+          }
+
+          for (const { definition, hash } of normalized) {
+            const json = JSON.stringify(definition);
+            const prev = existingTools.get(definition.name);
+            if (!prev) {
+              db.prepare(
+                `INSERT INTO app_tools
+                  (app_id, name, definition_hash, definition_json, label, label_source, reason, sorter_version,
+                   principal_floor, unsettled, sort_attempts, updated_at)
+                  VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 1, 0, ?)`,
+              ).run(appId, definition.name, hash, json, at);
+              changed = true;
+            } else if (prev.definition_hash !== hash) {
+              // A definition change keeps a principal-set Ask-first as a floor and clears a principal-set Just-do.
+              const keepFloor =
+                prev.principal_floor === 1 ||
+                (prev.label === 'ask_first' &&
+                  (prev.label_source === 'principal' || prev.label_source === 'approved_request'))
+                  ? 1
+                  : 0;
+              db.prepare(
+                `UPDATE app_tools SET definition_hash = ?, definition_json = ?, label = NULL, label_source = NULL,
+                  reason = NULL, sorter_version = NULL, principal_floor = ?, unsettled = 1, sort_attempts = 0,
+                  updated_at = ?
+                  WHERE app_id = ? AND name = ?`,
+              ).run(hash, json, keepFloor, at, appId, definition.name);
+              changed = true;
+            } else if (prev.definition_json !== json) {
+              db.prepare('UPDATE app_tools SET definition_json = ?, updated_at = ? WHERE app_id = ? AND name = ?').run(
+                json,
+                at,
+                appId,
+                definition.name,
+              );
+            }
+          }
+
+          const pinnedAt = !existingPin || existingPin.list_hash !== nextListHash ? at : existingPin.pinned_at;
+          db.prepare(
+            `INSERT INTO app_pins (app_id, instructions, list_hash, pinned_at, confirmed_at, reviewed_list_hash, reviewed_at)
+              VALUES (?, ?, ?, ?, ?, NULL, NULL)
+              ON CONFLICT(app_id) DO UPDATE SET instructions = excluded.instructions, list_hash = excluded.list_hash,
+                pinned_at = excluded.pinned_at, confirmed_at = excluded.confirmed_at`,
+          ).run(appId, input.instructions, nextListHash, pinnedAt, at);
+
+          const pinRow = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
+          if (!pinRow) throw new ConnectionsStoreError('store_unavailable');
+          const tools = db
+            .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? ORDER BY name')
+            .all(appId)
+            .map(toPinnedTool);
+          const unsortedCount = tools.filter((tool) => tool.label === null).length;
+          return { pin: toAppPin(pinRow), tools, changed, unsortedCount };
+        })
+        .immediate(),
+    );
+  }
+
+  /**
+   * Applies sorter or floor labels for tools whose stored definition hash still matches. A principal-set Ask-first
+   * floor can never be lowered by sorter or floor updates.
+   */
+  async applyToolLabels(
+    appId: string,
+    updates: readonly ToolLabelUpdate[],
+    options: { readonly sorterVersion?: string; readonly at?: string } = {},
+  ): Promise<number> {
+    const at = options.at ?? new Date().toISOString();
+    isoValid(at);
+    return this.use((db) =>
+      db
+        .transaction(() => {
+          let applied = 0;
+          for (const update of updates) {
+            const row = db
+              .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+              .get(appId, update.name);
+            if (!row || row.definition_hash !== update.definitionHash) continue;
+            const principalOverride = update.source === 'principal' || update.source === 'approved_request';
+            const floorLocked = !principalOverride && row.principal_floor === 1 && update.label === 'just_do';
+            const label: ToolLabel = floorLocked ? 'ask_first' : update.label;
+            const labelSource: ToolLabelSource = floorLocked ? 'principal' : update.source;
+            const reason = floorLocked ? 'Kept as ask first per your earlier choice' : update.reason;
+            const principalFloor = principalOverride ? (label === 'ask_first' ? 1 : 0) : row.principal_floor;
+            db.prepare(
+              `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, sorter_version = COALESCE(?, sorter_version),
+                principal_floor = ?, unsettled = 0, updated_at = ?
+                WHERE app_id = ? AND name = ? AND definition_hash = ?`,
+            ).run(
+              label,
+              labelSource,
+              reason,
+              options.sorterVersion ?? null,
+              principalFloor,
+              at,
+              appId,
+              update.name,
+              update.definitionHash,
+            );
+            applied += 1;
+          }
+          return applied;
+        })
+        .immediate(),
+    );
+  }
+
+  /**
+   * Records a failed/timed-out/malformed sort attempt for the given tools. Each affected tool defaults to Ask-first
+   * and remains unsettled until `maxAttempts` failures, after which it stays Ask-first with "couldn't be checked".
+   */
+  async markToolSortFailed(
+    appId: string,
+    targets: readonly { readonly name: string; readonly definitionHash: string }[],
+    options: { readonly maxAttempts?: number; readonly sorterVersion?: string; readonly at?: string } = {},
+  ): Promise<void> {
+    const at = options.at ?? new Date().toISOString();
+    isoValid(at);
+    const maxAttempts = options.maxAttempts ?? 3;
+    await this.use((db) =>
+      db
+        .transaction(() => {
+          for (const target of targets) {
+            const row = db
+              .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+              .get(appId, target.name);
+            if (!row || row.definition_hash !== target.definitionHash) continue;
+            // Never overwrite a settled principal choice.
+            if (row.label_source === 'principal' || row.label_source === 'approved_request') continue;
+            const attempts = row.sort_attempts + 1;
+            const unsettled = attempts < maxAttempts ? 1 : 0;
+            const reason = unsettled === 1 ? 'Being checked again' : "couldn't be checked";
+            db.prepare(
+              `UPDATE app_tools SET label = 'ask_first', label_source = 'fallback', reason = ?,
+                sorter_version = COALESCE(?, sorter_version), unsettled = ?, sort_attempts = ?, updated_at = ?
+                WHERE app_id = ? AND name = ? AND definition_hash = ?`,
+            ).run(
+              reason,
+              options.sorterVersion ?? null,
+              unsettled,
+              attempts,
+              at,
+              appId,
+              target.name,
+              target.definitionHash,
+            );
+          }
+        })
+        .immediate(),
+    );
+  }
+
+  /** Principal change on the Connections page or approved main request; bound to definitionHash when provided. */
+  async setToolLabel(
+    appId: string,
+    name: string,
+    label: ToolLabel,
+    source: 'principal' | 'approved_request',
+    options: { readonly expectedHash?: string; readonly reason?: string; readonly at?: string } = {},
+  ): Promise<boolean> {
+    const at = options.at ?? new Date().toISOString();
+    isoValid(at);
+    const reason = options.reason ?? (label === 'ask_first' ? 'Set to ask first' : 'Set to run without asking');
+    const principalFloor = label === 'ask_first' ? 1 : 0;
+    return this.use((db) => {
+      const row = db
+        .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+        .get(appId, name);
+      if (!row) return false;
+      if (options.expectedHash !== undefined && row.definition_hash !== options.expectedHash) return false;
+      return (
+        db
+          .prepare(
+            `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, principal_floor = ?, unsettled = 0,
+              updated_at = ?
+              WHERE app_id = ? AND name = ?`,
+          )
+          .run(label, source, reason, principalFloor, at, appId, name).changes === 1
+      );
+    });
+  }
+
+  /** Marks the app's current pinned tool list as reviewed by the principal ("Looks right"). */
+  async markToolsReviewed(appId: string, expectedListHash?: string, at = new Date().toISOString()): Promise<boolean> {
+    isoValid(at);
+    return this.use((db) => {
+      const pin = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
+      if (!pin) return false;
+      if (expectedListHash !== undefined && pin.list_hash !== expectedListHash) return false;
+      return (
+        db
+          .prepare('UPDATE app_pins SET reviewed_list_hash = list_hash, reviewed_at = ? WHERE app_id = ?')
+          .run(at, appId).changes === 1
+      );
+    });
+  }
+
+  /** Connected apps whose pinned tools still have unsorted or unsettled rows. */
+  async appsNeedingSort(): Promise<readonly { readonly appId: string; readonly listHash: string }[]> {
+    return this.use((db) =>
+      db
+        .prepare<[], { appId: string; listHash: string }>(
+          `SELECT DISTINCT p.app_id AS appId, p.list_hash AS listHash
+            FROM app_pins p
+            JOIN grants g ON g.app_id = p.app_id AND g.state = 'live'
+            JOIN app_tools t ON t.app_id = p.app_id
+            WHERE t.label IS NULL OR t.unsettled = 1
+            ORDER BY p.app_id`,
+        )
+        .all(),
+    );
+  }
+
+  /**
+   * Atomically claims an approved call before sending anything upstream. Replays find the existing row and never
+   * dispatch a second upstream call.
+   */
+  async claimApprovedCall(input: {
+    readonly approvalId: string;
+    readonly appId: string;
+    readonly grantGeneration: number;
+    readonly toolName: string;
+    readonly definitionHash: string;
+    readonly argsHash: string;
+    readonly at?: string;
+  }): Promise<ClaimApprovedCallResult> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    return this.use((db) =>
+      db
+        .transaction((): ClaimApprovedCallResult => {
+          const existing = db
+            .prepare<[string], RelayCallRow>('SELECT * FROM relay_calls WHERE approval_id = ?')
+            .get(input.approvalId);
+          if (existing) {
+            const record = toRelayCall(existing);
+            return record.state === 'executing'
+              ? { status: 'already_executing', record }
+              : { status: 'already_settled', record };
+          }
+          db.prepare(
+            `INSERT INTO relay_calls
+              (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,
+               created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, 'executing', NULL, ?, ?)`,
+          ).run(
+            input.approvalId,
+            input.approvalId,
+            input.appId,
+            input.grantGeneration,
+            input.toolName,
+            input.definitionHash,
+            input.argsHash,
+            at,
+            at,
+          );
+          return { status: 'claimed' };
+        })
+        .immediate(),
+    );
+  }
+
+  /** Records an in-flight direct ("just do it") call; replays of the same request id may run again. */
+  async recordDirectCallStart(input: {
+    readonly id: string;
+    readonly appId: string;
+    readonly grantGeneration: number;
+    readonly toolName: string;
+    readonly definitionHash: string;
+    readonly argsHash: string;
+    readonly at?: string;
+  }): Promise<void> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    await this.use((db) =>
+      db
+        .transaction(() => {
+          db.prepare(
+            `INSERT INTO relay_calls
+              (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,
+               created_at, updated_at)
+              VALUES (?, NULL, ?, ?, ?, ?, ?, 'executing', NULL, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET grant_generation = excluded.grant_generation,
+                definition_hash = excluded.definition_hash, args_hash = excluded.args_hash,
+                state = 'executing', outcome_json = NULL, updated_at = excluded.updated_at`,
+          ).run(
+            input.id,
+            input.appId,
+            input.grantGeneration,
+            input.toolName,
+            input.definitionHash,
+            input.argsHash,
+            at,
+            at,
+          );
+        })
+        .immediate(),
+    );
+  }
+
+  async settleRelayCall(
+    id: string,
+    outcome: {
+      readonly state: Exclude<RelayCallState, 'executing'>;
+      readonly outcomeJson?: string | null;
+      readonly at?: string;
+    },
+  ): Promise<void> {
+    const at = outcome.at ?? new Date().toISOString();
+    isoValid(at);
+    await this.use((db) =>
+      db
+        .transaction(() => {
+          const row = db
+            .prepare<
+              [string],
+              { app_id: string; approval_id: string | null }
+            >('SELECT app_id, approval_id FROM relay_calls WHERE id = ?')
+            .get(id);
+          db.prepare('UPDATE relay_calls SET state = ?, outcome_json = ?, updated_at = ? WHERE id = ?').run(
+            outcome.state,
+            outcome.outcomeJson ?? null,
+            at,
+            id,
+          );
+          if (row && row.approval_id === null) {
+            // Keep the 30 most recent direct call outcomes per app for held-call context matching.
+            db.prepare(
+              `DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL AND id NOT IN (
+                SELECT id FROM relay_calls WHERE app_id = ? AND approval_id IS NULL ORDER BY updated_at DESC LIMIT 30
+              )`,
+            ).run(row.app_id, row.app_id);
+          }
+        })
+        .immediate(),
+    );
+  }
+
+  /** Most recent completed results returned for this app and grant, newest first. */
+  async recentCompletedResults(
+    appId: string,
+    grantGeneration: number,
+    limit = 20,
+  ): Promise<readonly RecentRelayResult[]> {
+    return this.use((db) =>
+      db
+        .prepare<[string, number, number], RecentRelayResult>(
+          `SELECT id, tool_name AS toolName, outcome_json AS outcomeJson, updated_at AS updatedAt
+            FROM relay_calls
+            WHERE app_id = ? AND grant_generation = ? AND state = 'completed' AND outcome_json IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT ?`,
+        )
+        .all(appId, grantGeneration, limit),
     );
   }
 }

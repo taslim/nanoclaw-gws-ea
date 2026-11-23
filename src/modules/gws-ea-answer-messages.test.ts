@@ -55,6 +55,11 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       'the response frame keeps its transport error code; the error message tells main what was refused and what to do',
   },
+  'gws-ea-connections/relay-actions.ts errorFrame: code': {
+    kind: 'host-only',
+    reason:
+      'the response frame keeps its transport error code; the error message explains why the relay request was refused or failed',
+  },
   'gws-ea-connections/page.ts operatorMessage: status': {
     kind: 'host-only',
     reason: 'the HTTP status serves the page response; the principal reads only the constant message',

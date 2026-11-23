@@ -136,6 +136,43 @@ export async function startFakeEndpoints(hosts: readonly string[]): Promise<Fake
   };
 }
 
+export interface FakeToolDefinition {
+  readonly name: string;
+  readonly title?: string;
+  readonly description?: string;
+  readonly inputSchema: {
+    readonly type: 'object';
+    readonly properties?: Readonly<Record<string, Record<string, unknown>>>;
+    readonly required?: readonly string[];
+    readonly [key: string]: unknown;
+  };
+  readonly outputSchema?: {
+    readonly type: 'object';
+    readonly properties?: Readonly<Record<string, Record<string, unknown>>>;
+    readonly required?: readonly string[];
+    readonly [key: string]: unknown;
+  };
+  readonly annotations?: {
+    readonly title?: string;
+    readonly readOnlyHint?: boolean;
+    readonly destructiveHint?: boolean;
+    readonly idempotentHint?: boolean;
+    readonly openWorldHint?: boolean;
+  };
+}
+
+export interface RecordedToolCall {
+  readonly name: string;
+  readonly arguments: Record<string, unknown>;
+  readonly bearer: string | undefined;
+}
+
+export interface FakeToolResult {
+  readonly content: readonly { readonly type: 'text'; readonly text: string }[];
+  readonly isError?: boolean;
+  readonly structuredContent?: Record<string, unknown>;
+}
+
 export interface FakeAppOptions {
   readonly appUrl: string;
   /** Root-path issuer, on the app's host or another. */
@@ -149,6 +186,11 @@ export interface FakeAppOptions {
   /** A client registered by hand with the server, as a principal would. */
   readonly client?: { readonly id: string; readonly secret: string; readonly redirectUri: string };
   readonly serverName?: string;
+  readonly instructions?: string;
+  readonly tools?: readonly FakeToolDefinition[];
+  /** Allows unauthenticated MCP requests (for `auth: 'none'` apps). */
+  readonly allowUnauthenticated?: boolean;
+  readonly onToolCall?: (call: RecordedToolCall) => FakeToolResult | FakeReply | undefined;
   readonly fetchClientDocument?: (url: string) => Promise<FakeReply>;
 }
 
@@ -178,10 +220,17 @@ export class FakeMcpApp {
   readonly documents: Record<string, unknown>[] = [];
   readonly revoked: string[] = [];
   readonly accessTokens = new Set<string>();
+  readonly toolCalls: RecordedToolCall[] = [];
+  tools: FakeToolDefinition[];
+  instructions: string | undefined;
+  /** Optional reply override for the MCP endpoint (e.g., to simulate downtime or oversized responses). */
+  mcpOverride: ((request: FakeRequest) => FakeReply | undefined) | undefined;
+  onToolCall: ((call: RecordedToolCall) => FakeToolResult | FakeReply | undefined) | undefined;
   private readonly refreshTokens = new Map<string, string>();
   private readonly codes = new Map<string, PendingCode>();
   private readonly issParameter: boolean;
   private readonly serverName: string;
+  private readonly allowUnauthenticated: boolean;
   private readonly fetchClientDocument: ((url: string) => Promise<FakeReply>) | undefined;
 
   constructor(options: FakeAppOptions) {
@@ -189,6 +238,10 @@ export class FakeMcpApp {
     this.issuer = new URL(options.issuer);
     this.issParameter = options.issParameter ?? false;
     this.serverName = options.serverName ?? 'Ledgerly';
+    this.instructions = options.instructions;
+    this.tools = [...(options.tools ?? [])];
+    this.allowUnauthenticated = options.allowUnauthenticated ?? false;
+    this.onToolCall = options.onToolCall;
     this.fetchClientDocument = options.fetchClientDocument;
     const at = (route: string): string => new URL(route, this.issuer).href;
     this.resourceMetadata = {
@@ -277,6 +330,8 @@ export class FakeMcpApp {
   readonly handle: FakeHandler = (request) => {
     if (request.host === this.app.hostname) {
       if (request.method === 'POST' && request.path === this.app.pathname) return this.mcp(request);
+      if (request.method === 'GET' && request.path === this.app.pathname) return { status: 405 };
+      if (request.method === 'DELETE' && request.path === this.app.pathname) return { status: 204 };
       if (request.method === 'GET' && request.path === `/.well-known/oauth-protected-resource${this.app.pathname}`)
         return { status: 200, body: this.resourceMetadata };
     }
@@ -298,25 +353,63 @@ export class FakeMcpApp {
   };
 
   private mcp(request: FakeRequest): FakeReply {
+    const overridden = this.mcpOverride?.(request);
+    if (overridden) return overridden;
     const bearer = /^Bearer (.+)$/u.exec(request.headers.authorization ?? '')?.[1];
-    if (bearer === undefined || !this.accessTokens.has(bearer))
+    if (!this.allowUnauthenticated && (bearer === undefined || !this.accessTokens.has(bearer)))
       return {
         status: 401,
         headers: { 'www-authenticate': `Bearer resource_metadata="${this.resourceMetadataUrl}"` },
         body: { error: 'invalid_token' },
       };
-    return {
-      status: 200,
-      body: {
-        jsonrpc: '2.0',
-        id: 1,
-        result: {
-          protocolVersion: '2025-11-25',
-          capabilities: {},
-          serverInfo: { name: this.serverName, version: '1' },
-        },
-      },
-    };
+    let parsed: { id?: string | number; method?: string; params?: Record<string, unknown> } = {};
+    if (request.body.trim()) {
+      try {
+        parsed = JSON.parse(request.body) as typeof parsed;
+        /* eslint-disable-next-line no-catch-all/no-catch-all -- invalid JSON falls back to default initialize reply */
+      } catch {
+        parsed = {};
+      }
+    }
+    const id = parsed.id ?? 1;
+    switch (parsed.method) {
+      case 'notifications/initialized':
+        return { status: 202 };
+      case 'tools/list':
+        return { status: 200, body: { jsonrpc: '2.0', id, result: { tools: this.tools } } };
+      case 'tools/call': {
+        const params = parsed.params ?? {};
+        const name = typeof params.name === 'string' ? params.name : '';
+        const args =
+          typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
+            ? (params.arguments as Record<string, unknown>)
+            : {};
+        const call: RecordedToolCall = { name, arguments: args, bearer };
+        this.toolCalls.push(call);
+        const custom = this.onToolCall?.(call);
+        if (custom && 'status' in custom) return custom;
+        const result: FakeToolResult = custom ?? {
+          content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: name, arguments: args }) }],
+        };
+        return { status: 200, body: { jsonrpc: '2.0', id, result } };
+      }
+      case 'ping':
+        return { status: 200, body: { jsonrpc: '2.0', id, result: {} } };
+      default:
+        return {
+          status: 200,
+          body: {
+            jsonrpc: '2.0',
+            id,
+            result: {
+              protocolVersion: '2025-11-25',
+              capabilities: { tools: {} },
+              serverInfo: { name: this.serverName, version: '1' },
+              ...(this.instructions === undefined ? {} : { instructions: this.instructions }),
+            },
+          },
+        };
+    }
   }
 
   private authenticated(request: FakeRequest, form: URLSearchParams): string | undefined {
