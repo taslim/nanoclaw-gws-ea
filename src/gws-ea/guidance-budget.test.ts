@@ -50,9 +50,9 @@ type Agent = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser';
 /** A raise needs its reason here; each reason records the size its budget was set from. */
 const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason: string }>> = {
   main: {
-    tokens: 8_350,
+    tokens: 8_600,
     reason:
-      "8,320 tokens (33,278 characters): main's whole document with web connector enabled after trimming resident tool-schema repetition (interactive, artifacts, whatsapp-formatting) to deferred MCP descriptions and on-demand SKILL.md while preserving all doctrine, post-compaction skill-load cues, communication craft, briefing privacy rules, browser/web/Connections guidance, and front-page budget; rounded up.",
+      "8,558 tokens (34,229 characters): main's whole document with web connector enabled after trimming resident tool-schema repetition (interactive, artifacts, whatsapp-formatting) to deferred MCP descriptions and on-demand SKILL.md while preserving verbatim Google skill post-compaction trigger lines, all doctrine, communication craft, briefing privacy rules, browser/web/Connections guidance, and front-page budget; rounded up.",
   },
   'external-email': {
     tokens: 4_100,
