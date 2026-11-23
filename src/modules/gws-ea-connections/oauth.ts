@@ -150,6 +150,16 @@ export function appRedirectUri(webHostname: string, appHost: string): string {
   return `https://${webHostname}/connections/callback/${appHost}`;
 }
 
+export const CLIENT_DOCUMENT_PATH = '/oauth-client';
+
+/**
+ * A document client's ID is the address its metadata document is served from, so it changes only with the web
+ * hostname: the app ID is opaque and survives renames, and the address never reveals which apps are connected.
+ */
+export function appClientDocumentUrl(webHostname: string, appId: string): string {
+  return `https://${webHostname}${CLIENT_DOCUMENT_PATH}/${appId}`;
+}
+
 /** Counts whether any answer said to come back later, since the SDK's errors do not keep the status. */
 interface Watched {
   readonly fetch: PublicFetch;

@@ -8,7 +8,7 @@ import { registerWebMount } from '../gws-ea-web/mounts.js';
 import { registerAppActions } from './actions.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import { connectionsRoot } from './config.js';
-import { connectionsWebMount, operatorAsApp } from './connections-mount.js';
+import { clientDocumentsWebMount, connectionsWebMount, operatorAsApp } from './connections-mount.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
@@ -80,6 +80,7 @@ register({
 });
 
 registerWebMount(connectionsWebMount);
+registerWebMount(clientDocumentsWebMount);
 registerAppActions();
 
 onHostStart(async ({ signal }) => {

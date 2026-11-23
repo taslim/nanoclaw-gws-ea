@@ -40,6 +40,25 @@ export function sendJson(response: ServerResponse, status: number, data: Readonl
   response.end(JSON.stringify(data));
 }
 
+/**
+ * A JSON document anyone may fetch and cache. Its length is sent explicitly so a HEAD answer carries exactly the
+ * headers its GET would.
+ */
+export function sendPublicJson(
+  response: ServerResponse,
+  document: Readonly<Record<string, unknown>>,
+  options: { readonly head: boolean; readonly maxAgeSeconds: number },
+): void {
+  const body = JSON.stringify(document);
+  response.writeHead(200, {
+    ...pageHeaders(),
+    'cache-control': `public, max-age=${options.maxAgeSeconds}`,
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(body),
+  });
+  response.end(options.head ? undefined : body);
+}
+
 export interface PageResponse {
   readonly status: number;
   readonly nonce: string;

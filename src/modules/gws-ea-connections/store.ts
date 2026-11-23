@@ -149,6 +149,8 @@ export interface ConnectionsStoreOptions {
   readonly runCommand?: SanitizedCommandOutcomeRunner;
 }
 
+/** Every app ID the store issues is a lowercase random UUID. */
+export const APP_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const SIGN_IN_TTL_MS = 10 * 60_000;
 export const NAME_MAX = 100;
 const SECRET_MAX = 64 * 1024;

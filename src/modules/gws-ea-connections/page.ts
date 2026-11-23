@@ -29,7 +29,7 @@ import {
   type OperatorDisconnectOutcome,
 } from './operator.js';
 import { renderConnectionsPage, type ConnectionsPageState, type ConnectionsView } from './page-view.js';
-import { ConnectionsStoreError, getConnectionsStore, NAME_MAX } from './store.js';
+import { APP_ID_PATTERN, ConnectionsStoreError, getConnectionsStore, NAME_MAX } from './store.js';
 
 /** Builds the operations for one request; a store that cannot be opened leaves the page listing what it can. */
 export type ConnectionsOperationsFactory = (webHostname: string) => Promise<ConnectionOperations>;
@@ -58,9 +58,8 @@ type Route =
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
 
-const APP_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-const EXACT_APP_ID = new RegExp(`^${APP_ID}$`, 'u');
-const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID})/(connect|rename)$`, 'u');
+const EXACT_APP_ID = new RegExp(`^${APP_ID_PATTERN}$`, 'u');
+const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/(connect|rename)$`, 'u');
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
 /** Each code's one message. Only a refused client says why a sign-in ended: the principal can correct it. */
