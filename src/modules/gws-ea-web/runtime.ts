@@ -1,7 +1,7 @@
-import { createServer, type Server } from 'node:http';
-import { readWebOperatorConfig, reconcileWebAccessEmails } from '../../gws-ea/web-cloudflare.js';
+import { createServer, type RequestListener, type Server } from 'node:http';
+import { readWebOperatorConfig, reconcileWebAccessEmails, type WEB_PUBLIC_PATHS } from '../../gws-ea/web-cloudflare.js';
 import { log } from '../../log.js';
-import { createWebIdentity } from './access.js';
+import { createWebIdentity, type WebIdentity } from './access.js';
 import { webAdmissionEmails, type WebMount } from './mounts.js';
 import { WEB_POLICY_VERSIONS, readWebPolicy, webPolicyDigest, type WebPolicyFile } from './policy.js';
 import { createWebHandler, principalGate, unavailableWebHandler } from './server.js';
@@ -20,11 +20,29 @@ export interface WebReadiness {
   readonly verifyAdmission: (config: WebPolicyFile) => Promise<void>;
   readonly publicationReady: (config: WebPolicyFile) => Promise<boolean>;
 }
+const CLIENT_DOCUMENTS: (typeof WEB_PUBLIC_PATHS)[number] = '/oauth-client/*';
+
+function routeListener(mount: WebMount, config: WebPolicyFile, identity: WebIdentity): RequestListener {
+  switch (mount.audience) {
+    case 'public':
+      return mount.handler(config);
+    case 'principal':
+    case 'artifact-readers':
+      return mount.handler(config, identity);
+    default: {
+      const unhandled: never = mount;
+      throw new Error(`Unknown web mount audience ${String(unhandled)}`);
+    }
+  }
+}
+
 /** One optional origin and one non-overlapping admission reconciliation tick per host. */
 export class WebRuntime {
   private server: Server | undefined;
   private config: WebPolicyFile | undefined;
   private verified: string | undefined;
+  /** The policy digest whose last verification saw the client-document override. */
+  private clientDocumentsVerified: string | undefined;
   private verifying: Promise<void> | undefined;
   private ready = false;
   private unavailable = false;
@@ -88,18 +106,32 @@ export class WebRuntime {
       });
       if (this.stopped || !(await this.coordinatesMatch(config))) throw new Error('Web coordinates changed.');
       this.verified = JSON.stringify([webPolicyDigest(config), result.emails]);
+      this.clientDocumentsVerified = result.clientDocumentPath ? webPolicyDigest(config) : undefined;
     };
     this.verifying = task();
     try {
       await this.verifying;
       this.retryAt = 0;
     } catch (error) {
+      this.clientDocumentsVerified = undefined;
       this.retryAt = Date.now() + 15000;
       this.retryPolicy = webPolicyDigest(config);
       throw error;
     } finally {
       this.verifying = undefined;
     }
+  }
+  /**
+   * Whether an authorization server can fetch client documents now: a recorded path alone could precede the Access
+   * app's update, and a verified override alone could outlive the origin that serves it.
+   */
+  clientDocumentsServed(): boolean {
+    return (
+      this.ready &&
+      this.server?.listening === true &&
+      this.config?.publicPaths?.includes(CLIENT_DOCUMENTS) === true &&
+      this.clientDocumentsVerified === webPolicyDigest(this.config)
+    );
   }
   async health(): Promise<WebHealth> {
     const policy = await readWebPolicy();
@@ -187,7 +219,7 @@ export class WebRuntime {
         const config = fresh.config;
         const handler = createWebHandler(
           config.hostname,
-          this.mounts().map((mount) => ({ mount, listener: mount.handler(config, identity) })),
+          this.mounts().map((mount) => ({ mount, listener: routeListener(mount, config, identity) })),
           principalGate(identity),
         );
         const server = createServer((request, response) => {

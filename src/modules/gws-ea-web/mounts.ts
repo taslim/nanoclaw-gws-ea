@@ -1,5 +1,6 @@
 import type { RequestListener } from 'node:http';
 import type { GuardedAction } from '../../guard/index.js';
+import { WEB_PUBLIC_PATHS } from '../../gws-ea/web-cloudflare.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import type { WebIdentity } from './access.js';
 import type { IconName } from './kit/html.js';
@@ -14,12 +15,12 @@ interface WebMountBase {
   readonly name: string;
   readonly path: WebMountPath;
   readonly methods: readonly WebMethod[];
-  readonly handler: WebHandlerFactory;
 }
 
 /** Served only after the web module has verified the principal, on every request. */
 export interface PrincipalPageMount extends WebMountBase {
   readonly audience: 'principal';
+  readonly handler: WebHandlerFactory;
   readonly title: string;
   /** Marks the page in the phone's tab bar. */
   readonly icon?: IconName;
@@ -34,12 +35,22 @@ export interface PrincipalPageMount extends WebMountBase {
 /** Authorizes its own readers; the web module only enforces sandboxing of authored content. */
 export interface ArtifactReadersMount extends WebMountBase {
   readonly audience: 'artifact-readers';
+  readonly handler: WebHandlerFactory;
   readonly admissionEmails: () => Promise<readonly string[]>;
   /** Responses on these paths render authored content and must carry an opaque-origin sandbox. */
   readonly authoredContent: (pathname: string) => boolean;
 }
 
-export type WebMount = PrincipalPageMount | ArtifactReadersMount;
+/**
+ * Answers anyone Access lets through on its path, so its handler is never given a way to identify the caller and
+ * its path must be one the Access app serves publicly.
+ */
+export interface PublicMount extends WebMountBase {
+  readonly audience: 'public';
+  readonly handler: (config: WebPolicyFile) => RequestListener;
+}
+
+export type WebMount = PrincipalPageMount | ArtifactReadersMount | PublicMount;
 
 const NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const PATH = /^(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)+$/u;
@@ -85,6 +96,8 @@ export class WebMountRegistry {
       throw new Error(`Web mount "${mount.name}" has invalid methods.`);
     if (mount.audience === 'principal' && !mount.title.trim())
       throw new Error(`Principal page "${mount.name}" needs a title.`);
+    if (mount.audience === 'public' && !WEB_PUBLIC_PATHS.some((pattern) => pattern === `${mount.path}/*`))
+      throw new Error(`Public web mount "${mount.name}" is outside the paths Access serves publicly.`);
     for (const existing of this.mounts) {
       if (existing.name === mount.name) throw new Error(`Web mount "${mount.name}" is already registered.`);
       if (overlaps(existing.path, mount.path))

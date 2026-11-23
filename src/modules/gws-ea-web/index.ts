@@ -11,6 +11,7 @@ export const webReadiness: WebReadiness = {
   verifyAdmission: (config) => runtime.verifyAdmission(config),
   publicationReady: (config) => runtime.publicationReady(config),
 };
+export const clientDocumentsServed = (): boolean => runtime.clientDocumentsServed();
 registerPrincipalPageDelivery(webReadiness);
 onHostStart(({ signal }) => runtime.start(signal));
 onHostShutdown(() => runtime.stop());

@@ -10,6 +10,7 @@ import {
   WebMountRegistry,
   type ArtifactReadersMount,
   type PrincipalPageMount,
+  type PublicMount,
   type WebMountPath,
 } from './mounts.js';
 
@@ -50,17 +51,28 @@ function readers(name: string, mountPath: WebMountPath, emails: readonly string[
   };
 }
 
+function publicMount(name: string, mountPath: WebMountPath): PublicMount {
+  return { name, audience: 'public', path: mountPath, methods: ['GET', 'HEAD'], handler };
+}
+
 it('refuses overlapping or duplicate registrations and accepts siblings and the root', () => {
   const registry = new WebMountRegistry();
   registry.register(page('home', '/'));
   registry.register(page('logins', '/logins'));
   registry.register(readers('artifacts', '/artifacts'));
   registry.register(page('logins-extra', '/loginsx'));
+  registry.register(publicMount('client-documents', '/oauth-client'));
   expect(() => registry.register(page('nested', '/logins/add'))).toThrow(/overlaps "logins"/u);
   expect(() => registry.register(readers('parent', '/artifacts'))).toThrow(/overlaps "artifacts"/u);
   expect(() => registry.register(page('second-home', '/'))).toThrow(/overlaps "home"/u);
   expect(() => registry.register(page('logins', '/elsewhere'))).toThrow(/already registered/u);
-  expect(registry.all().map(({ name }) => name)).toEqual(['home', 'logins', 'artifacts', 'logins-extra']);
+  expect(registry.all().map(({ name }) => name)).toEqual([
+    'home',
+    'logins',
+    'artifacts',
+    'logins-extra',
+    'client-documents',
+  ]);
   expect(registry.principalPages().map(({ name }) => name)).toEqual(['home', 'logins', 'logins-extra']);
 });
 
@@ -73,6 +85,14 @@ it('refuses malformed paths, names, methods and untitled principal pages', () =>
   expect(() => registry.register({ ...page('twice', '/x'), methods: ['GET', 'GET'] })).toThrow(/methods/u);
   expect(() => registry.register({ ...page('untitled', '/x'), title: ' ' })).toThrow(/title/u);
   expect(registry.all()).toEqual([]);
+});
+
+it('refuses a public mount whose path Access does not let through without identity', () => {
+  const registry = new WebMountRegistry();
+  for (const outside of ['/', '/elsewhere', '/oauth', '/oauth-client/x', '/connections'] as WebMountPath[])
+    expect(() => registry.register(publicMount('outside', outside)), outside).toThrow(/public/u);
+  registry.register(publicMount('client-documents', '/oauth-client'));
+  expect(registry.all().map(({ name }) => name)).toEqual(['client-documents']);
 });
 
 it('normalizes only paths that spell what they address', () => {
@@ -97,18 +117,20 @@ it('normalizes only paths that spell what they address', () => {
     expect(normalizeWebPathname(url), url).toBeUndefined();
 });
 
-it('admits the principal for principal pages and each artifact-readers mount its own readers', async () => {
+it('admits the principal for principal pages, each artifact-readers mount its own readers and no one for public mounts', async () => {
   expect(
     await webAdmissionEmails([
       page('logins', '/logins'),
       page('home', '/'),
       readers('artifacts', '/artifacts', ['remy@example.com', 'morgan@example.com']),
+      publicMount('client-documents', '/oauth-client'),
     ]),
   ).toEqual(['morgan@example.com', 'remy@example.com']);
   expect(principals.reads).toBe(1);
   expect(await webAdmissionEmails([readers('artifacts', '/artifacts', ['juno@example.com'])])).toEqual([
     'juno@example.com',
   ]);
+  expect(await webAdmissionEmails([publicMount('client-documents', '/oauth-client')])).toEqual([]);
   expect(principals.reads).toBe(1);
 });
 
