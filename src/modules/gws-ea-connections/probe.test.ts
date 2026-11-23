@@ -118,6 +118,27 @@ describe('probeApp', () => {
     });
   });
 
+  it.each([
+    ['lists none', ['none'], true],
+    ['takes only client_secret_basic', ['client_secret_basic'], false],
+    ['names no token endpoint auth method, which means client_secret_basic', [], false],
+  ])(
+    'reads client documents as supported only when a server advertising them %s',
+    async (_case, methods, documents) => {
+      const app = new FakeMcpApp({
+        appUrl: LEDGERLY,
+        issuer: 'https://app.ledgerly.example.test',
+        tokenAuthMethods: methods,
+        fetchClientDocument: async () => ({ status: 404 }),
+      });
+      serve(app.handle);
+      expect(await probeApp(LEDGERLY, { fetches: endpoints.fetches })).toMatchObject({
+        status: 'ok',
+        method: { kind: 'oauth', dynamicRegistration: false, clientDocuments: documents },
+      });
+    },
+  );
+
   it('refuses OAuth whose protected resource names another address', async () => {
     const app = ledgerly();
     app.resourceMetadata.resource = 'https://app.ledgerly.example.test/';

@@ -14,15 +14,23 @@ import type {
 } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
+import { createWebHandler } from '../gws-ea-web/server.js';
 import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, mainOperatorServers } from './apply.js';
-import { connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
+import { createClientDocumentHandler } from './client-document.js';
+import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
 import { AppCredentialsUnavailableError, type AppConnection } from './credentials.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
-import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
+import {
+  FakeMcpApp,
+  startFakeEndpoints,
+  type FakeEndpoints,
+  type FakeHandler,
+  type FakeReply,
+} from './testing/oauth-server.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
 
 const HOST = 'juno.example.test';
@@ -33,6 +41,9 @@ const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
 const LEDGERLY_REDIRECT = `https://${HOST}/connections/callback/app.ledgerly.example.test`;
 const LEDGER = 'https://mcp.ledger.example.test/mcp';
 const NOTES = 'https://notes.example.test/mcp';
+/** Takes only client documents: `none` clients, no registration endpoint, `iss` sent back. */
+const LARDER = 'https://mcp.larder.example.test/mcp';
+const LARDER_REDIRECT = `https://${HOST}/connections/callback/mcp.larder.example.test`;
 const RECIPES = 'https://recipes.example.test/mcp';
 const CLIENT_ID = 'juno-ledgerly-client';
 const SENTINEL_SECRET = 'sentinel-client-secret-V7k2';
@@ -114,6 +125,9 @@ let server: Server;
 let port: number;
 let replies: Reply[];
 let logged: string[];
+let documentsServed: boolean;
+let documentServer: Server;
+let documentPort: number;
 
 beforeAll(async () => {
   endpoints = await startFakeEndpoints([
@@ -123,6 +137,7 @@ beforeAll(async () => {
     'notes.example.test',
     'recipes.example.test',
     'down.example.test',
+    'mcp.larder.example.test',
   ]);
 });
 afterAll(async () => {
@@ -150,7 +165,15 @@ function operations(): ConnectionOperations {
       gateway.events.push('apply');
       return changed;
     },
+    clientDocumentsServed: () => documentsServed,
   });
+}
+
+async function listen(target: Server): Promise<number> {
+  await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+  const address = target.address();
+  if (!address || typeof address === 'string') throw new Error('No test server port');
+  return address.port;
 }
 
 beforeEach(async () => {
@@ -160,6 +183,7 @@ beforeEach(async () => {
   gateway = new FakeGateway();
   gatewaySeam = true;
   hostSeam = true;
+  documentsServed = true;
   replies = [];
   logged = [];
   for (const level of ['debug', 'info', 'warn', 'error'] as const)
@@ -197,14 +221,29 @@ beforeEach(async () => {
     }),
   });
   server = createServer(handler);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('No test server port');
-  port = address.port;
+  port = await listen(server);
+  // The assistant's web origin as an authorization server reaches it: only the public client-document mount.
+  documentServer = createServer(
+    createWebHandler(
+      HOST,
+      [
+        {
+          mount: clientDocumentsWebMount,
+          listener: createClientDocumentHandler({ hostname: HOST, openStore: async () => store }),
+        },
+      ],
+      async () => {
+        throw new Error('A client document never consults the principal gate');
+      },
+    ),
+  );
+  documentPort = await listen(documentServer);
 });
 afterEach(async () => {
   server.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  documentServer.closeAllConnections();
+  await new Promise<void>((resolve) => documentServer.close(() => resolve()));
   await closeDb();
   await rm(directory, { recursive: true, force: true });
   vi.restoreAllMocks();
@@ -255,6 +294,65 @@ function fakeLedgerly(): FakeMcpApp {
     issuer: 'https://app.ledgerly.example.test',
     client: { id: CLIENT_ID, secret: SENTINEL_SECRET, redirectUri: LEDGERLY_REDIRECT },
   });
+}
+
+/** What an authorization server reads at a client document's address on the assistant's hostname. */
+function fetchClientDocument(url: string): Promise<FakeReply> {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(
+      { hostname: '127.0.0.1', port: documentPort, path: target.pathname, headers: { host: target.host } },
+      (incoming) => {
+        let text = '';
+        incoming.on('data', (chunk: Buffer) => {
+          text += chunk.toString();
+        });
+        incoming.on('end', () => {
+          const json = incoming.headers['content-type'] === 'application/json';
+          resolve({ status: incoming.statusCode ?? 0, body: json ? (JSON.parse(text) as unknown) : text });
+        });
+      },
+    );
+    outgoing.on('error', reject);
+    outgoing.end();
+  });
+}
+
+function fakeLarder(): FakeMcpApp {
+  return new FakeMcpApp({
+    appUrl: LARDER,
+    issuer: 'https://mcp.larder.example.test',
+    tokenAuthMethods: ['none'],
+    issParameter: true,
+    fetchClientDocument,
+  });
+}
+
+/** Ledger's authorization server, which registers clients and also takes client documents. */
+function fakeLedgerWithDocuments(): FakeMcpApp {
+  return new FakeMcpApp({
+    appUrl: LEDGER,
+    issuer: 'https://auth.example.test',
+    registration: true,
+    tokenAuthMethods: ['client_secret_basic', 'none'],
+    fetchClientDocument,
+  });
+}
+
+function documentUrl(app: Pick<ConnectionApp, 'id'>): string {
+  return `https://${HOST}/oauth-client/${app.id}`;
+}
+
+function clientIdOf(authorizationUrl: string): string | null {
+  return new URL(authorizationUrl).searchParams.get('client_id');
+}
+
+function tokenRequests(): FakeEndpoints['requests'] {
+  return endpoints.requests.filter((incoming) => incoming.path === '/oauth/token');
+}
+
+function registrationRequests(): FakeEndpoints['requests'] {
+  return endpoints.requests.filter((incoming) => incoming.path === '/oauth/register');
 }
 
 /** Takes a pasted token and nothing else, publishing no sign-in metadata. */
@@ -510,7 +608,7 @@ describe('client details the server refuses', () => {
     const url = await startSignIn(await onlyApp());
 
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=client_refused',
+      '/connections?outcome=assistant_client_refused',
     );
     expect(ledger.registrations).toHaveLength(2);
     const replaced = await onlyApp();
@@ -621,6 +719,362 @@ describe('client details the server refuses', () => {
   });
 });
 
+describe('apps whose server takes client documents', () => {
+  const unavailable = 'Your assistant can’t sign in to this app right now. Try again in a few minutes.';
+  const assistantRefused = 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.';
+
+  /** The server expires a registration's secret, so it refuses that client at the exchange. */
+  function expireSecret(app: FakeMcpApp, clientId: string): void {
+    const registered = app.clients.get(clientId);
+    if (!registered) throw new Error('No such registration');
+    app.clients.set(clientId, { ...registered, secret: 'expired-secret' });
+  }
+
+  /** Approves at the server, which fetches the client document, and returns to the assistant. */
+  async function signInWithDocument(app: FakeMcpApp, host: string, authorizationUrl: string): Promise<Reply> {
+    return callback(host, (await app.approveWithDocument(authorizationUrl)).query);
+  }
+
+  it('adds and connects a server that takes only client documents, with no client form and no secret', async () => {
+    const larder = fakeLarder();
+    serve(larder.handle);
+    const added = await post('/connections/add', { url: LARDER, name: '' });
+    expect(added.status).toBe(200);
+    const stored = await onlyApp();
+    expect(stored).toMatchObject({ auth: 'oauth', hasClient: true, clientEntered: false });
+    for (const body of [added.body, (await request(`/connections/app/${stored.id}/connect`)).body]) {
+      expect(body).toContain('>Continue to mcp.larder.example.test</button>');
+      expect(body).not.toContain('name="clientId"');
+    }
+    expect(registrationRequests()).toEqual([]);
+
+    const url = await startSignIn(stored);
+    expect(clientIdOf(url)).toBe(documentUrl(stored));
+    expect(new URL(url).searchParams.get('redirect_uri')).toBe(LARDER_REDIRECT);
+    const returned = await signInWithDocument(larder, 'mcp.larder.example.test', url);
+
+    expect(returned.headers.location).toBe('/connections?outcome=connected');
+    expect(larder.documents).toEqual([
+      expect.objectContaining({
+        client_id: documentUrl(stored),
+        client_name: 'Juno',
+        redirect_uris: [LARDER_REDIRECT],
+        token_endpoint_auth_method: 'none',
+      }),
+    ]);
+    const [exchange, ...others] = tokenRequests();
+    expect(others).toEqual([]);
+    const sent = new URLSearchParams(exchange.body);
+    expect(sent.get('client_id')).toBe(documentUrl(stored));
+    expect(sent.get('resource')).toBe(LARDER);
+    expect(sent.has('client_secret')).toBe(false);
+    expect(exchange.headers.authorization).toBeUndefined();
+    const connected = await onlyApp();
+    expect(connected.status).toBe('connected');
+    expect(larder.accessTokens.has(gateway.held.get(`gws-ea-app-${connected.id}`)?.value ?? '')).toBe(true);
+    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LARDER } });
+  });
+
+  it('gives a server that also registers clients a document client, with no registration request', async () => {
+    const ledger = fakeLedgerWithDocuments();
+    serve(ledger.handle);
+    expect((await post('/connections/add', { url: LEDGER, name: 'Ledger' })).status).toBe(200);
+    const stored = await onlyApp();
+
+    const url = await startSignIn(stored);
+    expect(clientIdOf(url)).toBe(documentUrl(stored));
+    expect((await signInWithDocument(ledger, 'mcp.ledger.example.test', url)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    expect(registrationRequests()).toEqual([]);
+  });
+
+  it.each([
+    ['only client_secret_basic', ['client_secret_basic']],
+    ['no token endpoint auth methods, which means client_secret_basic', []],
+  ])('registers with a server advertising documents but %s', async (_case, methods) => {
+    const ledger = new FakeMcpApp({
+      appUrl: LEDGER,
+      issuer: 'https://auth.example.test',
+      registration: true,
+      tokenAuthMethods: methods,
+      fetchClientDocument,
+    });
+    serve(ledger.handle);
+    await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+
+    expect(ledger.registrations).toHaveLength(1);
+    const url = await startSignIn(await onlyApp());
+    expect(clientIdOf(url)).toBe([...ledger.clients.keys()][0]);
+    expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    expect(ledger.documents).toEqual([]);
+  });
+
+  describe('while client documents are not served', () => {
+    it('refuses to add a server that takes only documents, storing nothing', async () => {
+      serve(fakeLarder().handle);
+      documentsServed = false;
+      const reply = await post('/connections/add', { url: LARDER, name: '' });
+      expect(reply.status).toBe(400);
+      expect(reply.body).toContain(unavailable);
+      expect(await store.apps()).toEqual([]);
+    });
+
+    it('registers with a server that also registers clients', async () => {
+      const ledger = fakeLedgerWithDocuments();
+      serve(ledger.handle);
+      documentsServed = false;
+      await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+      expect(ledger.registrations).toHaveLength(1);
+      expect(await onlyApp()).toMatchObject({ hasClient: true, clientEntered: false });
+    });
+
+    it('refuses a sign-in with a stored document client until they are served again', async () => {
+      const larder = fakeLarder();
+      serve(larder.handle);
+      await post('/connections/add', { url: LARDER, name: '' });
+      const stored = await onlyApp();
+      documentsServed = false;
+
+      const reply = await post('/connections/sign-in', { id: stored.id, version: String(stored.version) });
+      expect(reply.status).toBe(400);
+      expect(JSON.parse(reply.body)).toEqual({ error: unavailable });
+      expect(await onlyApp()).toEqual(stored);
+      expect(signInRow(stored.id)).toBeUndefined();
+
+      documentsServed = true;
+      expect(clientIdOf(await startSignIn(stored))).toBe(documentUrl(stored));
+    });
+  });
+
+  describe('a stored document client that no longer fits', () => {
+    async function withStaleDocumentClient(appUrl: string, issuer: string): Promise<ConnectionApp> {
+      expect((await post('/connections/add', { url: appUrl, name: '' })).status).toBe(200);
+      const added = await onlyApp();
+      return store.setClient(added.id, added.version, {
+        issuer,
+        client: {
+          clientId: `https://old-name.example.test/oauth-client/${added.id}`,
+          tokenEndpointAuthMethod: 'none',
+          kind: 'document',
+        },
+        entered: false,
+      });
+    }
+
+    it('is replaced by the document at the current address when it names another hostname', async () => {
+      const larder = fakeLarder();
+      serve(larder.handle);
+      const stale = await withStaleDocumentClient(LARDER, 'https://mcp.larder.example.test/');
+
+      const url = await startSignIn(stale);
+      expect(clientIdOf(url)).toBe(documentUrl(stale));
+      expect((await signInWithDocument(larder, 'mcp.larder.example.test', url)).headers.location).toBe(
+        '/connections?outcome=connected',
+      );
+    });
+
+    it('is replaced by a registration once the server stops advertising documents', async () => {
+      const ledger = fakeLedgerWithDocuments();
+      serve(ledger.handle);
+      await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+      expect(await onlyApp()).toMatchObject({ hasClient: true });
+      expect(ledger.registrations).toEqual([]);
+      delete ledger.serverMetadata.client_id_metadata_document_supported;
+
+      const url = await startSignIn(await onlyApp());
+      expect(ledger.registrations).toHaveLength(1);
+      expect(clientIdOf(url)).toBe([...ledger.clients.keys()][0]);
+      expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
+        '/connections?outcome=connected',
+      );
+    });
+
+    it('is forgotten, and client details asked for, when the assistant can provide no other client', async () => {
+      const larder = fakeLarder();
+      serve(larder.handle);
+      await post('/connections/add', { url: LARDER, name: '' });
+      const stored = await onlyApp();
+      expect(stored).toMatchObject({ hasClient: true });
+      delete larder.serverMetadata.client_id_metadata_document_supported;
+
+      const reply = await post('/connections/sign-in', { id: stored.id, version: String(stored.version) });
+      expect(reply.status).toBe(400);
+      expect(JSON.parse(reply.body)).toEqual({
+        error: 'This app now needs client details. Reload the page to enter them.',
+      });
+      const cleared = await onlyApp();
+      expect(cleared).toMatchObject({ hasClient: false, clientEntered: false });
+      expect((await request(`/connections/app/${cleared.id}/connect`)).body).toContain('name="clientId"');
+    });
+  });
+
+  describe('a client the server refuses at the exchange', () => {
+    it('replaces a refused document with a registration that remembers it, and never picks the document again', async () => {
+      const ledger = fakeLedgerWithDocuments();
+      serve(ledger.handle);
+      await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+      const added = await onlyApp();
+      const url = await startSignIn(added);
+      const { query } = await ledger.approveWithDocument(url);
+      // The server stops accepting the document between the sign-in page and the exchange.
+      ledger.clients.delete(documentUrl(added));
+
+      const returned = await callback('mcp.ledger.example.test', query);
+      expect(returned.headers.location).toBe('/connections?outcome=assistant_client_refused');
+      const list = (await request('/connections?outcome=assistant_client_refused')).body;
+      expect(list).toContain(assistantRefused);
+      expect(list).not.toContain('enter new ones');
+      expect(ledger.registrations).toHaveLength(1);
+      const replaced = await onlyApp();
+      expect(replaced).toMatchObject({ status: 'not_connected', hasClient: true, clientEntered: false });
+      expect((await store.readClient(replaced.id)).client).toMatchObject({ documentRefused: true });
+
+      // That registration is refused too: it is registered again, never replaced by the document.
+      const second = await startSignIn(replaced);
+      const [registeredId] = [...ledger.clients.keys()].filter((id) => id !== documentUrl(added));
+      expect(clientIdOf(second)).toBe(registeredId);
+      expireSecret(ledger, registeredId);
+      expect((await callback('mcp.ledger.example.test', ledger.approve(second).query)).headers.location).toBe(
+        '/connections?outcome=assistant_client_refused',
+      );
+      expect(ledger.registrations).toHaveLength(2);
+      const third = await startSignIn(await onlyApp());
+      expect(clientIdOf(third)).not.toBe(documentUrl(added));
+      expect((await callback('mcp.ledger.example.test', ledger.approve(third).query)).headers.location).toBe(
+        '/connections?outcome=connected',
+      );
+      expect(ledger.documents).toHaveLength(1);
+    });
+
+    it('falls to client details on a server that only takes documents, and never picks the document again', async () => {
+      const larder = fakeLarder();
+      serve(larder.handle);
+      await post('/connections/add', { url: LARDER, name: '' });
+      const added = await onlyApp();
+      const url = await startSignIn(added);
+      const { query } = await larder.approveWithDocument(url);
+      larder.clients.delete(documentUrl(added));
+
+      expect((await callback('mcp.larder.example.test', query)).headers.location).toBe(
+        '/connections?outcome=assistant_client_refused',
+      );
+      const cleared = await onlyApp();
+      expect(cleared).toMatchObject({ status: 'not_connected', hasClient: false });
+      expect((await request(`/connections/app/${cleared.id}/connect`)).body).toContain('name="clientId"');
+
+      const withoutDetails = await post('/connections/sign-in', { id: cleared.id, version: String(cleared.version) });
+      expect(withoutDetails.status).toBe(400);
+      expect(signInRow(cleared.id)).toBeUndefined();
+      larder.clients.set('larder-entered-client', { secret: SENTINEL_SECRET, redirectUris: [LARDER_REDIRECT] });
+      const entered = await startSignIn(cleared, { clientId: 'larder-entered-client', clientSecret: SENTINEL_SECRET });
+      expect(clientIdOf(entered)).toBe('larder-entered-client');
+      expect(larder.documents).toHaveLength(1);
+      assertNoSentinels();
+    });
+
+    it('replaces a refused registration with the document on a server that takes both', async () => {
+      const ledger = fakeLedgerWithDocuments();
+      serve(ledger.handle);
+      documentsServed = false;
+      await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+      documentsServed = true;
+      const registered = await onlyApp();
+
+      // An app that holds a working client keeps it.
+      const url = await startSignIn(registered);
+      const [registeredId] = [...ledger.clients.keys()];
+      expect(clientIdOf(url)).toBe(registeredId);
+      expireSecret(ledger, registeredId);
+      expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
+        '/connections?outcome=assistant_client_refused',
+      );
+
+      expect(ledger.registrations).toHaveLength(1);
+      const replaced = await onlyApp();
+      const next = await startSignIn(replaced);
+      expect(clientIdOf(next)).toBe(documentUrl(replaced));
+      expect((await signInWithDocument(ledger, 'mcp.ledger.example.test', next)).headers.location).toBe(
+        '/connections?outcome=connected',
+      );
+    });
+  });
+
+  it('signs in with a client sealed before documents existed as the registration it is', async () => {
+    const ledger = fakeLedgerWithDocuments();
+    serve(ledger.handle);
+    ledger.clients.set('juno-ledger-client', {
+      secret: SENTINEL_SECRET,
+      redirectUris: [`https://${HOST}/connections/callback/mcp.ledger.example.test`],
+    });
+    const created = await store.create({
+      name: 'Ledger',
+      url: LEDGER,
+      auth: 'oauth',
+      issuer: 'https://auth.example.test/',
+    });
+    const sealed = await store.setClient(created.id, created.version, {
+      issuer: 'https://auth.example.test/',
+      client: {
+        clientId: 'juno-ledger-client',
+        clientSecret: SENTINEL_SECRET,
+        tokenEndpointAuthMethod: 'client_secret_basic',
+      },
+      entered: false,
+    });
+
+    const url = await startSignIn(sealed);
+    expect(clientIdOf(url)).toBe('juno-ledger-client');
+    expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    expect(ledger.documents).toEqual([]);
+    expect(ledger.registrations).toEqual([]);
+  });
+
+  it('refuses a return whose iss names another issuer before any token request', async () => {
+    const larder = fakeLarder();
+    serve(larder.handle);
+    await post('/connections/add', { url: LARDER, name: '' });
+    const url = await startSignIn(await onlyApp());
+    const { query } = await larder.approveWithDocument(url);
+    query.set('iss', 'https://auth.example.test/');
+
+    expect((await callback('mcp.larder.example.test', query)).headers.location).toBe('/connections?outcome=failed');
+    expect(tokenRequests()).toEqual([]);
+    expect(logged.some((line) => line.includes('"code":"issuer_mismatch"'))).toBe(true);
+    expect(await onlyApp()).toMatchObject({ status: 'not_connected', hasClient: true });
+  });
+
+  it('logs no sign-in code, state or callback query, for an unknown state or a valid one that fails', async () => {
+    const larder = fakeLarder();
+    serve(larder.handle);
+    await post('/connections/add', { url: LARDER, name: '' });
+    const url = await startSignIn(await onlyApp());
+    const { query } = await larder.approveWithDocument(url);
+    const state = query.get('state') ?? '';
+    const unknown = new URLSearchParams({ code: 'sentinel-code-U8f1', state: 'sentinel-state-K3n7', iss: 'x' });
+    query.set('code', 'sentinel-code-W5p2');
+
+    expect((await callback('mcp.larder.example.test', unknown)).headers.location).toBe('/connections?outcome=expired');
+    expect((await callback('mcp.larder.example.test', query)).headers.location).toBe('/connections?outcome=failed');
+
+    expect(logged.length).toBeGreaterThan(0);
+    for (const line of logged)
+      for (const value of [
+        'sentinel-code-U8f1',
+        'sentinel-state-K3n7',
+        'sentinel-code-W5p2',
+        state,
+        unknown.toString(),
+        query.toString(),
+      ])
+        expect(line).not.toContain(value);
+  });
+});
+
 describe('pasted tokens and servers without sign-in', () => {
   it('connects a token app, disconnects it, and connects it again through the token field', async () => {
     serve(notesServer);
@@ -687,6 +1141,7 @@ describe('sign-in returns', () => {
       expired: 'That sign-in expired or was already used.',
       failed: 'Sign-in didn’t finish, so nothing changed.',
       client_refused: 'The sign-in service didn’t accept the client details, so they were removed.',
+      assistant_client_refused: 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.',
     };
     for (const [code, message] of Object.entries(messages)) {
       const reply = await request(`/connections?outcome=${code}`);

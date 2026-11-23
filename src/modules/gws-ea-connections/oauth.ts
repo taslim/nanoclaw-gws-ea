@@ -41,6 +41,8 @@ export type ConnectionOAuthCode =
   | 'issuer_mismatch'
   /** The server offers no automatic registration and no client details were entered. */
   | 'needs_client'
+  /** The app's client document would be used, but no server can fetch it right now. Worth asking again later. */
+  | 'client_unavailable'
   /** The server refused the client: registration, `invalid_client` or `unauthorized_client`. */
   | 'client_refused'
   /** The server refused the code or the refresh token (`invalid_grant`). */
@@ -92,6 +94,7 @@ export interface AuthorizationServer {
   readonly tokenAuthMethods: readonly string[];
   readonly revocationAuthMethods: readonly string[];
   readonly issParameterSupported: boolean;
+  readonly clientDocumentsSupported: boolean;
 }
 
 export interface ProtectedResource {
@@ -265,6 +268,7 @@ function readServerMetadata(document: unknown, issuer: string, assistantHost: st
     tokenAuthMethods: strings(document.token_endpoint_auth_methods_supported),
     revocationAuthMethods: strings(document.revocation_endpoint_auth_methods_supported),
     issParameterSupported: document.authorization_response_iss_parameter_supported === true,
+    clientDocumentsSupported: document.client_id_metadata_document_supported === true,
   };
 }
 
@@ -365,19 +369,68 @@ function registrationAuthMethod(server: AuthorizationServer): string {
 }
 
 /**
- * The client this app signs in with: the details the principal entered for this issuer, else a registration made
- * now for this app alone, else the principal must enter details. A client is never borrowed from another app, even
- * one on the same authorization server; `registered` asks the caller to store the new one.
+ * A document client is a public PKCE client, so a server must advertise documents and take clients without a
+ * secret. An empty method list means `client_secret_basic` alone.
+ */
+export function takesClientDocuments(server: AuthorizationServer): boolean {
+  return server.clientDocumentsSupported && server.tokenAuthMethods.includes('none');
+}
+
+/** What decides whether this app's client document may be chosen. */
+export interface DocumentOffer {
+  /** An authorization server can fetch the document now. */
+  readonly served: boolean;
+  /** The server refused this app's document once, so it is never chosen again and a registration remembers that. */
+  readonly refused: boolean;
+}
+
+export interface ClientDocumentOffer extends DocumentOffer {
+  readonly url: string;
+}
+
+export function documentClient(url: string): ClientRegistration {
+  return { clientId: url, tokenEndpointAuthMethod: 'none', kind: 'document' };
+}
+
+/**
+ * The kind of client an app without a usable one gets, in the MCP specification's order: the app's document, then
+ * a registration, then the principal's client details (`needs_client`). Without an offer the document is skipped.
+ * Choosing a document needs no request, but one no server can fetch now would fail at the sign-in page, so a
+ * registration stands in, or the choice waits (`client_unavailable`).
+ */
+export function newClientKind(
+  server: AuthorizationServer,
+  document: DocumentOffer | undefined,
+): 'document' | 'registration' {
+  if (document && !document.refused && takesClientDocuments(server)) {
+    if (document.served) return 'document';
+    return server.registrationEndpoint === undefined ? fail('client_unavailable') : 'registration';
+  }
+  return server.registrationEndpoint === undefined ? fail('needs_client') : 'registration';
+}
+
+/**
+ * The client this app signs in with: the one stored for this issuer, else a new one by `newClientKind`, made for
+ * this app alone. A stored document client is kept only while it names the app's current document address and the
+ * server still takes documents, and is used only while the document is served. A client is never borrowed from
+ * another app, even one on the same authorization server; `created` asks the caller to store the new one.
  */
 export async function clientForSignIn(
   signIn: SignInServer,
   stored: { readonly issuer: string | null; readonly client: ClientRegistration | undefined },
-  app: { readonly host: string; readonly redirectUri: string },
+  app: { readonly host: string; readonly redirectUri: string; readonly document?: ClientDocumentOffer },
   options: ConnectionOAuthOptions = {},
-): Promise<{ readonly client: ClientRegistration; readonly registered: boolean }> {
-  if (stored.client && stored.issuer !== null && sameUrl(stored.issuer, signIn.server.issuer))
-    return { client: stored.client, registered: false };
-  if (signIn.server.registrationEndpoint === undefined) return fail('needs_client');
+): Promise<{ readonly client: ClientRegistration; readonly created: boolean }> {
+  const { document } = app;
+  if (stored.client && stored.issuer !== null && sameUrl(stored.issuer, signIn.server.issuer)) {
+    if (stored.client.kind !== 'document') return { client: stored.client, created: false };
+    if (document && stored.client.clientId === document.url && takesClientDocuments(signIn.server)) {
+      if (!document.served) return fail('client_unavailable');
+      return { client: stored.client, created: false };
+    }
+  }
+  if (newClientKind(signIn.server, document) === 'document' && document)
+    return { client: documentClient(document.url), created: true };
   const method = registrationAuthMethod(signIn.server);
   // `application_type` is standard registration metadata the SDK's type does not list.
   const clientMetadata: SdkClientMetadata & { readonly application_type: 'web' } = {
@@ -401,9 +454,10 @@ export async function clientForSignIn(
     clientId: registered.client_id,
     ...(registered.client_secret === undefined ? {} : { clientSecret: registered.client_secret }),
     tokenEndpointAuthMethod: registered.token_endpoint_auth_method ?? method,
+    ...(document?.refused ? { documentRefused: true } : {}),
   };
   sdkClient(client);
-  return { client, registered: true };
+  return { client, created: true };
 }
 
 /** PKCE S256 with the app's URL as `resource`, the chosen scope and this app's redirect URI. */

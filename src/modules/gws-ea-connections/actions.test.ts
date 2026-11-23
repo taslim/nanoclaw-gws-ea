@@ -44,6 +44,7 @@ const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
 const RECIPES = 'https://recipes.example.test/mcp';
 const BOOKS = 'https://bücher.example.test/mcp';
 const BOOKS_HOST = 'xn--bcher-kva.example.test';
+const LARDER = 'https://mcp.larder.example.test/mcp';
 const SENTINEL_SECRET = 'sentinel-client-secret-H2v6';
 
 /** Answers without sign-in and advertises its name. */
@@ -97,6 +98,7 @@ beforeAll(async () => {
     'auth.example.test',
     'recipes.example.test',
     BOOKS_HOST,
+    'mcp.larder.example.test',
   ]);
   registerAppActions({
     context: async () => {
@@ -118,6 +120,7 @@ beforeAll(async () => {
           admission,
           connection: () => gateway.connection,
           applyMain: applyMainServers,
+          clientDocumentsServed: () => true,
         }),
       };
     },
@@ -247,6 +250,32 @@ describe('add_app', () => {
     });
     expect(everything()).not.toContain(SENTINEL_SECRET);
     expect(await getPendingApprovalsByAction(ADD_APP_ACTION)).toEqual([]);
+  });
+
+  it('adds an app whose server takes only client documents ready to connect, with no client details', async () => {
+    endpoints.use(
+      new FakeMcpApp({
+        appUrl: LARDER,
+        issuer: 'https://mcp.larder.example.test',
+        tokenAuthMethods: ['none'],
+        issParameter: true,
+        fetchClientDocument: async () => ({ status: 404 }),
+      }).handle,
+    );
+    await send(ADD_APP_ACTION, { url: LARDER, name: 'Larder' });
+    expect(cards[0].question).toContain('You would sign in at mcp.larder.example.test.');
+
+    await approve(ADD_APP_ACTION);
+
+    expect(await store.apps()).toEqual([
+      expect.objectContaining({ name: 'Larder', status: 'not_connected', hasClient: true, clientEntered: false }),
+    ]);
+    const { text } = JSON.parse(notes('connection-add:')[0].content) as { text: string };
+    expect(text).toContain(
+      'not connected yet. Send them the Connections link from principal_page; they sign in to it there.',
+    );
+    expect(text).not.toContain('client details');
+    expect(endpoints.requests.filter(({ path: route }) => route.startsWith('/oauth/'))).toEqual([]);
   });
 
   it('shows an internationalized host in plain letters on the card', async () => {

@@ -149,6 +149,11 @@ export interface FakeAppOptions {
   /** A client registered by hand with the server, as a principal would. */
   readonly client?: { readonly id: string; readonly secret: string; readonly redirectUri: string };
   readonly serverName?: string;
+  /**
+   * Advertises client metadata documents and fetches each URL `client_id` through this, as a server fetches it from
+   * the assistant's hostname.
+   */
+  readonly fetchClientDocument?: (url: string) => Promise<FakeReply>;
 }
 
 interface Client {
@@ -165,7 +170,7 @@ interface PendingCode {
 /**
  * An MCP server with OAuth in the shape Ledgerly publishes by default: protected-resource and authorization-server
  * metadata, PKCE S256, refresh tokens with rotation, revocation, `client_secret_basic` or `client_secret_post`, and
- * no registration endpoint unless asked for.
+ * no registration endpoint unless asked for. With `fetchClientDocument` it also takes client metadata documents.
  */
 export class FakeMcpApp {
   readonly app: URL;
@@ -174,18 +179,22 @@ export class FakeMcpApp {
   readonly serverMetadata: Record<string, unknown>;
   readonly clients = new Map<string, Client>();
   readonly registrations: Record<string, unknown>[] = [];
+  /** Every client document fetched, as the server read it. */
+  readonly documents: Record<string, unknown>[] = [];
   readonly revoked: string[] = [];
   readonly accessTokens = new Set<string>();
   private readonly refreshTokens = new Map<string, string>();
   private readonly codes = new Map<string, PendingCode>();
   private readonly issParameter: boolean;
   private readonly serverName: string;
+  private readonly fetchClientDocument: ((url: string) => Promise<FakeReply>) | undefined;
 
   constructor(options: FakeAppOptions) {
     this.app = new URL(options.appUrl);
     this.issuer = new URL(options.issuer);
     this.issParameter = options.issParameter ?? false;
     this.serverName = options.serverName ?? 'Ledgerly';
+    this.fetchClientDocument = options.fetchClientDocument;
     const at = (route: string): string => new URL(route, this.issuer).href;
     this.resourceMetadata = {
       resource: this.app.href,
@@ -205,6 +214,7 @@ export class FakeMcpApp {
       ...(options.registration ? { registration_endpoint: at('/oauth/register') } : {}),
       ...(options.revocation === false ? {} : { revocation_endpoint: at('/oauth/revoke') }),
       ...(this.issParameter ? { authorization_response_iss_parameter_supported: true } : {}),
+      ...(options.fetchClientDocument ? { client_id_metadata_document_supported: true } : {}),
     };
     if (options.client)
       this.clients.set(options.client.id, {
@@ -241,6 +251,37 @@ export class FakeMcpApp {
     const query = new URLSearchParams({ code, state: parameters.get('state') ?? '' });
     if (this.issParameter) query.set('iss', String(this.serverMetadata.issuer));
     return { redirectUri, query };
+  }
+
+  /**
+   * Plays the principal approving a sign-in whose `client_id` is a URL: the server fetches that document, takes it
+   * only when its `client_id` is the URL it fetched and it is a `none` client, and then knows the client by the
+   * redirect URIs the document lists.
+   */
+  async approveWithDocument(
+    authorizationUrl: string,
+  ): Promise<{ readonly redirectUri: string; readonly query: URLSearchParams }> {
+    const clientId = new URL(authorizationUrl).searchParams.get('client_id') ?? '';
+    if (!this.fetchClientDocument || !URL.canParse(clientId))
+      throw new Error('The fake server takes no client document for this authorization request');
+    const reply = await this.fetchClientDocument(clientId);
+    const document = reply.body;
+    if (
+      reply.status !== 200 ||
+      typeof document !== 'object' ||
+      document === null ||
+      Array.isArray(document) ||
+      !('client_id' in document) ||
+      document.client_id !== clientId ||
+      !('token_endpoint_auth_method' in document) ||
+      document.token_endpoint_auth_method !== 'none' ||
+      !('redirect_uris' in document) ||
+      !Array.isArray(document.redirect_uris)
+    )
+      throw new Error('The fake server would show an error page for this client document');
+    this.documents.push(document as Record<string, unknown>);
+    this.clients.set(clientId, { secret: undefined, redirectUris: document.redirect_uris.map(String) });
+    return this.approve(authorizationUrl);
   }
 
   readonly handle: FakeHandler = (request) => {

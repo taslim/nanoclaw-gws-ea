@@ -12,6 +12,7 @@ import {
   MCP_PROTOCOL_VERSION,
   readProtectedResource,
   signInServer,
+  takesClientDocuments,
   type ConnectionOAuthOptions,
   type SignInServer,
 } from './oauth.js';
@@ -25,6 +26,8 @@ export type SignInMethod =
       readonly issuer: string;
       /** The server registers clients itself, so the principal enters no client details. */
       readonly dynamicRegistration: boolean;
+      /** The server takes the app's client document, so the principal enters no client details. */
+      readonly clientDocuments: boolean;
       /** How the token endpoint takes client credentials, `client_secret_basic` when the server names none. */
       readonly clientAuthMethods: readonly string[];
       readonly scope: string | undefined;
@@ -124,6 +127,7 @@ async function unauthorized(
         kind: 'oauth',
         issuer: signIn.server.issuer,
         dynamicRegistration: signIn.server.registrationEndpoint !== undefined,
+        clientDocuments: takesClientDocuments(signIn.server),
         clientAuthMethods: methods.length > 0 ? methods : ['client_secret_basic'],
         scope: signIn.scope,
         signIn,

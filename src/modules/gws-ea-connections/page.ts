@@ -1,5 +1,6 @@
 import type { RequestListener, ServerResponse } from 'node:http';
 import type { WebIdentity } from '../gws-ea-web/access.js';
+import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import {
   handle,
   InvalidSubmission,
@@ -70,6 +71,7 @@ const RETURN_MESSAGES = {
   failed: 'Sign-in didn’t finish, so nothing changed. Try connecting again.',
   client_refused:
     'The sign-in service didn’t accept the client details, so they were removed. Connect again to enter new ones.',
+  assistant_client_refused: 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.',
 } satisfies Record<SignInReturn, string>;
 
 function isSignInReturn(code: string | null): code is SignInReturn {
@@ -82,6 +84,7 @@ const UNREACHABLE = 'The app didn’t respond. Check the address and try again.'
 const UNSUPPORTED = 'This app uses a kind of sign-in your assistant doesn’t support.';
 const HOST_IN_USE = 'Another app already uses this address. Remove it first, then add this one.';
 const OPERATOR_NEEDED = 'Apps can’t be added or connected right now. Ask your operator.';
+const CLIENT_UNAVAILABLE = 'Your assistant can’t sign in to this app right now. Try again in a few minutes.';
 
 function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnected'>): {
   readonly status: number;
@@ -124,6 +127,8 @@ function addMessage(reason: AddRefusal): string {
       return UNREACHABLE;
     case 'unsupported':
       return UNSUPPORTED;
+    case 'client_unavailable':
+      return CLIENT_UNAVAILABLE;
     case 'duplicate_name':
       return 'Another app already has that name. Try a different one.';
     case 'invalid_name':
@@ -148,7 +153,9 @@ function connectMessage(reason: ConnectRefusal): string {
     case 'needs_client':
       return 'This app now needs client details. Reload the page to enter them.';
     case 'client_refused':
-      return 'The sign-in service didn’t accept the client details. Reload the page to enter them again.';
+      return 'The sign-in service didn’t accept your assistant’s client. Reload the page to enter client details.';
+    case 'client_unavailable':
+      return CLIENT_UNAVAILABLE;
     case 'unreachable':
       return UNREACHABLE;
     case 'unsupported':
@@ -235,7 +242,7 @@ function appReference(data: Record<string, unknown>): { readonly id: string; rea
 }
 
 async function defaultOperations(webHostname: string): Promise<ConnectionOperations> {
-  return new ConnectionOperations({ store: await getConnectionsStore(), webHostname });
+  return new ConnectionOperations({ store: await getConnectionsStore(), webHostname, clientDocumentsServed });
 }
 
 async function openOperations(
