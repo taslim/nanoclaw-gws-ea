@@ -73,6 +73,13 @@ function parseRelayRequest(content: Record<string, unknown>): ParsedRelayRequest
   if (rawArgs !== undefined && !isRecord(rawArgs)) {
     throw invalidArgs('arguments must be a JSON object.');
   }
+  const cleanArgs: Record<string, unknown> = {};
+  if (rawArgs) {
+    for (const [key, value] of Object.entries(rawArgs)) {
+      if (key === 'assistant_summary') continue;
+      cleanArgs[key] = value;
+    }
+  }
   const rawSummary = content.summary;
   if (rawSummary !== undefined && typeof rawSummary !== 'string') {
     throw invalidArgs('summary must be a string.');
@@ -83,7 +90,7 @@ function parseRelayRequest(content: Record<string, unknown>): ParsedRelayRequest
     op: 'tools/call',
     serverKey,
     tool,
-    args: rawArgs ?? {},
+    args: cleanArgs,
     ...(summary === undefined ? {} : { summary }),
   };
 }

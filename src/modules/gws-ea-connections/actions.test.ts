@@ -30,7 +30,7 @@ import '../gws-ea-profile/index.js';
 import '../self-mod/index.js';
 import { ADD_APP_ACTION, DELETE_APP_ACTION, registerAppActions } from './actions.js';
 import type { AdmissionDependencies } from './admit.js';
-import { applyMainServers, mainOperatorServers } from './apply.js';
+import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { ConnectionOperations } from './operations.js';
 import type { ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
@@ -305,7 +305,7 @@ describe('add_app', () => {
     const [app] = await store.apps();
     expect(app).toMatchObject({ name: 'Recipes', status: 'connected' });
     const servers = JSON.parse((await getContainerConfig(MAIN))?.mcp_servers ?? '{}') as Record<string, unknown>;
-    expect(servers[app.serverKey]).toEqual({ type: 'http', url: RECIPES });
+    expect(servers[app.serverKey]).toEqual(appRelayServerEntry(app.serverKey));
     expect(await store.pendingRestart()).toBeDefined();
     expect(JSON.parse(notes('connection-add:')[0].content)).toMatchObject({
       text: expect.stringContaining('connected; its tools reach you by their next message'),

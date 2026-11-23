@@ -14,7 +14,7 @@ import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
 import { createWebHandler } from '../gws-ea-web/server.js';
 import type { AdmissionDependencies } from './admit.js';
-import { applyMainServers, mainOperatorServers } from './apply.js';
+import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
@@ -426,7 +426,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
     const storedToken = await store.readAccessToken(connected.id, 1);
     expect(storedToken && app.accessTokens.has(storedToken.token)).toBe(true);
     expect(gateway.events).toEqual(['apply']);
-    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LEDGERLY } });
+    expect(await mainServers()).toEqual({ [connected.serverKey]: appRelayServerEntry(connected.serverKey) });
     expect(await store.pendingRestart()).toBeDefined();
     expect(signInRow(connected.id)).toBeUndefined();
 
@@ -744,7 +744,7 @@ describe('apps whose server takes client documents', () => {
     expect(gateway.held.size).toBe(0);
     const storedToken = await store.readAccessToken(connected.id, 1);
     expect(storedToken && larder.accessTokens.has(storedToken.token)).toBe(true);
-    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LARDER } });
+    expect(await mainServers()).toEqual({ [connected.serverKey]: appRelayServerEntry(connected.serverKey) });
   });
 
   it('gives a server that also registers clients a document client, with no registration request', async () => {
@@ -1107,7 +1107,7 @@ describe('pasted tokens and servers without sign-in', () => {
     app = await onlyApp();
     expect(app.status).toBe('connected');
     expect(gateway.held.size).toBe(0);
-    expect(await mainServers()).toEqual({ [app.serverKey]: { type: 'http', url: RECIPES } });
+    expect(await mainServers()).toEqual({ [app.serverKey]: appRelayServerEntry(app.serverKey) });
     expect(endpoints.requests.every((incoming) => !incoming.path.includes('oauth'))).toBe(true);
   });
 });

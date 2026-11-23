@@ -10,7 +10,7 @@ import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } 
 import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import '../gws-ea-profile/index.js';
 import { appCredentialName } from './admit.js';
-import { applyMainServers } from './apply.js';
+import { applyMainServers, appRelayServerEntry } from './apply.js';
 import { withAppLock } from './locks.js';
 import { appRedirectUri, type ConnectionFetches } from './oauth.js';
 import {
@@ -810,7 +810,7 @@ describe('locks, rollback sweep and drift', () => {
     startConnectionsRefresher(store, controller.signal, dependencies());
 
     await vi.waitFor(async () => {
-      expect(await mainServers()).toEqual({ [app.serverKey]: { type: 'http', url: NOTES } });
+      expect(await mainServers()).toEqual({ [app.serverKey]: appRelayServerEntry(app.serverKey) });
     });
     controller.abort();
   });

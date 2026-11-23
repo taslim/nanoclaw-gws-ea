@@ -1,6 +1,6 @@
 /**
- * Main's MCP servers follow the connections store: each connected app is one `http` entry under its fixed server
- * key, and every entry the store does not own is left as the operator wrote it.
+ * Main's MCP servers follow the connections store: each connected app is one stdio relay entry under its fixed
+ * server key, and every entry the store does not own is left as the operator wrote it.
  */
 import { isDeepStrictEqual } from 'node:util';
 
@@ -14,6 +14,17 @@ import type { ConnectionApp, ConnectionsStore } from './store.js';
 
 /** The key prefix the store gives every app; main's entries under it belong to the store alone. */
 export const APP_SERVER_PREFIX = 'app_';
+export const APP_RELAY_COMMAND = 'bun';
+export const APP_RELAY_SCRIPT = '/app/src/mcp-tools/app-relay.ts';
+
+export interface AppRelayServerEntry {
+  readonly command: typeof APP_RELAY_COMMAND;
+  readonly args: readonly ['run', typeof APP_RELAY_SCRIPT, string];
+}
+
+export function appRelayServerEntry(serverKey: string): AppRelayServerEntry {
+  return { command: APP_RELAY_COMMAND, args: ['run', APP_RELAY_SCRIPT, serverKey] };
+}
 
 export interface OperatorServer {
   readonly key: string;
@@ -30,10 +41,7 @@ export class MainServersUnreadableError extends Error {
 }
 
 type StoredServers = Record<string, unknown>;
-interface AppEntry {
-  readonly type: 'http';
-  readonly url: string;
-}
+type AppEntry = AppRelayServerEntry;
 
 /** Applies and removals read, change and write one stored column, so one runs at a time. */
 const MAIN_SERVERS_LOCK = 'main-servers';
@@ -50,12 +58,12 @@ function isAppEntry(key: string, entry: unknown): boolean {
   return key.startsWith(APP_SERVER_PREFIX) && mcpServerPluginOwner(entry) === undefined;
 }
 
-/** No headers and no instructions: the gateway supplies the credential and the server its own instructions. */
+/** Each principal app runs through the container stdio relay; no URL or credential reaches the container. */
 function desiredAppEntries(apps: readonly ConnectionApp[]): Map<string, AppEntry> {
   return new Map(
     apps
       .filter((app) => app.status === 'connected')
-      .map((app): [string, AppEntry] => [app.serverKey, { type: 'http', url: app.url }])
+      .map((app): [string, AppEntry] => [app.serverKey, appRelayServerEntry(app.serverKey)])
       .sort(([a], [b]) => a.localeCompare(b)),
   );
 }
