@@ -127,7 +127,7 @@ it.each(['list', 'show'] as const)(
       await mkdir(path.join(runtime.checkout_root, 'src/gws-ea'), { recursive: true });
       await writeFile(
         path.join(runtime.checkout_root, 'src/gws-ea/web-compatibility.json'),
-        JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-1' }),
+        JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-2' }),
       );
     }
     const malformedId = ids[1];

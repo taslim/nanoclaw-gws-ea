@@ -11,7 +11,7 @@ import {
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { DENY, defineGuardedAction } from '../../guard/index.js';
 import { createWebIdentity } from './access.js';
-import type { WebMount } from './mounts.js';
+import type { ArtifactReadersMount, PrincipalPageMount, PublicMount, WebMount } from './mounts.js';
 import type { WebPolicyFile } from './policy.js';
 import { createWebHandler, principalGate, type WebRoute } from './server.js';
 
@@ -49,7 +49,10 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function mount(overrides: Partial<WebMount> & Pick<WebMount, 'name' | 'audience' | 'path'>): WebMount {
+function mount(
+  overrides: Partial<PrincipalPageMount | ArtifactReadersMount> &
+    Pick<PrincipalPageMount | ArtifactReadersMount, 'name' | 'audience' | 'path'>,
+): WebMount {
   const handler = (): RequestListener => () => undefined;
   return overrides.audience === 'principal'
     ? {
@@ -78,10 +81,21 @@ async function fixture(
   const artifacts = vi.fn<RequestListener>(artifact);
   const logins = vi.fn<RequestListener>(principalPage);
   const home = vi.fn<RequestListener>((_request, response) => response.end('home'));
+  const connections = vi.fn<RequestListener>((_request, response) => response.end('connections'));
+  const documents = vi.fn<RequestListener>((_request, response) => response.end('document'));
+  const clientDocuments: PublicMount = {
+    name: 'client-documents',
+    audience: 'public',
+    path: '/oauth-client',
+    methods: ['GET', 'HEAD'],
+    handler: () => documents,
+  };
   const routes: WebRoute[] = [
     { mount: mount({ name: 'artifacts', audience: 'artifact-readers', path: '/artifacts' }), listener: artifacts },
     { mount: mount({ name: 'logins', audience: 'principal', path: '/logins' }), listener: logins },
+    { mount: mount({ name: 'connections', audience: 'principal', path: '/connections' }), listener: connections },
     { mount: mount({ name: 'home', audience: 'principal', path: '/' }), listener: home },
+    { mount: clientDocuments, listener: documents },
   ];
   const policy = JSON.parse(fs.readFileSync(path.join(root, 'policy.json'), 'utf8')) as WebPolicyFile;
   const identity = createWebIdentity(policy, async (token) => {
@@ -89,7 +103,8 @@ async function fixture(
     if (token === 'broken') throw new Error('Access keys unreachable');
     return token === 'principal' ? 'morgan@example.com' : token === 'reader' ? 'juno@example.com' : undefined;
   });
-  server = createServer(createWebHandler(HOST, routes, principalGate(identity)));
+  const gate = vi.fn(principalGate(identity));
+  server = createServer(createWebHandler(HOST, routes, gate));
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('No fixture port');
@@ -126,7 +141,7 @@ async function fixture(
     const response = await request(...args);
     return 'reset' in response ? 'reset' : response.status;
   };
-  return { artifacts, logins, home, request, status };
+  return { artifacts, logins, home, connections, documents, gate, request, status };
 }
 
 it('admits only the verified principal to a principal mount; an invited reader gets not-found unseen', async () => {
@@ -326,4 +341,43 @@ it('drops an authored-content response of any status unless every policy it send
     await new Promise<void>((resolve) => server!.close(() => resolve()));
     server = undefined;
   }
+});
+
+it('serves a public mount to anyone without consulting the principal gate', async () => {
+  const { documents, gate, request } = await fixture();
+  const id = '33333333-3333-4333-8333-333333333333';
+  expect(await request(`/oauth-client/${id}`)).toMatchObject({ status: 200, body: 'document' });
+  expect(await request(`/oauth-client/${id}`, { method: 'HEAD' })).toMatchObject({ status: 200, body: '' });
+  expect(documents).toHaveBeenCalledTimes(2);
+  expect(gate).not.toHaveBeenCalled();
+  expect(verified).toEqual([]);
+});
+
+it('keeps every principal route closed to an unidentified caller beside a public mount', async () => {
+  const { logins, home, connections, documents, status } = await fixture();
+  for (const route of [
+    '/connections',
+    '/logins',
+    '/',
+    '/connections/app/33333333-3333-4333-8333-333333333333/connect',
+    '/oauth-client/../connections',
+    '/oauth-client%2f..%2fconnections',
+    '/oauth-client/x/../../logins',
+    '//oauth-client/x',
+  ])
+    expect(await status(route), route).toBe(404);
+  expect(connections).not.toHaveBeenCalled();
+  expect(logins).not.toHaveBeenCalled();
+  expect(home).not.toHaveBeenCalled();
+  expect(documents).not.toHaveBeenCalled();
+});
+
+it('refuses a public mount on a wrong Host header or a method it does not serve', async () => {
+  const { documents, gate, status } = await fixture();
+  for (const host of ['juno.example.com', `${HOST}:443`, `${HOST}.`])
+    expect(await status('/oauth-client/x', { host }), host).toBe(404);
+  for (const method of ['POST', 'PUT', 'DELETE', 'OPTIONS'])
+    expect(await status('/oauth-client/x', { method }), method).toBe(405);
+  expect(documents).not.toHaveBeenCalled();
+  expect(gate).not.toHaveBeenCalled();
 });

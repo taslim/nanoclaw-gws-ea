@@ -40,6 +40,7 @@ export interface ClientRegistration {
   readonly clientId: string;
   readonly clientSecret?: string;
   readonly tokenEndpointAuthMethod?: string;
+  readonly kind?: 'document';
 }
 
 export interface ConnectionApp {
@@ -149,6 +150,7 @@ export interface ConnectionsStoreOptions {
   readonly runCommand?: SanitizedCommandOutcomeRunner;
 }
 
+export const APP_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const SIGN_IN_TTL_MS = 10 * 60_000;
 export const NAME_MAX = 100;
 const SECRET_MAX = 64 * 1024;
@@ -274,12 +276,13 @@ function clientValid(client: ClientRegistration): void {
 function parseClient(json: string): ClientRegistration {
   const value: unknown = JSON.parse(json);
   if (typeof value !== 'object' || value === null) throw new Error('Sealed client is malformed');
-  const { clientId, clientSecret, tokenEndpointAuthMethod } = value as Record<string, unknown>;
+  const { clientId, clientSecret, tokenEndpointAuthMethod, kind } = value as Record<string, unknown>;
   if (typeof clientId !== 'string') throw new Error('Sealed client is malformed');
   return {
     clientId,
     ...(typeof clientSecret === 'string' ? { clientSecret } : {}),
     ...(typeof tokenEndpointAuthMethod === 'string' ? { tokenEndpointAuthMethod } : {}),
+    ...(kind === 'document' ? { kind } : {}),
   };
 }
 function grantValid(grant: NewGrant): void {

@@ -1,8 +1,10 @@
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
-import type { PrincipalPageMount } from '../gws-ea-web/mounts.js';
+import type { PrincipalPageMount, PublicMount } from '../gws-ea-web/mounts.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
+import { createClientDocumentHandler } from './client-document.js';
+import { CLIENT_DOCUMENT_PATH } from './oauth.js';
 import { readListing, type ConnectionsListing } from './operations.js';
 import { createConnectionsPageHandler } from './page.js';
 import { ConnectionsStoreError, getConnectionsStore, type AppStatus } from './store.js';
@@ -86,4 +88,12 @@ export const connectionsWebMount: PrincipalPageMount = {
   linkGuard: connectionsPageGuard,
   linkFacts: () => connectionsLinkFacts(),
   handler: (config, identity) => createConnectionsPageHandler({ hostname: config.hostname, identity }),
+};
+
+export const clientDocumentsWebMount: PublicMount = {
+  name: 'client-documents',
+  audience: 'public',
+  path: CLIENT_DOCUMENT_PATH,
+  methods: ['GET', 'HEAD'],
+  handler: (config) => createClientDocumentHandler({ hostname: config.hostname }),
 };

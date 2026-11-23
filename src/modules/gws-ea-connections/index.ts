@@ -4,11 +4,12 @@
 import { register } from '../../cli/registry.js';
 import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
+import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import { registerWebMount } from '../gws-ea-web/mounts.js';
 import { registerAppActions } from './actions.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import { connectionsRoot } from './config.js';
-import { connectionsWebMount, operatorAsApp } from './connections-mount.js';
+import { clientDocumentsWebMount, connectionsWebMount, operatorAsApp } from './connections-mount.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
@@ -80,6 +81,7 @@ register({
 });
 
 registerWebMount(connectionsWebMount);
+registerWebMount(clientDocumentsWebMount);
 registerAppActions();
 
 onHostStart(async ({ signal }) => {
@@ -97,7 +99,7 @@ onHostStart(async ({ signal }) => {
     // Armed first, so a restart a previous host left pending and one this apply records are both served.
     startRestartChecks(store, signal);
     await startReconnectNotes(store, signal);
-    startConnectionsRefresher(store, signal, { onRefused: oweReconnectNote });
+    startConnectionsRefresher(store, signal, { onRefused: oweReconnectNote, clientDocumentsServed });
     await applyMainServers(store);
   } catch (error) {
     if (error instanceof ConnectionsStoreError) log.warn('Connections store unavailable', { reason: error.reason });

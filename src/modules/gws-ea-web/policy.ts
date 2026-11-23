@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { readRegularFileBounded } from '../../anchored-dir.js';
 import { readEnvFile } from '../../env.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { WEB_PUBLIC_PATHS } from '../../gws-ea/web-cloudflare.js';
 
 export const WEB_POLICY_FILE_ENV = 'GWS_EA_WEB_POLICY_FILE';
 export const WEB_POLICY_VERSIONS = [1] as const;
@@ -21,6 +22,7 @@ export interface WebPolicyFile {
     readonly applicationId: string;
     readonly operatorConfigFile: string;
   };
+  readonly publicPaths?: readonly string[];
 }
 export type WebPolicy =
   | { readonly status: 'enabled'; readonly enabled: true; readonly config: WebPolicyFile }
@@ -34,9 +36,16 @@ export function parseWebPolicyFile(value: unknown): WebPolicyFile | undefined {
     !isRecord(value) ||
     Object.keys(value).some(
       (key) =>
-        !['schemaVersion', 'enabled', 'hostname', 'listenPort', 'accessIssuer', 'accessAud', 'cloudflare'].includes(
-          key,
-        ),
+        ![
+          'schemaVersion',
+          'enabled',
+          'hostname',
+          'listenPort',
+          'accessIssuer',
+          'accessAud',
+          'cloudflare',
+          'publicPaths',
+        ].includes(key),
     )
   )
     return undefined;
@@ -61,7 +70,8 @@ export function parseWebPolicyFile(value: unknown): WebPolicyFile | undefined {
     typeof cf.applicationId !== 'string' ||
     !ID.test(cf.applicationId) ||
     typeof cf.operatorConfigFile !== 'string' ||
-    !path.isAbsolute(cf.operatorConfigFile)
+    !path.isAbsolute(cf.operatorConfigFile) ||
+    (value.publicPaths !== undefined && !verifiedPublicPaths(value.publicPaths))
   )
     return undefined;
   return {
@@ -72,7 +82,15 @@ export function parseWebPolicyFile(value: unknown): WebPolicyFile | undefined {
     accessIssuer: value.accessIssuer,
     accessAud: value.accessAud,
     cloudflare: { accountId: cf.accountId, applicationId: cf.applicationId, operatorConfigFile: cf.operatorConfigFile },
+    ...(verifiedPublicPaths(value.publicPaths) ? { publicPaths: [...value.publicPaths] } : {}),
   };
+}
+function verifiedPublicPaths(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.length === WEB_PUBLIC_PATHS.length &&
+    WEB_PUBLIC_PATHS.every((pattern) => value.includes(pattern))
+  );
 }
 export function webPolicyFile(): string | undefined {
   return (

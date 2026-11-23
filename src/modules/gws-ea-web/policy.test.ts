@@ -3,7 +3,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { parseWebPolicyFile, readWebPolicy, type WebPolicyFile } from './policy.js';
+import { parseWebPolicyFile, readWebPolicy, webPolicyDigest, type WebPolicyFile } from './policy.js';
 
 const ROOT = path.join(fs.realpathSync(tmpdir()), `gws-ea-artifact-policy-${process.pid}`);
 const config: WebPolicyFile = {
@@ -69,4 +69,21 @@ it.each(['symlink', 'fifo', 'mode', 'oversized'] as const)('refuses unsafe %s po
 it('refuses the removed path-prefix field, including the old fixed mount', () => {
   for (const pathPrefix of ['', '/aya', '/artifacts'])
     expect(parseWebPolicyFile({ ...config, pathPrefix })).toBeUndefined();
+});
+
+it('keeps the recorded public paths, in any order, so they enter the policy digest', () => {
+  const publicPaths = ['/oauth-client/*', '/artifacts/public/*'];
+  expect(parseWebPolicyFile({ ...config, publicPaths })).toEqual({ ...config, publicPaths });
+  expect(webPolicyDigest(parseWebPolicyFile({ ...config, publicPaths }))).not.toBe(webPolicyDigest(config));
+});
+
+it.each([
+  { publicPaths: ['/artifacts/public/*'] },
+  { publicPaths: ['/artifacts/public/*', '/artifacts/public/*'] },
+  { publicPaths: ['/artifacts/public/*', '/oauth-client/*', '/*'] },
+  { publicPaths: ['/artifacts/public/*', '/*'] },
+  { publicPaths: [] },
+  { publicPaths: '/oauth-client/*' },
+])('refuses public paths other than the exact verified set %j', (change) => {
+  expect(parseWebPolicyFile({ ...config, ...change })).toBeUndefined();
 });

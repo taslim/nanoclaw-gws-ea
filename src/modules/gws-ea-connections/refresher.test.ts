@@ -27,10 +27,17 @@ import {
   type RefusedApp,
   type RefresherLog,
 } from './refresher.js';
-import { ConnectionsStoreError, type ConnectionApp, type ConnectionsStore, type LiveGrant } from './store.js';
+import {
+  ConnectionsStoreError,
+  type ClientRegistration,
+  type ConnectionApp,
+  type ConnectionsStore,
+  type LiveGrant,
+} from './store.js';
 import {
   FakeMcpApp,
   startFakeEndpoints,
+  type FakeAppOptions,
   type FakeEndpoints,
   type FakeHandler,
   type FakeReply,
@@ -118,11 +125,14 @@ class TokenEndpoint {
   readonly queued: FakeReply[] = [];
   expiresIn: number | undefined = 3600;
   issued = 0;
+  /** Runs while a token request is in flight, before the reply. */
+  onRequest: (() => void) | undefined;
 
   constructor(readonly host: string) {}
 
   readonly handle: FakeHandler = (request) => {
     if (request.host !== this.host || request.method !== 'POST' || request.path !== '/oauth/token') return undefined;
+    this.onRequest?.();
     this.presented.push(new URLSearchParams(request.body).get('refresh_token') ?? '');
     const queued = this.queued.shift();
     if (queued) return queued;
@@ -153,6 +163,7 @@ let clock: number;
 let lines: LogLine[];
 let refused: RefusedApp[];
 let applied: boolean[];
+let documentsServed: boolean;
 
 const testLog: RefresherLog = {
   info: (message, fields) => lines.push({ level: 'info', message, fields }),
@@ -176,6 +187,7 @@ function dependencies(overrides: Partial<ConnectionsRefresherDependencies> = {})
     onRefused: (app) => {
       refused.push(app);
     },
+    clientDocumentsServed: () => documentsServed,
     ...overrides,
   };
 }
@@ -196,6 +208,7 @@ beforeEach(async () => {
   lines = [];
   refused = [];
   applied = [];
+  documentsServed = true;
   await runMigrations(await initTestDb());
   await createAgentGroup({
     id: MAIN,
@@ -221,10 +234,10 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-function serveApp(appUrl: string): TokenEndpoint {
+function serveApp(appUrl: string, options: Partial<FakeAppOptions> = {}): TokenEndpoint {
   const host = new URL(appUrl).hostname;
   const tokens = new TokenEndpoint(host);
-  const app = new FakeMcpApp({ appUrl, issuer: `https://${host}` });
+  const app = new FakeMcpApp({ appUrl, issuer: `https://${host}`, ...options });
   endpoints.use(tokens.handle);
   endpoints.use(app.handle);
   return tokens;
@@ -237,14 +250,23 @@ interface OAuthGrantSpec {
 }
 
 /** An app signed in through the store's own sign-in path, as the page leaves it. */
-async function oauthApp(name: string, appUrl: string, grant: OAuthGrantSpec): Promise<ConnectionApp> {
+async function oauthApp(
+  name: string,
+  appUrl: string,
+  grant: OAuthGrantSpec,
+  client: (app: ConnectionApp) => ClientRegistration = (app) => ({
+    clientId: `${app.host}-client`,
+    clientSecret: CLIENT_SECRET,
+  }),
+): Promise<ConnectionApp> {
   const host = new URL(appUrl).hostname;
   const issuer = `https://${host}/`;
   const created = await store.create({ name, url: appUrl, auth: 'oauth', issuer });
+  const sealed = client(created);
   const withClient = await store.setClient(created.id, created.version, {
     issuer,
-    client: { clientId: `${host}-client`, clientSecret: CLIENT_SECRET },
-    entered: true,
+    client: sealed,
+    entered: sealed.kind !== 'document',
   });
   const { state } = await store.startSignIn(withClient.id, withClient.version, {
     principalId: PRINCIPAL,
@@ -266,8 +288,13 @@ async function oauthApp(name: string, appUrl: string, grant: OAuthGrantSpec): Pr
 }
 
 /** As a connect leaves it: the grant stored, its credential published and the publish recorded. */
-async function publishedOAuthApp(name: string, appUrl: string, grant: OAuthGrantSpec): Promise<ConnectionApp> {
-  const app = await oauthApp(name, appUrl, grant);
+async function publishedOAuthApp(
+  name: string,
+  appUrl: string,
+  grant: OAuthGrantSpec,
+  client?: (app: ConnectionApp) => ClientRegistration,
+): Promise<ConnectionApp> {
+  const app = await oauthApp(name, appUrl, grant, client);
   gateway.put(appCredentialName(app.id), app.host, 'sentinel-access-at-sign-in');
   expect(await store.markPublished(app.id, 1, new Date(grant.expiresAt).toISOString())).toBe(true);
   return app;
@@ -386,7 +413,43 @@ describe('renewal timing', () => {
   });
 });
 
+/** A server that takes client documents from `none` clients. */
+const documentServer: Partial<FakeAppOptions> = {
+  tokenAuthMethods: ['none'],
+  fetchClientDocument: async () => ({ status: 404 }),
+};
+const documentClient = (app: ConnectionApp): ClientRegistration => ({
+  clientId: `https://${ASSISTANT}/oauth-client/${app.id}`,
+  tokenEndpointAuthMethod: 'none',
+  kind: 'document',
+});
+
 describe('durable rotation', () => {
+  it('renews a document client with its client ID and resource, no secret, and stores the rotated refresh token', async () => {
+    const tokens = serveApp(LEDGERLY, documentServer);
+    const app = await publishedOAuthApp(
+      'Ledgerly',
+      LEDGERLY,
+      { refreshToken: 'sentinel-refresh-home', issuedAt: START - 55 * MINUTE, expiresAt: START + 5 * MINUTE },
+      documentClient,
+    );
+    const refresher = createConnectionsRefresher(dependencies());
+
+    await refresher.tick();
+
+    const [renewal] = endpoints.requests.filter(({ path: route }) => route === '/oauth/token');
+    const sent = new URLSearchParams(renewal.body);
+    expect(sent.get('client_id')).toBe(documentClient(app).clientId);
+    expect(sent.get('resource')).toBe(LEDGERLY);
+    expect(sent.has('client_secret')).toBe(false);
+    expect(renewal.headers.authorization).toBeUndefined();
+    expect(gateway.valueFor(app)).toBe('sentinel-access-1');
+
+    clock = START + 50 * MINUTE;
+    await refresher.tick();
+    expect(tokens.presented).toEqual(['sentinel-refresh-home', 'sentinel-refresh-1']);
+  });
+
   it('stores the rotated refresh token before the access token is published', async () => {
     serveApp(LEDGERLY);
     const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
@@ -580,20 +643,24 @@ describe('refusals', () => {
     ]);
   });
 
-  it('ends a grant whose client the server refuses', async () => {
-    const tokens = serveApp(LEDGERLY);
-    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
-      refreshToken: 'sentinel-refresh-home',
-      issuedAt: START - 55 * MINUTE,
-      expiresAt: START + 5 * MINUTE,
-    });
-    tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
+  it.each([true, false])(
+    'ends a grant whose client the server refuses, with client documents served: %s',
+    async (served) => {
+      const tokens = serveApp(LEDGERLY);
+      const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
+        refreshToken: 'sentinel-refresh-home',
+        issuedAt: START - 55 * MINUTE,
+        expiresAt: START + 5 * MINUTE,
+      });
+      documentsServed = served;
+      tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
 
-    await createConnectionsRefresher(dependencies()).tick();
+      await createConnectionsRefresher(dependencies()).tick();
 
-    expect((await store.get(app.id)).status).toBe('needs_reconnecting');
-    expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
-  });
+      expect((await store.get(app.id)).status).toBe('needs_reconnecting');
+      expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
+    },
+  );
 
   it('keeps the grant live and Connected through a 503', async () => {
     const tokens = serveApp(LEDGERLY);
@@ -615,6 +682,60 @@ describe('refusals', () => {
       message: 'Could not renew app access; retrying',
       fields: { appId: app.id, code: 'unreachable' },
     });
+  });
+
+  it('keeps a document client’s refused renewal while documents are not served, and ends it once they are', async () => {
+    const tokens = serveApp(LEDGERLY, documentServer);
+    const app = await publishedOAuthApp(
+      'Ledgerly',
+      LEDGERLY,
+      { refreshToken: 'sentinel-refresh-home', issuedAt: START - 55 * MINUTE, expiresAt: START + 5 * MINUTE },
+      documentClient,
+    );
+    const refresher = createConnectionsRefresher(dependencies());
+    documentsServed = false;
+    tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
+
+    await refresher.tick();
+
+    expect((await store.get(app.id)).status).toBe('connected');
+    expect(gateway.valueFor(app)).toBe('sentinel-access-at-sign-in');
+    expect(refused).toEqual([]);
+    expect(lines).toContainEqual({
+      level: 'warn',
+      message: 'Could not renew app access; retrying',
+      fields: { appId: app.id, code: 'client_refused' },
+    });
+
+    documentsServed = true;
+    tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
+    clock = START + MINUTE;
+    await refresher.tick();
+
+    expect((await store.get(app.id)).status).toBe('needs_reconnecting');
+    expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
+  });
+
+  it('keeps a document client’s refused renewal when documents come back while the request is in flight', async () => {
+    const tokens = serveApp(LEDGERLY, documentServer);
+    const app = await publishedOAuthApp(
+      'Ledgerly',
+      LEDGERLY,
+      { refreshToken: 'sentinel-refresh-home', issuedAt: START - 55 * MINUTE, expiresAt: START + 5 * MINUTE },
+      documentClient,
+    );
+    const refresher = createConnectionsRefresher(dependencies());
+    documentsServed = false;
+    tokens.onRequest = () => {
+      documentsServed = true;
+    };
+    tokens.queued.push({ status: 401, body: { error: 'invalid_client' } });
+
+    await refresher.tick();
+
+    expect((await store.get(app.id)).status).toBe('connected');
+    expect(gateway.valueFor(app)).toBe('sentinel-access-at-sign-in');
+    expect(refused).toEqual([]);
   });
 
   it('marks a grant without a refresh token Needs reconnecting once its access lapses', async () => {

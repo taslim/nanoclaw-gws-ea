@@ -57,11 +57,24 @@ The `web` connector gives each assistant a stable address such as
 `aya.example.com`. HTML artifacts live at `/artifacts`. The principal’s home at
 `/` links their own pages: saved logins at `/logins` and connected apps at
 `/connections`. Main sends their links with `principal_page`. There is one connector install
-and no separate feature switch. Cloudflare Access covers the whole hostname;
-public artifacts retain their explicit public route.
+and no separate feature switch. Cloudflare Access covers the whole hostname
+except two public routes: public artifacts at `/artifacts/public`, and client
+documents at `/oauth-client`, which sign-in services fetch to identify the
+assistant when it connects an app.
 
-For an existing web install, uninstall web using the **current checkout before
-updating to this release**. Then pull the release, run `bash gws-ea.sh`, run
+An assistant's Access app created before client documents has only the
+artifacts route. `gws-ea update` adds the client-document route in place; web
+stays up and no reinstall is needed. Rolling an assistant back below the
+release that added the route takes its web address offline, because older
+releases refuse the updated Access app. Update it again to recover. A
+bot-fighting or challenge setting on the zone that covers the assistant's
+hostname blocks sign-in services from fetching client documents, so apps that
+use them cannot connect.
+
+Only an install still on the older artifacts-only Cloudflare route, from before
+Access covered the whole hostname, needs a reinstall instead: uninstall web
+using the **current checkout before updating to this release**. Then pull the
+release, run `bash gws-ea.sh`, run
 `gws-ea update --all`, and run `gws-ea connectors install web` with its setup
 options. The old artifacts-only Cloudflare route is deliberately refused; it
 cannot protect the logins page. Uninstall keeps saved HTML and logins, while
@@ -140,9 +153,10 @@ See the [artifact guide](gws-ea-artifacts.md) for retention, sharing and native 
 On the Connections page at `/connections`, the principal adds the remote MCP
 servers they use, by HTTPS address, as apps for main. They connect each one by
 signing in at the app's service, pasting an access token, or confirming a server
-that needs no sign-in. A service that registers clients itself gets a client for
-this app alone; otherwise the page shows the redirect URI to register and asks
-for the client details. The operator does not review these apps: once one is
+that needs no sign-in. A service that accepts client documents signs in the
+assistant by its document at `/oauth-client/<app id>`. A service that
+registers clients itself gets a client for this app alone. Otherwise the page
+shows the redirect URI to register and asks for the client details. The operator does not review these apps: once one is
 connected, main sends it information to use its tools. Main can add or delete an
 app only after the principal approves; connecting happens only on the page.
 

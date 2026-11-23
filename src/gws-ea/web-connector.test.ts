@@ -64,7 +64,7 @@ async function fixture() {
     const runtime = await persistTestRuntime(paths, reservation);
     const marker = path.join(runtime.checkout_root, 'src/gws-ea/web-compatibility.json');
     await mkdir(path.dirname(marker), { recursive: true });
-    await writeFile(marker, JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-1' }));
+    await writeFile(marker, JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-2' }));
     return { instanceId, runtime };
   }
   return { root, paths, assistant };
@@ -158,8 +158,24 @@ function cloudflareFixture(zoneApex = 'example.test') {
       return reply(policy[2] ? records.find((item) => item.id === policy[2]) : records);
     }
     if (resource.endsWith('/revoke_tokens')) return reply(null);
-    if (/^\/accounts\/account\/access\/apps\/[^/]+$/u.test(resource))
-      return reply(apps.find((item) => item.id === resource.split('/').at(-1)));
+    const application = /^\/accounts\/account\/access\/apps\/([^/]+)$/u.exec(resource);
+    if (application) {
+      const index = apps.findIndex((item) => item.id === application[1]);
+      if (method === 'PUT') {
+        // A full update replaces the application, policy list included, and keeps its ID and audience.
+        const { policies: links, ...fields } = body ?? {};
+        const linked = new Set(
+          Array.isArray(links) ? links.map((link: unknown) => (isRecord(link) ? link.id : link)) : [],
+        );
+        policies.set(
+          application[1],
+          (policies.get(application[1]) ?? []).filter((item) => linked.has(item.id)),
+        );
+        apps[index] = { ...fields, id: apps[index].id, aud: apps[index].aud };
+        return reply(apps[index]);
+      }
+      return reply(apps[index]);
+    }
     if (resource === '/accounts/account/cfd_tunnel' && method === 'POST') return reply({ id: 'tunnel' });
     if (resource === '/accounts/account/cfd_tunnel/tunnel')
       return reply({ id: 'tunnel', config_src: 'cloudflare', deleted_at: null });
@@ -648,7 +664,10 @@ describe('web operator capability', () => {
         {
           type: 'public',
           uri: 'views.example.test',
-          overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
+          overrides: [
+            { behavior: 'public', path_pattern: '/artifacts/public/*' },
+            { behavior: 'public', path_pattern: '/oauth-client/*' },
+          ],
         },
       ],
       allowed_idps: [f.api.idps[0].id],
@@ -665,7 +684,13 @@ describe('web operator capability', () => {
       { service: 'http_status:404' },
     ]);
     const policy = await readWebPolicy(instanceWebPolicyFile(f.a.runtime));
-    expect(policy).toMatchObject({ enabled: true, config: { accessAud: app.aud } });
+    expect(policy).toMatchObject({
+      enabled: true,
+      config: { accessAud: app.aud, publicPaths: ['/artifacts/public/*', '/oauth-client/*'] },
+    });
+    expect(
+      f.api.requests.some((request) => request.method === 'PUT' && request.resource.endsWith(`/apps/${app.id}`)),
+    ).toBe(false);
     const owned = await readWebOperatorConfig(f.files.configFile);
     expect(owned).toMatchObject({
       pin: { owned: true },
@@ -756,9 +781,15 @@ describe('web operator capability', () => {
       accountId: 'account',
       applicationId,
       emails: async () => ['principal@example.test', 'guest@example.test'],
+      publicPaths: ['/artifacts/public/*', '/oauth-client/*'],
     };
     const first = await reconcileWebAccessEmails(input, f.dependencies);
-    expect(first).toEqual({ verified: true, changed: true, emails: ['guest@example.test', 'principal@example.test'] });
+    expect(first).toEqual({
+      verified: true,
+      changed: true,
+      emails: ['guest@example.test', 'principal@example.test'],
+      clientDocumentPath: true,
+    });
     expect(
       f.api.requests.some((request) => request.method === 'POST' && request.resource.endsWith('/revoke_tokens')),
     ).toBe(true);
@@ -1184,7 +1215,10 @@ it.each([
     {
       type: 'public',
       uri: `${label}.example.test`,
-      overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
+      overrides: [
+        { behavior: 'public', path_pattern: '/artifacts/public/*' },
+        { behavior: 'public', path_pattern: '/oauth-client/*' },
+      ],
     },
   ]);
   f.firstName('李娜');
@@ -1496,5 +1530,220 @@ it('reports unavailable when an extra path-specific route precedes the owned who
   expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
     remote: 'mismatch',
     reason_code: 'web_tunnel_unverified',
+  });
+});
+
+describe('Access public paths across the client-document update', () => {
+  const ARTIFACTS = { behavior: 'public', path_pattern: '/artifacts/public/*' };
+  const CLIENT_DOCUMENTS = { behavior: 'public', path_pattern: '/oauth-client/*' };
+  const PUBLIC_PATHS = ['/artifacts/public/*', '/oauth-client/*'];
+
+  async function readyAssistant() {
+    const f = await provisionFixture();
+    await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantWeb(operation, f.dependencies),
+    );
+    return f;
+  }
+  function setOverrides(f: Awaited<ReturnType<typeof provisionFixture>>, overrides: unknown[], uri?: string): void {
+    f.api.apps[0].destinations = [{ type: 'public', uri: uri ?? 'views.example.test', overrides }];
+  }
+  async function forgetRecordedPaths(f: Awaited<ReturnType<typeof provisionFixture>>): Promise<string> {
+    const file = instanceWebPolicyFile(f.a.runtime);
+    const policy = await readWebPolicy(file);
+    if (policy.status !== 'enabled') throw new Error('Fixture policy is not enabled');
+    const { publicPaths: _recorded, ...previous } = policy.config;
+    await writeFile(file, JSON.stringify(previous));
+    return readFile(file, 'utf8');
+  }
+  /** An assistant activated by the release before client documents: artifact-only Access app and policy. */
+  async function previousReleaseAssistant() {
+    const f = await readyAssistant();
+    setOverrides(f, [ARTIFACTS]);
+    const policy = await forgetRecordedPaths(f);
+    const owned = (await readWebOperatorConfig(f.files.configFile))!.assistants[f.a.instanceId];
+    return { ...f, policy, owned, appPath: `/accounts/account/access/apps/${owned.applicationId}` };
+  }
+  function runtimeCheck(f: Awaited<ReturnType<typeof provisionFixture>>, publicPaths: readonly string[]) {
+    return reconcileWebAccessEmails(
+      {
+        operatorConfigFile: f.files.configFile,
+        accountId: 'account',
+        applicationId: String(f.api.apps[0].id),
+        emails: ['principal@example.test', 'second@example.test'],
+        publicPaths,
+      },
+      f.dependencies,
+    );
+  }
+
+  it.each([
+    { label: 'artifacts only', overrides: [ARTIFACTS], clientDocumentPath: false },
+    { label: 'both paths', overrides: [ARTIFACTS, CLIENT_DOCUMENTS], clientDocumentPath: true },
+    { label: 'both paths reordered', overrides: [CLIENT_DOCUMENTS, ARTIFACTS], clientDocumentPath: true },
+  ])('accepts $label at runtime before the policy records public paths', async ({ overrides, clientDocumentPath }) => {
+    const f = await readyAssistant();
+    setOverrides(f, overrides);
+    await expect(runtimeCheck(f, [])).resolves.toMatchObject({ verified: true, clientDocumentPath });
+  });
+
+  it('requires the client document path at runtime once the policy records the public paths', async () => {
+    const f = await readyAssistant();
+    await expect(runtimeCheck(f, PUBLIC_PATHS)).resolves.toMatchObject({ clientDocumentPath: true });
+    setOverrides(f, [ARTIFACTS]);
+    await expect(runtimeCheck(f, PUBLIC_PATHS)).rejects.toMatchObject({ code: 'web_access_mismatch' });
+  });
+
+  it.each([
+    { label: 'the client document path alone', overrides: [CLIENT_DOCUMENTS] },
+    { label: 'a whole-host override', overrides: [ARTIFACTS, { behavior: 'public', path_pattern: '/*' }] },
+    {
+      label: 'three overrides',
+      overrides: [ARTIFACTS, CLIENT_DOCUMENTS, { behavior: 'public', path_pattern: '/status/*' }],
+    },
+    { label: 'a non-public behavior', overrides: [ARTIFACTS, { ...CLIENT_DOCUMENTS, behavior: 'bypass' }] },
+  ])('refuses $label at runtime', async ({ overrides }) => {
+    const f = await readyAssistant();
+    setOverrides(f, overrides);
+    for (const recorded of [[], PUBLIC_PATHS])
+      await expect(runtimeCheck(f, recorded)).rejects.toMatchObject({ code: 'web_access_mismatch' });
+  });
+
+  it('refuses a changed Access hostname at runtime as an ownership mismatch', async () => {
+    const f = await readyAssistant();
+    setOverrides(f, [ARTIFACTS, CLIENT_DOCUMENTS], 'other.example.test');
+    await expect(runtimeCheck(f, [])).rejects.toMatchObject({ code: 'web_application_mismatch' });
+  });
+
+  it('inspects an artifact-only Access app as an access mismatch, not an ownership mismatch', async () => {
+    const f = await previousReleaseAssistant();
+    expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+      ready: false,
+      remote: 'mismatch',
+      reason_code: 'web_access_mismatch',
+    });
+    // The live Access check alone, under a policy that already records the public paths.
+    const recorded = await readyAssistant();
+    setOverrides(recorded, [ARTIFACTS]);
+    expect(
+      await inspectWebCapability(recorded.paths, recorded.a.instanceId, { ...recorded.dependencies, check: true }),
+    ).toMatchObject({ ready: false, remote: 'mismatch', reason_code: 'web_access_mismatch' });
+  });
+
+  it('updates an artifact-only Access app in place with its recorded policy and keeps web enabled', async () => {
+    const f = await previousReleaseAssistant();
+    const policyFile = instanceWebPolicyFile(f.a.runtime);
+    const start = f.api.requests.length;
+    const restarts = f.restarts.length;
+    const enabledAtUpdate: boolean[] = [];
+    const dependencies = {
+      ...f.dependencies,
+      fetch: (async (input, init) => {
+        if (init?.method === 'PUT' && String(input).endsWith(f.appPath))
+          enabledAtUpdate.push(
+            (await readWebPolicy(policyFile)).enabled &&
+              (await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.enabled === true,
+          );
+        return f.api.transport(input, init);
+      }) satisfies typeof fetch,
+    };
+    const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantWeb(operation, dependencies),
+    );
+    expect(result).toMatchObject({ outcome: 'ready', changed: true });
+    const requests = f.api.requests.slice(start);
+    const updates = requests.filter((request) => request.method === 'PUT' && request.resource === f.appPath);
+    expect(updates).toEqual([
+      {
+        method: 'PUT',
+        resource: f.appPath,
+        body: {
+          name: 'Web views.example.test',
+          type: 'self_hosted',
+          destinations: [{ type: 'public', uri: 'views.example.test', overrides: [ARTIFACTS, CLIENT_DOCUMENTS] }],
+          allowed_idps: [f.api.idps[0].id],
+          auto_redirect_to_identity: true,
+          app_launcher_visible: false,
+          session_duration: '1h',
+          policies: [{ id: f.owned.policyId, precedence: 1 }],
+        },
+      },
+    ]);
+    const update = requests.findIndex((request) => request.method === 'PUT' && request.resource === f.appPath);
+    expect(
+      requests.slice(update + 1).some((request) => request.method === 'GET' && request.resource === f.appPath),
+    ).toBe(true);
+    expect(requests.some((request) => request.method === 'POST' && !request.resource.endsWith('/revoke_tokens'))).toBe(
+      false,
+    );
+    expect(enabledAtUpdate).toEqual([true]);
+    expect(f.api.apps).toHaveLength(1);
+    expect(f.api.policies.get(String(f.owned.applicationId))?.map((policy) => policy.id)).toEqual([f.owned.policyId]);
+    expect((await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]).toEqual(f.owned);
+    const policy = await readWebPolicy(policyFile);
+    expect(policy).toMatchObject({ enabled: true, config: { publicPaths: PUBLIC_PATHS } });
+    expect(f.restarts).toHaveLength(restarts);
+    expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+      ready: true,
+    });
+  });
+
+  it('records the public paths without updating an Access app that already has both', async () => {
+    const f = await readyAssistant();
+    const policyFile = instanceWebPolicyFile(f.a.runtime);
+    const converged = await readFile(policyFile, 'utf8');
+    await forgetRecordedPaths(f);
+    const start = f.api.requests.length;
+    const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantWeb(operation, f.dependencies),
+    );
+    expect(result).toMatchObject({ outcome: 'ready' });
+    expect(
+      f.api.requests
+        .slice(start)
+        .some((request) => request.method === 'PUT' && /\/access\/apps\/[^/]+$/u.test(request.resource)),
+    ).toBe(false);
+    expect(await readFile(policyFile, 'utf8')).toBe(converged);
+  });
+
+  it.each([
+    { outcome: 'still artifact-only', reason: 'web_access_mismatch' },
+    { outcome: 'gained a policy', reason: 'web_access_unverified' },
+  ] as const)('fails provisioning when the updated Access app read back $outcome', async ({ outcome, reason }) => {
+    const f = await previousReleaseAssistant();
+    const before = await readWebOperatorConfig(f.files.configFile);
+    const dependencies = {
+      ...f.dependencies,
+      fetch: (async (input, init) => {
+        if (init?.method !== 'PUT' || !String(input).endsWith(f.appPath)) return f.api.transport(input, init);
+        if (outcome === 'still artifact-only')
+          return new Response(JSON.stringify({ success: true, result: f.api.apps[0] }), { status: 200 });
+        const response = await f.api.transport(input, init);
+        f.api.policies.get(String(f.owned.applicationId))?.push({ id: 'unrecorded-policy' });
+        return response;
+      }) satisfies typeof fetch,
+    };
+    const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantWeb(operation, dependencies),
+    );
+    expect(result).toMatchObject({ outcome: 'pending', reason });
+    expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(f.policy);
+    expect(await readWebOperatorConfig(f.files.configFile)).toEqual(before);
+  });
+
+  it('leaves the Access app of an assistant on the previous web contract untouched', async () => {
+    const f = await previousReleaseAssistant();
+    await writeFile(
+      path.join(f.a.runtime.checkout_root, 'src/gws-ea/web-compatibility.json'),
+      JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-1' }),
+    );
+    const start = f.api.requests.length;
+    const installed = await installWebConnector(f.paths, {}, f.dependencies);
+    expect(installed.assistants).toContainEqual(
+      expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'unsupported', reason: 'release_unsupported' }),
+    );
+    expect(f.api.requests.slice(start).filter((request) => request.resource.includes('/access/apps'))).toEqual([]);
+    expect(f.api.apps[0].destinations).toEqual([{ type: 'public', uri: 'views.example.test', overrides: [ARTIFACTS] }]);
+    expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(f.policy);
   });
 });

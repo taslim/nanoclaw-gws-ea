@@ -116,21 +116,31 @@ export function createWebHandler(
     if (!pathname || !route) return finish(response, 404);
     const { mount, listener } = route;
     const allowed = mount.methods.some((method) => method === request.method);
-    if (mount.audience === 'artifact-readers') {
-      if (!allowed) return finish(response, 405);
-      if (mount.authoredContent(pathname)) requireSandbox(response, mount);
-      return listener(request, response);
+    switch (mount.audience) {
+      case 'public':
+        if (!allowed) return finish(response, 405);
+        return listener(request, response);
+      case 'artifact-readers':
+        if (!allowed) return finish(response, 405);
+        if (mount.authoredContent(pathname)) requireSandbox(response, mount);
+        return listener(request, response);
+      case 'principal':
+        void principal(request)
+          .catch((_error: unknown) => false)
+          .then((verified) => {
+            if (!verified) finish(response, 404);
+            else if (!allowed) finish(response, 405);
+            else listener(request, response);
+          })
+          .catch((_error: unknown) => {
+            if (response.headersSent) response.destroy();
+            else finish(response, 404);
+          });
+        return;
+      default: {
+        const unhandled: never = mount;
+        throw new Error(`Unknown web mount audience ${String(unhandled)}`);
+      }
     }
-    void principal(request)
-      .catch((_error: unknown) => false)
-      .then((verified) => {
-        if (!verified) finish(response, 404);
-        else if (!allowed) finish(response, 405);
-        else listener(request, response);
-      })
-      .catch((_error: unknown) => {
-        if (response.headersSent) response.destroy();
-        else finish(response, 404);
-      });
   };
 }

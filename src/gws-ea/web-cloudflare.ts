@@ -445,6 +445,9 @@ export function verifiedPolicyEmails(value: unknown): string[] {
   );
   return webEmails(emails);
 }
+export const WEB_PUBLIC_PATHS = ['/artifacts/public/*', '/oauth-client/*'] as const;
+const LEGACY_PUBLIC_PATHS = ['/artifacts/public/*'] as const;
+
 export function webAccessApplication(claim: WebNamespaceClaim, pinId: string): Record<string, unknown> {
   return {
     name: `Web ${claim.hostname}`,
@@ -453,7 +456,7 @@ export function webAccessApplication(claim: WebNamespaceClaim, pinId: string): R
       {
         type: 'public',
         uri: claim.hostname,
-        overrides: [{ behavior: 'public', path_pattern: `/artifacts/public/*` }],
+        overrides: WEB_PUBLIC_PATHS.map((pattern) => ({ behavior: 'public', path_pattern: pattern })),
       },
     ],
     allowed_idps: [pinId],
@@ -463,7 +466,29 @@ export function webAccessApplication(claim: WebNamespaceClaim, pinId: string): R
   };
 }
 
-export function assertWebApplication(value: unknown, assistant: WebRemoteAssistant, config: WebOperatorConfig): void {
+function samePaths(observed: readonly string[], expected: readonly string[]): boolean {
+  const sorted = [...expected].sort();
+  return observed.length === sorted.length && observed.every((pattern, index) => pattern === sorted[index]);
+}
+
+function publicOverridePaths(destination: Record<string, unknown>): string[] | undefined {
+  if (!Array.isArray(destination.overrides)) return undefined;
+  const paths: string[] = [];
+  for (const override of destination.overrides) {
+    if (!isRecord(override) || override.behavior !== 'public' || typeof override.path_pattern !== 'string')
+      return undefined;
+    paths.push(override.path_pattern);
+  }
+  return paths.sort();
+}
+
+export type WebAccessShape = 'current' | 'legacy';
+export function assertWebApplication(
+  value: unknown,
+  assistant: WebRemoteAssistant,
+  config: WebOperatorConfig,
+  accepts: 'current' | 'current-or-legacy',
+): WebAccessShape {
   const destination =
     isRecord(value) && Array.isArray(value.destinations) && value.destinations.length === 1
       ? value.destinations[0]
@@ -480,30 +505,26 @@ export function assertWebApplication(value: unknown, assistant: WebRemoteAssista
       'Cloudflare did not return verifiable Access application coordinates.',
     );
   if (
-    isRecord(value) &&
-    (value.id !== assistant.applicationId ||
-      value.aud !== assistant.aud ||
-      (isRecord(destination) && destination.uri !== assistant.claim.hostname))
+    value.id !== assistant.applicationId ||
+    value.aud !== assistant.aud ||
+    destination.uri !== assistant.claim.hostname
   )
     throw new GwsEaError(
       'web_application_mismatch',
       'The owned Access application no longer points at its recorded assistant address and audience.',
     );
-  const overrides =
-    isRecord(destination) && Array.isArray(destination.overrides) && destination.overrides.length === 1
-      ? destination.overrides[0]
-      : undefined;
+  const paths = publicOverridePaths(destination);
+  const shape: WebAccessShape | undefined = !paths
+    ? undefined
+    : samePaths(paths, WEB_PUBLIC_PATHS)
+      ? 'current'
+      : accepts === 'current-or-legacy' && samePaths(paths, LEGACY_PUBLIC_PATHS)
+        ? 'legacy'
+        : undefined;
   if (
-    !isRecord(value) ||
-    value.id !== assistant.applicationId ||
+    !shape ||
     value.type !== 'self_hosted' ||
-    value.aud !== assistant.aud ||
-    !isRecord(destination) ||
     destination.type !== 'public' ||
-    destination.uri !== assistant.claim.hostname ||
-    !isRecord(overrides) ||
-    overrides.behavior !== 'public' ||
-    overrides.path_pattern !== `/artifacts/public/*` ||
     !Array.isArray(value.allowed_idps) ||
     value.allowed_idps.length !== 1 ||
     value.allowed_idps[0] !== config.pin?.id ||
@@ -511,8 +532,9 @@ export function assertWebApplication(value: unknown, assistant: WebRemoteAssista
   )
     throw new GwsEaError(
       'web_access_mismatch',
-      'The owned Access application no longer matches its recorded destination, audience or PIN identity provider.',
+      'The owned Access application no longer matches its recorded destination, public paths, audience or PIN identity provider.',
     );
+  return shape;
 }
 
 export interface WebAccessReconciliation {
@@ -521,12 +543,18 @@ export interface WebAccessReconciliation {
   readonly applicationId: string;
   /** A callback is read once the machine lock is held, so it sees current local admission. */
   readonly emails: readonly string[] | (() => Promise<readonly string[]>);
+  readonly publicPaths: readonly string[];
 }
 /** Call outside DB transactions. Removing an admitted email revokes the app's existing sessions. */
 export async function reconcileWebAccessEmails(
   input: WebAccessReconciliation,
   dependencies: WebCloudflareDependencies = {},
-): Promise<{ readonly verified: true; readonly emails: readonly string[]; readonly changed: boolean }> {
+): Promise<{
+  readonly verified: true;
+  readonly emails: readonly string[];
+  readonly changed: boolean;
+  readonly clientDocumentPath: boolean;
+}> {
   const configRoot = path.dirname(path.dirname(input.operatorConfigFile));
   const paths = resolveControlPlanePaths({ configRoot });
   if (webOperatorFiles(paths).configFile !== input.operatorConfigFile)
@@ -544,7 +572,12 @@ export async function reconcileWebAccessEmails(
     const emails = webEmails(typeof input.emails === 'function' ? await input.emails() : input.emails);
     const api = await webApi(config, dependencies);
     const appPath = `/accounts/${config.accountId}/access/apps/${input.applicationId}`;
-    assertWebApplication(await api.request('GET', appPath), assistant, config);
+    const shape = assertWebApplication(
+      await api.request('GET', appPath),
+      assistant,
+      config,
+      input.publicPaths.length ? 'current' : 'current-or-legacy',
+    );
     const policies = await api.list(`${appPath}/policies`);
     if (policies.length !== 1 || policies[0].id !== assistant.policyId)
       throw new GwsEaError('web_access_mismatch', 'Unexpected policies exist on the owned Access application.');
@@ -567,6 +600,6 @@ export async function reconcileWebAccessEmails(
       };
       await writeWebOperatorConfig(input.operatorConfigFile, config);
     }
-    return { verified: true, emails, changed };
+    return { verified: true, emails, changed, clientDocumentPath: shape === 'current' };
   });
 }

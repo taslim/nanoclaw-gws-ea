@@ -158,13 +158,13 @@ describe('clients', () => {
     const probe = await probeApp(LEDGER, options);
     if (probe.status !== 'ok' || probe.method.kind !== 'oauth') throw new Error('Ledger signs in with OAuth');
     const redirectUri = appRedirectUri(ASSISTANT, 'mcp.ledger.example.test');
-    const { client, registered } = await clientForSignIn(
+    const { client, created } = await clientForSignIn(
       probe.method.signIn,
       { issuer: null, client: undefined },
       { host: 'mcp.ledger.example.test', redirectUri },
       options,
     );
-    expect(registered).toBe(true);
+    expect(created).toBe(true);
     expect(ledger.registrations).toEqual([
       expect.objectContaining({
         application_type: 'web',
@@ -199,8 +199,8 @@ describe('clients', () => {
       { host: 'notes.example.test', redirectUri: appRedirectUri(ASSISTANT, 'notes.example.test') },
       options,
     );
-    expect(forLedger).toEqual({ client: ledgerClient, registered: false });
-    expect(forNotes.registered).toBe(true);
+    expect(forLedger).toEqual({ client: ledgerClient, created: false });
+    expect(forNotes.created).toBe(true);
     expect(forNotes.client.clientId).not.toBe(ledgerClient.clientId);
     // Both apps name one authorization server, which the first fake plays.
     expect(ledger.registrations).toEqual([
@@ -220,7 +220,7 @@ describe('clients', () => {
     ).toBe('needs_client');
     expect(await clientForSignIn(signIn, { issuer: LEDGERLY_ISSUER, client: LEDGERLY_CLIENT }, app, options)).toEqual({
       client: LEDGERLY_CLIENT,
-      registered: false,
+      created: false,
     });
   });
 });

@@ -22,6 +22,7 @@ import { registerApprovalHandler, requestApproval } from '../approvals/index.js'
 import { quoted } from '../approvals/request-text.js';
 import { principalApproverUserId, readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../gws-ea-profile/main-note.js';
+import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { admissionDependencies, admitAppUrl, hostOf, type AdmissionDependencies } from './admit.js';
 import { APP_SERVER_PREFIX } from './apply.js';
@@ -76,6 +77,7 @@ const ADD_REFUSED: Readonly<Record<AddAnswer, string>> = {
   unavailable: 'Apps cannot be added right now. Try again later.',
   unreachable: 'The server did not answer. Try again later.',
   unsupported: "The server's sign-in cannot be used, so it cannot be added.",
+  client_unavailable: 'The assistant cannot sign in to this app right now, so it was not added. Try again later.',
   duplicate_name: 'Another app already has this name. Choose another.',
   invalid_name: `The name must be 1 to ${NAME_MAX} characters, with no control characters.`,
   operator_needed: OPERATOR_NEEDED,
@@ -98,6 +100,7 @@ const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
   invalid_client: 'the client details are not valid',
   needs_client: 'it needs client details',
   client_refused: 'the server refused the client',
+  client_unavailable: 'the assistant cannot sign in to it right now',
   unreachable: 'the server did not answer',
   unsupported: "the server's sign-in cannot be used",
   credentials_unavailable: 'the gateway cannot hold its credential',
@@ -288,7 +291,7 @@ async function defaultContext(): Promise<AppActionContext | AppsUnavailable> {
   const webHostname = web.config.hostname;
   return {
     store,
-    operations: new ConnectionOperations({ store, webHostname }),
+    operations: new ConnectionOperations({ store, webHostname, clientDocumentsServed }),
     admission: admissionDependencies(store),
     oauth: { assistantHost: webHostname },
   };

@@ -12,6 +12,7 @@ import { withAssistantLock } from './assistant-lock.js';
 import type { InstanceOperation } from './journal.js';
 import {
   webAccessApplication,
+  WEB_PUBLIC_PATHS,
   webApi,
   webEmailPolicy,
   webEmails,
@@ -129,7 +130,7 @@ export interface WebConnectorOperation {
 }
 
 export type WebReleaseCompatibility = 'compatible' | 'unsupported' | 'unknown';
-const WEB_CONTRACT = 'gws-ea-web-1';
+const WEB_CONTRACT = 'gws-ea-web-2';
 
 export async function webReleaseCompatibility(checkout: string): Promise<WebReleaseCompatibility> {
   try {
@@ -807,7 +808,7 @@ async function provision(
       assistant = { ...assistant, aud: app.aud };
       await save({ ...config, assistants: { ...config.assistants, [instanceId]: assistant } });
     }
-    assertWebApplication(app, assistant, config);
+    const shape = assertWebApplication(app, assistant, config, 'current-or-legacy');
     const policies = await api.list(`${appPath}/policies`);
     if (!assistant.policyId) {
       if (policies.length)
@@ -822,6 +823,20 @@ async function provision(
       assistant = config.assistants[instanceId];
     } else if (policies.length !== 1 || policies[0].id !== assistant.policyId)
       throw new GwsEaError('web_access_conflict', 'The owned application has unexpected policies.');
+    if (shape === 'legacy') {
+      // A full update replaces the policy list too, so it names the recorded policy rather than rely on a default.
+      await api.request('PUT', appPath, {
+        ...webAccessApplication(claim, config.pin!.id),
+        policies: [{ id: assistant.policyId, precedence: 1 }],
+      });
+      assertWebApplication(await readOwnedResource(api, appPath), assistant, config, 'current');
+      const kept = await api.list(`${appPath}/policies`);
+      if (kept.length !== 1 || kept[0].id !== assistant.policyId)
+        throw new GwsEaError(
+          'web_access_unverified',
+          'The updated Access application no longer lists exactly its recorded policy.',
+        );
+    }
     const token = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}/token`);
     if (typeof token !== 'string' || !token || /\s/u.test(token))
       throw new GwsEaError('web_tunnel_token_unavailable', 'Cloudflare tunnel run token is unavailable.');
@@ -1097,6 +1112,7 @@ async function provisionWebAssistant(
         accountId: provisioned.accountId,
         applicationId: assistant.applicationId!,
         emails: currentEmails,
+        publicPaths: WEB_PUBLIC_PATHS,
       },
       dependencies,
     );
@@ -1112,6 +1128,7 @@ async function provisionWebAssistant(
         applicationId: assistant.applicationId!,
         operatorConfigFile: webOperatorFiles(paths).configFile,
       },
+      publicPaths: [...WEB_PUBLIC_PATHS],
     };
     await writePolicy(policyFile, enabledPolicy);
     // The host module binds asynchronously. Poll for its listener outside the machine lock, and before ingress
@@ -1282,7 +1299,11 @@ export async function inspectWebCapability(
         await readOwnedResource(api, `${account}/access/apps/${assistant.applicationId}`),
         assistant,
         config,
+        'current',
       );
+      // Until the policy records the public paths, the running host has not verified the current Access shape.
+      if (policy.enabled && !coordinates.publicPaths)
+        throw new GwsEaError('web_access_mismatch', 'Web policy does not record the verified public paths.');
       const policies = await api.list(`${account}/access/apps/${assistant.applicationId}/policies`);
       if (policies.length !== 1 || policies[0].id !== assistant.policyId)
         throw new GwsEaError('web_access_mismatch', 'Unexpected Access policies exist.');

@@ -69,6 +69,7 @@ export interface ConnectionsRefresherDependencies {
   readonly onRefused?: (app: RefusedApp) => void | Promise<void>;
   /** The assistant's own web hostname, on which no sign-in endpoint may sit. */
   readonly assistantHost?: () => Promise<string | undefined>;
+  readonly clientDocumentsServed: () => boolean;
   readonly fetches?: ConnectionFetches;
   readonly now?: () => number;
   /** Once aborted, a tick finishes the app it is on, starts no other, and asks for no new token. */
@@ -118,12 +119,13 @@ function refusedForGood(code: ConnectionOAuthCode): boolean {
     case 'client_refused':
     case 'needs_client':
       return true;
-    // A renewal never answers issuer_mismatch or cancelled; only a sign-in return does.
+    // A renewal never answers issuer_mismatch, cancelled or client_unavailable; only a sign-in does.
     case 'unreachable':
     case 'unsupported':
     case 'failed':
     case 'issuer_mismatch':
     case 'cancelled':
+    case 'client_unavailable':
       return false;
   }
 }
@@ -208,6 +210,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     if (credentials?.kind !== 'oauth' || credentials.refreshToken === undefined) return;
     if (app.issuer === null) throw new ConnectionsStoreError('store_unavailable');
     let issued: Awaited<ReturnType<typeof refreshAccess>>;
+    // The server may fetch the document at any point during the request, so either reading can be the one it saw.
+    const servedBefore = dependencies.clientDocumentsServed();
     try {
       issued = await refreshAccess(
         { url: app.url, issuer: app.issuer },
@@ -220,7 +224,13 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         },
       );
     } catch (error) {
-      if (error instanceof ConnectionOAuthError && refusedForGood(error.code))
+      // A server that could not fetch the client document refuses the client only until it is served again.
+      const documentUnserved =
+        error instanceof ConnectionOAuthError &&
+        error.code === 'client_refused' &&
+        credentials.client?.kind === 'document' &&
+        !(servedBefore && dependencies.clientDocumentsServed());
+      if (error instanceof ConnectionOAuthError && refusedForGood(error.code) && !documentUnserved)
         return endRefused(app, grant.generation, error.code);
       throw error;
     }
@@ -384,7 +394,8 @@ let inFlight: Promise<void> | undefined;
 export function startConnectionsRefresher(
   store: ConnectionsStore,
   signal: AbortSignal,
-  overrides: Partial<Omit<ConnectionsRefresherDependencies, 'store' | 'signal'>> = {},
+  overrides: Partial<Omit<ConnectionsRefresherDependencies, 'store' | 'signal'>> &
+    Pick<ConnectionsRefresherDependencies, 'clientDocumentsServed'>,
 ): void {
   if (signal.aborted) return;
   let gateway = overrides.gateway;

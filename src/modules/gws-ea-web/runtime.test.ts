@@ -3,7 +3,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { writeWebOperatorConfig } from '../../gws-ea/web-cloudflare.js';
+import { WEB_PUBLIC_PATHS, writeWebOperatorConfig } from '../../gws-ea/web-cloudflare.js';
 import { defineGuardedAction, DENY } from '../../guard/index.js';
 import type { WebMount } from './mounts.js';
 import { WebRuntime } from './runtime.js';
@@ -20,7 +20,7 @@ const mounts: readonly WebMount[] = [
     path: '/artifacts',
     methods: ['GET', 'HEAD'],
     handler: () => (_request, response) => response.end('artifact'),
-    admissionEmails: async () => ['juno@example.com'],
+    admissionEmails: async () => readers,
     authoredContent: () => false,
   },
   {
@@ -41,6 +41,10 @@ let runtime: WebRuntime;
 let blocker: Server | undefined;
 let unavailable: boolean;
 let admitted: readonly string[] = [];
+let checkedPublicPaths: readonly string[] | undefined;
+let readers: readonly string[];
+let documentPath: boolean;
+let verifications: number;
 const emails = ['juno@example.com', 'principal@example.com'];
 beforeEach(async () => {
   root = fs.mkdtempSync(path.join(fs.realpathSync(tmpdir()), 'web-runtime-'));
@@ -89,11 +93,16 @@ beforeEach(async () => {
   vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(root, 'policy.json'));
   unavailable = false;
   admitted = [];
+  readers = ['juno@example.com'];
+  documentPath = false;
+  verifications = 0;
   runtime = new WebRuntime(() => mounts, {
     reconcileAccess: async (options) => {
+      verifications++;
       if (unavailable) throw new Error('Admission unavailable');
       admitted = typeof options.emails === 'function' ? await options.emails() : options.emails;
-      return { verified: true, emails, changed: false };
+      checkedPublicPaths = options.publicPaths;
+      return { verified: true, emails: admitted, changed: false, clientDocumentPath: documentPath };
     },
   });
 });
@@ -125,7 +134,17 @@ it('serves registered mounts through the same ready origin and closes publicatio
   await runtime.stop();
   expect(await runtime.publicationReady(config)).toBe(false);
 });
+it('verifies Access against the public paths its policy records, again whenever they change', async () => {
+  await runtime.reconcile();
+  expect(checkedPublicPaths).toEqual([]);
+  const recorded = { ...config, publicPaths: ['/artifacts/public/*', '/oauth-client/*'] };
+  fs.writeFileSync(path.join(root, 'policy.json'), JSON.stringify(recorded));
+  await runtime.reconcile();
+  expect(checkedPublicPaths).toEqual(['/artifacts/public/*', '/oauth-client/*']);
+  expect(await runtime.publicationReady(recorded)).toBe(true);
+});
 afterEach(async () => {
+  vi.useRealTimers();
   await runtime?.stop();
   await new Promise<void>((resolve) => (blocker ? blocker.close(() => resolve()) : resolve()));
   blocker = undefined;
@@ -172,4 +191,38 @@ it('closes a listening origin on invalid policy or failed admission, without thr
   });
   expect(await runtime.publicationReady(config)).toBe(false);
   controller.abort();
+});
+it('reports client documents unserved while the policy records no public paths, even once Access lets them through', async () => {
+  documentPath = true;
+  await runtime.reconcile();
+  expect(await runtime.health()).toMatchObject({ availability: 'available' });
+  expect(runtime.clientDocumentsServed()).toBe(false);
+});
+it('reports client documents served only while a ready origin verified them under a policy recording their path', async () => {
+  // The host first verifies the artifact-only Access app under a policy that records no public paths.
+  await runtime.reconcile();
+  expect(runtime.clientDocumentsServed()).toBe(false);
+  // Provisioning converges the app and then records the paths; the digest change alone triggers verification.
+  documentPath = true;
+  const before = verifications;
+  fs.writeFileSync(path.join(root, 'policy.json'), JSON.stringify({ ...config, publicPaths: [...WEB_PUBLIC_PATHS] }));
+  await runtime.reconcile();
+  expect(verifications).toBe(before + 1);
+  expect(admitted).toEqual(emails);
+  expect(runtime.clientDocumentsServed()).toBe(true);
+  // A failed admission closes the listener.
+  readers = ['remy@example.com'];
+  unavailable = true;
+  await runtime.reconcile();
+  expect(await runtime.health()).toMatchObject({ availability: 'unavailable', listener: { state: 'stopped' } });
+  expect(runtime.clientDocumentsServed()).toBe(false);
+  // Recovery once the retry window has passed.
+  unavailable = false;
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 16_000);
+  await runtime.reconcile();
+  expect(await runtime.health()).toMatchObject({ availability: 'available' });
+  expect(runtime.clientDocumentsServed()).toBe(true);
+  await runtime.stop();
+  expect(runtime.clientDocumentsServed()).toBe(false);
 });
