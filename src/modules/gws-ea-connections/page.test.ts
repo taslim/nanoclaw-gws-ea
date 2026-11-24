@@ -7,20 +7,17 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import type {
-  GatewayCredentialRemoval,
-  GatewayCredentialTarget,
-} from '../../gateway-providers/credential-connection.js';
+import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
 import { createWebHandler } from '../gws-ea-web/server.js';
 import type { AdmissionDependencies } from './admit.js';
-import { applyMainServers, mainOperatorServers } from './apply.js';
+import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
-import { AppCredentialsUnavailableError, type AppConnection } from './credentials.js';
+import { HELD_APP_CALL_ACTION, type HeldAppCallPayload } from './held-calls.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
@@ -67,38 +64,16 @@ interface HeldCredential {
   readonly value: string;
 }
 
-/** The gateway seam as the host sees it: credentials by name, listed and removed by exact host. */
 class FakeGateway implements OperatorCredentials {
   readonly held = new Map<string, HeldCredential>();
   readonly events: string[] = [];
   readonly failingIds = new Set<string>();
-  failRemoval = false;
   /** A credential written into the gateway directly, as an operator does. */
   hold(name: string, host: string): string {
     const id = randomUUID();
     this.held.set(name, { id, host, path: undefined, value: 'operator-written-token' });
     return id;
   }
-  readonly connection: AppConnection = (target: GatewayCredentialTarget) => {
-    let observed: HeldCredential | undefined;
-    return {
-      find: async () => {
-        observed = this.held.get(target.name);
-        return observed ? { reusable: true } : null;
-      },
-      save: async (value) => {
-        if (typeof value !== 'string') throw new Error('App credentials are plain tokens');
-        this.held.set(target.name, { id: observed?.id ?? randomUUID(), host: target.host, path: target.path, value });
-        this.events.push(`publish:${target.name}`);
-      },
-      keep: async () => undefined,
-      remove: async () => {
-        if (this.failRemoval) throw new Error('gateway unreachable');
-        if (observed) this.held.delete(target.name);
-        this.events.push(`remove:${target.name}`);
-      },
-    };
-  };
   async listForHost(host: string): Promise<{ id: string; name: string }[]> {
     return [...this.held].filter(([, held]) => held.host === host).map(([name, held]) => ({ id: held.id, name }));
   }
@@ -119,9 +94,7 @@ let store: ConnectionsStore;
 let keychain: TestKeychain;
 let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let gateway: FakeGateway;
-let gatewaySeam: boolean;
-/** Whether the gateway can also list and remove credentials by host. */
-let hostSeam: boolean;
+let operatorCredentialsAvailable: boolean;
 let server: Server;
 let port: number;
 let replies: Reply[];
@@ -157,10 +130,6 @@ function operations(): ConnectionOperations {
     webHostname: HOST,
     fetches: endpoints.fetches,
     admission,
-    connection: () => {
-      if (!gatewaySeam) throw new AppCredentialsUnavailableError();
-      return gateway.connection;
-    },
     applyMain: async (applied) => {
       const changed = await applyMainServers(applied);
       gateway.events.push('apply');
@@ -182,8 +151,7 @@ beforeEach(async () => {
   directory = await mkdtemp(path.join(os.tmpdir(), 'connections-page-'));
   ({ store, keychain, raw } = testConnectionsStore(path.join(directory, 'connections')));
   gateway = new FakeGateway();
-  gatewaySeam = true;
-  hostSeam = true;
+  operatorCredentialsAvailable = true;
   documentsServed = true;
   replies = [];
   logged = [];
@@ -217,7 +185,7 @@ beforeEach(async () => {
     },
     operations: async () => operations(),
     operatorDependencies: () => ({
-      credentials: gatewaySeam && hostSeam ? gateway : undefined,
+      credentials: operatorCredentialsAvailable ? gateway : undefined,
       protectedHosts: async () => new Set([HOST, 'api.anthropic.com']),
     }),
   });
@@ -402,13 +370,18 @@ function callback(host: string, query: URLSearchParams, identity = PRINCIPAL): P
   return request(`/connections/callback/${host}?${query.toString()}`, 'GET', { 'cf-access-jwt-assertion': identity });
 }
 
+function toolsReturn(app: Pick<ConnectionApp, 'id'>): string {
+  return `/connections/app/${app.id}/tools?outcome=connected`;
+}
+
 /** Ledgerly added from the page and signed in, as F1 runs it. */
 async function connectedLedgerly(app = fakeLedgerly()): Promise<ConnectionApp> {
   serve(app.handle);
   expect((await post('/connections/add', { url: LEDGERLY, name: '' })).status).toBe(200);
-  const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+  const stored = await onlyApp();
+  const url = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
   const reply = await callback('app.ledgerly.example.test', app.approve(url).query);
-  expect(reply.headers.location).toBe('/connections?outcome=connected');
+  expect(reply.headers.location).toBe(toolsReturn(stored));
   return onlyApp();
 }
 
@@ -449,15 +422,15 @@ describe('adding and connecting an OAuth app that needs a client', () => {
 
     const returned = await callback('app.ledgerly.example.test', app.approve(authorizationUrl.href).query);
     expect(returned.status).toBe(302);
-    expect(returned.headers.location).toBe('/connections?outcome=connected');
+    expect(returned.headers.location).toBe(toolsReturn(stored));
 
     const connected = await onlyApp();
     expect(connected.status).toBe('connected');
-    const credential = gateway.held.get(`gws-ea-app-${connected.id}`);
-    expect(credential).toMatchObject({ host: 'app.ledgerly.example.test', path: '/mcp' });
-    expect(app.accessTokens.has(credential?.value ?? '')).toBe(true);
-    expect(gateway.events).toEqual([`publish:gws-ea-app-${connected.id}`, 'apply']);
-    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LEDGERLY } });
+    expect(gateway.held.size).toBe(0);
+    const storedToken = await store.readAccessToken(connected.id, 1);
+    expect(storedToken && app.accessTokens.has(storedToken.token)).toBe(true);
+    expect(gateway.events).toEqual(['apply']);
+    expect(await mainServers()).toEqual({ [connected.serverKey]: appRelayServerEntry(connected.serverKey) });
     expect(await store.pendingRestart()).toBeDefined();
     expect(signInRow(connected.id)).toBeUndefined();
 
@@ -476,7 +449,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
 
     const url = await startSignIn(added.app, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     expect((await callback('app.ledgerly.example.test', app.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(added.app),
     );
     expect((await onlyApp()).status).toBe('connected');
     assertNoSentinels();
@@ -494,9 +467,10 @@ describe('adding and connecting an OAuth app that needs a client', () => {
       redirect_uris: [`https://${HOST}/connections/callback/mcp.ledger.example.test`],
     });
 
-    const url = await startSignIn(await onlyApp());
+    const stored = await onlyApp();
+    const url = await startSignIn(stored);
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     expect((await onlyApp()).status).toBe('connected');
     expect(ledger.registrations).toHaveLength(1);
@@ -594,7 +568,7 @@ describe('client details the server refuses', () => {
 
     const retry = await startSignIn(cleared, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     expect((await callback('app.ledgerly.example.test', app.approve(retry).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(cleared),
     );
     assertNoSentinels();
   });
@@ -618,7 +592,7 @@ describe('client details the server refuses', () => {
 
     const again = await startSignIn(replaced);
     expect((await callback('mcp.ledger.example.test', ledger.approve(again).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(replaced),
     );
   });
 
@@ -699,7 +673,7 @@ describe('client details the server refuses', () => {
 
     const retry = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     expect((await callback('app.ledgerly.example.test', app.approve(retry).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     assertNoSentinels();
   });
@@ -754,7 +728,7 @@ describe('apps whose server takes client documents', () => {
     expect(new URL(url).searchParams.get('redirect_uri')).toBe(LARDER_REDIRECT);
     const returned = await signInWithDocument(larder, 'mcp.larder.example.test', url);
 
-    expect(returned.headers.location).toBe('/connections?outcome=connected');
+    expect(returned.headers.location).toBe(toolsReturn(stored));
     expect(larder.documents).toEqual([
       expect.objectContaining({
         client_id: documentUrl(stored),
@@ -772,8 +746,10 @@ describe('apps whose server takes client documents', () => {
     expect(exchange.headers.authorization).toBeUndefined();
     const connected = await onlyApp();
     expect(connected.status).toBe('connected');
-    expect(larder.accessTokens.has(gateway.held.get(`gws-ea-app-${connected.id}`)?.value ?? '')).toBe(true);
-    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LARDER } });
+    expect(gateway.held.size).toBe(0);
+    const storedToken = await store.readAccessToken(connected.id, 1);
+    expect(storedToken && larder.accessTokens.has(storedToken.token)).toBe(true);
+    expect(await mainServers()).toEqual({ [connected.serverKey]: appRelayServerEntry(connected.serverKey) });
   });
 
   it('gives a server that also registers clients a document client, with no registration request', async () => {
@@ -785,7 +761,7 @@ describe('apps whose server takes client documents', () => {
     const url = await startSignIn(stored);
     expect(clientIdOf(url)).toBe(documentUrl(stored));
     expect((await signInWithDocument(ledger, 'mcp.ledger.example.test', url)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     expect(registrationRequests()).toEqual([]);
   });
@@ -805,10 +781,11 @@ describe('apps whose server takes client documents', () => {
     await post('/connections/add', { url: LEDGER, name: 'Ledger' });
 
     expect(ledger.registrations).toHaveLength(1);
-    const url = await startSignIn(await onlyApp());
+    const stored = await onlyApp();
+    const url = await startSignIn(stored);
     expect(clientIdOf(url)).toBe([...ledger.clients.keys()][0]);
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     expect(ledger.documents).toEqual([]);
   });
@@ -873,7 +850,7 @@ describe('apps whose server takes client documents', () => {
       const url = await startSignIn(stale);
       expect(clientIdOf(url)).toBe(documentUrl(stale));
       expect((await signInWithDocument(larder, 'mcp.larder.example.test', url)).headers.location).toBe(
-        '/connections?outcome=connected',
+        toolsReturn(stale),
       );
     });
 
@@ -885,11 +862,12 @@ describe('apps whose server takes client documents', () => {
       expect(ledger.registrations).toEqual([]);
       delete ledger.serverMetadata.client_id_metadata_document_supported;
 
-      const url = await startSignIn(await onlyApp());
+      const stored = await onlyApp();
+      const url = await startSignIn(stored);
       expect(ledger.registrations).toHaveLength(1);
       expect(clientIdOf(url)).toBe([...ledger.clients.keys()][0]);
       expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-        '/connections?outcome=connected',
+        toolsReturn(stored),
       );
     });
 
@@ -997,7 +975,7 @@ describe('apps whose server takes client documents', () => {
       const next = await startSignIn(replaced);
       expect(clientIdOf(next)).toBe(documentUrl(replaced));
       expect((await signInWithDocument(ledger, 'mcp.ledger.example.test', next)).headers.location).toBe(
-        '/connections?outcome=connected',
+        toolsReturn(replaced),
       );
     });
   });
@@ -1028,7 +1006,7 @@ describe('apps whose server takes client documents', () => {
     const url = await startSignIn(sealed);
     expect(clientIdOf(url)).toBe('juno-ledger-client');
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(sealed),
     );
     expect(ledger.documents).toEqual([]);
     expect(ledger.registrations).toEqual([]);
@@ -1107,12 +1085,14 @@ describe('pasted tokens and servers without sign-in', () => {
     expect(connected.status).toBe(200);
     app = await onlyApp();
     expect(app.status).toBe('connected');
-    expect(gateway.held.get(`gws-ea-app-${app.id}`)?.value).toBe(SENTINEL_TOKEN);
+    expect(gateway.held.size).toBe(0);
+    expect(await store.readGrant(app.id, 1)).toEqual({ kind: 'token', generation: 1, token: SENTINEL_TOKEN });
 
     expect((await post('/connections/disconnect', { id: app.id, version: String(app.version) })).status).toBe(200);
     app = await onlyApp();
     expect(app.status).toBe('not_connected');
     expect(gateway.held.size).toBe(0);
+    expect(await store.readGrant(app.id, 1)).toBeUndefined();
     expect((await request(`/connections/app/${app.id}/connect`)).body).toContain('name="token"');
 
     await post('/connections/connect', { id: app.id, version: String(app.version), token: SENTINEL_TOKEN });
@@ -1134,7 +1114,7 @@ describe('pasted tokens and servers without sign-in', () => {
     app = await onlyApp();
     expect(app.status).toBe('connected');
     expect(gateway.held.size).toBe(0);
-    expect(await mainServers()).toEqual({ [app.serverKey]: { type: 'http', url: RECIPES } });
+    expect(await mainServers()).toEqual({ [app.serverKey]: appRelayServerEntry(app.serverKey) });
     expect(endpoints.requests.every((incoming) => !incoming.path.includes('oauth'))).toBe(true);
   });
 });
@@ -1199,9 +1179,7 @@ describe('sign-in returns', () => {
     );
 
     const secondQuery = app.approve(second).query;
-    expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(
-      '/connections?outcome=connected',
-    );
+    expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(toolsReturn(stored));
     expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(
       '/connections?outcome=expired',
     );
@@ -1284,11 +1262,11 @@ describe('managing apps', () => {
     expect(reply.body).toContain('App disconnected.');
     expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
     expect(gateway.held.size).toBe(0);
+    expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
     expect(signInRow(app.id)).toBeUndefined();
     expect(ledgerly.revoked).toEqual([grant.refreshToken]);
     expect(await mainServers()).toEqual({});
     expect(await store.pendingRestart()).toBeDefined();
-    expect(gateway.events.indexOf(`remove:gws-ea-app-${app.id}`)).toBeLessThan(gateway.events.lastIndexOf('apply'));
   });
 
   it('deletes a connected app even when the server refuses revocation', async () => {
@@ -1317,31 +1295,6 @@ describe('managing apps', () => {
 
     expect((await post('/connections/delete', { id: refused.id, version: String(refused.version) })).status).toBe(200);
     expect(await store.apps()).toEqual([]);
-  });
-
-  it('keeps an app listed, Not connected, when its credential cannot be removed, so Delete can run again', async () => {
-    serve(notesServer);
-    await post('/connections/add', { url: NOTES, name: '' });
-    let app = await onlyApp();
-    await post('/connections/connect', { id: app.id, version: String(app.version), token: SENTINEL_TOKEN });
-    app = await onlyApp();
-    gateway.failRemoval = true;
-
-    const reply = await post('/connections/delete', { id: app.id, version: String(app.version) });
-    expect(reply.status).toBe(200);
-    expect(reply.body).toContain('Try deleting it again.');
-    app = await onlyApp();
-    expect(app.status).toBe('not_connected');
-    expect(gateway.held.has(`gws-ea-app-${app.id}`)).toBe(true);
-    expect(await mainServers()).toEqual({});
-
-    gateway.failRemoval = false;
-    expect((await post('/connections/delete', { id: app.id, version: String(app.version) })).body).toContain(
-      'App deleted.',
-    );
-    expect(await store.apps()).toEqual([]);
-    expect(gateway.held.size).toBe(0);
-    assertNoSentinels();
   });
 
   it('asks before Delete, which also forgets entered client details, and not before Disconnect', async () => {
@@ -1472,14 +1425,11 @@ describe('page states', () => {
     assertNoSentinels();
   });
 
-  it.each([
-    ['an unreadable Keychain', () => (keychain.unavailable = true)],
-    ['a gateway without a credential store', () => (gatewaySeam = false)],
-  ])('lists existing apps but hides Add and Connect with %s', async (_case, breakIt) => {
+  it('lists existing apps but hides Add and Connect with an unreadable Keychain', async () => {
     serve(recipesServer);
     await post('/connections/add', { url: RECIPES, name: '' });
     const app = await onlyApp();
-    breakIt();
+    keychain.unavailable = true;
     const list = await request('/connections');
     expect(list.body).toContain('Recipes');
     expect(list.body).toContain('Apps can’t be added or connected right now. Ask your operator.');
@@ -1574,7 +1524,7 @@ describe('operator servers', () => {
   it('shows Can’t disconnect on a gateway that cannot list and remove credentials by host', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
     gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
-    hostSeam = false;
+    operatorCredentialsAvailable = false;
 
     const page = await request('/connections');
     expect(page.body).toContain('Can’t disconnect');
@@ -1664,5 +1614,250 @@ describe('home status and link facts', () => {
       ],
     });
     expect(JSON.stringify(facts)).not.toContain('https://');
+  });
+
+  it('includes needsReview state in main link facts for pinned principal apps', async () => {
+    const recipes = app('connected', 'Recipes');
+    const needsReview = await connectionsLinkFacts(
+      listing({
+        apps: [recipes],
+        pins: {
+          [recipes.id]: {
+            appId: recipes.id,
+            instructions: null,
+            listHash: 'hash-1',
+            pinnedAt: '2026-11-23T12:00:00.000Z',
+            confirmedAt: '2026-11-23T12:00:00.000Z',
+            reviewedListHash: null,
+            reviewedAt: null,
+            needsReview: true,
+          },
+        },
+      }),
+    );
+    expect(needsReview.apps).toEqual([
+      {
+        name: 'Recipes',
+        key: 'app_recipes',
+        host: 'recipes.example.test',
+        origin: 'principal',
+        status: 'connected',
+        needsReview: true,
+      },
+    ]);
+    const reviewed = await connectionsLinkFacts(
+      listing({
+        apps: [recipes],
+        pins: {
+          [recipes.id]: {
+            appId: recipes.id,
+            instructions: null,
+            listHash: 'hash-1',
+            pinnedAt: '2026-11-23T12:00:00.000Z',
+            confirmedAt: '2026-11-23T12:00:00.000Z',
+            reviewedListHash: 'hash-1',
+            reviewedAt: '2026-11-23T12:05:00.000Z',
+            needsReview: false,
+          },
+        },
+      }),
+    );
+    expect(reviewed.apps[0]?.needsReview).toBe(false);
+  });
+});
+
+describe('tool approvals review and held-call details', () => {
+  it('leads to the review view after connecting, flips switches immediately without a card, clears and restores review marker', async () => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    let app = await onlyApp();
+    const connectReply = await post('/connections/connect', { id: app.id, version: String(app.version) });
+    expect(connectReply.status).toBe(200);
+    expect(connectReply.headers['x-page-location']).toBe(`/connections/app/${app.id}/tools`);
+    expect(connectReply.body).toContain('When I’ll check with you first');
+
+    app = await onlyApp();
+    const pinned = await store.pinTools(app.id, {
+      instructions: null,
+      tools: [
+        { name: 'search_recipes', description: 'Search recipes', inputSchema: { type: 'object', properties: {} } },
+        {
+          name: 'order_groceries',
+          description: 'Place grocery order',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        { name: 'sync_pantry', description: 'Sync pantry items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_recipes',
+        definitionHash: hashes.get('search_recipes')!,
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Read-only search',
+      },
+      {
+        name: 'order_groceries',
+        definitionHash: hashes.get('order_groceries')!,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places an order',
+      },
+    ]);
+
+    const listBefore = await request('/connections');
+    expect(listBefore.body).toContain('Needs review');
+    expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
+    const factsBefore = await connectionsLinkFacts(() => operations().listing());
+    expect(factsBefore.apps[0]?.needsReview).toBe(true);
+    expect(factsBefore.apps[0]?.tools).toEqual([
+      { name: 'order_groceries', label: 'ask_first', reason: 'Places an order' },
+      { name: 'search_recipes', label: 'just_do', reason: 'Read-only search' },
+      { name: 'sync_pantry', label: 'unsorted', reason: null },
+    ]);
+
+    const reviewWhileUnsorted = await request(`/connections/app/${app.id}/tools?outcome=connected`);
+    expect(reviewWhileUnsorted.status).toBe(200);
+    expect(reviewWhileUnsorted.body).toContain('When I’ll check with you first');
+    expect(reviewWhileUnsorted.body).toContain('Read-only search');
+    expect(reviewWhileUnsorted.body).toContain('Places an order');
+    expect(reviewWhileUnsorted.body).toContain('Being set up');
+    expect(reviewWhileUnsorted.body).not.toContain('Looks right');
+    expect((await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash })).status).toBe(409);
+
+    const staleToggle = await post('/connections/tool-label', {
+      id: app.id,
+      tool: 'order_groceries',
+      label: 'just_do',
+      definitionHash: 'stale-definition-hash',
+    });
+    expect(staleToggle.status).toBe(409);
+
+    const flipDown = await post('/connections/tool-label', {
+      id: app.id,
+      tool: 'order_groceries',
+      label: 'just_do',
+      definitionHash: hashes.get('order_groceries')!,
+    });
+    expect(flipDown.status).toBe(200);
+    expect(flipDown.headers['x-page-saved']).toBe('true');
+    expect(await store.getTool(app.id, 'order_groceries')).toMatchObject({
+      label: 'just_do',
+      labelSource: 'principal',
+    });
+
+    const flipUp = await post('/connections/tool-label', {
+      id: app.id,
+      tool: 'search_recipes',
+      label: 'ask_first',
+      definitionHash: hashes.get('search_recipes')!,
+    });
+    expect(flipUp.status).toBe(200);
+    expect(await store.getTool(app.id, 'search_recipes')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+    });
+
+    // Once the remaining unsorted tool receives a label, Looks right becomes available and confirms review.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'sync_pantry',
+        definitionHash: hashes.get('sync_pantry')!,
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Syncs pantry list',
+      },
+    ]);
+    const reviewReady = await request(`/connections/app/${app.id}/tools`);
+    expect(reviewReady.status).toBe(200);
+    expect(reviewReady.body).toContain('Looks right');
+
+    const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
+    expect(staleReview.status).toBe(409);
+
+    const confirmed = await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.headers['x-page-location']).toBe('/connections');
+    expect(confirmed.body).not.toContain('Needs review');
+    expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(false);
+
+    await store.pinTools(app.id, {
+      instructions: null,
+      tools: [
+        {
+          name: 'search_recipes',
+          description: 'Search and bookmark recipes',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'order_groceries',
+          description: 'Place grocery order',
+          inputSchema: { type: 'object', properties: {} },
+        },
+      ],
+    });
+    const listAfterChange = await request('/connections');
+    expect(listAfterChange.body).toContain('Needs review');
+    expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(true);
+  });
+
+  it('shows full untruncated arguments and app words on /connections/held/<id> only to the principal', async () => {
+    const approvalId = 'appr-held-detail-test';
+    const viewId = 'held-detail-view-1';
+    const longNotes = 'Special delivery instructions '.repeat(120);
+    const payload: HeldAppCallPayload = {
+      viewId,
+      invocationId: 'sess-1:req-1',
+      appId: randomUUID(),
+      appName: 'Chowdeck',
+      appHost: 'mcp.chowdeck.example.test',
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: 'defhash-1',
+      canonicalArgs: JSON.stringify({
+        checkout_id: 'chk_\u200B999',
+        delivery_notes: longNotes,
+      }),
+      argsHash: 'argshash-1',
+      summary: 'Confirm Jollof Rice order for Morgan',
+      appContext: {
+        toolName: 'prepare_checkout',
+        text: 'Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.',
+      },
+      expiresAt: '2026-11-24T12:00:00.000Z',
+    };
+    await createPendingApproval({
+      approval_id: approvalId,
+      session_id: null,
+      request_id: 'req-1',
+      action: HELD_APP_CALL_ACTION,
+      payload: JSON.stringify(payload),
+      title: 'Allow Chowdeck to run confirm_checkout?',
+      question: 'Truncated preview',
+      options_json: JSON.stringify([{ value: 'approve', label: 'Approve' }]),
+      status: 'pending',
+      created_at: '2026-11-23T12:00:00.000Z',
+      expires_at: payload.expiresAt,
+    });
+
+    const view = await request(`/connections/held/${viewId}`);
+    expect(view.status).toBe(200);
+    expect(view.body).toContain('Chowdeck · confirm_checkout');
+    expect(view.body).toContain('Confirm Jollof Rice order for Morgan');
+    expect(view.body).toContain('[U+200B]');
+    expect(view.body).toContain(longNotes);
+    expect(view.body).toContain('Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.');
+
+    const readerView = await request(`/connections/held/${viewId}`, 'GET', {
+      'cf-access-jwt-assertion': READER,
+    });
+    expect(readerView.status).toBe(404);
+    expect(readerView.body).toBe('');
+
+    const unknownView = await request('/connections/held/appr-does-not-exist');
+    expect(unknownView.status).toBe(404);
+    expect(unknownView.body).toBe('');
   });
 });

@@ -315,8 +315,32 @@ describe('public fetch', () => {
     };
     const error = await failure(client({ redirect: 'none' })(`https://${HOST}/token`, { method: 'POST' }));
     expect(error.code).toBe('refused');
+    expect(error.detail).toEqual({ sent: true, reason: 'response_too_large' });
     expect(error.message).not.toContain(SENTINEL);
     expect(error.cause).toBeUndefined();
+  });
+
+  it('honors a per-request maxBodyBytes cap both above and below the default', async () => {
+    const large = 'a'.repeat(1024 * 1024 + 512);
+    handler = reply(200, { 'content-type': 'application/json' }, `{"data":"${large}"}`);
+    const response = await client({ redirect: 'none', maxBodyBytes: 2 * 1024 * 1024 })(`https://${HOST}/mcp`, {
+      method: 'POST',
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ data: large });
+
+    handler = reply(200, { 'content-type': 'text/plain' }, 'x'.repeat(256));
+    const small = await failure(client({ redirect: 'none', maxBodyBytes: 128 })(`https://${HOST}/mcp`));
+    expect(small.code).toBe('refused');
+    expect(small.detail).toEqual({ sent: true, reason: 'response_too_large' });
+  });
+
+  it('marks a pre-send refusal as unsent', async () => {
+    dnsBoundary.lookup.mockResolvedValue([{ address: '10.0.0.5', family: 4 }]);
+    const fetch = publicFetch({ redirect: 'none' }, { connect: connectLoopback });
+    const error = await failure(fetch(`https://${HOST}/mcp`));
+    expect(error.code).toBe('refused');
+    expect(error.detail).toEqual({ sent: false });
   });
 
   it('refuses an encoded body it could not cap before decoding', async () => {
@@ -334,10 +358,20 @@ describe('public fetch', () => {
     expect(error.message).not.toContain(SENTINEL);
   });
 
-  it('ends a server that never answers with a timeout', async () => {
+  it('ends a server that never answers with a timeout and marks sent: true after TLS connects', async () => {
     handler = () => undefined;
     const error = await failure(client({ redirect: 'none' }, { timeoutMs: 150 })(`https://${HOST}/token`));
     expect(error.code).toBe('timeout');
+    expect(error.detail?.sent).toBe(true);
+  });
+
+  it('marks pre-connect DNS timeouts with sent: false', async () => {
+    const neverResolve = () => new Promise<never>(() => undefined);
+    const error = await failure(
+      publicFetch({ redirect: 'none' }, { timeoutMs: 80, resolve: neverResolve })(`https://${HOST}/token`),
+    );
+    expect(error.code).toBe('timeout');
+    expect(error.detail?.sent).toBe(false);
   });
 
   it('stops when the caller aborts', async () => {

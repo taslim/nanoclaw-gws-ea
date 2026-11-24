@@ -7,7 +7,7 @@ import { createClientDocumentHandler } from './client-document.js';
 import { CLIENT_DOCUMENT_PATH } from './oauth.js';
 import { readListing, type ConnectionsListing } from './operations.js';
 import { createConnectionsPageHandler } from './page.js';
-import { ConnectionsStoreError, getConnectionsStore, type AppStatus } from './store.js';
+import { ConnectionsStoreError, getConnectionsStore, type AppStatus, type ToolLabel } from './store.js';
 
 export const connectionsPageGuard = defineGuardedAction({
   action: 'gws_ea_connections.connections_page',
@@ -18,9 +18,9 @@ export const connectionsPageGuard = defineGuardedAction({
   },
 });
 
-async function currentListing(): Promise<ConnectionsListing> {
+async function currentListing(includeAvailability = true): Promise<ConnectionsListing> {
   try {
-    return await readListing(await getConnectionsStore());
+    return await readListing(await getConnectionsStore(), undefined, { includeAvailability });
   } catch (error) {
     if (!(error instanceof ConnectionsStoreError)) throw error;
     return readListing(undefined);
@@ -41,12 +41,22 @@ export async function connectionsStatus(read: () => Promise<ConnectionsListing> 
   return connected ? count(connected, 'app connected', 'apps connected') : 'No apps yet';
 }
 
+export interface ConnectionToolFact {
+  readonly name: string;
+  readonly label: ToolLabel | 'unsorted';
+  readonly reason: string | null;
+}
+
 export interface ConnectionLinkFact {
   readonly name: string;
   readonly key: string;
   readonly host: string;
   readonly origin: 'principal' | 'operator';
   readonly status: AppStatus;
+  /** Present for pinned principal apps: true until the principal confirms "Looks right" or after definitions change. */
+  readonly needsReview?: boolean;
+  /** Present for pinned principal apps: current approval label and reason for each pinned tool. */
+  readonly tools?: readonly ConnectionToolFact[];
 }
 
 /** The host knows nothing of an operator server beyond its entry, so a present entry is connected. */
@@ -58,20 +68,34 @@ export function operatorAsApp(server: OperatorServer): ConnectionLinkFact | unde
 
 /** Main learns which apps exist and how they stand, never an address that could carry a credential. */
 export async function connectionsLinkFacts(
-  read: () => Promise<ConnectionsListing> = currentListing,
+  read: () => Promise<ConnectionsListing> = () => currentListing(false),
 ): Promise<{ readonly apps: readonly ConnectionLinkFact[] }> {
-  const { apps, operators } = await read();
+  const { apps, operators, pins, toolsByApp } = await read();
   return {
     apps: [
-      ...apps.map(
-        ({ name, serverKey, host, status }): ConnectionLinkFact => ({
+      ...apps.map(({ id, name, serverKey, host, status }): ConnectionLinkFact => {
+        const pin = pins?.[id];
+        const pinnedTools = toolsByApp?.[id];
+        const tools =
+          pin && pinnedTools
+            ? pinnedTools.map(
+                (tool): ConnectionToolFact => ({
+                  name: tool.name,
+                  label: tool.label ?? 'unsorted',
+                  reason: tool.reason,
+                }),
+              )
+            : undefined;
+        return {
           name,
           key: serverKey,
           host,
           origin: 'principal',
           status,
-        }),
-      ),
+          ...(pin ? { needsReview: pin.needsReview } : {}),
+          ...(tools ? { tools } : {}),
+        };
+      }),
       ...operators.flatMap((server) => operatorAsApp(server) ?? []),
     ],
   };

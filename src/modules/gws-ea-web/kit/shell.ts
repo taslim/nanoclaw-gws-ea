@@ -96,6 +96,16 @@ export function renderCopyButton(sourceId: string, label: string): string {
   return `<button class="button button-secondary" type="button" data-copy-from="${escapeHtml(sourceId)}" aria-label="${escapeHtml(label)}"><span data-copy-label>Copy</span></button>`;
 }
 
+export function renderSwitch(options: {
+  readonly checked: boolean;
+  readonly label: string;
+  readonly stateText: string;
+  readonly name?: string;
+}): string {
+  const dataName = options.name ? ` data-switch-name="${escapeHtml(options.name)}"` : '';
+  return `<button class="switch" type="submit" role="switch" aria-checked="${options.checked ? 'true' : 'false'}" aria-label="${escapeHtml(options.label)}"${dataName}><span class="switch-state">${escapeHtml(options.stateText)}</span><span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span></button>`;
+}
+
 function initial(name: string): string {
   return ([...name.trim()][0] ?? '•').toLocaleUpperCase();
 }

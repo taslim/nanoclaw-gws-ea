@@ -51,7 +51,8 @@ registerCapability(MAIN_CHAT_CAPABILITY, {
 });
 export const MAIN_APPS_CAPABILITY = 'gws-ea-connections';
 registerCapability(MAIN_APPS_CAPABILITY, {
-  description: "add_app and delete_app: the principal's apps, each change approved by the principal",
+  description:
+    "add_app, delete_app and app_tool_ask: the principal's apps and tool approval settings, each change approved by the principal",
   default: 'off',
   instructions: [MAIN_APPS_CAPABILITY],
   // Custom apps are main's alone, so no other group learns to ask for them.

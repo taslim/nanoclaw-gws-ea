@@ -129,6 +129,8 @@ const POLICY: Policy = {
     'gws-ea-chat-agents/docs.ts': 'job',
     // The answers and notes of main's app tools; their cards name no tool.
     'gws-ea-connections/actions.ts': 'main',
+    'gws-ea-connections/sort-rules.ts': 'external-email',
+    'gws-ea-connections/sorter.ts': 'external-email',
     // `ncl people` and `ncl preferences` help, answers and guidance.
     'gws-ea-people/index.ts': 'main',
     'gws-ea-preferences/index.ts': 'main',

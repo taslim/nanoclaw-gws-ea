@@ -32,4 +32,23 @@ export const deleteApp = requestTool({
   timeoutMs: 120_000,
 });
 
-registerTools([addApp, deleteApp], 'gws-ea-connections');
+export const appToolAsk = requestTool({
+  name: 'app_tool_ask',
+  description:
+    "Ask the principal to change whether one tool on a connected app asks before running (ask_first: true to check with them first, false to run without asking). Every change in either direction sends the principal an approval request bound to the tool's current definition; awaiting_principal means the request is out, and a host message tells you once they decide. After a timeout use request_status before asking again.",
+  properties: {
+    app: { type: 'string', description: "The app's key, starting with app_." },
+    tool: { type: 'string', description: 'Exact name of the tool on that app.' },
+    ask_first: {
+      type: 'boolean',
+      description: 'true to require approval before running; false to run without asking.',
+    },
+    reason: { type: 'string', description: 'Optional short one-line note for the principal.' },
+  },
+  required: ['app', 'tool', 'ask_first'],
+  additionalProperties: false,
+  repeatable: false,
+  timeoutMs: 120_000,
+});
+
+registerTools([addApp, deleteApp, appToolAsk], 'gws-ea-connections');

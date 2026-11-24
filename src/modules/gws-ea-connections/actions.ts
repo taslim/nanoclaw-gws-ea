@@ -25,7 +25,7 @@ import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../g
 import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { admissionDependencies, admitAppUrl, hostOf, type AdmissionDependencies } from './admit.js';
-import { APP_SERVER_PREFIX } from './apply.js';
+import { APP_SERVER_PREFIX, MainServersUnreadableError, mainOperatorServers, notifyMainToolsChanged } from './apply.js';
 import type { ConnectionOAuthOptions, SignInServer } from './oauth.js';
 import { ConnectionOperations, type AddRefusal, type ConnectRefusal } from './operations.js';
 import { probeApp, type SignInMethod } from './probe.js';
@@ -39,6 +39,7 @@ import {
 
 export const ADD_APP_ACTION = 'add_app';
 export const DELETE_APP_ACTION = 'delete_app';
+export const APP_TOOL_ASK_ACTION = 'app_tool_ask';
 
 /** What apps are changed through, read fresh for every request. */
 export interface AppActionContext {
@@ -59,9 +60,20 @@ export interface AppActionDependencies {
 const ADD_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'url', 'name']);
 /** The approved request also carries the app's id, so it deletes exactly the app the principal saw. */
 const DELETE_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'app', 'id']);
+const TOOL_ASK_APPROVAL_BOUND_FIELDS = ['id', 'grantGeneration', 'definitionHash', 'priorDecisionRevision'] as const;
+const TOOL_ASK_FIELDS: ReadonlySet<string> = new Set([
+  'action',
+  'requestId',
+  'app',
+  'tool',
+  'ask_first',
+  'reason',
+  ...TOOL_ASK_APPROVAL_BOUND_FIELDS,
+]);
 
 type AddAnswer = AddRefusal | AppsUnavailable;
 type DeleteAnswer = AppsUnavailable | 'operator_server' | 'not_found';
+type ToolAskAnswer = AppsUnavailable | 'operator_server' | 'not_found' | 'tool_not_found' | 'unsorted' | 'unchanged';
 
 const OPERATOR_NEEDED =
   'Web is not set up, so the principal has no Connections page. Tell them to ask their operator to finish setup.';
@@ -91,6 +103,16 @@ const DELETE_REFUSED: Readonly<Record<DeleteAnswer, string>> = {
   operator_needed: OPERATOR_NEEDED,
 };
 
+const TOOL_ASK_REFUSED: Readonly<Record<ToolAskAnswer, string>> = {
+  operator_server: "Operator-added servers are not approval-gated, so their tools don't have Ask-first settings.",
+  not_found: 'No connected app the principal added has this key. Check the app keys principal_page connections lists.',
+  tool_not_found: 'That app does not currently offer a tool with that name.',
+  unsorted: 'That tool is still being set up; wait until it has a label before asking to change it.',
+  unchanged: 'That tool already has that setting.',
+  unavailable: 'App tool settings cannot be changed right now. Try again later.',
+  operator_needed: OPERATOR_NEEDED,
+};
+
 const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
   already_connected: 'it is already connected',
   wrong_method: 'it signs in another way',
@@ -103,8 +125,6 @@ const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
   client_unavailable: 'the assistant cannot sign in to it right now',
   unreachable: 'the server did not answer',
   unsupported: "the server's sign-in cannot be used",
-  credentials_unavailable: 'the gateway cannot hold its credential',
-  publish_failed: 'its credential could not be stored',
 };
 
 async function principalHold({ actor, grant }: GuardInput, what: string): Promise<GuardDecision> {
@@ -134,6 +154,13 @@ export const deleteAppGuard = defineGuardedAction({
   decide: (input) => principalHold(input, 'delete an app'),
 });
 
+export const appToolAskGuard = defineGuardedAction({
+  action: 'gws_ea_connections.app_tool_ask',
+  grantActionName: APP_TOOL_ASK_ACTION,
+  grantCoversRequest: coversExactRequest,
+  decide: (input) => principalHold(input, 'change whether an app tool asks first'),
+});
+
 registerMcpServerPolicy('gws-ea-connections:main-apps', async ({ agentGroupId, serverName }) => {
   if (serverName?.startsWith(APP_SERVER_PREFIX))
     return `server names starting with ${APP_SERVER_PREFIX} belong to the principal's connected apps`;
@@ -152,6 +179,18 @@ interface DeleteRequest {
   readonly requestId: string;
   readonly app: string;
   readonly id?: string;
+}
+
+interface ToolAskRequest {
+  readonly requestId: string;
+  readonly app: string;
+  readonly tool: string;
+  readonly askFirst: boolean;
+  readonly reason?: string;
+  readonly id?: string;
+  readonly grantGeneration?: number;
+  readonly definitionHash?: string;
+  readonly priorDecisionRevision?: number;
 }
 
 function fieldsOnly(content: Record<string, unknown>, allowed: ReadonlySet<string>, takes: string): void {
@@ -181,6 +220,52 @@ function deleteRequest(content: Record<string, unknown>, requestId: string): Del
     throw invalidArgs('app is the key principal_page connections lists for the app.');
   if (content.id !== undefined && typeof content.id !== 'string') throw invalidArgs('The request takes only app.');
   return { requestId, app: content.app.trim(), ...(typeof content.id === 'string' ? { id: content.id } : {}) };
+}
+
+function toolAskRequest(content: Record<string, unknown>, requestId: string): ToolAskRequest {
+  fieldsOnly(content, TOOL_ASK_FIELDS, 'app, tool, ask_first, and optional reason');
+  if (typeof content.app !== 'string' || !content.app.trim())
+    throw invalidArgs('app is the key principal_page connections lists for the app.');
+  if (typeof content.tool !== 'string' || content.tool.length === 0)
+    throw invalidArgs('tool is the exact name of the app tool.');
+  if (typeof content.ask_first !== 'boolean')
+    throw invalidArgs('ask_first must be true (ask before running) or false (run without asking).');
+  if (content.reason !== undefined && (typeof content.reason !== 'string' || hasControlCharacters(content.reason)))
+    throw invalidArgs('reason must be plain text with no control characters.');
+  if (content.id !== undefined && typeof content.id !== 'string') throw invalidArgs('Invalid app id.');
+  if (
+    content.grantGeneration !== undefined &&
+    (typeof content.grantGeneration !== 'number' ||
+      !Number.isSafeInteger(content.grantGeneration) ||
+      content.grantGeneration < 1)
+  ) {
+    throw invalidArgs('Invalid grant generation.');
+  }
+  if (content.definitionHash !== undefined && typeof content.definitionHash !== 'string')
+    throw invalidArgs('Invalid definition hash.');
+  if (
+    content.priorDecisionRevision !== undefined &&
+    (typeof content.priorDecisionRevision !== 'number' ||
+      !Number.isSafeInteger(content.priorDecisionRevision) ||
+      content.priorDecisionRevision < 0)
+  ) {
+    throw invalidArgs('Invalid tool decision revision.');
+  }
+  const reason =
+    typeof content.reason === 'string' && content.reason.trim() ? content.reason.trim().slice(0, 200) : undefined;
+  return {
+    requestId,
+    app: content.app.trim(),
+    tool: content.tool,
+    askFirst: content.ask_first,
+    ...(reason === undefined ? {} : { reason }),
+    ...(typeof content.id === 'string' ? { id: content.id } : {}),
+    ...(typeof content.grantGeneration === 'number' ? { grantGeneration: content.grantGeneration } : {}),
+    ...(typeof content.definitionHash === 'string' ? { definitionHash: content.definitionHash } : {}),
+    ...(typeof content.priorDecisionRevision === 'number'
+      ? { priorDecisionRevision: content.priorDecisionRevision }
+      : {}),
+  };
 }
 
 function refusal(requestId: string, error: ActionRefusal): ResponseFrame {
@@ -261,6 +346,14 @@ registerApprovalHandler(DELETE_APP_ACTION, reenterGuardedDeliveryAction(DELETE_A
   restartSafe: true,
   rejectionNote: (approval, reason) =>
     `The principal declined deleting the app ${String(payloadOf(approval).app)}${reasonSuffix(reason)}. It stays as it was.`,
+});
+registerApprovalHandler(APP_TOOL_ASK_ACTION, reenterGuardedDeliveryAction(APP_TOOL_ASK_ACTION), {
+  restartSafe: true,
+  rejectionNote: (approval, reason) => {
+    const p = payloadOf(approval);
+    const target = typeof p.app === 'string' && typeof p.tool === 'string' ? `${p.app}.${p.tool}` : 'that tool';
+    return `The principal declined changing the Ask-first setting for ${target}${reasonSuffix(reason)}. Its setting stays as it was.`;
+  },
 });
 
 function needsText(app: ConnectionApp): string {
@@ -366,7 +459,7 @@ export function createAppActions(dependencies: AppActionDependencies) {
     session: Session,
     requestId: string,
     note: {
-      readonly kind: 'add' | 'delete';
+      readonly kind: 'add' | 'delete' | 'tool-ask';
       readonly settle: () => Promise<string>;
       readonly unfinished: string;
       readonly wake: boolean;
@@ -447,6 +540,15 @@ export function createAppActions(dependencies: AppActionDependencies) {
     });
   };
 
+  async function hasOperatorServer(key: string): Promise<boolean | 'unavailable'> {
+    try {
+      return (await mainOperatorServers()).some((server) => server.key === key);
+    } catch (error) {
+      if (error instanceof MainServersUnreadableError) return 'unavailable';
+      throw error;
+    }
+  }
+
   async function requestDeleteHold(content: Record<string, unknown>, session: Session): Promise<void> {
     const request = deleteRequest(content, requestIdOf(content) ?? '');
     if (await alreadyAnswered(session, request.requestId)) return;
@@ -454,10 +556,10 @@ export function createAppActions(dependencies: AppActionDependencies) {
       answer(session, request.requestId, refusal(request.requestId, forbidden(DELETE_REFUSED[reason])));
     const context = await dependencies.context();
     if (typeof context === 'string') return refuse(context);
-    const app = (await context.store.apps()).find(({ serverKey }) => serverKey === request.app);
+    const app = await context.store.byServerKey(request.app);
     if (!app) {
-      const { operators } = await context.operations.listing();
-      return refuse(operators.some(({ key }) => key === request.app) ? 'operator_server' : 'not_found');
+      const isOperator = await hasOperatorServer(request.app);
+      return refuse(isOperator === 'unavailable' ? 'unavailable' : isOperator ? 'operator_server' : 'not_found');
     }
     const payload = { action: DELETE_APP_ACTION, requestId: request.requestId, app: app.serverKey, id: app.id };
     await hold(session, request, DELETE_APP_ACTION, payload, {
@@ -474,14 +576,12 @@ export function createAppActions(dependencies: AppActionDependencies) {
     const context = await dependencies.context();
     if (typeof context === 'string')
       return `The principal approved deleting the app ${request.app}, but it could not be deleted: ${DELETE_REFUSED[context]}`;
-    const app = (await context.store.apps()).find(
-      ({ id, serverKey }) => id === request.id && serverKey === request.app,
-    );
-    if (!app) return `The principal approved deleting the app ${request.app}; it was already gone.`;
+    const app = await context.store.byServerKey(request.app);
+    if (!app || app.id !== request.id)
+      return `The principal approved deleting the app ${request.app}; it was already gone.`;
     const approved = `The principal approved deleting ${JSON.stringify(app.name)} at ${app.host}`;
-    return (await context.operations.remove(app.id, app.version)) === 'deleted'
-      ? `${approved}. It is deleted, and its tools leave you by their next message.`
-      : `${approved}. It is disconnected, but the gateway still holds its credential, so it stays on their Connections page as Not connected while the host retries the removal.`;
+    await context.operations.remove(app.id, app.version);
+    return `${approved}. It is deleted, and its tools leave you by their next message.`;
   }
 
   const applyDelete: GuardedDeliveryHandler = async (content, session) => {
@@ -490,6 +590,102 @@ export function createAppActions(dependencies: AppActionDependencies) {
       kind: 'delete',
       settle: () => settleDelete(request),
       unfinished: `The principal approved deleting the app ${request.app}, but it could not be finished right now. Check principal_page connections before asking again.`,
+      wake: false,
+    });
+  };
+
+  async function requestToolAskHold(content: Record<string, unknown>, session: Session): Promise<void> {
+    const request = toolAskRequest(content, requestIdOf(content) ?? '');
+    if (await alreadyAnswered(session, request.requestId)) return;
+    const refuse = (reason: ToolAskAnswer) =>
+      answer(session, request.requestId, refusal(request.requestId, forbidden(TOOL_ASK_REFUSED[reason])));
+    const context = await dependencies.context();
+    if (typeof context === 'string') return refuse(context);
+    const app = await context.store.byServerKey(request.app);
+    if (!app || app.status !== 'connected') {
+      const isOperator = await hasOperatorServer(request.app);
+      return refuse(isOperator === 'unavailable' ? 'unavailable' : isOperator ? 'operator_server' : 'not_found');
+    }
+    const {
+      grantGeneration,
+      tool,
+      decisionRevision: priorDecisionRevision,
+    } = await context.store.readToolForAsk(app.id, request.tool);
+    if (grantGeneration === undefined) return refuse('not_found');
+    if (!tool) return refuse('tool_not_found');
+    if (tool.label === null) return refuse('unsorted');
+    if ((tool.label === 'ask_first') === request.askFirst) return refuse('unchanged');
+    const payload: Record<string, unknown> = {
+      action: APP_TOOL_ASK_ACTION,
+      requestId: request.requestId,
+      app: app.serverKey,
+      id: app.id,
+      grantGeneration,
+      tool: tool.name,
+      definitionHash: tool.definitionHash,
+      priorDecisionRevision,
+      ask_first: request.askFirst,
+      ...(request.reason === undefined ? {} : { reason: request.reason }),
+    };
+    const title = request.askFirst
+      ? `Start asking before ${app.name} runs ${tool.name}?`
+      : `Stop asking before ${app.name} runs ${tool.name}?`;
+    const lines = [
+      request.askFirst
+        ? `I'd like to start checking with you before running ${tool.name} on ${app.name} (${app.host}).`
+        : `I'd like to run ${tool.name} on ${app.name} (${app.host}) without asking you first.`,
+      ...(request.reason ? [`Assistant's note: ${quoted(request.reason, 200)}`] : []),
+      'You can always change this anytime on your Connections page.',
+    ];
+    await hold(session, request, APP_TOOL_ASK_ACTION, payload, {
+      title: title.slice(0, 120),
+      question: lines.join('\n'),
+      facts: { app: app.name, tool: tool.name, ask_first: String(request.askFirst) },
+    });
+  }
+
+  async function settleToolAsk(request: ToolAskRequest): Promise<string> {
+    const context = await dependencies.context();
+    if (typeof context === 'string')
+      return `The principal approved changing ${request.app}.${request.tool}, but it could not be saved: ${TOOL_ASK_REFUSED[context]}`;
+    const app = await context.store.byServerKey(request.app);
+    if (!app || app.id !== request.id)
+      return `The principal approved changing ${request.app}.${request.tool}, but that app is no longer there.`;
+    const nextLabel = request.askFirst ? 'ask_first' : 'just_do';
+    const outcome = await context.store.applyApprovedToolAsk({
+      requestId: request.requestId,
+      appId: app.id,
+      name: request.tool,
+      label: nextLabel,
+      ...(request.grantGeneration === undefined ? {} : { expectedGrantGeneration: request.grantGeneration }),
+      ...(request.definitionHash === undefined ? {} : { expectedHash: request.definitionHash }),
+      ...(request.priorDecisionRevision === undefined
+        ? {}
+        : { expectedDecisionRevision: request.priorDecisionRevision }),
+    });
+    if (outcome === 'grant_changed') {
+      return `The principal approved changing ${app.name}.${request.tool}, but the app was disconnected or reconnected since approval was requested, so nothing changed.`;
+    }
+    if (outcome === 'definition_changed') {
+      return `The principal approved changing ${app.name}.${request.tool}, but the tool definition changed since approval was requested, so nothing changed.`;
+    }
+    if (outcome === 'principal_changed') {
+      return `The principal already updated ${app.name}.${request.tool}, so nothing changed.`;
+    }
+    if (outcome === 'applied') {
+      await notifyMainToolsChanged(context.store);
+    }
+    return request.askFirst
+      ? `The principal approved asking first before ${app.name}.${request.tool}.`
+      : `The principal approved running ${app.name}.${request.tool} without asking first.`;
+  }
+
+  const applyToolAsk: GuardedDeliveryHandler = async (content, session) => {
+    const request = toolAskRequest(content, requestIdOf(content) ?? '');
+    await noteSettled(session, request.requestId, {
+      kind: 'tool-ask',
+      settle: () => settleToolAsk(request),
+      unfinished: `The principal approved changing ${request.app}.${request.tool}, but it could not be saved right now.`,
       wake: false,
     });
   };
@@ -506,15 +702,22 @@ export function createAppActions(dependencies: AppActionDependencies) {
     requestHold: requestDeleteHold,
     onDeny,
   };
+  const toolAskSpec: DeliveryGuardSpec = {
+    guardAction: appToolAskGuard,
+    precheck: precheck(toolAskRequest),
+    requestHold: requestToolAskHold,
+    onDeny,
+  };
   return {
     add: { handler: applyAdd, spec: addSpec },
     delete: { handler: applyDelete, spec: deleteSpec },
+    toolAsk: { handler: applyToolAsk, spec: toolAskSpec },
   };
 }
 
-/** Main's two app actions; their approvals resume through the registrations above. */
 export function registerAppActions(dependencies: AppActionDependencies = { context: defaultContext }): void {
   const actions = createAppActions(dependencies);
   registerDeliveryAction(ADD_APP_ACTION, actions.add.handler, actions.add.spec);
   registerDeliveryAction(DELETE_APP_ACTION, actions.delete.handler, actions.delete.spec);
+  registerDeliveryAction(APP_TOOL_ASK_ACTION, actions.toolAsk.handler, actions.toolAsk.spec);
 }

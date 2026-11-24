@@ -6,7 +6,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import '../gws-ea-profile/index.js';
-import { applyMainServers, MainServersUnreadableError, mainOperatorServers, removeOperatorServer } from './apply.js';
+import {
+  applyMainServers,
+  appRelayServerEntry,
+  MainServersUnreadableError,
+  mainOperatorServers,
+  removeOperatorServer,
+} from './apply.js';
 import type { ConnectionsStore } from './store.js';
 import { testConnectionsStore } from './testing/store.js';
 
@@ -67,7 +73,7 @@ describe('applyMainServers', () => {
       ledgerly: OPERATOR,
       calendar: STDIO,
       travel: PLUGIN,
-      [ledger.serverKey]: { type: 'http', url: 'https://mcp.ledger.example.test/mcp' },
+      [ledger.serverKey]: { command: 'bun', args: ['run', '/app/src/mcp-tools/app-relay.ts', ledger.serverKey] },
     });
     expect(JSON.stringify(await mainServers())).not.toContain(SENTINEL_TOKEN);
     const requested = await store.pendingRestart();
@@ -112,7 +118,7 @@ describe('applyMainServers', () => {
       calendar: STDIO,
       travel: PLUGIN,
       app_travelkit: PLUGIN,
-      [notes.serverKey]: { type: 'http', url: 'https://notes.example.test/mcp' },
+      [notes.serverKey]: appRelayServerEntry(notes.serverKey),
     });
   });
 
@@ -153,7 +159,7 @@ describe('operator servers', () => {
     expect(await mainServers()).toEqual({
       calendar: STDIO,
       travel: PLUGIN,
-      [ledger.serverKey]: { type: 'http', url: 'https://mcp.ledger.example.test/mcp' },
+      [ledger.serverKey]: appRelayServerEntry(ledger.serverKey),
     });
     expect(await store.pendingRestart()).toBeDefined();
     expect(await removeOperatorServer(store, 'ledgerly')).toBe('absent');

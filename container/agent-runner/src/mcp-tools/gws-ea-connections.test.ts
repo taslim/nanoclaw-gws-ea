@@ -6,7 +6,7 @@ import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqli
 import type { McpToolDefinition } from './types.js';
 // The barrel loads every tool module under its key, as the container does.
 import './index.js';
-import { addApp, deleteApp } from './gws-ea-connections.js';
+import { addApp, appToolAsk, deleteApp } from './gws-ea-connections.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
@@ -70,14 +70,44 @@ it('keeps credentials out of chat and sends the Connections link only when a sig
   expect(deleteApp.tool.description).toContain("An operator's server cannot be deleted here");
 });
 
-it('teaches what a failing app tool means and when the link is sent', () => {
+it('asks the host to change a tool approval label by app key, tool name, and ask_first flag', async () => {
+  const validate = new Ajv().compile(appToolAsk.tool.inputSchema);
+  expect(validate({ app: 'app_0a1b2c3d4e5f', tool: 'confirm_checkout', ask_first: false })).toBe(true);
+  expect(validate({ app: 'app_0a1b2c3d4e5f', tool: 'search_menu', ask_first: true, reason: 'User prefers review' })).toBe(
+    true,
+  );
+  for (const fields of [
+    {},
+    { app: 'app_0a1b2c3d4e5f', tool: 'confirm_checkout' },
+    { app: 'app_0a1b2c3d4e5f', tool: 'confirm_checkout', ask_first: 'never' },
+    { app: 'app_0a1b2c3d4e5f', tool: 'confirm_checkout', ask_first: false, extra: 'x' },
+  ])
+    expect(validate(fields)).toBe(false);
+  const { request, id } = await call(
+    appToolAsk,
+    { app: 'app_0a1b2c3d4e5f', tool: 'confirm_checkout', ask_first: false, reason: 'Principal asked' },
+    { status: 'awaiting_principal' },
+  );
+  expect(request).toEqual({
+    action: 'app_tool_ask',
+    requestId: id,
+    app: 'app_0a1b2c3d4e5f',
+    tool: 'confirm_checkout',
+    ask_first: false,
+    reason: 'Principal asked',
+  });
+});
+
+it('teaches that held/setup app answers are normal and when the Connections link is sent', () => {
   const instructions = fs.readFileSync(new URL('./gws-ea-connections.instructions.md', import.meta.url), 'utf8');
   for (const rule of [
-    'A failing `app_` tool means its app is unavailable',
+    'principal was asked',
+    'still being set up',
+    'wait for the note rather than treating it as a failure',
     '`principal_page` connections facts',
-    'disconnected without a link',
-    'gets the Connections link once',
-    'Never ask for tokens or client secrets in chat',
+    'disconnected app without a link',
+    'Connections link once',
+    'never ask for tokens or client secrets in chat',
   ])
     expect(instructions).toContain(rule);
   expect(instructions).not.toMatch(/authenticate/iu);

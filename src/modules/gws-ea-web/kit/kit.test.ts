@@ -27,6 +27,7 @@ import {
   renderMenu,
   renderPageHeading,
   renderPrincipalPage,
+  renderSwitch,
   sameOriginJson,
   sendJson,
   sendPage,
@@ -226,6 +227,12 @@ it('draws the shell with the escaped assistant name and the current page marked'
   expect(html).toContain('<p id="announcer" class="sr-only" role="status" aria-live="polite"></p>');
   expect(html.match(/nonce="nonce-value"/gu)).toHaveLength(2);
   expect(escapeHtml(`"'&`)).toBe('&quot;&#39;&amp;');
+  const toggle = renderSwitch({ checked: true, label: 'Ask first for <send>', stateText: 'Ask first', name: 'send' });
+  expect(toggle).toContain('role="switch"');
+  expect(toggle).toContain('aria-checked="true"');
+  expect(toggle).toContain('aria-label="Ask first for &lt;send&gt;"');
+  expect(toggle).toContain('data-switch-name="send"');
+  expect(toggle).toContain('>Ask first</span>');
 });
 
 it('reads the assistant name and lists home first, then pages in registration order', async () => {

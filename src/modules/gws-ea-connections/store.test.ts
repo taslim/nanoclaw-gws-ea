@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { canonicalJson } from './canonical.js';
 import { ConnectionsStoreError, SIGN_IN_TTL_MS, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
 
@@ -12,6 +13,8 @@ const LEDGER = { name: 'Ledger', url: 'https://mcp.ledger.example/mcp', auth: 'o
 const PRINCIPAL = 'gchat:users/morgan-ellery';
 const SENTINELS = {
   token: 'sentinel-pasted-token-7Qx9',
+  access: 'sentinel-access-token-M4j8',
+  accessRotated: 'sentinel-access-rotated-V9k3',
   refresh: 'sentinel-refresh-token-K2m4',
   rotated: 'sentinel-rotated-token-Z8p1',
   clientSecret: 'sentinel-client-secret-W5r3',
@@ -34,9 +37,10 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-const oauthGrant = (refreshToken?: string) => ({
+const oauthGrant = (refreshToken?: string, accessToken = SENTINELS.access) => ({
   kind: 'oauth' as const,
   ...(refreshToken === undefined ? {} : { refreshToken }),
+  accessToken,
   accessIssuedAt: '2026-11-14T10:00:00.000Z',
   accessExpiresAt: '2026-11-14T11:00:00.000Z',
 });
@@ -228,58 +232,84 @@ describe('grants', () => {
     expect(await store.readGrant(app.id, 2)).toMatchObject({ refreshToken: 'next-refresh' });
   });
 
-  it('persists a rotation only while the grant is live at the same generation', async () => {
+  it('persists a rotation and replaces the sealed access token only while the grant is live at the same generation', async () => {
     const { app } = await connectedOauth();
     const rotation = {
       refreshToken: SENTINELS.rotated,
+      accessToken: SENTINELS.accessRotated,
       accessIssuedAt: '2026-11-14T11:00:00.000Z',
       accessExpiresAt: '2026-11-14T12:00:00.000Z',
     };
     expect(await store.rotateGrant(app.id, 1, rotation)).toBe(true);
     expect(await store.readGrant(app.id, 1)).toMatchObject({ refreshToken: SENTINELS.rotated });
+    expect(await store.readAccessToken(app.id, 1)).toEqual({
+      generation: 1,
+      token: SENTINELS.accessRotated,
+      issuedAt: rotation.accessIssuedAt,
+      expiresAt: rotation.accessExpiresAt,
+    });
     expect(await store.currentGrant(app.id)).toMatchObject({
       kind: 'oauth',
       renewable: true,
+      hasAccessToken: true,
       accessIssuedAt: rotation.accessIssuedAt,
       accessExpiresAt: rotation.accessExpiresAt,
     });
-    const kept = { accessIssuedAt: '2026-11-14T12:00:00.000Z', accessExpiresAt: '2026-11-14T13:00:00.000Z' };
+    const kept = {
+      accessToken: 'sentinel-access-kept-3',
+      accessIssuedAt: '2026-11-14T12:00:00.000Z',
+      accessExpiresAt: '2026-11-14T13:00:00.000Z',
+    };
     expect(await store.rotateGrant(app.id, 1, kept)).toBe(true);
     expect(await store.readGrant(app.id, 1)).toMatchObject({ refreshToken: SENTINELS.rotated });
+    expect(await store.readAccessToken(app.id, 1)).toEqual({
+      generation: 1,
+      token: kept.accessToken,
+      issuedAt: kept.accessIssuedAt,
+      expiresAt: kept.accessExpiresAt,
+    });
     expect(await store.rotateGrant(app.id, 2, kept)).toBe(false);
     await store.disconnect(app.id, (await store.get(app.id)).version);
     expect(await store.rotateGrant(app.id, 1, kept)).toBe(false);
+    expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
   });
 
-  it('records a publish only for the access token it names, until a renewal or reconnect replaces it', async () => {
+  it('stores sealed access tokens keyed by generation, clears them on end/replace, and detects pre-release missing tokens', async () => {
     const { app } = await connectedOauth();
-    const issued = oauthGrant().accessExpiresAt;
-    const published = async () => {
-      const grant = await store.currentGrant(app.id);
-      return grant?.kind === 'oauth' ? grant.published : undefined;
-    };
-    expect(await published()).toBe(false);
-    expect(await store.markPublished(app.id, 1, '2026-11-14T12:00:00.000Z')).toBe(false);
-    expect(await store.markPublished(app.id, 2, issued)).toBe(false);
-    expect(await store.markPublished(app.id, 1, issued)).toBe(true);
-    expect(await published()).toBe(true);
-    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 1, published: true });
-
-    const rotation = { accessIssuedAt: '2026-11-14T11:00:00.000Z', accessExpiresAt: '2026-11-14T12:00:00.000Z' };
-    expect(await store.rotateGrant(app.id, 1, rotation)).toBe(true);
-    expect(await published()).toBe(false);
-    expect(await store.markPublished(app.id, 1, rotation.accessExpiresAt)).toBe(true);
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 1, hasAccessToken: true });
+    expect(await store.readAccessToken(app.id, 1)).toEqual({
+      generation: 1,
+      token: SENTINELS.access,
+      issuedAt: '2026-11-14T10:00:00.000Z',
+      expiresAt: '2026-11-14T11:00:00.000Z',
+    });
+    expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
 
     const current = await store.get(app.id);
     const { state } = await store.startSignIn(app.id, current.version, signIn(current));
     const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
     if (!claim) throw new Error('Expected a claim');
-    await store.completeSignIn(claim, oauthGrant('next-refresh'));
-    expect(await published()).toBe(false);
+    await store.completeSignIn(claim, oauthGrant(SENTINELS.refresh, SENTINELS.access));
+    expect(raw((db) => db.prepare('SELECT generation FROM access_tokens WHERE app_id = ?').all(app.id))).toEqual([
+      { generation: 2 },
+    ]);
+    raw((db) => db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id), { writable: true });
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 2, hasAccessToken: false });
+    expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
+    expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
 
-    await store.disconnect(app.id, (await store.get(app.id)).version);
-    expect(await store.markPublished(app.id, 2, issued)).toBe(false);
-    expect(await store.currentGrant(app.id)).toBeUndefined();
+    const again = await store.get(app.id);
+    const { state: nextState } = await store.startSignIn(app.id, again.version, signIn(again));
+    const nextClaim = await store.claimSignIn(nextState, { host: app.host, principalId: PRINCIPAL });
+    if (!nextClaim) throw new Error('Expected a claim');
+    await store.completeSignIn(nextClaim, oauthGrant('next-refresh', SENTINELS.accessRotated));
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 3, hasAccessToken: true });
+    expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
+    expect(await store.readAccessToken(app.id, 3)).toMatchObject({ generation: 3, token: SENTINELS.accessRotated });
+
+    expect(await store.markRefused(app.id, 3)).toBe(true);
+    expect(await store.readAccessToken(app.id, 3)).toBeUndefined();
+    expect(raw((db) => db.prepare('SELECT COUNT(*) AS n FROM access_tokens').get())).toEqual({ n: 0 });
   });
 
   it('remembers whether the principal entered the client, and forgets it with the client and any pending sign-in', async () => {
@@ -327,9 +357,11 @@ describe('grants', () => {
     expect(await store.apps()).toEqual([]);
     expect(
       raw((db) =>
-        ['apps', 'grants', 'sign_ins'].map((table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()),
+        ['apps', 'grants', 'access_tokens', 'sign_ins'].map((table) =>
+          db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get(),
+        ),
       ),
-    ).toEqual([{ n: 0 }, { n: 0 }, { n: 0 }]);
+    ).toEqual([{ n: 0 }, { n: 0 }, { n: 0 }, { n: 0 }]);
   });
 
   it('keeps client secrets, tokens and verifiers unreadable in the raw file', async () => {
@@ -340,6 +372,7 @@ describe('grants', () => {
     const file = await readFile(path.join(root, 'apps.db'));
     for (const sentinel of [
       SENTINELS.token,
+      SENTINELS.access,
       SENTINELS.refresh,
       SENTINELS.clientSecret,
       SENTINELS.verifier,
@@ -492,6 +525,17 @@ describe('availability', () => {
     expect(await store.availability()).toEqual({ available: false, reason: 'keychain_unavailable' });
   });
 
+  it('counts an access token alone as a secret when reporting a missing key', async () => {
+    const app = await store.create(LEDGER);
+    const { state } = await store.startSignIn(app.id, app.version, signIn(app));
+    const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
+    if (!claim) throw new Error('Expected a claim');
+    await store.completeSignIn(claim, oauthGrant(undefined, SENTINELS.access));
+    keychain.key = undefined;
+    expect(await store.availability()).toEqual({ available: false, reason: 'key_missing' });
+    await expect(store.readAccessToken(app.id, 1)).rejects.toMatchObject({ reason: 'store_unavailable' });
+  });
+
   it('uses the connections Keychain service under this assistant', async () => {
     const app = await store.create(LEDGERLY);
     await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
@@ -503,5 +547,421 @@ describe('availability', () => {
       'c4f1d2a8-5b3e-4e7a-9a61-0d2f8b7c6e15',
     ]);
     expect(await store.availability()).toEqual({ available: true });
+  });
+});
+
+describe('tool pinning, principal floors, and call claims', () => {
+  it('deduplicates duplicate tool names, pins server instructions in listHash, preserves principal floor across drop-and-readd, blocks review while unsorted, and returns app_not_found on deleted app claims', async () => {
+    const app = await store.create(LEDGERLY);
+    await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+
+    const pinned = await store.pinTools(app.id, {
+      instructions: 'Initial instructions.',
+      tools: [
+        { name: 'place_order', description: 'Place an order', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Duplicate ignored', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    expect(pinned.tools.map((t) => t.name)).toEqual(['list_items', 'place_order']);
+    expect(pinned.tools.find((t) => t.name === 'place_order')?.definition.description).toBe('Place an order');
+
+    // Review confirmation must fail while any tool still has label === null.
+    expect(await store.markToolsReviewed(app.id, pinned.pin.listHash)).toBe(false);
+
+    const placeHash = pinned.tools.find((t) => t.name === 'place_order')!.definitionHash;
+    const listHash = pinned.tools.find((t) => t.name === 'list_items')!.definitionHash;
+    await store.setToolLabel(app.id, 'place_order', 'ask_first', 'principal', { expectedHash: placeHash });
+    await store.setToolLabel(app.id, 'list_items', 'just_do', 'principal', { expectedHash: listHash });
+    expect(await store.markToolsReviewed(app.id, pinned.pin.listHash)).toBe(true);
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
+
+    // Changing instructions alone must invalidate listHash and restore needsReview.
+    const changedInstructions = await store.pinTools(app.id, {
+      instructions: 'Injected post-review instructions!',
+      tools: [
+        { name: 'place_order', description: 'Place an order', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    expect(changedInstructions.changed).toBe(true);
+    expect(changedInstructions.pin.listHash).not.toBe(pinned.pin.listHash);
+    expect(changedInstructions.pin.needsReview).toBe(true);
+
+    // Dropping place_order and re-adding it must preserve the principal Ask-first floor.
+    await store.pinTools(app.id, {
+      instructions: 'Initial instructions.',
+      tools: [{ name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } }],
+    });
+    const readded = await store.pinTools(app.id, {
+      instructions: 'Initial instructions.',
+      tools: [
+        { name: 'place_order', description: 'Harmless lookup', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const readdedPlace = readded.tools.find((t) => t.name === 'place_order')!;
+    expect(readdedPlace.principalFloor).toBe(true);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'place_order',
+        definitionHash: readdedPlace.definitionHash,
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Looks harmless now',
+      },
+    ]);
+    expect(await store.getTool(app.id, 'place_order')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+      principalFloor: true,
+    });
+
+    // Claiming an approved call for a deleted app returns app_not_found instead of throwing a FK error.
+    const deletedClaim = await store.claimApprovedCall({
+      approvalId: 'appr-missing-app',
+      appId: '00000000-0000-0000-0000-000000000000',
+      grantGeneration: 1,
+      toolName: 'place_order',
+      definitionHash: placeHash,
+      argsHash: 'abc',
+    });
+    expect(deletedClaim).toEqual({ status: 'app_not_found' });
+  });
+
+  it('clears reviewed marker on catalog flip-flop, protects principal choices from late sorter replies, excludes executing rows from pruning, and clears pins on replaceGrant while keeping floors', async () => {
+    const app = await store.create(LEDGERLY);
+    await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+
+    const pinH1 = await store.pinTools(app.id, {
+      instructions: 'v1',
+      tools: [
+        { name: 'list_items', description: 'List v1', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const listH1 = pinH1.tools.find((t) => t.name === 'list_items')!.definitionHash;
+    const placeH1 = pinH1.tools.find((t) => t.name === 'place_order')!.definitionHash;
+
+    // Principal sets list_items -> just_do and place_order -> ask_first, then reviews H1.
+    await store.setToolLabel(app.id, 'list_items', 'just_do', 'principal', { expectedHash: listH1 });
+    await store.setToolLabel(app.id, 'place_order', 'ask_first', 'principal', { expectedHash: placeH1 });
+    expect(await store.markToolsReviewed(app.id, pinH1.pin.listHash)).toBe(true);
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
+
+    // A late sorter reply must NOT overwrite principal just_do OR principal ask_first source/reason.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'list_items',
+        definitionHash: listH1,
+        label: 'ask_first',
+        source: 'sorter',
+        reason: 'Late sorter override attempt',
+      },
+      {
+        name: 'place_order',
+        definitionHash: placeH1,
+        label: 'ask_first',
+        source: 'sorter',
+        reason: 'Late sorter reason overwrite attempt',
+      },
+    ]);
+    expect(await store.getTool(app.id, 'list_items')).toMatchObject({
+      label: 'just_do',
+      labelSource: 'principal',
+    });
+    expect(await store.getTool(app.id, 'place_order')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+      reason: 'Set to ask first',
+    });
+
+    // H1 -> H2 -> H1 must clear reviewed_list_hash so restoring H1 still needs review.
+    await store.pinTools(app.id, {
+      instructions: 'v2',
+      tools: [
+        { name: 'list_items', description: 'List v2', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const restoredH1 = await store.pinTools(app.id, {
+      instructions: 'v1',
+      tools: [
+        { name: 'list_items', description: 'List v1', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    expect(restoredH1.pin.listHash).toBe(pinH1.pin.listHash);
+    expect(restoredH1.pin.needsReview).toBe(true);
+
+    // Executing direct calls must never be pruned when >30 direct calls settle.
+    const executingId = 'direct:sess:still-running';
+    expect(
+      await store.claimDirectCall({
+        id: executingId,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'list_items',
+        definitionHash: listH1,
+        argsHash: 'exec-hash',
+        at: '2026-11-23T12:00:00.000Z',
+      }),
+    ).toEqual({ status: 'claimed' });
+    for (let i = 0; i < 35; i += 1) {
+      const id = `direct:sess:done-${i}`;
+      const at = new Date(Date.parse('2026-11-23T12:01:00.000Z') + i * 1000).toISOString();
+      await store.claimDirectCall({
+        id,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'list_items',
+        definitionHash: listH1,
+        argsHash: `h-${i}`,
+        at,
+      });
+      await store.settleRelayCall(id, { state: 'completed', outcomeJson: JSON.stringify({ ok: i }), at });
+    }
+    // Re-claiming the still-executing row proves it was not pruned.
+    expect(
+      await store.claimDirectCall({
+        id: executingId,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'list_items',
+        definitionHash: listH1,
+        argsHash: 'exec-hash',
+      }),
+    ).toMatchObject({ status: 'already_executing' });
+    // Evicted older direct call keeps its replay-protection claim with outcomeJson cleared, while recent calls keep cached JSON.
+    const evictedClaim = await store.claimDirectCall({
+      id: 'direct:sess:done-0',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'list_items',
+      definitionHash: listH1,
+      argsHash: 'h-0',
+    });
+    expect(evictedClaim).toMatchObject({
+      status: 'already_settled',
+      record: { id: 'direct:sess:done-0', state: 'completed', outcomeJson: null },
+    });
+    const recentClaim = await store.claimDirectCall({
+      id: 'direct:sess:done-34',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'list_items',
+      definitionHash: listH1,
+      argsHash: 'h-34',
+    });
+    expect(recentClaim).toMatchObject({
+      status: 'already_settled',
+      record: { id: 'direct:sess:done-34', state: 'completed', outcomeJson: JSON.stringify({ ok: 34 }) },
+    });
+
+    // markToolsReviewed blocks while an unsettled fallback retry is still pending, then allows once attempts finish.
+    await store.markToolSortFailed(app.id, [{ name: 'list_items', definitionHash: listH1 }], { maxAttempts: 2 });
+    expect(await store.markToolsReviewed(app.id, restoredH1.pin.listHash)).toBe(false);
+    await store.markToolSortFailed(app.id, [{ name: 'list_items', definitionHash: listH1 }], { maxAttempts: 2 });
+    expect(await store.markToolsReviewed(app.id, restoredH1.pin.listHash)).toBe(true);
+
+    // Replacing the grant clears app_pins and app_tools while preserving app_tool_floors.
+    const latest = await store.get(app.id);
+    await store.connect(latest.id, latest.version, { kind: 'token', token: 'new-account-token' });
+    expect(await store.getPin(app.id)).toBeUndefined();
+    expect(await store.listTools(app.id)).toEqual([]);
+    const postReconnectPin = await store.pinTools(app.id, {
+      instructions: 'v1',
+      tools: [{ name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } }],
+    });
+    expect(postReconnectPin.tools[0]?.principalFloor).toBe(true);
+    // Stale grant generation label writes must be ignored even when definitionHash matches.
+    expect(
+      await store.applyToolLabels(
+        app.id,
+        [
+          {
+            name: 'place_order',
+            definitionHash: postReconnectPin.tools[0]!.definitionHash,
+            label: 'just_do',
+            source: 'sorter',
+            reason: 'Stale gen 1 sort',
+          },
+        ],
+        { expectedGrantGeneration: 1 },
+      ),
+    ).toBe(0);
+    expect((await store.getTool(app.id, 'place_order'))?.label).toBeNull();
+  });
+
+  it('rejects unpaired UTF-16 surrogates in canonicalJson while preserving valid surrogate pairs', () => {
+    expect(() => canonicalJson('lone-\uD800-surrogate')).toThrow(TypeError);
+    expect(() => canonicalJson({ ['key-\uDC00']: 1 })).toThrow(TypeError);
+    expect(canonicalJson({ emoji: '😀' })).toBe('{"emoji":"😀"}');
+  });
+
+  it('guards applyApprovedToolAsk against newer approved_request decisions, grant replacements, and records restart atomically while allowing sorter-only writes', async () => {
+    const app = await store.create(LEDGERLY);
+    const firstGrant = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+    const toolDef = {
+      name: 'place_order',
+      description: 'Place order',
+      inputSchema: { type: 'object', properties: {} },
+    };
+    const pinned = await store.pinTools(app.id, { instructions: null, tools: [toolDef] });
+    const hash = pinned.tools[0]!.definitionHash;
+    await store.applyToolLabels(app.id, [
+      { name: 'place_order', definitionHash: hash, label: 'ask_first', source: 'floor', reason: 'Places order' },
+    ]);
+
+    const rev0 = await store.getToolDecisionRevision(app.id, 'place_order');
+    expect(rev0).toBe(0);
+
+    // Sorter-only and fallback writes must NOT advance the principal decision revision.
+    await store.applyToolLabels(app.id, [
+      { name: 'place_order', definitionHash: hash, label: 'ask_first', source: 'sorter', reason: 'Still ask' },
+    ]);
+    expect(await store.getToolDecisionRevision(app.id, 'place_order')).toBe(0);
+
+    // Principal turns Ask-first off on the page (rev 1), then approves request B turning Ask-first back on (rev 2, source=approved_request).
+    await store.setToolLabel(app.id, 'place_order', 'just_do', 'principal', { expectedHash: hash });
+    const rev1 = await store.getToolDecisionRevision(app.id, 'place_order');
+    expect(rev1).toBe(1);
+    expect(await store.pendingRestart()).toBeUndefined();
+    expect(
+      await store.applyApprovedToolAsk({
+        requestId: 'req-b-raise',
+        appId: app.id,
+        name: 'place_order',
+        label: 'ask_first',
+        expectedGrantGeneration: firstGrant.generation,
+        expectedHash: hash,
+        expectedDecisionRevision: rev1,
+      }),
+    ).toBe('applied');
+    // Restart request was recorded atomically inside the applyApprovedToolAsk transaction.
+    expect(await store.pendingRestart()).toBeDefined();
+    expect(await store.getToolDecisionRevision(app.id, 'place_order')).toBe(2);
+
+    // Older request A (captured at rev 0) must NOT override newer approved_request B or clear the Ask-first floor.
+    expect(
+      await store.applyApprovedToolAsk({
+        requestId: 'req-a-stale-lower',
+        appId: app.id,
+        name: 'place_order',
+        label: 'just_do',
+        expectedGrantGeneration: firstGrant.generation,
+        expectedHash: hash,
+        expectedDecisionRevision: rev0,
+      }),
+    ).toBe('principal_changed');
+    expect(await store.getTool(app.id, 'place_order')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'approved_request',
+      principalFloor: true,
+    });
+
+    // Grant replacement followed by identical re-pin must STILL reject an approval captured under generation 1.
+    const current = await store.get(app.id);
+    await store.connect(current.id, current.version, { kind: 'token', token: 'tok-gen-2' });
+    await store.pinTools(app.id, { instructions: null, tools: [toolDef] });
+    expect(
+      await store.applyApprovedToolAsk({
+        requestId: 'req-gen1-stale',
+        appId: app.id,
+        name: 'place_order',
+        label: 'just_do',
+        expectedGrantGeneration: firstGrant.generation,
+        expectedHash: hash,
+        expectedDecisionRevision: 2,
+      }),
+    ).toBe('grant_changed');
+    expect((await store.getTool(app.id, 'place_order'))?.principalFloor).toBe(true);
+  });
+
+  it('reads tool ask snapshot atomically, stores stripSummary on invocations, and never caches direct results after grant ends', async () => {
+    const app = await store.create(LEDGERLY);
+    const gen1 = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+    const toolDef = {
+      name: 'lookup_balance',
+      description: 'Lookup account balance',
+      inputSchema: { type: 'object', properties: {} },
+    };
+    const pinned = await store.pinTools(app.id, { instructions: null, tools: [toolDef] });
+    const hash = pinned.tools[0]!.definitionHash;
+    await store.applyToolLabels(app.id, [
+      { name: 'lookup_balance', definitionHash: hash, label: 'just_do', source: 'sorter', reason: 'Read-only' },
+    ]);
+
+    // 1) Atomic ask snapshot returns live generation, tool, and revision together.
+    const snap = await store.readToolForAsk(app.id, 'lookup_balance');
+    expect(snap.grantGeneration).toBe(gen1.generation);
+    expect(snap.tool?.label).toBe('just_do');
+    expect(snap.decisionRevision).toBe(0);
+
+    // 2) stripSummary flag persists accurately on direct and held invocations.
+    await store.claimDirectCall({
+      id: 'direct:s-1:r-strip-false',
+      invocationId: 's-1:r-strip-false',
+      appId: app.id,
+      grantGeneration: gen1.generation,
+      toolName: 'lookup_balance',
+      definitionHash: hash,
+      argsHash: 'hash-a',
+      stripSummary: false,
+    });
+    expect((await store.getRelayInvocation('s-1:r-strip-false'))?.stripSummary).toBe(false);
+
+    // Direct call settling under its original live grant caches its outcomeJson.
+    await store.settleRelayCall('direct:s-1:r-strip-false', {
+      state: 'completed',
+      outcomeJson: JSON.stringify({ content: [{ type: 'text', text: 'live-gen-1-balance' }] }),
+    });
+    expect((await store.getRelayCall('direct:s-1:r-strip-false'))?.outcomeJson).toContain('live-gen-1-balance');
+
+    // 3) Direct call in flight when disconnect commits must NOT write outcomeJson back after disconnect.
+    await store.claimDirectCall({
+      id: 'direct:s-1:r-inflight-disc',
+      invocationId: 's-1:r-inflight-disc',
+      appId: app.id,
+      grantGeneration: gen1.generation,
+      toolName: 'lookup_balance',
+      definitionHash: hash,
+      argsHash: 'hash-b',
+      stripSummary: true,
+    });
+    expect((await store.getRelayInvocation('s-1:r-inflight-disc'))?.stripSummary).toBe(true);
+
+    const beforeDisc = await store.get(app.id);
+    await store.disconnect(beforeDisc.id, beforeDisc.version);
+    expect((await store.readToolForAsk(app.id, 'lookup_balance')).grantGeneration).toBeUndefined();
+
+    await store.settleRelayCall('direct:s-1:r-inflight-disc', {
+      state: 'completed',
+      outcomeJson: JSON.stringify({ content: [{ type: 'text', text: 'stale-gen-1-secret' }] }),
+    });
+    const settledAfterDisc = await store.getRelayCall('direct:s-1:r-inflight-disc');
+    expect(settledAfterDisc).toMatchObject({ state: 'completed', outcomeJson: null });
+    expect((await store.getRelayInvocation('s-1:r-inflight-disc'))?.state).toBe('settled');
+
+    // Even after reconnecting (gen 2), late settlement of another gen-1 direct call stays uncached.
+    const afterDisc = await store.get(app.id);
+    await store.connect(afterDisc.id, afterDisc.version, { kind: 'token', token: 'tok-gen-2' });
+    await store.claimDirectCall({
+      id: 'direct:s-1:r-stale-gen',
+      invocationId: 's-1:r-stale-gen',
+      appId: app.id,
+      grantGeneration: gen1.generation,
+      toolName: 'lookup_balance',
+      definitionHash: hash,
+      argsHash: 'hash-c',
+    });
+    await store.settleRelayCall('direct:s-1:r-stale-gen', {
+      state: 'completed',
+      outcomeJson: JSON.stringify({ content: [{ type: 'text', text: 'must-not-cache' }] }),
+    });
+    expect(await store.getRelayCall('direct:s-1:r-stale-gen')).toMatchObject({
+      state: 'completed',
+      outcomeJson: null,
+    });
   });
 });

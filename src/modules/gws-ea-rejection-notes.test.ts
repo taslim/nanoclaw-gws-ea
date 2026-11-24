@@ -26,6 +26,8 @@ const TOLD_BY_THEIR_MODULE = [
 ];
 const WORDED = [
   'add_app',
+  'app_tool_ask',
+  'app_tool_call',
   'delete_app',
   'browser_credential_release',
   'browser_reservation_guarantee',

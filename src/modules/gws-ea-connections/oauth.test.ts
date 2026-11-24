@@ -529,6 +529,7 @@ describe('a Ledgerly-shaped server end to end', () => {
     const completion = await store.completeSignIn(claim, {
       kind: 'oauth',
       refreshToken: tokens.refreshToken,
+      accessToken: tokens.accessToken,
       accessIssuedAt: tokens.accessIssuedAt,
       accessExpiresAt: tokens.accessExpiresAt,
     });

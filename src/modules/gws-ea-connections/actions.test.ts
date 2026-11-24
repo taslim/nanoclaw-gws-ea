@@ -19,7 +19,6 @@ import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/i
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { createSession, getPendingApprovalsByAction, transitionPendingApprovalStatus } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
-import type { GatewayCredentialTarget } from '../../gateway-providers/credential-connection.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { PendingApproval, Session } from '../../types.js';
 import '../approvals/index.js';
@@ -29,10 +28,10 @@ import { resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { MAIN, mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
 import '../self-mod/index.js';
-import { ADD_APP_ACTION, DELETE_APP_ACTION, registerAppActions } from './actions.js';
+import { ADD_APP_ACTION, APP_TOOL_ASK_ACTION, DELETE_APP_ACTION, registerAppActions } from './actions.js';
+import { normalizeToolDefinition } from './canonical.js';
 import type { AdmissionDependencies } from './admit.js';
-import { applyMainServers, mainOperatorServers } from './apply.js';
-import type { AppConnection } from './credentials.js';
+import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { ConnectionOperations } from './operations.js';
 import type { ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
@@ -68,19 +67,8 @@ function ledgerly(): FakeMcpApp {
   });
 }
 
-/** The gateway seam as the host sees it: credentials by name, listed by exact host. */
 class FakeGateway {
   readonly held = new Map<string, { readonly id: string; readonly host: string }>();
-  readonly connection: AppConnection = (target: GatewayCredentialTarget) => ({
-    find: async () => (this.held.has(target.name) ? { reusable: true } : null),
-    save: async () => {
-      this.held.set(target.name, { id: randomUUID(), host: target.host });
-    },
-    keep: async () => undefined,
-    remove: async () => {
-      this.held.delete(target.name);
-    },
-  });
   async listForHost(host: string): Promise<{ id: string; name: string }[]> {
     return [...this.held].filter(([, held]) => held.host === host).map(([name, held]) => ({ id: held.id, name }));
   }
@@ -119,7 +107,6 @@ beforeAll(async () => {
           webHostname: HOST,
           fetches: endpoints.fetches,
           admission,
-          connection: () => gateway.connection,
           applyMain: applyMainServers,
           clientDocumentsServed: () => documentsServed,
         }),
@@ -318,7 +305,7 @@ describe('add_app', () => {
     const [app] = await store.apps();
     expect(app).toMatchObject({ name: 'Recipes', status: 'connected' });
     const servers = JSON.parse((await getContainerConfig(MAIN))?.mcp_servers ?? '{}') as Record<string, unknown>;
-    expect(servers[app.serverKey]).toEqual({ type: 'http', url: RECIPES });
+    expect(servers[app.serverKey]).toEqual(appRelayServerEntry(app.serverKey));
     expect(await store.pendingRestart()).toBeDefined();
     expect(JSON.parse(notes('connection-add:')[0].content)).toMatchObject({
       text: expect.stringContaining('connected; its tools reach you by their next message'),
@@ -440,6 +427,338 @@ describe('delete_app', () => {
     const [note] = notes('connection-delete:');
     expect(note.trigger).toBe(0);
     expect(JSON.parse(note.content)).toMatchObject({ text: expect.stringContaining('It is deleted') });
+  });
+});
+
+describe('app_tool_ask', () => {
+  it('holds a card in both directions, updates the label only on approval, and refuses if the definition changed', async () => {
+    const created = await store.create({ name: 'Food', url: RECIPES, auth: 'token' });
+    await store.connect(created.id, created.version, { kind: 'token', token: 'tok-abc' });
+    const v1 = normalizeToolDefinition({
+      name: 'confirm_checkout',
+      description: 'Place the food order.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [v1] });
+    await store.applyToolLabels(created.id, [
+      {
+        name: 'confirm_checkout',
+        definitionHash: pinned.tools[0]!.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    const lower = await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'confirm_checkout',
+      ask_first: false,
+      reason: 'Principal asked to run without asking',
+    });
+    expect(lower.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('just_do');
+
+    const raise = await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'confirm_checkout',
+      ask_first: true,
+    });
+    expect(raise.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    const v2 = normalizeToolDefinition({
+      name: 'confirm_checkout',
+      description: 'Place the food order with tip.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    await store.pinTools(created.id, { instructions: null, tools: [v2] });
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBeNull();
+    const changeNote = notes('connection-tool-ask:').at(-1);
+    expect(JSON.parse(changeNote!.content)).toMatchObject({
+      text: expect.stringContaining('definition changed'),
+    });
+  });
+
+  it('refuses operator servers, disconnected apps, missing/unsorted/unchanged tools, control chars, and non-main sessions before posting cards', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', {
+      op_srv: { type: 'http', url: LEDGERLY },
+    });
+    const disconnected = await store.create({ name: 'Paused', url: RECIPES, auth: 'none' });
+    const connected = await store.create({ name: 'Live', url: LARDER, auth: 'token' });
+    await store.connect(connected.id, connected.version, { kind: 'token', token: 'tok-live' });
+    const t1 = normalizeToolDefinition({
+      name: 'unsorted_tool',
+      description: 'Still sorting',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const t2 = normalizeToolDefinition({
+      name: 'already_ask',
+      description: 'Places order',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(connected.id, { instructions: null, tools: [t1, t2] });
+    await store.applyToolLabels(connected.id, [
+      {
+        name: 'already_ask',
+        definitionHash: pinned.tools.find((t) => t.name === 'already_ask')!.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    const opRes = await send(APP_TOOL_ASK_ACTION, { app: 'op_srv', tool: 'anything', ask_first: true });
+    expect(opRes.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const discRes = await send(APP_TOOL_ASK_ACTION, { app: disconnected.serverKey, tool: 'x', ask_first: true });
+    expect(discRes.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const missingTool = await send(APP_TOOL_ASK_ACTION, { app: connected.serverKey, tool: 'nope', ask_first: true });
+    expect(missingTool.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const unsortedTool = await send(APP_TOOL_ASK_ACTION, {
+      app: connected.serverKey,
+      tool: 'unsorted_tool',
+      ask_first: false,
+    });
+    expect(unsortedTool.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const unchanged = await send(APP_TOOL_ASK_ACTION, {
+      app: connected.serverKey,
+      tool: 'already_ask',
+      ask_first: true,
+    });
+    expect(unchanged.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const badReason = await send(APP_TOOL_ASK_ACTION, {
+      app: connected.serverKey,
+      tool: 'already_ask',
+      ask_first: false,
+      reason: 'bad\u0007bell',
+    });
+    expect(badReason.answer).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+
+    await createAgentGroup({
+      id: 'other-group',
+      name: 'Other',
+      folder: 'other',
+      agent_provider: 'claude',
+      created_at: '2026-11-23T12:00:00.000Z',
+    });
+    await ensureContainerConfig('other-group');
+    const otherSession: Session = {
+      id: 'sess-other-tool-ask',
+      agent_group_id: 'other-group',
+      messaging_group_id: null,
+      thread_id: 'system:other',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: '2026-11-23T12:00:00.000Z',
+    };
+    await createSession(otherSession);
+    const run = getDeliveryAction(APP_TOOL_ASK_ACTION)!;
+    const reqId = `req-${randomUUID()}`;
+    await run(
+      {
+        action: APP_TOOL_ASK_ACTION,
+        requestId: reqId,
+        app: connected.serverKey,
+        tool: 'already_ask',
+        ask_first: false,
+      },
+      otherSession,
+    );
+
+    expect(cards).toEqual([]);
+    expect(await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).toEqual([]);
+  });
+
+  it('does not revert a principal label change when a restart replays an already-settled app_tool_ask approval', async () => {
+    const created = await store.create({ name: 'Food', url: RECIPES, auth: 'token' });
+    await store.connect(created.id, created.version, { kind: 'token', token: 'tok-replay' });
+    const v1 = normalizeToolDefinition({
+      name: 'confirm_checkout',
+      description: 'Place the food order.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [v1] });
+    const hash = pinned.tools[0]!.definitionHash;
+    await store.applyToolLabels(created.id, [
+      {
+        name: 'confirm_checkout',
+        definitionHash: hash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'confirm_checkout',
+      ask_first: false,
+    });
+    const row = await onlyApproval(APP_TOOL_ASK_ACTION);
+    await transitionPendingApprovalStatus(row.approval_id, 'pending', 'approved');
+    const handler = getApprovalHandler(APP_TOOL_ASK_ACTION);
+    if (!handler) throw new Error('app_tool_ask has no approval handler');
+
+    // First execution settles the approved change to just_do (simulating crash before pending_approvals delete).
+    await handler({
+      session,
+      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      approval: { ...row, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('just_do');
+
+    // Principal later flips the tool back to ask_first on the Connections page.
+    await store.setToolLabel(created.id, 'confirm_checkout', 'ask_first', 'principal', { expectedHash: hash });
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
+
+    // Restart replays the approved row: must NOT revert the principal's ask_first choice.
+    await resumeApprovedApprovals();
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.labelSource).toBe('principal');
+  });
+
+  it('preserves exact whitespace tool names, prevents older tool-ask approvals from overriding newer decisions or surviving grant replacement, and withdraws tool-ask cards on disconnect', async () => {
+    const created = await store.create({ name: 'Scanner', url: RECIPES, auth: 'token' });
+    await store.connect(created.id, created.version, { kind: 'token', token: 'tok-scan-1' });
+    const plain = normalizeToolDefinition({
+      name: 'scan',
+      description: 'Plain scan',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const trailing = normalizeToolDefinition({
+      name: 'scan ',
+      description: 'Trailing space scan',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const whitespaceOnly = normalizeToolDefinition({
+      name: ' ',
+      description: 'Whitespace-only catalog name',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [plain, trailing, whitespaceOnly] });
+    const plainHash = pinned.tools.find((t) => t.name === 'scan')!.definitionHash;
+    const trailingHash = pinned.tools.find((t) => t.name === 'scan ')!.definitionHash;
+    const wsHash = pinned.tools.find((t) => t.name === ' ')!.definitionHash;
+    await store.applyToolLabels(created.id, [
+      { name: 'scan', definitionHash: plainHash, label: 'ask_first', source: 'floor', reason: 'Ask plain' },
+      { name: 'scan ', definitionHash: trailingHash, label: 'ask_first', source: 'floor', reason: 'Ask trailing' },
+      { name: ' ', definitionHash: wsHash, label: 'ask_first', source: 'floor', reason: 'Ask whitespace' },
+    ]);
+
+    // Empty tool name is rejected, while whitespace-only catalog names remain addressable consistently.
+    const emptyReq = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: '', ask_first: false });
+    expect(emptyReq.answer).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+    const wsReq = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: ' ', ask_first: false });
+    expect(wsReq.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, ' '))?.label).toBe('just_do');
+
+    // Exact tool name with trailing space targets "scan ", not "scan".
+    const spaceReq = await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'scan ',
+      ask_first: false,
+    });
+    expect(spaceReq.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, 'scan '))?.label).toBe('just_do');
+    expect((await store.getTool(created.id, 'scan'))?.label).toBe('ask_first');
+
+    // Request A (lower scan -> just_do) is held, then principal flips scan to just_do on page and approves Request B (scan -> ask_first).
+    await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: false });
+    const reqARow = (await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).at(-1)!;
+    await store.setToolLabel(created.id, 'scan', 'just_do', 'principal', { expectedHash: plainHash });
+    await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: true });
+    const reqBRow = (await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).find(
+      (r) => r.approval_id !== reqARow.approval_id,
+    )!;
+    const handler = getApprovalHandler(APP_TOOL_ASK_ACTION)!;
+    // Approve B first -> sets label_source = 'approved_request' and principal_floor = true.
+    await handler({
+      session,
+      payload: JSON.parse(reqBRow.payload) as Record<string, unknown>,
+      approval: { ...reqBRow, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect(await store.getTool(created.id, 'scan')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'approved_request',
+      principalFloor: true,
+    });
+    // Now approve older A -> must NOT clear B's Ask-first floor.
+    await handler({
+      session,
+      payload: JSON.parse(reqARow.payload) as Record<string, unknown>,
+      approval: { ...reqARow, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect(await store.getTool(created.id, 'scan')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'approved_request',
+      principalFloor: true,
+    });
+
+    // Create two fresh lowering requests after Request B (matching the post-B decision revision):
+    // - Request C is approved right before disconnect (simulating a replay surviving across grant replacement),
+    // - Request D stays pending so we verify disconnect withdraws pending app_tool_ask cards.
+    const postBRevision = await store.getToolDecisionRevision(created.id, 'scan');
+    const reqCSend = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: false });
+    expect(reqCSend.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    const reqDSend = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: false });
+    expect(reqDSend.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    const pendingBeforeDisc = (await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).filter(
+      (r) => r.status === 'pending',
+    );
+    const reqCRow = pendingBeforeDisc.find((r) => {
+      const parsed = JSON.parse(r.payload) as { requestId?: string; priorDecisionRevision?: number };
+      return parsed.requestId === reqCSend.requestId && parsed.priorDecisionRevision === postBRevision;
+    });
+    const reqDRow = pendingBeforeDisc.find((r) => {
+      const parsed = JSON.parse(r.payload) as { requestId?: string; priorDecisionRevision?: number };
+      return parsed.requestId === reqDSend.requestId && parsed.priorDecisionRevision === postBRevision;
+    });
+    expect(reqCRow).toBeDefined();
+    expect(reqDRow).toBeDefined();
+    expect(await transitionPendingApprovalStatus(reqCRow!.approval_id, 'pending', 'approved')).toBe(true);
+
+    // Disconnecting withdraws pending Request D while leaving already-approved Request C to replay after reconnect;
+    // replaying Request C after reconnect + re-pin fails specifically on grant replacement even though its decision
+    // revision still matches.
+    const latestApp = await store.get(created.id);
+    const ops = new ConnectionOperations({
+      store,
+      webHostname: HOST,
+      fetches: endpoints.fetches,
+      clientDocumentsServed: () => true,
+      applyMain: applyMainServers,
+    });
+    await ops.disconnect(latestApp.id, latestApp.version);
+    expect((await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).filter((r) => r.status === 'pending')).toHaveLength(
+      0,
+    );
+    const afterDisc = await store.get(created.id);
+    await store.connect(afterDisc.id, afterDisc.version, { kind: 'token', token: 'tok-scan-2' });
+    await store.pinTools(created.id, { instructions: null, tools: [plain] });
+    expect(await store.getToolDecisionRevision(created.id, 'scan')).toBe(postBRevision);
+    await resumeApprovedApprovals();
+    const reqCNote = notes(`connection-tool-ask:${session.id}:${reqCSend.requestId}`)[0];
+    expect(reqCNote).toBeDefined();
+    expect(JSON.parse(reqCNote!.content)).toMatchObject({
+      text: expect.stringContaining('disconnected or reconnected'),
+    });
+    expect((await store.getTool(created.id, 'scan'))?.principalFloor).toBe(true);
   });
 });
 

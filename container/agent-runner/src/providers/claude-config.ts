@@ -172,28 +172,6 @@ export function allowsMcpTool(policy: ClaudeCapabilityPolicy, toolName: string):
   return policy.externalMcpServers || toolName.startsWith(`mcp__${NANOCLAW_MCP_SERVER}__`);
 }
 
-/**
- * Servers under this key prefix are the host's: it holds their credentials and the gateway supplies them, so
- * nothing inside the container may sign in to one.
- */
-export const HOST_MANAGED_MCP_PREFIX = 'app_';
-
-export function isHostManagedMcpServer(serverName: string): boolean {
-  return serverName.startsWith(HOST_MANAGED_MCP_PREFIX);
-}
-
-/**
- * The tools Claude Code offers in place of a server's own when the server answers 401: one starts its own OAuth
- * sign-in and hands the model an authorization URL, the other completes it.
- */
-const MCP_SIGN_IN_TOOLS = ['authenticate', 'complete_authentication'] as const;
-
-export function hostManagedMcpSignInTools(serverNames: Iterable<string>): string[] {
-  return [...serverNames]
-    .filter(isHostManagedMcpServer)
-    .flatMap((name) => MCP_SIGN_IN_TOOLS.map((tool) => `${mcpToolPrefix(name)}${tool}`));
-}
-
 export interface ClaudeToolOptions {
   tools?: string[];
   allowedTools: string[];
@@ -224,11 +202,7 @@ export function resolveClaudeToolOptions(
   return {
     ...(policy.tools ? { tools: [...policy.tools] } : {}),
     allowedTools,
-    disallowedTools: [
-      ...disallowedTools,
-      ...policy.withheldTools,
-      ...hostManagedMcpSignInTools(Object.keys(mcpServers)),
-    ],
+    disallowedTools: [...disallowedTools, ...policy.withheldTools],
     mcpServers,
     ...(policy.externalMcpServers ? {} : { strictMcpConfig: true as const }),
     // The pinned CLI reads this switch beside its disableClaudeAiConnectors setting.

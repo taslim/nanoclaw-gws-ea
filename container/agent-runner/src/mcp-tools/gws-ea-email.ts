@@ -293,5 +293,31 @@ export const cancelBooking = requestTool({
   repeatable: false,
 });
 
+export const sortTools = requestTool({
+  ...common,
+  name: 'sort_tools',
+  description:
+    'Answer an isolated host tool-sorting task. Return one entry per tool with its exact name, exact definition_hash, label (ask_first or just_do), and a short one-line plain-language reason. Bias to ask_first when uncertain, and end silently after calling this tool.',
+  properties: {
+    tools: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Exact tool name from the list.' },
+          definition_hash: { type: 'string', description: 'Exact definition_hash from the list.' },
+          label: { type: 'string', enum: ['ask_first', 'just_do'] },
+          reason: { type: 'string', description: 'Short plain-language reason, one line.' },
+        },
+        required: ['name', 'definition_hash', 'label', 'reason'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['tools'],
+  additionalProperties: false,
+  repeatable: false,
+});
+
 registerTools([emailHandoff, emailToPrincipal], MAIN_CAPABILITY);
-registerTools([signInReply, emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);
+registerTools([signInReply, sortTools, emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);

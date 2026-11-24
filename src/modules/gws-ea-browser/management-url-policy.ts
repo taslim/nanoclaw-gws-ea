@@ -6,16 +6,18 @@ import { readRegistry } from '../../gws-ea/registry.js';
 import { readWebOperatorConfig } from '../../gws-ea/web-cloudflare.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 
-function normalizedLoginMount(candidate: string): boolean {
+const PRIVATE_MOUNT_RE = /^\/+(?:logins|connections)(?:\/|$)/u;
+
+function normalizedPrivateMount(candidate: string): boolean {
   const slashes = candidate.replaceAll('\\', '/').split(/[?#]/u, 1)[0].toLowerCase();
-  return [slashes, path.posix.normalize(slashes)].some((route) => /^\/+logins(?:\/|$)/u.test(route));
+  return [slashes, path.posix.normalize(slashes)].some((route) => PRIVATE_MOUNT_RE.test(route));
 }
 
-function loginMount(pathname: string): boolean {
+function privateMount(pathname: string): boolean {
   let candidate = pathname;
   for (let depth = 0; depth < 4; depth++) {
     // Check each representation: a proxy may decode separators or dot segments before routing.
-    if (normalizedLoginMount(candidate)) return true;
+    if (normalizedPrivateMount(candidate)) return true;
     const decoded = candidate.replace(/%([a-f\d]{2})/giu, (_escape, hex: string) =>
       String.fromCharCode(Number.parseInt(hex, 16)),
     );
@@ -23,13 +25,13 @@ function loginMount(pathname: string): boolean {
     candidate = decoded;
   }
   // Deeper escaping stays a candidate on protected hosts, without unbounded synchronous decoding.
-  return normalizedLoginMount(candidate) || /%[a-f\d]{2}/iu.test(candidate);
+  return normalizedPrivateMount(candidate) || /%[a-f\d]{2}/iu.test(candidate);
 }
 
-/** Managed Chrome may carry the principal's Access cookies, so no target may reach this private mount. */
+/** Managed Chrome may carry the principal's Access cookies, so no target may reach private management mounts (`/logins`, `/connections`). */
 export async function blocksManagedLogins(rawUrl: string): Promise<boolean> {
   const url = new URL(rawUrl);
-  if (!['http:', 'https:'].includes(url.protocol) || !loginMount(url.pathname)) return false;
+  if (!['http:', 'https:'].includes(url.protocol) || !privateMount(url.pathname)) return false;
   try {
     const configRoot = process.env.GWS_EA_CONFIG_ROOT?.trim() || envValue('GWS_EA_CONFIG_ROOT')?.trim();
     if (configRoot && !path.isAbsolute(configRoot)) return true;

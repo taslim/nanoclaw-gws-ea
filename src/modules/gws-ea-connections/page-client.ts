@@ -49,8 +49,27 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   }
   document.addEventListener('submit', event => {
     const form = event.target;
-    if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-sign-in')) return;
-    event.preventDefault();
-    void signIn(form);
+    if (!(form instanceof HTMLFormElement)) return;
+    if (form.hasAttribute('data-sign-in')) {
+      event.preventDefault();
+      void signIn(form);
+      return;
+    }
+    if (form.hasAttribute('data-tool-switch')) {
+      event.preventDefault();
+      if (signingIn) return;
+      void kit.send(form, {
+        pendingLabel: false,
+        keepScroll: true,
+        afterSwap: data => {
+          const toolName = typeof data.tool === 'string' ? data.tool : '';
+          const moved = [...document.querySelectorAll('button[data-switch-name]')].find(button => button.dataset.switchName === toolName);
+          moved?.focus();
+          const stateText = moved?.querySelector('.switch-state')?.textContent?.trim();
+          const nextLabel = stateText || (moved ? (moved.getAttribute('aria-checked') === 'true' ? 'Ask first' : 'Just do it') : (data.label === 'ask_first' ? 'Ask first' : 'Just do it'));
+          kit.announce(toolName ? toolName + ': ' + nextLabel : nextLabel);
+        },
+      });
+    }
   });
 `;
