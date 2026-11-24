@@ -169,6 +169,14 @@ h2 { font-size: 14px; font-weight: 600; line-height: 1.4; letter-spacing: -.005e
 .icon-button .icon { margin: 0; width: 20px; height: 20px; }
 .icon-button[aria-expanded="true"] { background: var(--fill-strong); color: var(--text); }
 
+/* Switches */
+.switch { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 4px 6px 10px; border: 0; border-radius: 12px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 500; white-space: nowrap; }
+.switch[aria-checked="true"] { color: var(--text); }
+.switch-track { position: relative; display: inline-flex; align-items: center; width: 42px; height: 24px; padding: 2px; border-radius: 999px; background: var(--fill-strong); box-shadow: inset 0 0 0 1px var(--line-strong); transition: background-color .16s var(--ease-out), box-shadow .16s var(--ease-out); flex-shrink: 0; }
+.switch[aria-checked="true"] .switch-track { background: var(--ink); box-shadow: none; }
+.switch-thumb { width: 20px; height: 20px; border-radius: 50%; background: var(--surface); box-shadow: 0 1px 2px rgb(0 0 0 / .2); transition: transform .16s var(--ease-out); }
+.switch[aria-checked="true"] .switch-thumb { background: var(--ink-text); transform: translateX(18px); }
+
 /* Fields */
 .field + .field { margin-top: 20px; }
 .field label { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 6px; font-size: 13px; font-weight: 500; }

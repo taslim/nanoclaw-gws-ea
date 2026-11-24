@@ -33,10 +33,12 @@ import {
 import { checkPastedToken, probeApp } from './probe.js';
 import {
   ConnectionsStoreError,
+  type AppPin,
   type ClientRegistration,
   type ConnectionApp,
   type ConnectionsStore,
   type GrantCredentials,
+  type ToolLabel,
 } from './store.js';
 
 export type AddRefusal =
@@ -122,6 +124,8 @@ export interface ConnectionsListing {
   readonly canChange: boolean;
   readonly apps: readonly ConnectionApp[];
   readonly operators: readonly OperatorServer[];
+  /** Pinned tool metadata per principal app id, read without Keychain. */
+  readonly pins?: Readonly<Record<string, AppPin>>;
 }
 
 export interface ListingSources {
@@ -150,9 +154,9 @@ export async function readListing(
   }
   if (!store) return { listed: false, canChange: false, apps: [], operators };
   try {
-    const apps = await store.apps();
-    const readable = (await store.availability()).available;
-    return { listed: true, canChange: operatorsRead && readable, apps, operators };
+    const [apps, pinList, availability] = await Promise.all([store.apps(), store.listPins(), store.availability()]);
+    const pins = Object.fromEntries(pinList.map((pin) => [pin.appId, pin]));
+    return { listed: true, canChange: operatorsRead && availability.available, apps, operators, pins };
   } catch (error) {
     if (!(error instanceof ConnectionsStoreError)) throw error;
     return { listed: false, canChange: false, apps: [], operators };
@@ -487,6 +491,16 @@ export class ConnectionOperations {
   /** A label only: the app's server key, and so main's tools, stay as they are. */
   rename(id: string, version: number, name: string): Promise<ConnectionApp> {
     return withAppLock(id, () => this.store.rename(id, version, name));
+  }
+
+  /** Principal flip on the Connections page: takes effect immediately without a card. */
+  setToolLabel(id: string, toolName: string, label: ToolLabel): Promise<boolean> {
+    return withAppLock(id, () => this.store.setToolLabel(id, toolName, label, 'principal'));
+  }
+
+  /** Confirms the current pinned tool list as reviewed ("Looks right"). */
+  markToolsReviewed(id: string, expectedListHash: string): Promise<boolean> {
+    return withAppLock(id, () => this.store.markToolsReviewed(id, expectedListHash));
   }
 
   /**

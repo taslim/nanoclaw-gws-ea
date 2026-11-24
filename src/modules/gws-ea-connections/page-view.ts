@@ -1,3 +1,4 @@
+import { formatLocalTime } from '../../timezone.js';
 import {
   escapeHtml,
   icon,
@@ -8,20 +9,29 @@ import {
   renderMenu,
   renderPageHeading,
   renderPrincipalPage,
+  renderSwitch,
   type BadgeTone,
   type Shell,
 } from '../gws-ea-web/kit/index.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
+import { escapeInvisibleChars, type HeldAppCallPayload } from './held-calls.js';
 import type { ConnectionsListing } from './operations.js';
 import { operatorServerHost } from './operator.js';
 import { CONNECTIONS_PAGE_SCRIPT } from './page-client.js';
-import { NAME_MAX, type AppStatus, type ConnectionApp } from './store.js';
+import { NAME_MAX, type AppPin, type AppStatus, type ConnectionApp, type PinnedAppTool } from './store.js';
 
 export type ConnectionsView =
   | { readonly kind: 'list' }
   | { readonly kind: 'add' }
-  | { readonly kind: 'connect' | 'rename'; readonly id: string };
+  | { readonly kind: 'connect' | 'rename' | 'tools'; readonly id: string }
+  | { readonly kind: 'held'; readonly approvalId: string };
+
+export interface HeldCallViewData {
+  readonly approvalId: string;
+  readonly payload: HeldAppCallPayload;
+  readonly timezone: string;
+}
 
 export interface ConnectionsPageState {
   readonly view: ConnectionsView;
@@ -35,6 +45,11 @@ export interface ConnectionsPageState {
   readonly operatorDisconnect: boolean;
   /** The operator server whose disconnect just stopped part way, and the host the principal confirmed for it. */
   readonly retryServer?: { readonly key: string; readonly host: string };
+  /** Populated for the per-app tool review view. */
+  readonly pin?: AppPin;
+  readonly tools?: readonly PinnedAppTool[];
+  /** Populated for the principal-only held-call details view. */
+  readonly heldCall?: HeldCallViewData;
 }
 
 const STATUS_LABELS = {
@@ -51,7 +66,7 @@ const STATUS_TONES = {
 
 const UNAVAILABLE = 'Apps can’t be added or connected right now. Ask your operator.';
 
-function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename'): string {
+function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename' | 'tools'): string {
   return `/connections/app/${encodeURIComponent(app.id)}/${action}`;
 }
 
@@ -82,8 +97,13 @@ function deleteConfirmation(app: ConnectionApp): string {
   return `data-confirm-title="${escapeHtml(`Delete ${app.name}?`)}" data-confirm-action="Delete app" data-confirm-message="Your assistant will stop using it, and its sign-in and any client details you entered will be forgotten. You can add it again later."`;
 }
 
-function appMenu(app: ConnectionApp, index: number): string {
+function appMenu(app: ConnectionApp, index: number, hasPin: boolean): string {
   const items = [
+    ...(app.status === 'connected' || hasPin
+      ? [
+          `<a role="menuitem" tabindex="-1" href="${escapeHtml(appUrl(app, 'tools'))}" data-navigation>Tool approvals</a>`,
+        ]
+      : []),
     `<a role="menuitem" tabindex="-1" href="${escapeHtml(appUrl(app, 'rename'))}" data-navigation>Rename</a>`,
     ...(app.status === 'not_connected'
       ? []
@@ -93,12 +113,18 @@ function appMenu(app: ConnectionApp, index: number): string {
   return renderMenu(`app-menu-${index}`, `More for ${app.name}`, items, app.name);
 }
 
-function appRow(app: ConnectionApp, index: number, canChange: boolean): string {
-  const connect =
+function appRow(app: ConnectionApp, index: number, canChange: boolean, pin: AppPin | undefined): string {
+  const needsReview = app.status === 'connected' && pin?.needsReview === true;
+  const action =
     canChange && app.status !== 'connected'
       ? `<a class="button button-secondary row-button" href="${escapeHtml(appUrl(app, 'connect'))}" data-navigation>${app.status === 'needs_reconnecting' ? 'Reconnect' : 'Connect'}</a>`
-      : '';
-  return `<li class="row app-row"><span class="row-main"><span class="row-title">${escapeHtml(app.name)}</span><span class="row-sub">${escapeHtml(app.host)}</span></span>${statusBadge(app.status)}${connect}${appMenu(app, index)}</li>`;
+      : needsReview
+        ? `<a class="button button-secondary row-button" href="${escapeHtml(appUrl(app, 'tools'))}" data-navigation>Review tools</a>`
+        : '';
+  const badges = needsReview
+    ? `<span class="row-badges">${statusBadge(app.status)}${renderBadge('Needs review', 'warning')}</span>`
+    : statusBadge(app.status);
+  return `<li class="row app-row"><span class="row-main"><span class="row-title">${escapeHtml(app.name)}</span><span class="row-sub">${escapeHtml(app.host)}</span></span>${badges}${action}${appMenu(app, index, pin !== undefined)}</li>`;
 }
 
 /** The page names the host it showed, and the host disconnects only if main's entry still points there. */
@@ -151,7 +177,7 @@ function appList(state: ConnectionsPageState): string {
       ? section(
           'added-heading',
           operators.length ? 'Your apps' : undefined,
-          apps.map((app, index) => appRow(app, index, canChange)),
+          apps.map((app, index) => appRow(app, index, canChange, state.listing.pins?.[app.id])),
         )
       : ''
   }${
@@ -218,6 +244,71 @@ function renameView(app: ConnectionApp): string {
   return `${BACK}${renderPageHeading('Rename app', `<span>${escapeHtml(app.host)}</span>`)}<form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save name</button><a class="button button-secondary" href="/connections" data-navigation>Cancel</a></div></form>`;
 }
 
+function toolRow(app: ConnectionApp, tool: PinnedAppTool): string {
+  const isAskFirst = tool.label !== 'just_do';
+  const nextLabel = isAskFirst ? 'just_do' : 'ask_first';
+  const reason =
+    tool.label === null ? 'Being set up' : (tool.reason ?? (tool.label === 'ask_first' ? 'Ask first' : 'Just do it'));
+  const stateText = tool.label === null ? 'Being set up' : isAskFirst ? 'Ask first' : 'Just do it';
+  return `<li class="row tool-row"><span class="row-main"><span class="row-title tool-name">${escapeHtml(tool.name)}</span><span class="row-sub tool-reason">${escapeHtml(reason)}</span></span><form method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${tool.name}`, stateText, name: tool.name })}</form></li>`;
+}
+
+function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
+  const reviewBadge = pin
+    ? pin.needsReview
+      ? renderBadge('Needs review', 'warning')
+      : renderBadge('Reviewed', 'success')
+    : renderBadge('Being set up', 'neutral');
+  const heading = `${BACK}${renderPageHeading('When I’ll check with you first', `<span>${escapeHtml(app.name)}</span><span>${escapeHtml(app.host)}</span>${reviewBadge}`)}`;
+  if (!pin) {
+    return `${heading}${notice('Tools are still being set up. Reload in a moment to review them.')}<div class="form-actions"><a class="button button-secondary" href="/connections" data-navigation>Back to Connections</a></div>`;
+  }
+  const sorted = [...tools].sort((left, right) => {
+    const leftAsk = left.label !== 'just_do' ? 0 : 1;
+    const rightAsk = right.label !== 'just_do' ? 0 : 1;
+    return leftAsk - rightAsk || left.name.localeCompare(right.name);
+  });
+  const listMarkup =
+    sorted.length > 0
+      ? `<section class="section" aria-label="App tools"><ul class="list">${sorted.map((tool) => toolRow(app, tool)).join('')}</ul></section>`
+      : notice('This app didn’t list any tools.');
+  const reviewControl = pin.needsReview
+    ? `<form method="post" action="/connections/review-tools" data-send><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="listHash" value="${escapeHtml(pin.listHash)}"><div class="form-actions"><button class="button button-primary" type="submit" data-pending-label="Saving…">Looks right</button><a class="button button-secondary" href="/connections" data-navigation>Back to Connections</a></div></form>`
+    : notice('Tool approvals reviewed. Flip any switch above to change a tool immediately.');
+  return `${heading}${listMarkup}${reviewControl}`;
+}
+
+function prettyArgsJson(canonicalArgs: string): string {
+  try {
+    return JSON.stringify(JSON.parse(canonicalArgs) as unknown, null, 2);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return canonicalArgs;
+  }
+}
+
+function heldCallView(held: HeldCallViewData): string {
+  const { payload, timezone } = held;
+  const heading = `${BACK}${renderPageHeading(`${payload.appName} · ${payload.toolName}`, `<span>${escapeHtml(payload.appHost)}</span>${renderBadge('Waiting for approval', 'warning')}`)}`;
+  const expiry = formatLocalTime(payload.expiresAt, timezone);
+  const info = notice(
+    `Approve or decline this call with 👍 or 👎 in your assistant chat. Expires ${escapeHtml(expiry)}.`,
+  );
+  const argsOut = escapeInvisibleChars(prettyArgsJson(payload.canonicalArgs));
+  const contextOut = payload.appContext ? escapeInvisibleChars(payload.appContext.text) : undefined;
+  const invisibleWarning =
+    argsOut.hasInvisible || contextOut?.hasInvisible
+      ? notice('<strong>Invisible or hidden characters detected.</strong> They are shown as [U+...] below.')
+      : '';
+  const summarySection = `<section class="section"><h2 class="section-title">Assistant’s description</h2><p class="detail-box">${escapeHtml(payload.summary ?? 'No summary given')}</p></section>`;
+  const argsSection = `<section class="section"><h2 class="section-title">Arguments</h2><pre class="detail-code">${escapeHtml(argsOut.rendered)}</pre></section>`;
+  const contextSection =
+    payload.appContext && contextOut
+      ? `<section class="section"><h2 class="section-title">Earlier from ${escapeHtml(payload.appName)} (${escapeHtml(payload.appContext.toolName)})</h2><pre class="detail-code">${escapeHtml(contextOut.rendered)}</pre></section>`
+      : '';
+  return `${heading}${info}${invisibleWarning}${summarySection}${argsSection}${contextSection}`;
+}
+
 function pageContent(state: ConnectionsPageState): string {
   const { view } = state;
   switch (view.kind) {
@@ -226,16 +317,27 @@ function pageContent(state: ConnectionsPageState): string {
     case 'add':
       return addForm(state);
     case 'connect':
-    case 'rename': {
+    case 'rename':
+    case 'tools': {
       const app = state.listing.apps.find((entry) => entry.id === view.id);
       if (!app) return appMissing();
-      return view.kind === 'connect' ? connectView(app, state) : renameView(app);
+      if (view.kind === 'connect') return connectView(app, state);
+      if (view.kind === 'rename') return renameView(app);
+      return toolsView(app, state.pin, state.tools ?? []);
     }
+    case 'held':
+      if (!state.heldCall) return appMissing();
+      return heldCallView(state.heldCall);
   }
 }
 
 const STYLE = `
 .row-button { padding-inline: 14px; font-size: 13px; }
+.row-badges { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; flex-shrink: 0; }
+.tool-row .row-title, .tool-row .row-sub { white-space: normal; overflow-wrap: anywhere; }
+.tool-name { font-family: ui-monospace, "SF Mono", monospace; font-size: 13px; }
+.detail-box { margin: 0; padding: 14px 16px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
+.detail-code { margin: 0; padding: 14px 16px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); font: 13px/1.55 ui-monospace, "SF Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .steps { margin: 0; padding: 0; list-style: none; counter-reset: step; }
 .steps > li { position: relative; padding-left: 36px; counter-increment: step; }
 .steps > li + li { margin-top: 28px; }
@@ -252,11 +354,12 @@ const STYLE = `
   .app-row > .row-main { display: contents; }
   .app-row .row-title { grid-area: title; }
   .app-row .row-sub { display: none; }
-  .app-row > .badge { grid-area: status; justify-self: start; height: auto; padding: 0; background: none; font-size: 14px; font-weight: 400; }
-  .app-row > .badge::before { width: 7px; height: 7px; }
+  .app-row > .badge, .app-row > .row-badges { grid-area: status; justify-self: start; }
+  .app-row .badge { height: auto; padding: 0; background: none; font-size: 14px; font-weight: 400; }
+  .app-row .badge::before { width: 7px; height: 7px; }
   /* Only what needs attention keeps its colour in words; a settled status is a coloured dot. */
-  .app-row > .badge-success, .app-row > .badge:not([class*="badge-"]) { color: var(--muted); }
-  .app-row > .badge-success::before { background: var(--success); }
+  .app-row .badge-success, .app-row .badge:not([class*="badge-"]) { color: var(--muted); }
+  .app-row .badge-success::before { background: var(--success); }
   .app-row > .row-button, .app-row > form { grid-area: action; }
   .app-row > .menu, .app-row > .row-note { grid-area: menu; }
   .steps h2 { font-size: 15px; }
@@ -273,6 +376,8 @@ export function renderConnectionsPage(state: ConnectionsPageState, shell: Shell,
     add: 'Add app',
     connect: 'Connect app',
     rename: 'Rename app',
+    tools: 'Tool approvals',
+    held: 'Pending approval',
   } satisfies Record<ConnectionsView['kind'], string>;
   return renderPrincipalPage(
     {
@@ -280,7 +385,7 @@ export function renderConnectionsPage(state: ConnectionsPageState, shell: Shell,
       page: '/connections',
       title: titles[state.view.kind],
       view: state.view.kind,
-      narrow: state.view.kind !== 'list',
+      narrow: state.view.kind === 'add' || state.view.kind === 'connect' || state.view.kind === 'rename',
       outcome: state.outcome,
       error: state.error,
       content: pageContent(state),

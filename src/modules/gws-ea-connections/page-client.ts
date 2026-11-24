@@ -49,8 +49,58 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   }
   document.addEventListener('submit', event => {
     const form = event.target;
-    if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-sign-in')) return;
-    event.preventDefault();
-    void signIn(form);
+    if (!(form instanceof HTMLFormElement)) return;
+    if (form.hasAttribute('data-sign-in')) {
+      event.preventDefault();
+      void signIn(form);
+      return;
+    }
+    if (form.hasAttribute('data-tool-switch')) {
+      event.preventDefault();
+      void toggleTool(form);
+    }
   });
+  let toggling = false;
+  async function toggleTool(form) {
+    if (toggling || signingIn || kit.busy()) return;
+    toggling = true;
+    const data = Object.fromEntries(new FormData(form));
+    const toolName = typeof data.tool === 'string' ? data.tool : '';
+    const nextLabel = data.label === 'ask_first' ? 'Ask first' : 'Just do it';
+    const controls = [...document.querySelectorAll('button, input')].filter(control => !control.disabled);
+    controls.forEach(control => { control.disabled = true; });
+    document.querySelector('main').setAttribute('aria-busy', 'true');
+    let uncertain = false;
+    try {
+      const response = await fetch(form.action, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+        credentials: 'same-origin', cache: 'no-store',
+      });
+      if (response.status === 404) {
+        uncertain = true;
+        kit.message('That didn’t go through. Reload the page and try again.', true);
+        return;
+      }
+      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const next = page.querySelector('main');
+      if (!next || !response.ok) {
+        uncertain = response.status >= 500 || !next;
+        kit.message(page.getElementById('outcome')?.textContent || 'Couldn’t save that change. Reload and try again.', uncertain || response.status === 409);
+        return;
+      }
+      document.querySelector('main').replaceWith(next);
+      document.title = page.title;
+      const moved = [...document.querySelectorAll('button[data-switch-name]')].find(button => button.dataset.switchName === toolName);
+      moved?.focus();
+      kit.announce(toolName ? toolName + ': ' + nextLabel : nextLabel);
+    } catch {
+      uncertain = true;
+      kit.message('Couldn’t save that change. Reload the page and try again.', true);
+    } finally {
+      toggling = false;
+      document.querySelector('main').removeAttribute('aria-busy');
+      if (!uncertain) controls.forEach(control => { control.disabled = false; });
+    }
+  }
 `;

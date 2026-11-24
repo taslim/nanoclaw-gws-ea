@@ -7,7 +7,7 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
@@ -17,6 +17,7 @@ import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
+import { HELD_APP_CALL_ACTION, type HeldAppCallPayload } from './held-calls.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
@@ -371,13 +372,18 @@ function callback(host: string, query: URLSearchParams, identity = PRINCIPAL): P
   return request(`/connections/callback/${host}?${query.toString()}`, 'GET', { 'cf-access-jwt-assertion': identity });
 }
 
+function toolsReturn(app: Pick<ConnectionApp, 'id'>): string {
+  return `/connections/app/${app.id}/tools?outcome=connected`;
+}
+
 /** Ledgerly added from the page and signed in, as F1 runs it. */
 async function connectedLedgerly(app = fakeLedgerly()): Promise<ConnectionApp> {
   serve(app.handle);
   expect((await post('/connections/add', { url: LEDGERLY, name: '' })).status).toBe(200);
-  const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+  const stored = await onlyApp();
+  const url = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
   const reply = await callback('app.ledgerly.example.test', app.approve(url).query);
-  expect(reply.headers.location).toBe('/connections?outcome=connected');
+  expect(reply.headers.location).toBe(toolsReturn(stored));
   return onlyApp();
 }
 
@@ -418,7 +424,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
 
     const returned = await callback('app.ledgerly.example.test', app.approve(authorizationUrl.href).query);
     expect(returned.status).toBe(302);
-    expect(returned.headers.location).toBe('/connections?outcome=connected');
+    expect(returned.headers.location).toBe(toolsReturn(stored));
 
     const connected = await onlyApp();
     expect(connected.status).toBe('connected');
@@ -445,7 +451,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
 
     const url = await startSignIn(added.app, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     expect((await callback('app.ledgerly.example.test', app.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(added.app),
     );
     expect((await onlyApp()).status).toBe('connected');
     assertNoSentinels();
@@ -463,9 +469,10 @@ describe('adding and connecting an OAuth app that needs a client', () => {
       redirect_uris: [`https://${HOST}/connections/callback/mcp.ledger.example.test`],
     });
 
-    const url = await startSignIn(await onlyApp());
+    const stored = await onlyApp();
+    const url = await startSignIn(stored);
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     expect((await onlyApp()).status).toBe('connected');
     expect(ledger.registrations).toHaveLength(1);
@@ -563,7 +570,7 @@ describe('client details the server refuses', () => {
 
     const retry = await startSignIn(cleared, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     expect((await callback('app.ledgerly.example.test', app.approve(retry).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(cleared),
     );
     assertNoSentinels();
   });
@@ -587,7 +594,7 @@ describe('client details the server refuses', () => {
 
     const again = await startSignIn(replaced);
     expect((await callback('mcp.ledger.example.test', ledger.approve(again).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(replaced),
     );
   });
 
@@ -668,7 +675,7 @@ describe('client details the server refuses', () => {
 
     const retry = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     expect((await callback('app.ledgerly.example.test', app.approve(retry).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     assertNoSentinels();
   });
@@ -723,7 +730,7 @@ describe('apps whose server takes client documents', () => {
     expect(new URL(url).searchParams.get('redirect_uri')).toBe(LARDER_REDIRECT);
     const returned = await signInWithDocument(larder, 'mcp.larder.example.test', url);
 
-    expect(returned.headers.location).toBe('/connections?outcome=connected');
+    expect(returned.headers.location).toBe(toolsReturn(stored));
     expect(larder.documents).toEqual([
       expect.objectContaining({
         client_id: documentUrl(stored),
@@ -756,7 +763,7 @@ describe('apps whose server takes client documents', () => {
     const url = await startSignIn(stored);
     expect(clientIdOf(url)).toBe(documentUrl(stored));
     expect((await signInWithDocument(ledger, 'mcp.ledger.example.test', url)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     expect(registrationRequests()).toEqual([]);
   });
@@ -776,10 +783,11 @@ describe('apps whose server takes client documents', () => {
     await post('/connections/add', { url: LEDGER, name: 'Ledger' });
 
     expect(ledger.registrations).toHaveLength(1);
-    const url = await startSignIn(await onlyApp());
+    const stored = await onlyApp();
+    const url = await startSignIn(stored);
     expect(clientIdOf(url)).toBe([...ledger.clients.keys()][0]);
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(stored),
     );
     expect(ledger.documents).toEqual([]);
   });
@@ -844,7 +852,7 @@ describe('apps whose server takes client documents', () => {
       const url = await startSignIn(stale);
       expect(clientIdOf(url)).toBe(documentUrl(stale));
       expect((await signInWithDocument(larder, 'mcp.larder.example.test', url)).headers.location).toBe(
-        '/connections?outcome=connected',
+        toolsReturn(stale),
       );
     });
 
@@ -856,11 +864,12 @@ describe('apps whose server takes client documents', () => {
       expect(ledger.registrations).toEqual([]);
       delete ledger.serverMetadata.client_id_metadata_document_supported;
 
-      const url = await startSignIn(await onlyApp());
+      const stored = await onlyApp();
+      const url = await startSignIn(stored);
       expect(ledger.registrations).toHaveLength(1);
       expect(clientIdOf(url)).toBe([...ledger.clients.keys()][0]);
       expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-        '/connections?outcome=connected',
+        toolsReturn(stored),
       );
     });
 
@@ -968,7 +977,7 @@ describe('apps whose server takes client documents', () => {
       const next = await startSignIn(replaced);
       expect(clientIdOf(next)).toBe(documentUrl(replaced));
       expect((await signInWithDocument(ledger, 'mcp.ledger.example.test', next)).headers.location).toBe(
-        '/connections?outcome=connected',
+        toolsReturn(replaced),
       );
     });
   });
@@ -999,7 +1008,7 @@ describe('apps whose server takes client documents', () => {
     const url = await startSignIn(sealed);
     expect(clientIdOf(url)).toBe('juno-ledger-client');
     expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
-      '/connections?outcome=connected',
+      toolsReturn(sealed),
     );
     expect(ledger.documents).toEqual([]);
     expect(ledger.registrations).toEqual([]);
@@ -1172,9 +1181,7 @@ describe('sign-in returns', () => {
     );
 
     const secondQuery = app.approve(second).query;
-    expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(
-      '/connections?outcome=connected',
-    );
+    expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(toolsReturn(stored));
     expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(
       '/connections?outcome=expired',
     );
@@ -1609,5 +1616,227 @@ describe('home status and link facts', () => {
       ],
     });
     expect(JSON.stringify(facts)).not.toContain('https://');
+  });
+
+  it('includes needsReview state in main link facts for pinned principal apps', async () => {
+    const recipes = app('connected', 'Recipes');
+    const needsReview = await connectionsLinkFacts(
+      listing({
+        apps: [recipes],
+        pins: {
+          [recipes.id]: {
+            appId: recipes.id,
+            instructions: null,
+            listHash: 'hash-1',
+            pinnedAt: '2026-11-23T12:00:00.000Z',
+            confirmedAt: '2026-11-23T12:00:00.000Z',
+            reviewedListHash: null,
+            reviewedAt: null,
+            needsReview: true,
+          },
+        },
+      }),
+    );
+    expect(needsReview.apps).toEqual([
+      {
+        name: 'Recipes',
+        key: 'app_recipes',
+        host: 'recipes.example.test',
+        origin: 'principal',
+        status: 'connected',
+        needsReview: true,
+      },
+    ]);
+    const reviewed = await connectionsLinkFacts(
+      listing({
+        apps: [recipes],
+        pins: {
+          [recipes.id]: {
+            appId: recipes.id,
+            instructions: null,
+            listHash: 'hash-1',
+            pinnedAt: '2026-11-23T12:00:00.000Z',
+            confirmedAt: '2026-11-23T12:00:00.000Z',
+            reviewedListHash: 'hash-1',
+            reviewedAt: '2026-11-23T12:05:00.000Z',
+            needsReview: false,
+          },
+        },
+      }),
+    );
+    expect(reviewed.apps[0]?.needsReview).toBe(false);
+  });
+});
+
+describe('tool approvals review and held-call details', () => {
+  it('leads to the review view after connecting, flips switches immediately without a card, clears and restores review marker', async () => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    let app = await onlyApp();
+    const connectReply = await post('/connections/connect', { id: app.id, version: String(app.version) });
+    expect(connectReply.status).toBe(200);
+    expect(connectReply.headers['x-page-location']).toBe(`/connections/app/${app.id}/tools`);
+    expect(connectReply.body).toContain('When I’ll check with you first');
+
+    // Pin 3 tools: one just_do, one ask_first, one still unsorted (being set up).
+    app = await onlyApp();
+    const pinned = await store.pinTools(app.id, {
+      instructions: null,
+      tools: [
+        { name: 'search_recipes', description: 'Search recipes', inputSchema: { type: 'object', properties: {} } },
+        {
+          name: 'order_groceries',
+          description: 'Place grocery order',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        { name: 'sync_pantry', description: 'Sync pantry items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_recipes',
+        definitionHash: hashes.get('search_recipes')!,
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Read-only search',
+      },
+      {
+        name: 'order_groceries',
+        definitionHash: hashes.get('order_groceries')!,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places an order',
+      },
+    ]);
+
+    // List row shows Needs review marker and Review tools button; link facts report needsReview: true.
+    const listBefore = await request('/connections');
+    expect(listBefore.body).toContain('Needs review');
+    expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
+    const factsBefore = await connectionsLinkFacts(() => operations().listing());
+    expect(factsBefore.apps[0]?.needsReview).toBe(true);
+
+    // Review page shows labels, reasons, and "Being set up" for the unsorted tool.
+    const review = await request(`/connections/app/${app.id}/tools?outcome=connected`);
+    expect(review.status).toBe(200);
+    expect(review.body).toContain('When I’ll check with you first');
+    expect(review.body).toContain('Read-only search');
+    expect(review.body).toContain('Places an order');
+    expect(review.body).toContain('Being set up');
+    expect(review.body).toContain('Looks right');
+
+    // Flipping a switch updates the label immediately without creating an approval card.
+    const flipDown = await post('/connections/tool-label', {
+      id: app.id,
+      tool: 'order_groceries',
+      label: 'just_do',
+    });
+    expect(flipDown.status).toBe(200);
+    expect(flipDown.headers['x-page-saved']).toBe('true');
+    expect(await store.getTool(app.id, 'order_groceries')).toMatchObject({
+      label: 'just_do',
+      labelSource: 'principal',
+    });
+
+    const flipUp = await post('/connections/tool-label', {
+      id: app.id,
+      tool: 'search_recipes',
+      label: 'ask_first',
+    });
+    expect(flipUp.status).toBe(200);
+    expect(await store.getTool(app.id, 'search_recipes')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+    });
+
+    // Rejects stale listHash on Looks right.
+    const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
+    expect(staleReview.status).toBe(409);
+
+    // Confirming "Looks right" clears the review marker on list and link facts.
+    const confirmed = await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.headers['x-page-location']).toBe('/connections');
+    expect(confirmed.body).not.toContain('Needs review');
+    expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(false);
+
+    // Definition change restores the Needs review marker.
+    await store.pinTools(app.id, {
+      instructions: null,
+      tools: [
+        {
+          name: 'search_recipes',
+          description: 'Search and bookmark recipes',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'order_groceries',
+          description: 'Place grocery order',
+          inputSchema: { type: 'object', properties: {} },
+        },
+      ],
+    });
+    const listAfterChange = await request('/connections');
+    expect(listAfterChange.body).toContain('Needs review');
+    expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(true);
+  });
+
+  it('shows full untruncated arguments and app words on /connections/held/<id> only to the principal', async () => {
+    const approvalId = 'appr-held-detail-test';
+    const longNotes = 'Special delivery instructions '.repeat(120);
+    const payload: HeldAppCallPayload = {
+      invocationId: 'sess-1:req-1',
+      appId: randomUUID(),
+      appName: 'Chowdeck',
+      appHost: 'mcp.chowdeck.example.test',
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: 'defhash-1',
+      canonicalArgs: JSON.stringify({
+        checkout_id: 'chk_\u200B999',
+        delivery_notes: longNotes,
+      }),
+      argsHash: 'argshash-1',
+      summary: 'Confirm Jollof Rice order for Morgan',
+      appContext: {
+        toolName: 'prepare_checkout',
+        text: 'Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.',
+      },
+      expiresAt: '2026-11-24T12:00:00.000Z',
+    };
+    await createPendingApproval({
+      approval_id: approvalId,
+      session_id: null,
+      request_id: 'req-1',
+      action: HELD_APP_CALL_ACTION,
+      payload: JSON.stringify(payload),
+      title: 'Allow Chowdeck to run confirm_checkout?',
+      question: 'Truncated preview',
+      options_json: JSON.stringify([{ value: 'approve', label: 'Approve' }]),
+      status: 'pending',
+      created_at: '2026-11-23T12:00:00.000Z',
+      expires_at: payload.expiresAt,
+    });
+
+    // Principal sees full arguments (with invisible character flagged), app context, and assistant description.
+    const view = await request(`/connections/held/${approvalId}`);
+    expect(view.status).toBe(200);
+    expect(view.body).toContain('Chowdeck · confirm_checkout');
+    expect(view.body).toContain('Confirm Jollof Rice order for Morgan');
+    expect(view.body).toContain('[U+200B]');
+    expect(view.body).toContain(longNotes);
+    expect(view.body).toContain('Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.');
+
+    // Reader, unauthenticated, and unknown IDs get empty 404.
+    const readerView = await request(`/connections/held/${approvalId}`, 'GET', {
+      'cf-access-jwt-assertion': READER,
+    });
+    expect(readerView.status).toBe(404);
+    expect(readerView.body).toBe('');
+
+    const unknownView = await request('/connections/held/appr-does-not-exist');
+    expect(unknownView.status).toBe(404);
+    expect(unknownView.body).toBe('');
   });
 });

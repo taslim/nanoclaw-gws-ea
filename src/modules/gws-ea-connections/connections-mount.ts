@@ -47,6 +47,8 @@ export interface ConnectionLinkFact {
   readonly host: string;
   readonly origin: 'principal' | 'operator';
   readonly status: AppStatus;
+  /** Present for pinned principal apps: true until the principal confirms "Looks right" or after definitions change. */
+  readonly needsReview?: boolean;
 }
 
 /** The host knows nothing of an operator server beyond its entry, so a present entry is connected. */
@@ -60,18 +62,20 @@ export function operatorAsApp(server: OperatorServer): ConnectionLinkFact | unde
 export async function connectionsLinkFacts(
   read: () => Promise<ConnectionsListing> = currentListing,
 ): Promise<{ readonly apps: readonly ConnectionLinkFact[] }> {
-  const { apps, operators } = await read();
+  const { apps, operators, pins } = await read();
   return {
     apps: [
-      ...apps.map(
-        ({ name, serverKey, host, status }): ConnectionLinkFact => ({
+      ...apps.map(({ id, name, serverKey, host, status }): ConnectionLinkFact => {
+        const pin = pins?.[id];
+        return {
           name,
           key: serverKey,
           host,
           origin: 'principal',
           status,
-        }),
-      ),
+          ...(pin ? { needsReview: pin.needsReview } : {}),
+        };
+      }),
       ...operators.flatMap((server) => operatorAsApp(server) ?? []),
     ],
   };

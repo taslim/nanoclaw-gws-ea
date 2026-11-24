@@ -93,12 +93,32 @@ it('protects the mount and conservative encoded variants while leaving unrelated
     '/logins%3fview=detail',
     '/other%2f..%2flogins',
     '/logins%2f..%2fartifacts/id',
+    '/connections',
+    '/connections/tool-label',
+    '/connections/app/abc/tools',
+    '/connections/held/appr-1',
+    '/CONNECTIONS/tool-label',
+    '/%63onnections/tool-label',
+    '/%2563onnections%252ftool-label',
+    '/other%2f..%2fconnections/tool-label',
+    '/connections%5capp%5cabc%5ctools',
   ])
     expect(await blocksManagedLogins(`https://AYA.EXAMPLE.COM.${route}`), route).toBe(true);
-  for (const route of ['/artifacts/id', '/loginsx', '/public/logins', '/artifacts/id?next=/logins', '/%61rtifacts/id'])
+  for (const route of [
+    '/artifacts/id',
+    '/loginsx',
+    '/connectionsx',
+    '/public/logins',
+    '/public/connections',
+    '/artifacts/id?next=/logins',
+    '/artifacts/id?next=/connections',
+    '/%61rtifacts/id',
+  ])
     expect(await blocksManagedLogins(`https://aya.example.com${route}`), route).toBe(false);
   expect(await blocksManagedLogins('https://shop.example/logins/item/id')).toBe(false);
+  expect(await blocksManagedLogins('https://shop.example/connections/app/abc/tools')).toBe(false);
   expect(await blocksManagedLogins('https://aya.example.com.evil.example/logins')).toBe(false);
+  expect(await blocksManagedLogins('https://aya.example.com.evil.example/connections')).toBe(false);
 });
 
 it('bounds normalization of deeply nested encodings without blocking another public host', async () => {

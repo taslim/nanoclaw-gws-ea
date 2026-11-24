@@ -1,4 +1,7 @@
 import type { RequestListener, ServerResponse } from 'node:http';
+import { TIMEZONE } from '../../config.js';
+import { resolveTimezone } from '../../timezone.js';
+import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import type { WebIdentity } from '../gws-ea-web/access.js';
 import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import {
@@ -14,6 +17,7 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
+import { getHeldCallApproval } from './held-calls.js';
 import {
   ConnectionOperations,
   readListing,
@@ -52,6 +56,8 @@ const WRITES = [
   'delete',
   'rename',
   'disconnect-operator',
+  'tool-label',
+  'review-tools',
 ] as const;
 type WriteAction = (typeof WRITES)[number];
 type Route =
@@ -60,7 +66,8 @@ type Route =
   | { readonly kind: 'write'; readonly action: WriteAction };
 
 const EXACT_APP_ID = new RegExp(`^${APP_ID_PATTERN}$`, 'u');
-const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/(connect|rename)$`, 'u');
+const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/(connect|rename|tools)$`, 'u');
+const HELD_VIEW = /^\/connections\/held\/([A-Za-z0-9_-]{4,128})$/u;
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
 /** Each code's one message. Only a refused client says why a sign-in ended: the principal can correct it. */
@@ -198,11 +205,24 @@ function readRoute(method: string | undefined, url: string | undefined): Route |
     const outcome = isSignInReturn(code) ? code : undefined;
     return outcome && [...query.keys()].length === 1 ? { kind: 'view', view: { kind: 'list' }, outcome } : undefined;
   }
+  const appMatch = APP_VIEW.exec(pathname);
+  if (appMatch) {
+    const kind = appMatch[2] as 'connect' | 'rename' | 'tools';
+    if (search === undefined) return { kind: 'view', view: { kind, id: appMatch[1] } };
+    if (kind === 'tools') {
+      const query = new URLSearchParams(search);
+      const code = query.get('outcome');
+      if (code === 'connected' && [...query.keys()].length === 1) {
+        return { kind: 'view', view: { kind: 'tools', id: appMatch[1] }, outcome: 'connected' };
+      }
+    }
+    return undefined;
+  }
   if (search !== undefined) return undefined;
   if (pathname === '/connections/new') return { kind: 'view', view: { kind: 'add' } };
-  const match = APP_VIEW.exec(pathname);
-  if (!match) return undefined;
-  return { kind: 'view', view: { kind: match[2] === 'connect' ? 'connect' : 'rename', id: match[1] } };
+  const heldMatch = HELD_VIEW.exec(pathname);
+  if (heldMatch) return { kind: 'view', view: { kind: 'held', approvalId: heldMatch[1] } };
+  return undefined;
 }
 
 function viewLocation(view: ConnectionsView): string {
@@ -213,7 +233,10 @@ function viewLocation(view: ConnectionsView): string {
       return '/connections/new';
     case 'connect':
     case 'rename':
+    case 'tools':
       return `/connections/app/${view.id}/${view.kind}`;
+    case 'held':
+      return `/connections/held/${encodeURIComponent(view.approvalId)}`;
   }
 }
 
@@ -254,8 +277,8 @@ async function openOperations(
   }
 }
 
-function sendReturn(response: ServerResponse, outcome: SignInReturn): void {
-  response.writeHead(302, { ...pageHeaders(), location: `/connections?outcome=${outcome}` });
+function sendReturn(response: ServerResponse, outcome: SignInReturn, basePath = '/connections'): void {
+  response.writeHead(302, { ...pageHeaders(), location: `${basePath}?outcome=${outcome}` });
   response.end();
 }
 
@@ -302,7 +325,7 @@ async function write(
           connectMessage(connected.reason),
           connectRefusalStatus(connected.reason),
         );
-      return done({ kind: 'list' }, RETURN_MESSAGES.connected);
+      return done({ kind: 'tools', id }, RETURN_MESSAGES.connected);
     }
     case 'change-client': {
       only(data, ['id', 'version']);
@@ -341,6 +364,29 @@ async function write(
       const { status, message } = operatorMessage(outcome);
       if (outcome !== 'credentials_kept') return refused({ kind: 'list' }, message, status);
       return { ...done({ kind: 'list' }, message), failed: true, retryServer: { key, host } };
+    }
+    case 'tool-label': {
+      only(data, ['id', 'tool', 'label']);
+      const id = text(data, 'id');
+      const tool = text(data, 'tool').trim();
+      const label = text(data, 'label');
+      if (!EXACT_APP_ID.test(id) || !tool || (label !== 'ask_first' && label !== 'just_do'))
+        throw new InvalidSubmission();
+      const updated = await operations.setToolLabel(id, tool, label);
+      if (!updated) return refused({ kind: 'tools', id }, CHANGED, 409);
+      return done(
+        { kind: 'tools', id },
+        label === 'ask_first' ? `${tool} will ask first.` : `${tool} will run without asking.`,
+      );
+    }
+    case 'review-tools': {
+      only(data, ['id', 'listHash']);
+      const id = text(data, 'id');
+      const listHash = text(data, 'listHash').trim();
+      if (!EXACT_APP_ID.test(id) || !listHash) throw new InvalidSubmission();
+      const reviewed = await operations.markToolsReviewed(id, listHash);
+      if (!reviewed) return refused({ kind: 'tools', id }, CHANGED, 409);
+      return done({ kind: 'list' }, 'Tool approvals confirmed.');
     }
   }
 }
@@ -392,10 +438,52 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       const operations = await openOperations(factory, options.hostname);
       if (route.kind === 'callback') {
         if (!operations) return sendReturn(response, 'failed');
-        return sendReturn(response, await operations.finishSignIn(route.host, principal, route.query));
+        const outcome = await operations.finishSignIn(route.host, principal, route.query);
+        if (outcome === 'connected') {
+          const app = await operations.store.byHost(route.host).catch(() => undefined);
+          if (app) return sendReturn(response, 'connected', `/connections/app/${encodeURIComponent(app.id)}/tools`);
+        }
+        return sendReturn(response, outcome);
       }
       if (route.kind === 'write' && route.action === 'sign-in')
         return startSignIn(response, data ?? {}, principal, operations);
+      if (route.kind === 'view' && route.view.kind === 'held') {
+        const held = await getHeldCallApproval(route.view.approvalId);
+        if (!held) return refuse(response);
+        const shell = await readShell();
+        let timezone = TIMEZONE;
+        try {
+          const profile = await getGwsEaProfile();
+          timezone = resolveTimezone(profile.principal_timezone ?? TIMEZONE);
+          /* eslint-disable-next-line no-catch-all/no-catch-all -- fall back to install timezone when profile is absent */
+        } catch {
+          timezone = TIMEZONE;
+        }
+        const nonce = pageNonce();
+        sendPage(response, {
+          status: 200,
+          nonce,
+          location: viewLocation(route.view),
+          saved: false,
+          body:
+            request.method === 'HEAD'
+              ? undefined
+              : renderConnectionsPage(
+                  {
+                    view: route.view,
+                    listing: { listed: true, canChange: false, apps: [], operators: [] },
+                    outcome: '',
+                    error: false,
+                    redirectUri: (app) => appRedirectUri(options.hostname, app.host),
+                    operatorDisconnect: false,
+                    heldCall: { approvalId: route.view.approvalId, payload: held.payload, timezone },
+                  },
+                  shell,
+                  nonce,
+                ),
+        });
+        return;
+      }
       // Before any write, so a page that cannot be drawn changes nothing.
       const shell = await readShell();
       const operatorDependencies = readOperatorDependencies();
@@ -425,10 +513,15 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       const listing: ConnectionsListing = operations ? await operations.listing() : await readListing(undefined);
       const { view } = result;
       let status = result.status;
-      if (route.kind === 'view' && (view.kind === 'connect' || view.kind === 'rename')) {
+      if (route.kind === 'view' && (view.kind === 'connect' || view.kind === 'rename' || view.kind === 'tools')) {
         if (!listing.listed) status = 503;
         else if (!listing.apps.some((app) => app.id === view.id)) status = 404;
       }
+      const pin = view.kind === 'tools' ? listing.pins?.[view.id] : undefined;
+      const tools =
+        view.kind === 'tools' && operations && listing.apps.some((app) => app.id === view.id)
+          ? await operations.store.listTools(view.id).catch(() => [])
+          : undefined;
       const outcome = route.kind === 'view' && !listing.listed && !result.outcome ? STORE_UNAVAILABLE : result.outcome;
       const nonce = pageNonce();
       sendPage(response, {
@@ -450,6 +543,8 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                   // Main's restart after an operator disconnect is requested through the store.
                   operatorDisconnect: operations !== undefined && operatorDependencies.credentials !== undefined,
                   ...(result.retryServer === undefined ? {} : { retryServer: result.retryServer }),
+                  ...(pin === undefined ? {} : { pin }),
+                  ...(tools === undefined ? {} : { tools }),
                 },
                 shell,
                 nonce,
