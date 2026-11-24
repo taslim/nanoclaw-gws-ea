@@ -22,13 +22,14 @@ import {
 } from '../approvals/primitive.js';
 import { quoted } from '../approvals/request-text.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
-import { getGwsEaProfile, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
   resolveMainConversation,
   writeNoteForMain,
   type NoteForMain,
   type NoteForMainResult,
 } from '../gws-ea-profile/main-note.js';
+import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import {
   getAppRelay,
@@ -188,11 +189,13 @@ function defaultWebHostname(): Promise<string | undefined> {
   return readWebPolicy().then((policy) => (policy.status === 'enabled' ? policy.config.hostname : undefined));
 }
 
-async function resolvePrincipalTimezone(): Promise<string> {
+/** Resolves the principal's local clock for `isoInstant` via whereabouts, falling back to install timezone. */
+export async function resolvePrincipalZoneAt(isoInstant: string): Promise<string> {
+  const instant = Date.parse(isoInstant);
   try {
-    const profile = await getGwsEaProfile();
-    return resolveTimezone(profile.principal_timezone ?? TIMEZONE);
-    /* eslint-disable-next-line no-catch-all/no-catch-all -- fall back to install timezone when profile table is absent */
+    const zone = zoneAt(await loadTimeline(), Number.isFinite(instant) ? instant : Date.now());
+    return resolveTimezone(zone ?? TIMEZONE);
+    /* eslint-disable-next-line no-catch-all/no-catch-all -- fall back to install timezone when whereabouts tables are absent */
   } catch {
     return TIMEZONE;
   }
@@ -378,7 +381,7 @@ export function createHoldCallHandler(dependencies: {
     const recent = await dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20);
     const appContext = findMatchingAppContext(input.args, recent);
     const expiresAt = new Date(now() + HELD_CALL_TTL_MS).toISOString();
-    const timezone = await resolvePrincipalTimezone();
+    const timezone = await resolvePrincipalZoneAt(expiresAt);
     const webHostname = await readHostname().catch(() => undefined);
     const approvalId = `appr-${now()}-${randomBytes(4).toString('hex')}`;
 

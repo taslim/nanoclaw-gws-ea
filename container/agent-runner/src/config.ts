@@ -54,8 +54,10 @@ export function resolveSessionCapabilities(
 
 export function applySessionCapabilities(threadId: string | null | undefined): ReadonlySet<string> {
   const base = _config?.capabilities ?? NO_CAPABILITIES;
-  _sessionCapabilities = resolveSessionCapabilities(base, threadId);
-  return _sessionCapabilities;
+  const narrowed = resolveSessionCapabilities(base, threadId);
+  _sessionCapabilities = narrowed;
+  if (_config) _config.capabilities = narrowed;
+  return narrowed;
 }
 
 /**

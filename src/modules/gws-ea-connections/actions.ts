@@ -330,7 +330,8 @@ registerApprovalHandler(APP_TOOL_ASK_ACTION, reenterGuardedDeliveryAction(APP_TO
   restartSafe: true,
   rejectionNote: (approval, reason) => {
     const p = payloadOf(approval);
-    return `The principal declined changing the Ask-first setting for ${String(p.app)}.${String(p.tool)}${reasonSuffix(reason)}. Its setting stays as it was.`;
+    const target = typeof p.app === 'string' && typeof p.tool === 'string' ? `${p.app}.${p.tool}` : 'that tool';
+    return `The principal declined changing the Ask-first setting for ${target}${reasonSuffix(reason)}. Its setting stays as it was.`;
   },
 });
 

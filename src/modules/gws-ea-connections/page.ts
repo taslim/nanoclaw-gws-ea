@@ -1,7 +1,4 @@
 import type { RequestListener, ServerResponse } from 'node:http';
-import { TIMEZONE } from '../../config.js';
-import { resolveTimezone } from '../../timezone.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 import type { WebIdentity } from '../gws-ea-web/access.js';
 import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import {
@@ -17,7 +14,7 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
-import { getHeldCallApproval } from './held-calls.js';
+import { getHeldCallApproval, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
   readListing,
@@ -450,15 +447,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       if (route.kind === 'view' && route.view.kind === 'held') {
         const held = await getHeldCallApproval(route.view.approvalId);
         if (!held) return refuse(response);
-        const shell = await readShell();
-        let timezone = TIMEZONE;
-        try {
-          const profile = await getGwsEaProfile();
-          timezone = resolveTimezone(profile.principal_timezone ?? TIMEZONE);
-          /* eslint-disable-next-line no-catch-all/no-catch-all -- fall back to install timezone when profile is absent */
-        } catch {
-          timezone = TIMEZONE;
-        }
+        const [shell, timezone] = await Promise.all([readShell(), resolvePrincipalZoneAt(held.payload.expiresAt)]);
         const nonce = pageNonce();
         sendPage(response, {
           status: 200,

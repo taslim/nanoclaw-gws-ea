@@ -56,7 +56,7 @@ async function main(): Promise<void> {
   const providerName = requireProviderName(config.provider);
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
-  const sessionCapabilities = applySessionCapabilities(getSessionRouting().thread_id);
+  applySessionCapabilities(getSessionRouting().thread_id);
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
@@ -64,7 +64,7 @@ async function main(): Promise<void> {
   // operator-run migration and never happen in this normal startup path. A
   // sealed session (one whose group lacks conversation-context) keeps no
   // group memory and archives no conversation: see memory/sealed.ts.
-  const sealed = sessionsSealed(sessionCapabilities);
+  const sealed = sessionsSealed(config.capabilities);
   const memoryHook = prepareSessionMemory(sealed);
 
   // The agent browser trusts only NSS, not the gateway CA env vars.
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
   const instructions = buildSystemPromptAddendum(
     config.assistantName || undefined,
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
-    sessionCapabilities,
+    config.capabilities,
   );
 
   // Discover additional directories mounted at /workspace/extra/*
