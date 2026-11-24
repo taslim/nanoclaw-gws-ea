@@ -33,6 +33,13 @@ import { readWebPolicy } from '../gws-ea-web/policy.js';
 import type { WebReadiness } from '../gws-ea-web/runtime.js';
 import { canonicalArgsHash } from './canonical.js';
 import {
+  capUtf16,
+  escapeInvisibleChars,
+  renderCompactArgs,
+  renderDistilledArgs,
+  renderDistilledContext,
+} from './held-card.js';
+import {
   getAppRelay,
   outcomeFromSettledRecord,
   UNKNOWN_OUTCOME_MESSAGE,
@@ -54,33 +61,7 @@ const RESULT_NOTE_MAX = 32_000;
 const SUMMARY_CARD_MAX = 280;
 const TOOL_CARD_MAX = 120;
 
-const SOFT_HYPHEN = 0x00ad;
-const COMBINING_GRAPHEME_JOINER = 0x034f;
-const ARABIC_LETTER_MARK = 0x061c;
-const MONGOLIAN_VOWEL_SEPARATOR = 0x180e;
-const BYTE_ORDER_MARK = 0xfeff;
-
-function isNonWhitespaceControl(cp: number): boolean {
-  return cp <= 0x08 || cp === 0x0b || cp === 0x0c || (cp >= 0x0e && cp <= 0x1f) || cp === 0x7f;
-}
-
-function isInvisibleFormatChar(cp: number): boolean {
-  return (
-    cp === SOFT_HYPHEN ||
-    cp === COMBINING_GRAPHEME_JOINER ||
-    cp === ARABIC_LETTER_MARK ||
-    cp === MONGOLIAN_VOWEL_SEPARATOR ||
-    cp === BYTE_ORDER_MARK
-  );
-}
-
-function isZeroWidthOrBidi(cp: number): boolean {
-  return (cp >= 0x200b && cp <= 0x200f) || (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2060 && cp <= 0x2069);
-}
-
-function isInvisibleCodePoint(cp: number): boolean {
-  return isNonWhitespaceControl(cp) || isInvisibleFormatChar(cp) || isZeroWidthOrBidi(cp);
-}
+export { escapeInvisibleChars, renderCompactArgs };
 
 export interface HeldAppCallContext {
   readonly toolName: string;
@@ -108,64 +89,6 @@ export interface HeldCallsDependencies {
   readonly store?: () => ConnectionsStore | undefined | Promise<ConnectionsStore | undefined>;
   readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
   readonly now?: () => number;
-}
-
-/** Truncates to at most `maxUnits` UTF-16 code units without splitting surrogate pairs; counts ellipsis in the budget. */
-function capUtf16(text: string, maxUnits: number): string {
-  if (text.length <= maxUnits) return text;
-  if (maxUnits <= 1) return maxUnits === 1 ? '…' : '';
-  const limit = maxUnits - 1;
-  let end = 0;
-  for (const ch of text) {
-    if (end + ch.length > limit) break;
-    end += ch.length;
-  }
-  return `${text.slice(0, end)}…`;
-}
-
-export function escapeInvisibleChars(text: string): { readonly rendered: string; readonly hasInvisible: boolean } {
-  let hasInvisible = false;
-  let rendered = '';
-  for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0;
-    if (isInvisibleCodePoint(cp)) {
-      hasInvisible = true;
-      rendered += `[U+${cp.toString(16).toUpperCase().padStart(4, '0')}]`;
-    } else {
-      rendered += ch;
-    }
-  }
-  return { rendered, hasInvisible };
-}
-
-const PLAIN_ARG_KEY = /^[A-Za-z0-9_.-]+$/u;
-
-export function renderCompactArgs(args: Record<string, unknown>): {
-  readonly text: string;
-  readonly hasInvisible: boolean;
-} {
-  const entries = Object.entries(args);
-  if (entries.length === 0) return { text: '(none)', hasInvisible: false };
-  let hasInvisible = false;
-  const lines: string[] = [];
-  for (const [key, value] of entries) {
-    const keyOut = escapeInvisibleChars(key);
-    const renderedKey = PLAIN_ARG_KEY.test(keyOut.rendered) ? keyOut.rendered : JSON.stringify(keyOut.rendered);
-    let renderedValue: string;
-    let valueHasInvisible: boolean;
-    if (typeof value === 'string') {
-      const valOut = escapeInvisibleChars(value);
-      valueHasInvisible = valOut.hasInvisible;
-      renderedValue = JSON.stringify(valOut.rendered);
-    } else {
-      const valOut = escapeInvisibleChars(JSON.stringify(value));
-      valueHasInvisible = valOut.hasInvisible;
-      renderedValue = valOut.rendered;
-    }
-    if (keyOut.hasInvisible || valueHasInvisible) hasInvisible = true;
-    lines.push(`${renderedKey}: ${renderedValue}`);
-  }
-  return { text: lines.join('\n'), hasInvisible };
 }
 
 function collectArgStrings(value: unknown, out: Set<string>, depth = 0): void {
@@ -253,6 +176,28 @@ type BuiltHeldCallCard =
   | { readonly kind: 'card'; readonly title: string; readonly question: string }
   | { readonly kind: 'unreachable_details' };
 
+function allocateBodyBudgets(
+  argsLength: number,
+  contextLength: number | undefined,
+  targetBody: number,
+): { readonly argsBudget: number; readonly contextBudget: number } {
+  if (contextLength === undefined) {
+    return { argsBudget: targetBody, contextBudget: 0 };
+  }
+  if (argsLength + contextLength <= targetBody) {
+    return { argsBudget: argsLength, contextBudget: contextLength };
+  }
+  const argsShare = Math.floor(targetBody * 0.45);
+  const contextShare = targetBody - argsShare;
+  if (argsLength <= argsShare) {
+    return { argsBudget: argsLength, contextBudget: targetBody - argsLength };
+  }
+  if (contextLength <= contextShare) {
+    return { argsBudget: targetBody - contextLength, contextBudget: contextLength };
+  }
+  return { argsBudget: argsShare, contextBudget: contextShare };
+}
+
 async function buildHeldCallCard(input: {
   readonly viewId: string;
   readonly appName: string;
@@ -268,10 +213,22 @@ async function buildHeldCallCard(input: {
   const displayToolName = capUtf16(input.toolName, TOOL_CARD_MAX);
   const toolNameTruncated = displayToolName !== input.toolName;
   const title = capUtf16(`Allow ${input.appName} to run ${displayToolName}?`, 120);
-  const { text: renderedArgs, hasInvisible: argsHasInvisible } = renderCompactArgs(input.args);
+  const rawArgs = renderCompactArgs(input.args);
+  const distilledArgs = renderDistilledArgs(input.args);
   const summaryOut = input.summary && input.summary.trim() ? escapeInvisibleChars(input.summary.trim()) : undefined;
-  const contextOut = input.appContext ? escapeInvisibleChars(input.appContext.text) : undefined;
-  const hasInvisible = argsHasInvisible || summaryOut?.hasInvisible === true || contextOut?.hasInvisible === true;
+  const rawContextOut = input.appContext ? escapeInvisibleChars(input.appContext.text) : undefined;
+  const contextToolOut = input.appContext ? escapeInvisibleChars(input.appContext.toolName) : undefined;
+  const distilledContext = input.appContext
+    ? renderDistilledContext(input.appContext.text, distilledArgs.opaqueTokens)
+    : undefined;
+  const hasInvisible =
+    rawArgs.hasInvisible ||
+    distilledArgs.hasInvisible ||
+    summaryOut?.hasInvisible === true ||
+    rawContextOut?.hasInvisible === true ||
+    contextToolOut?.hasInvisible === true ||
+    distilledContext?.hasInvisible === true;
+  const detailsCompacted = distilledArgs.compacted || distilledContext?.compacted === true;
   const summaryLine = summaryOut
     ? `Assistant's description: ${quoted(summaryOut.rendered, SUMMARY_CARD_MAX)}`
     : "Assistant's description: no summary given";
@@ -288,32 +245,47 @@ async function buildHeldCallCard(input: {
   ];
 
   const contextHeader = input.appContext
-    ? `From ${input.appName} (${capUtf16(input.appContext.toolName, TOOL_CARD_MAX)}):\n`
+    ? `From ${input.appName} (${capUtf16(contextToolOut?.rendered ?? input.appContext.toolName, TOOL_CARD_MAX)}):\n`
     : '';
-  const fullParts = [
+  const rawQuestion = [
     ...headerLines,
-    `Arguments:\n${renderedArgs}`,
-    ...(contextOut ? [`${contextHeader}${contextOut.rendered}`] : []),
+    `Arguments:\n${rawArgs.text}`,
+    ...(rawContextOut ? [`${contextHeader}${rawContextOut.rendered}`] : []),
     expiryLine,
-  ];
-  const fullQuestion = fullParts.join('\n');
-  if (!toolNameTruncated && title.length + fullQuestion.length <= CARD_SAFE_BUDGET) {
-    return { kind: 'card', title, question: fullQuestion };
+  ].join('\n');
+
+  if (!detailsCompacted && !toolNameTruncated && title.length + rawQuestion.length <= CARD_SAFE_BUDGET) {
+    return { kind: 'card', title, question: rawQuestion };
   }
 
   const webHostname = await input.readHostname().catch(() => undefined);
   if (!webHostname) {
+    if (!toolNameTruncated && title.length + rawQuestion.length <= CARD_SAFE_BUDGET) {
+      return { kind: 'card', title, question: rawQuestion };
+    }
     return { kind: 'unreachable_details' };
   }
-  const detailsUrl = `https://${webHostname}/connections/held/${encodeURIComponent(input.viewId)}`;
-  const linkLine = `Full details are too long for this message — review them in full: ${detailsUrl}`;
 
+  const detailsUrl = `https://${webHostname}/connections/held/${encodeURIComponent(input.viewId)}`;
+  const compactLinkLine = `Full details: ${detailsUrl}`;
+  const distilledQuestion = [
+    ...headerLines,
+    `Arguments:\n${distilledArgs.text}`,
+    ...(distilledContext ? [`${contextHeader}${distilledContext.text}`] : []),
+    compactLinkLine,
+    expiryLine,
+  ].join('\n');
+  if (!toolNameTruncated && title.length + distilledQuestion.length <= CARD_SAFE_BUDGET) {
+    return { kind: 'card', title, question: distilledQuestion };
+  }
+
+  const linkLine = `Full details are too long for this message — review them in full: ${detailsUrl}`;
   const overhead =
     title.length +
     headerLines.join('\n').length +
     1 +
     'Arguments:\n'.length +
-    (contextOut ? 1 + contextHeader.length : 0) +
+    (distilledContext ? 1 + contextHeader.length : 0) +
     1 +
     linkLine.length +
     1 +
@@ -323,13 +295,16 @@ async function buildHeldCallCard(input: {
     return { kind: 'unreachable_details' };
   }
   const targetBody = Math.min(available, Math.max(40, CARD_SAFE_BUDGET - overhead));
-  const argsBudget = contextOut ? Math.floor(targetBody * 0.6) : targetBody;
-  const contextBudget = contextOut ? targetBody - argsBudget : 0;
+  const { argsBudget, contextBudget } = allocateBodyBudgets(
+    distilledArgs.text.length,
+    distilledContext?.text.length,
+    targetBody,
+  );
 
   const trimmedParts = [
     ...headerLines,
-    `Arguments:\n${capUtf16(renderedArgs, argsBudget)}`,
-    ...(contextOut ? [`${contextHeader}${capUtf16(contextOut.rendered, contextBudget)}`] : []),
+    `Arguments:\n${capUtf16(distilledArgs.text, argsBudget)}`,
+    ...(distilledContext ? [`${contextHeader}${capUtf16(distilledContext.text, contextBudget)}`] : []),
     linkLine,
     expiryLine,
   ];

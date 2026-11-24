@@ -288,6 +288,15 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).toContain('only their approval ends the hold');
   });
 
+  it('tracks placed orders and deliveries to completion across apps, browser and email', () => {
+    expect(GUIDANCE).toContain('**Orders & deliveries:**');
+    expect(GUIDANCE).toContain('Placing an order is not done at checkout; it finishes on delivery.');
+    expect(GUIDANCE).toContain('`ncl matters open` with `--due`');
+    expect(GUIDANCE).toContain('adaptive one-off `--look` times');
+    expect(GUIDANCE).toContain('Stay silent in `<internal>` when nothing changed');
+    expect(GUIDANCE).toContain('close the matter once delivered');
+  });
+
   it('renders the protected doctrine and one account-failure response, without separate store pointers', async () => {
     const main = group('ag-main');
     await createGroup(main);

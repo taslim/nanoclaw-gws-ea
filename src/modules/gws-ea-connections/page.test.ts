@@ -2067,6 +2067,37 @@ describe('tool approvals review and held-call details', () => {
     expect(view.body).toContain(longNotes);
     expect(view.body).toContain('Prepared checkout chk_999: 1x Grain Bowl, total $18.50.');
 
+    // Minified JSON app context is pretty-printed losslessly on the web details page.
+    const jsonViewId = 'held-test-json-1';
+    const jsonPayload: HeldAppCallPayload = {
+      ...payload,
+      viewId: jsonViewId,
+      invocationId: 'sess-1:req-json-1',
+      canonicalArgs: JSON.stringify({ checkout_id: 'chk_json_1', confirmed: true }),
+      appContext: {
+        toolName: 'prepare_checkout',
+        text: JSON.stringify({ ok: true, data: { vendor_id: 23787, tip: 0, total: 1850 } }),
+      },
+    };
+    await createPendingApproval({
+      approval_id: 'appr-held-json-1',
+      session_id: null,
+      request_id: 'req-json-1',
+      action: HELD_APP_CALL_ACTION,
+      payload: JSON.stringify(jsonPayload),
+      title: 'Allow Bistro to run confirm_checkout?',
+      question: 'Distilled preview',
+      options_json: JSON.stringify([{ value: 'approve', label: 'Approve' }]),
+      status: 'pending',
+      created_at: '2026-11-23T12:00:00.000Z',
+      expires_at: jsonPayload.expiresAt,
+    });
+    const jsonView = await request(`/connections/held/${jsonViewId}`);
+    expect(jsonView.status).toBe(200);
+    expect(jsonView.body).toContain('&quot;vendor_id&quot;: 23787');
+    expect(jsonView.body).toContain('&quot;tip&quot;: 0');
+    expect(jsonView.body).toContain('\n  &quot;data&quot;: {');
+
     const readerView = await request(`/connections/held/${viewId}`, 'GET', {
       'cf-access-jwt-assertion': READER,
     });

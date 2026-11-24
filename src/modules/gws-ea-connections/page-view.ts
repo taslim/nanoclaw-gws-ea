@@ -439,12 +439,18 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
   return `<div class="tools-view" data-tools-app="${escapeHtml(app.id)}" data-tools-polling="${hasUnsorted ? 'true' : 'false'}" data-tools-list-hash="${escapeHtml(pin?.listHash ?? '')}">${heading}${mobileStrip}<section class="section tools-section" aria-label="App tools" data-tools-body>${bodyMarkup}</section>${mobileDock}</div>`;
 }
 
-function prettyArgsJson(canonicalArgs: string): string {
+function prettyJsonStructure(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return raw;
   try {
-    return JSON.stringify(JSON.parse(canonicalArgs) as unknown, null, 2);
+    const parsed: unknown = JSON.parse(trimmed);
+    if (parsed !== null && typeof parsed === 'object') {
+      return JSON.stringify(parsed, null, 2);
+    }
+    return raw;
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
-    return canonicalArgs;
+    return raw;
   }
 }
 
@@ -483,10 +489,19 @@ function heldCallView(held: HeldCallViewData): string {
     ? ''
     : `<div class="held-actions-header">${heldDecisionForm(held.approvalId, 'reject', 'Decline', 'Declining…', 'button-secondary')}${heldDecisionForm(held.approvalId, 'approve', 'Approve', 'Approving…', 'button-primary')}</div>`;
   const heading = `${BACK}${renderPageHeading(displayName, metadata, desktopActions)}`;
-  const argsOut = escapeInvisibleChars(prettyArgsJson(payload.canonicalArgs));
-  const contextOut = payload.appContext ? escapeInvisibleChars(payload.appContext.text) : undefined;
+  const rawArgsOut = escapeInvisibleChars(payload.canonicalArgs);
+  const argsOut = rawArgsOut.hasInvisible
+    ? rawArgsOut
+    : escapeInvisibleChars(prettyJsonStructure(payload.canonicalArgs));
+  const rawContextOut = payload.appContext ? escapeInvisibleChars(payload.appContext.text) : undefined;
+  const contextOut =
+    payload.appContext && rawContextOut
+      ? rawContextOut.hasInvisible
+        ? rawContextOut
+        : escapeInvisibleChars(prettyJsonStructure(payload.appContext.text))
+      : undefined;
   const invisibleWarning =
-    argsOut.hasInvisible || contextOut?.hasInvisible
+    rawArgsOut.hasInvisible || argsOut.hasInvisible || rawContextOut?.hasInvisible || contextOut?.hasInvisible
       ? notice('<strong>Hidden characters detected.</strong> Shown as [U+...] below.')
       : '';
   const summarySection = `<section class="section"><h2 class="section-title">Summary</h2><p class="detail-box">${escapeHtml(payload.summary ?? 'No summary provided')}</p></section>`;
