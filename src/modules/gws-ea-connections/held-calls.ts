@@ -115,6 +115,8 @@ export function escapeInvisibleChars(text: string): { readonly rendered: string;
   return { rendered, hasInvisible };
 }
 
+const PLAIN_ARG_KEY = /^[A-Za-z0-9_.-]+$/u;
+
 export function renderCompactArgs(args: Record<string, unknown>): {
   readonly text: string;
   readonly hasInvisible: boolean;
@@ -124,11 +126,21 @@ export function renderCompactArgs(args: Record<string, unknown>): {
   let hasInvisible = false;
   const lines: string[] = [];
   for (const [key, value] of entries) {
-    const rawValue = typeof value === 'string' ? value : JSON.stringify(value);
     const keyOut = escapeInvisibleChars(key);
-    const valOut = escapeInvisibleChars(rawValue);
-    if (keyOut.hasInvisible || valOut.hasInvisible) hasInvisible = true;
-    lines.push(`${keyOut.rendered}: ${valOut.rendered}`);
+    const renderedKey = PLAIN_ARG_KEY.test(keyOut.rendered) ? keyOut.rendered : JSON.stringify(keyOut.rendered);
+    let renderedValue: string;
+    let valueHasInvisible: boolean;
+    if (typeof value === 'string') {
+      const valOut = escapeInvisibleChars(value);
+      valueHasInvisible = valOut.hasInvisible;
+      renderedValue = JSON.stringify(valOut.rendered);
+    } else {
+      const valOut = escapeInvisibleChars(JSON.stringify(value));
+      valueHasInvisible = valOut.hasInvisible;
+      renderedValue = valOut.rendered;
+    }
+    if (keyOut.hasInvisible || valueHasInvisible) hasInvisible = true;
+    lines.push(`${renderedKey}: ${renderedValue}`);
   }
   return { text: lines.join('\n'), hasInvisible };
 }
@@ -205,6 +217,10 @@ export async function resolvePrincipalZoneAt(isoInstant: string): Promise<string
   }
 }
 
+type BuiltHeldCallCard =
+  | { readonly kind: 'card'; readonly title: string; readonly question: string }
+  | { readonly kind: 'unreachable_details' };
+
 async function buildHeldCallCard(input: {
   readonly viewId: string;
   readonly appName: string;
@@ -216,7 +232,7 @@ async function buildHeldCallCard(input: {
   readonly expiresAt: string;
   readonly timezone: string;
   readonly readHostname: () => Promise<string | undefined>;
-}): Promise<{ readonly title: string; readonly question: string }> {
+}): Promise<BuiltHeldCallCard> {
   const title = `Allow ${input.appName} to run ${input.toolName}?`.slice(0, 120);
   const { text: renderedArgs, hasInvisible: argsHasInvisible } = renderCompactArgs(input.args);
   const summaryOut = input.summary && input.summary.trim() ? escapeInvisibleChars(input.summary.trim()) : undefined;
@@ -246,13 +262,14 @@ async function buildHeldCallCard(input: {
   ];
   const fullQuestion = fullParts.join('\n');
   if (title.length + fullQuestion.length <= CARD_SAFE_BUDGET) {
-    return { title, question: fullQuestion };
+    return { kind: 'card', title, question: fullQuestion };
   }
 
   const webHostname = await input.readHostname().catch(() => undefined);
-  const detailsUrl = webHostname
-    ? `https://${webHostname}/connections/held/${encodeURIComponent(input.viewId)}`
-    : `/connections/held/${encodeURIComponent(input.viewId)}`;
+  if (!webHostname) {
+    return { kind: 'unreachable_details' };
+  }
+  const detailsUrl = `https://${webHostname}/connections/held/${encodeURIComponent(input.viewId)}`;
   const linkLine = `Full details are too long for this message — review them in full: ${detailsUrl}`;
 
   const overhead =
@@ -275,7 +292,7 @@ async function buildHeldCallCard(input: {
     linkLine,
     expiryLine,
   ];
-  return { title, question: trimmedParts.join('\n') };
+  return { kind: 'card', title, question: trimmedParts.join('\n') };
 }
 
 export function parseHeldCallPayload(raw: string): HeldAppCallPayload | undefined {
@@ -406,6 +423,13 @@ export function createHoldCallHandler(dependencies: {
       timezone,
       readHostname,
     });
+    if (card.kind === 'unreachable_details') {
+      return {
+        status: 'unsent',
+        reason: 'details_unavailable',
+        text: 'This action has too many details to show on an approval card, and the Connections page is unavailable to review them in full; nothing was sent.',
+      };
+    }
 
     const payload: HeldAppCallPayload = {
       viewId,

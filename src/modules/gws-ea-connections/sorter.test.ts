@@ -236,7 +236,7 @@ describe('isolated tool sorter session lifecycle', () => {
     await vi.waitFor(() => expect(wokeSession).toBeDefined());
     expect(wokeSession!.agent_group_id).toBe(externalEmailId);
     expect(wokeSession!.messaging_group_id).toBeNull();
-    expect(wokeSession!.thread_id).toBe(`${APP_SORT_THREAD_PREFIX}${app.id}:${pin.listHash}`);
+    expect(wokeSession!.thread_id).toMatch(new RegExp(`^${APP_SORT_THREAD_PREFIX}${app.id}:${pin.listHash}:sort-`));
 
     const pinnedTools = await store.listTools(app.id);
     const byName = new Map(pinnedTools.map((t) => [t.name, t.definitionHash]));
@@ -863,13 +863,33 @@ describe('exhaustive deterministic floor coverage', () => {
 
     sorter = createAppToolSorter({ store, timeoutMs: 5_000 });
     registerSortToolsAction({ sorter: () => sorter });
+    const previousSession = wokeSession;
     wokeSession = undefined;
     const revertedJob = sorter.enqueue(app.id, reverted.pin.listHash);
     await vi.waitFor(() => expect(wokeSession).toBeDefined());
+    expect(wokeSession!.id).not.toBe(previousSession?.id);
     const db = new Database(path.join(sessionDir(wokeSession!.agent_group_id, wokeSession!.id), 'inbound.db'));
     const msgCount = (db.prepare('SELECT COUNT(*) AS n FROM messages_in').get() as { n: number }).n;
     db.close();
-    expect(msgCount).toBeGreaterThanOrEqual(3);
+    expect(msgCount).toBe(1);
+    // A late reply from an earlier attempt's session cannot settle the active retry attempt.
+    if (previousSession) {
+      await expect(
+        sendSortTools(
+          {
+            tools: [
+              {
+                name: 'search_menu',
+                definition_hash: reverted.tools[0]!.definitionHash,
+                label: 'just_do',
+                reason: 'Late reply from prior attempt',
+              },
+            ],
+          },
+          previousSession,
+        ),
+      ).resolves.toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    }
     await sendSortTools(
       {
         tools: [

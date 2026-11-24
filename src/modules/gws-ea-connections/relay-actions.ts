@@ -133,56 +133,58 @@ export function createRelayAction(dependencies: RelayActionDependencies) {
     let frame: ResponseFrame;
     /* eslint-disable no-catch-all/no-catch-all -- every deferred relay request must produce one response frame */
     try {
-      const relay = await dependencies.relay();
-      if (!relay) {
-        throw forbidden('The app relay is not running.');
+      try {
+        const relay = await dependencies.relay();
+        if (!relay) {
+          throw forbidden('The app relay is not running.');
+        }
+        let data: Record<string, unknown>;
+        switch (parsed.op) {
+          case 'initialize':
+            data = { ...(await relay.initializeApp(parsed.serverKey)) };
+            break;
+          case 'tools/list':
+            data = { ...(await relay.listToolsForSession(parsed.serverKey)) };
+            break;
+          case 'tools/call':
+            data = {
+              ...(await relay.callTool({
+                serverKey: parsed.serverKey,
+                toolName: parsed.tool,
+                args: parsed.args,
+                ...(parsed.summary === undefined ? {} : { summary: parsed.summary }),
+                session,
+                requestId,
+              })),
+            };
+            break;
+        }
+        frame = { id: requestId, ok: true, data };
+      } catch (error) {
+        if (!(error instanceof ActionRefusal) && !(error instanceof ConnectionsStoreError)) {
+          log.warn('App relay request failed', {
+            op: parsed.op,
+            serverKey: parsed.serverKey,
+            requestId,
+            sessionId: session.id,
+          });
+        }
+        frame = errorFrame(requestId, error);
       }
-      let data: Record<string, unknown>;
-      switch (parsed.op) {
-        case 'initialize':
-          data = { ...(await relay.initializeApp(parsed.serverKey)) };
-          break;
-        case 'tools/list':
-          data = { ...(await relay.listToolsForSession(parsed.serverKey)) };
-          break;
-        case 'tools/call':
-          data = {
-            ...(await relay.callTool({
-              serverKey: parsed.serverKey,
-              toolName: parsed.tool,
-              args: parsed.args,
-              ...(parsed.summary === undefined ? {} : { summary: parsed.summary }),
-              session,
-              requestId,
-            })),
-          };
-          break;
-      }
-      frame = { id: requestId, ok: true, data };
-    } catch (error) {
-      if (!(error instanceof ActionRefusal) && !(error instanceof ConnectionsStoreError)) {
-        log.warn('App relay request failed', {
+      try {
+        await writeActionResponse(session, requestId, frame);
+        clearOutbox(session.agent_group_id, session.id, requestId);
+      } catch (error) {
+        log.warn('Failed to write app relay response', {
           op: parsed.op,
           serverKey: parsed.serverKey,
           requestId,
           sessionId: session.id,
+          error: error instanceof Error ? error.message : String(error),
         });
       }
-      frame = errorFrame(requestId, error);
     } finally {
       inFlight.delete(key);
-    }
-    try {
-      await writeActionResponse(session, requestId, frame);
-      clearOutbox(session.agent_group_id, session.id, requestId);
-    } catch (error) {
-      log.warn('Failed to write app relay response', {
-        op: parsed.op,
-        serverKey: parsed.serverKey,
-        requestId,
-        sessionId: session.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }

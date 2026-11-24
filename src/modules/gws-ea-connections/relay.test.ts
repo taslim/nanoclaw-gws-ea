@@ -921,5 +921,215 @@ describe('host relay core', () => {
       requestId: 'req-after-drain',
     });
     expect(afterDrain).toMatchObject({ status: 'unsent', reason: 'relay_stopping' });
+    const approvedAfterDrain = await relay.executeApprovedCall({
+      approvalId: 'appr-after-drain',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+      args: { checkout_id: 'chk-1' },
+    });
+    expect(approvedAfterDrain).toMatchObject({ status: 'unsent', reason: 'relay_stopping' });
+    // Approval was NOT claimed/consumed during shutdown.
+    expect(
+      await store.claimApprovedCall({
+        approvalId: 'appr-after-drain',
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'confirm_checkout',
+        definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+        argsHash: 'unused',
+      }),
+    ).toEqual({ status: 'claimed' });
+  });
+
+  it('returns cached settled outcome on direct replay, refreshes instruction-only changes on pinApp, rechecks label/grant before queued direct send, and stops queued sends after drain deadline', async () => {
+    let blockNextResolve = false;
+    let releaseBlocked!: () => void;
+    let notifyBlockedEntered: (() => void) | undefined;
+
+    const fake = new FakeMcpApp({
+      appUrl: OPEN_URL,
+      issuer: 'https://recipes.example.test',
+      allowUnauthenticated: true,
+      instructions: 'Instructions v1',
+      tools: [SEARCH_TOOL, CHECKOUT_TOOL],
+      onToolCall(call) {
+        return { content: [{ type: 'text', text: `result:${String(call.arguments.query ?? '')}` }] };
+      },
+    });
+    endpoints.use(fake.handle);
+
+    const app = await connectOpenApp();
+    let localHeldCalls = 0;
+    const baseResolve = endpoints.egress.resolve!;
+    const localRelay = createAppRelay({
+      store,
+      egress: {
+        ...endpoints.egress,
+        resolve: async (host) => {
+          if (blockNextResolve) {
+            blockNextResolve = false;
+            const wait = new Promise<void>((resolve) => {
+              releaseBlocked = resolve;
+            });
+            notifyBlockedEntered?.();
+            await wait;
+          }
+          return baseResolve(host);
+        },
+      },
+      now: () => clock,
+      onHoldCall: async (input) => {
+        localHeldCalls += 1;
+        return { status: 'held', text: `held:${input.tool.name}` };
+      },
+    });
+    try {
+      const initialPin = await localRelay.pinApp(app.id);
+      expect(initialPin.pin.instructions).toBe('Instructions v1');
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'search_menu',
+          definitionHash: toolDefinitionHash(SEARCH_TOOL),
+          label: 'just_do',
+          source: 'sorter',
+          reason: 'Lookup',
+        },
+        {
+          name: 'confirm_checkout',
+          definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+          label: 'ask_first',
+          source: 'floor',
+          reason: 'Order',
+        },
+      ]);
+      await store.markToolsReviewed(app.id, initialPin.pin.listHash);
+
+      // 1) Instruction-only upstream change is picked up on pinApp via fresh handshake and invalidates review.
+      fake.instructions = 'Instructions v2 (updated)';
+      const refreshedPin = await localRelay.pinApp(app.id);
+      expect(refreshedPin.pin.instructions).toBe('Instructions v2 (updated)');
+      expect(refreshedPin.pin.listHash).not.toBe(initialPin.pin.listHash);
+      expect(refreshedPin.pin.needsReview).toBe(true);
+
+      // 2) Replaying a settled direct requestId returns the stored outcome without invoking upstream again.
+      const firstDirect = await localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'once-only' },
+        session,
+        requestId: 'req-replay-direct',
+      });
+      const replayedDirect = await localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'once-only' },
+        session,
+        requestId: 'req-replay-direct',
+      });
+      expect(firstDirect).toMatchObject({ status: 'completed' });
+      expect(replayedDirect).toEqual(firstDirect);
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'once-only')).toHaveLength(1);
+
+      // 3) Queued direct call whose tool flips to ask_first before dispatch routes to holdHandler instead of sending.
+      blockNextResolve = true;
+      const firstEntered = new Promise<void>((resolve) => {
+        notifyBlockedEntered = resolve;
+      });
+      const blockingCall = localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'hold-queue' },
+        session,
+        requestId: 'req-block-1',
+      });
+      await firstEntered;
+      const queuedFlipped = localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'flipped-while-queued' },
+        session,
+        requestId: 'req-flipped',
+      });
+      await store.setToolLabel(app.id, 'search_menu', 'ask_first', 'principal', {
+        expectedHash: toolDefinitionHash(SEARCH_TOOL),
+      });
+      releaseBlocked();
+      await blockingCall;
+      expect(await queuedFlipped).toMatchObject({ status: 'held', text: 'held:search_menu' });
+      expect(localHeldCalls).toBe(1);
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'flipped-while-queued')).toHaveLength(0);
+
+      // 4) Queued direct call to a no-auth app whose grant disconnects before dispatch is refused.
+      await store.setToolLabel(app.id, 'search_menu', 'just_do', 'principal', {
+        expectedHash: toolDefinitionHash(SEARCH_TOOL),
+      });
+      blockNextResolve = true;
+      const secondEntered = new Promise<void>((resolve) => {
+        notifyBlockedEntered = resolve;
+      });
+      const blockingDisconnect = localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'block-for-disconnect' },
+        session,
+        requestId: 'req-block-2',
+      });
+      await secondEntered;
+      const queuedAfterDisconnect = localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'should-not-send-after-disconnect' },
+        session,
+        requestId: 'req-disconn',
+      });
+      const currentApp = await store.get(app.id);
+      await store.disconnect(currentApp.id, currentApp.version);
+      releaseBlocked();
+      await blockingDisconnect;
+      expect(await queuedAfterDisconnect).toMatchObject({ status: 'unsent', reason: 'grant_changed' });
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'should-not-send-after-disconnect')).toHaveLength(0);
+
+      // 5) Queued call behind a slow op does not send once drain()'s grace deadline expires.
+      const reconnected = await store.get(app.id);
+      await store.connect(reconnected.id, reconnected.version, { kind: 'none' });
+      await localRelay.pinApp(app.id);
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'search_menu',
+          definitionHash: toolDefinitionHash(SEARCH_TOOL),
+          label: 'just_do',
+          source: 'sorter',
+          reason: 'Lookup',
+        },
+      ]);
+      blockNextResolve = true;
+      const drainEntered = new Promise<void>((resolve) => {
+        notifyBlockedEntered = resolve;
+      });
+      const slowCall = localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'slow-drain' },
+        session,
+        requestId: 'req-slow-drain',
+      });
+      await drainEntered;
+      const queuedBehindSlow = localRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'never-send-post-drain' },
+        session,
+        requestId: 'req-post-drain',
+      });
+      await localRelay.drain(20);
+      releaseBlocked();
+      await slowCall;
+      expect(await queuedBehindSlow).toMatchObject({ status: 'unsent', reason: 'relay_stopping' });
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'never-send-post-drain')).toHaveLength(0);
+    } finally {
+      await localRelay.closeAll();
+    }
   });
 });

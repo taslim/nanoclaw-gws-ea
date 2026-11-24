@@ -8,7 +8,12 @@ import type { ActionRequestOptions, ActionRequestResult } from '../action-reques
 import { closeSessionDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { getAgentMailbox } from '../mailbox/index.js';
-import { ASSISTANT_SUMMARY_FIELD, createAppRelayServer, type AppRelayRequestFn } from './app-relay.js';
+import {
+  ASSISTANT_SUMMARY_FIELD,
+  createAppRelayServer,
+  withAssistantSummarySchema,
+  type AppRelayRequestFn,
+} from './app-relay.js';
 
 const SERVER_KEY = 'app_0123456789ab';
 
@@ -342,6 +347,79 @@ describe('app-relay stdio MCP server', () => {
 
       failList = true;
       await expect(client.listTools()).rejects.toThrow('Not connected');
+    } finally {
+      await close();
+    }
+  });
+
+  it('omits upstream outputSchema and keeps restrictive ask_first inputSchema satisfiable', async () => {
+    const augmented = withAssistantSummarySchema({
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+      additionalProperties: false,
+      minProperties: 1,
+      maxProperties: 1,
+      allOf: [
+        {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          additionalProperties: false,
+          maxProperties: 1,
+        },
+      ],
+    });
+    expect(augmented.maxProperties).toBe(2);
+    expect(augmented.minProperties).toBe(2);
+    expect(augmented.required).toEqual(['id', ASSISTANT_SUMMARY_FIELD]);
+    const branch = (augmented.allOf as Record<string, unknown>[])[0]!;
+    expect(branch.maxProperties).toBe(2);
+    expect((branch.properties as Record<string, unknown>)[ASSISTANT_SUMMARY_FIELD]).toBeDefined();
+
+    const { client, close } = await connectRelay(async (_action, fields) => {
+      if (fields.op === 'initialize') {
+        return { status: 'answered', frame: { id: 'req-init', ok: true, data: { instructions: null } } };
+      }
+      if (fields.op === 'tools/list') {
+        return {
+          status: 'answered',
+          frame: {
+            id: 'req-list',
+            ok: true,
+            data: {
+              toolsVersion: 'v-out',
+              tools: [
+                {
+                  name: 'confirm_order',
+                  description: 'Confirm order',
+                  inputSchema: { type: 'object', properties: { id: { type: 'string' } }, maxProperties: 1 },
+                  outputSchema: {
+                    type: 'object',
+                    properties: { orderId: { type: 'string' } },
+                    required: ['orderId'],
+                  },
+                  label: 'ask_first',
+                },
+              ],
+            },
+          },
+        };
+      }
+      return {
+        status: 'answered',
+        frame: { id: 'req-call', ok: true, data: { status: 'held', text: 'Asked principal.' } },
+      };
+    });
+    try {
+      const listed = await client.listTools();
+      const tool = listed.tools[0]!;
+      expect(tool.outputSchema).toBeUndefined();
+      expect(tool.inputSchema.maxProperties).toBe(2);
+      const held = await client.callTool({
+        name: 'confirm_order',
+        arguments: { id: 'o-1', [ASSISTANT_SUMMARY_FIELD]: 'Confirm order o-1' },
+      });
+      expect(held).toEqual({ content: [{ type: 'text', text: 'Asked principal.' }] });
     } finally {
       await close();
     }

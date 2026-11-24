@@ -52,7 +52,6 @@ export interface RelayedTool {
   readonly title?: string;
   readonly description?: string;
   readonly inputSchema: Record<string, unknown>;
-  readonly outputSchema?: Record<string, unknown>;
   readonly annotations?: ToolDefinition['annotations'];
   readonly label: ToolLabel | null;
 }
@@ -140,6 +139,12 @@ class UpstreamUnauthorizedError extends Error {
   }
 }
 
+class RelayClosedError extends Error {
+  constructor() {
+    super('App relay is closed');
+  }
+}
+
 function isHttp401Error(error: unknown): boolean {
   return error instanceof StreamableHTTPError && error.code === 401;
 }
@@ -188,7 +193,6 @@ function formatToolForMain(pinned: PinnedAppTool): RelayedTool {
     ...(pinned.definition.title === undefined ? {} : { title: pinned.definition.title }),
     ...(description === undefined ? {} : { description }),
     inputSchema: pinned.definition.inputSchema,
-    ...(pinned.definition.outputSchema === undefined ? {} : { outputSchema: pinned.definition.outputSchema }),
     ...(pinned.definition.annotations === undefined ? {} : { annotations: pinned.definition.annotations }),
     label: pinned.label,
   };
@@ -219,6 +223,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
   const activeOps = new Set<Promise<unknown>>();
   const traceStore = new AsyncLocalStorage<CallTrace>();
   let stopping = false;
+  let closed = false;
 
   /**
    * Serializes upstream MCP operations per app without acquiring the credential app lock,
@@ -250,6 +255,8 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     return promise;
   }
 
+  type PreflightResult = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
   async function verifyLiveGrant(appId: string, expectedGeneration: number): Promise<boolean> {
     return withAppLock(appId, async () => {
       try {
@@ -257,6 +264,38 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         return freshApp.status === 'connected' && freshGrant?.generation === expectedGeneration;
       } catch (error) {
         if (error instanceof ConnectionsStoreError) return false;
+        throw error;
+      }
+    });
+  }
+
+  async function verifySendPreflight(input: {
+    readonly appId: string;
+    readonly expectedGeneration: number;
+    readonly toolName: string;
+    readonly expectedDefinitionHash: string;
+    readonly requireJustDo: boolean;
+  }): Promise<PreflightResult> {
+    return withAppLock(input.appId, async () => {
+      try {
+        const [freshApp, freshGrant, freshTool] = await Promise.all([
+          store.get(input.appId),
+          store.currentGrant(input.appId),
+          store.getTool(input.appId, input.toolName),
+        ]);
+        if (freshApp.status !== 'connected' || freshGrant?.generation !== input.expectedGeneration) {
+          return { ok: false, reason: 'grant_changed' };
+        }
+        if (!freshTool || freshTool.definitionHash !== input.expectedDefinitionHash) {
+          return { ok: false, reason: 'definition_changed' };
+        }
+        if (input.requireJustDo) {
+          if (freshTool.label === 'ask_first') return { ok: false, reason: 'label_changed_to_ask_first' };
+          if (freshTool.label !== 'just_do') return { ok: false, reason: 'tool_unsorted' };
+        }
+        return { ok: true };
+      } catch (error) {
+        if (error instanceof ConnectionsStoreError) return { ok: false, reason: 'grant_changed' };
         throw error;
       }
     });
@@ -283,7 +322,13 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     }
   }
 
-  async function ensureClient(app: ConnectionApp, grant: LiveGrant, forceRenew = false): Promise<ManagedClient> {
+  async function ensureClient(
+    app: ConnectionApp,
+    grant: LiveGrant,
+    forceRenew = false,
+    forceReconnect = false,
+  ): Promise<ManagedClient> {
+    if (closed) throw new RelayClosedError();
     let token: string | undefined;
     if (app.auth !== 'none') {
       const usable = await resolveBearer(app, grant, forceRenew);
@@ -292,9 +337,10 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       }
       token = usable.token;
     }
+    if (closed) throw new RelayClosedError();
 
     const existing = clients.get(app.id);
-    if (existing && existing.url === app.url && existing.grantGeneration === grant.generation) {
+    if (!forceReconnect && existing && existing.url === app.url && existing.grantGeneration === grant.generation) {
       existing.auth.token = token;
       return existing;
     }
@@ -344,6 +390,10 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       if (unauthorized) throw new UpstreamUnauthorizedError();
       throw error;
     }
+    if (closed) {
+      await closeClient(entry);
+      throw new RelayClosedError();
+    }
     clients.set(app.id, entry);
     return entry;
   }
@@ -372,10 +422,12 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
   async function pinConnectedApp(app: ConnectionApp, grant: LiveGrant): Promise<PinToolsResult> {
     const listed = await withRelayQueue(app.id, async () => {
+      if (closed) throw new ConnectionsStoreError('store_unavailable');
       const run = async (
         forceRenew: boolean,
       ): Promise<{ instructions: string | null; tools: readonly ToolDefinition[] }> => {
-        const managed = await ensureClient(app, grant, forceRenew);
+        // Always open a fresh handshake during catalog confirmation so instruction-only changes reach the pin.
+        const managed = await ensureClient(app, grant, forceRenew, true);
         const listTrace = newTrace();
         try {
           const tools = await traceStore.run(listTrace, () => listAllUpstreamTools(managed));
@@ -450,15 +502,18 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     grant: LiveGrant,
     toolName: string,
     args: Record<string, unknown>,
-    options: { readonly verifyBeforeCall?: () => Promise<boolean> } = {},
+    options: { readonly verifyBeforeCall?: () => Promise<PreflightResult> } = {},
   ): Promise<UpstreamCallResult> {
     return withRelayQueue(app.id, async () => {
+      if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
       const attempt = async (forceRenew: boolean) => {
+        if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
         let managed: ManagedClient;
         try {
           managed = await ensureClient(app, grant, forceRenew);
           /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any connect/handshake failure into retry_401, unsent, or unknown */
         } catch (error) {
+          if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
           if (error instanceof UpstreamUnauthorizedError && !forceRenew && app.auth === 'oauth') {
             return 'retry_401' as const;
           }
@@ -475,9 +530,20 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
                   : 'connect_failed',
           };
         }
-        if (options.verifyBeforeCall && !(await options.verifyBeforeCall())) {
+        if (closed) {
           await closeClient(managed);
-          return { status: 'unsent' as const, reason: 'grant_changed' };
+          return { status: 'unsent' as const, reason: 'relay_stopping' };
+        }
+        if (options.verifyBeforeCall) {
+          const check = await options.verifyBeforeCall();
+          if (!check.ok) {
+            if (check.reason === 'grant_changed') await closeClient(managed);
+            return { status: 'unsent' as const, reason: check.reason };
+          }
+        }
+        if (closed) {
+          await closeClient(managed);
+          return { status: 'unsent' as const, reason: 'relay_stopping' };
         }
         const callTrace = newTrace();
         try {
@@ -518,6 +584,33 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     });
   }
 
+  function outcomeFromSettledRecord(
+    record: { readonly state: string; readonly outcomeJson: string | null },
+    toolsVersion?: string,
+  ): RelayCallOutcome {
+    const versionField = toolsVersion === undefined ? {} : { toolsVersion };
+    if (record.state === 'completed' && record.outcomeJson) {
+      return {
+        status: 'completed',
+        result: JSON.parse(record.outcomeJson) as Record<string, unknown>,
+        ...versionField,
+      };
+    }
+    if (record.state === 'too_large') {
+      return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE, ...versionField };
+    }
+    if (record.state === 'unsent') {
+      const parsed = record.outcomeJson ? (JSON.parse(record.outcomeJson) as { reason?: string; text?: string }) : {};
+      return {
+        status: 'unsent',
+        reason: parsed.reason,
+        text: parsed.text ?? 'Nothing was sent to the app.',
+        ...versionField,
+      };
+    }
+    return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE, ...versionField };
+  }
+
   async function settleUpstreamOutcome(
     callId: string,
     upstream: UpstreamCallResult,
@@ -539,9 +632,13 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE, ...versionField };
       case 'unsent': {
         const text =
-          upstream.reason === 'grant_changed'
-            ? 'The app was disconnected or reconnected since approval was requested, so nothing was sent.'
-            : 'The app could not be reached, so nothing was sent.';
+          upstream.reason === 'definition_changed'
+            ? 'The tool definition changed since approval was requested, so nothing was sent.'
+            : upstream.reason === 'relay_stopping'
+              ? 'The app relay is shutting down, so nothing was sent.'
+              : upstream.reason === 'grant_changed'
+                ? 'The app was disconnected or reconnected since approval was requested, so nothing was sent.'
+                : 'The app could not be reached, so nothing was sent.';
         await store.settleRelayCall(callId, {
           state: 'unsent',
           ...(persistUnsentDetails ? { outcomeJson: JSON.stringify({ reason: upstream.reason, text }) } : {}),
@@ -577,6 +674,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       ]);
       bound.abort();
     }
+    closed = true;
     await closeAll();
   }
 
@@ -719,7 +817,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
         const callId = `direct:${input.session.id}:${input.requestId}`;
         const at = new Date(now()).toISOString();
-        await store.recordDirectCallStart({
+        const directClaim = await store.claimDirectCall({
           id: callId,
           appId: app.id,
           grantGeneration: grant.generation,
@@ -728,13 +826,79 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           argsHash,
           at,
         });
+        if (directClaim.status === 'app_not_found') {
+          return {
+            status: 'unsent',
+            reason: 'app_gone',
+            text: 'The app is no longer connected, so nothing was sent.',
+            toolsVersion,
+          };
+        }
+        if (directClaim.status === 'already_executing') {
+          return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE, toolsVersion };
+        }
+        if (directClaim.status === 'already_settled') {
+          return outcomeFromSettledRecord(directClaim.record, toolsVersion);
+        }
 
-        const upstream = await invokeUpstreamTool(app, grant, tool.name, input.args);
-        return settleUpstreamOutcome(callId, upstream, false, toolsVersion);
+        const upstream = await invokeUpstreamTool(app, grant, tool.name, input.args, {
+          verifyBeforeCall: () =>
+            verifySendPreflight({
+              appId: app.id,
+              expectedGeneration: grant.generation,
+              toolName: tool.name,
+              expectedDefinitionHash: tool.definitionHash,
+              requireJustDo: true,
+            }),
+        });
+        if (
+          upstream.status === 'unsent' &&
+          (upstream.reason === 'label_changed_to_ask_first' ||
+            upstream.reason === 'definition_changed' ||
+            upstream.reason === 'tool_unsorted')
+        ) {
+          await store.deleteRelayCall(callId);
+          const latest = await store.readAppTools(app.id);
+          const latestVersion = latest?.pin ? computeToolsVersion(latest.pin.listHash, latest.tools) : toolsVersion;
+          const latestTool = latest?.tools.find((entry) => entry.name === input.toolName);
+          if (!latestTool) {
+            return {
+              status: 'unsent',
+              reason: 'unknown_tool',
+              text: `Tool "${input.toolName}" is no longer offered by this app.`,
+              toolsVersion: latestVersion,
+            };
+          }
+          if (latestTool.label === null) {
+            return { status: 'unsorted', text: UNSORTED_TOOL_MESSAGE, toolsVersion: latestVersion };
+          }
+          if (latestTool.label === 'ask_first') {
+            const held = await holdHandler({
+              app,
+              grantGeneration: grant.generation,
+              tool: latestTool,
+              args: input.args,
+              canonicalArgs: canonical,
+              argsHash,
+              summary: input.summary,
+              session: input.session,
+              requestId: input.requestId,
+            });
+            return { ...held, toolsVersion: latestVersion };
+          }
+        }
+        return settleUpstreamOutcome(callId, upstream, true, toolsVersion);
       });
     },
 
     async executeApprovedCall(input: ExecuteApprovedCallInput): Promise<RelayCallOutcome> {
+      if (stopping) {
+        return {
+          status: 'unsent',
+          reason: 'relay_stopping',
+          text: 'The app relay is shutting down, so nothing was sent.',
+        };
+      }
       return trackOp(async () => {
         const { hash: argsHash } = canonicalArgsHash(input.args);
         const at = new Date(now()).toISOString();
@@ -759,20 +923,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
         }
         if (claim.status === 'already_settled') {
-          const { state, outcomeJson } = claim.record;
-          if (state === 'completed' && outcomeJson) {
-            return { status: 'completed', result: JSON.parse(outcomeJson) as Record<string, unknown> };
-          }
-          if (state === 'too_large') return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE };
-          if (state === 'unsent') {
-            const parsed = outcomeJson ? (JSON.parse(outcomeJson) as { reason?: string; text?: string }) : {};
-            return {
-              status: 'unsent',
-              reason: parsed.reason,
-              text: parsed.text ?? 'Nothing was sent to the app.',
-            };
-          }
-          return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
+          return outcomeFromSettledRecord(claim.record);
         }
 
         const failUnsent = async (reason: string, text: string): Promise<RelayCallOutcome> => {
@@ -834,7 +985,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         }
 
         const upstream = await invokeUpstreamTool(app, grant, input.toolName, input.args, {
-          verifyBeforeCall: () => verifyLiveGrant(input.appId, input.grantGeneration),
+          verifyBeforeCall: () =>
+            verifySendPreflight({
+              appId: input.appId,
+              expectedGeneration: input.grantGeneration,
+              toolName: input.toolName,
+              expectedDefinitionHash: input.definitionHash,
+              requireJustDo: false,
+            }),
         });
         return settleUpstreamOutcome(input.approvalId, upstream, true);
       });

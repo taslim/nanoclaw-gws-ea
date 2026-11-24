@@ -51,23 +51,79 @@ function plainToolResult(text: string): CallToolResult {
   return { content: [{ type: 'text', text }] };
 }
 
+const ASSISTANT_SUMMARY_PROPERTY = {
+  type: 'string',
+  description: ASSISTANT_SUMMARY_DESCRIPTION,
+} as const;
+
+function allowAssistantSummaryInBranch(subschema: unknown, depth: number): unknown {
+  if (depth > 4 || !isRecord(subschema)) return subschema;
+  let changed = false;
+  const next: Record<string, unknown> = { ...subschema };
+
+  const subProps = isRecord(subschema.properties) ? subschema.properties : undefined;
+  const hasSummary = subProps !== undefined && Object.prototype.hasOwnProperty.call(subProps, ASSISTANT_SUMMARY_FIELD);
+
+  if (!hasSummary && (subschema.additionalProperties === false || subschema.unevaluatedProperties === false)) {
+    next.properties = {
+      ...(subProps ?? {}),
+      [ASSISTANT_SUMMARY_FIELD]: ASSISTANT_SUMMARY_PROPERTY,
+    };
+    changed = true;
+  }
+  if (!hasSummary && typeof subschema.maxProperties === 'number' && Number.isFinite(subschema.maxProperties)) {
+    next.maxProperties = subschema.maxProperties + 1;
+    changed = true;
+  }
+  if (!hasSummary && typeof subschema.minProperties === 'number' && Number.isFinite(subschema.minProperties)) {
+    next.minProperties = subschema.minProperties + 1;
+    changed = true;
+  }
+  for (const combiner of ['allOf', 'anyOf', 'oneOf'] as const) {
+    const branches = subschema[combiner];
+    if (Array.isArray(branches)) {
+      const updated = branches.map((branch) => allowAssistantSummaryInBranch(branch, depth + 1));
+      if (updated.some((entry, index) => entry !== branches[index])) {
+        next[combiner] = updated;
+        changed = true;
+      }
+    }
+  }
+  return changed ? next : subschema;
+}
+
 export function withAssistantSummarySchema(schema: Record<string, unknown>): Tool['inputSchema'] {
   const existingProperties = isRecord(schema.properties) ? schema.properties : {};
+  const alreadyPresent = Object.prototype.hasOwnProperty.call(existingProperties, ASSISTANT_SUMMARY_FIELD);
   const existingRequired = Array.isArray(schema.required)
     ? schema.required.filter((entry): entry is string => typeof entry === 'string')
     : [];
   const required = existingRequired.includes(ASSISTANT_SUMMARY_FIELD)
     ? [...existingRequired]
     : [...existingRequired, ASSISTANT_SUMMARY_FIELD];
+
+  const base: Record<string, unknown> = { ...schema };
+  if (!alreadyPresent) {
+    if (typeof schema.maxProperties === 'number' && Number.isFinite(schema.maxProperties)) {
+      base.maxProperties = schema.maxProperties + 1;
+    }
+    if (typeof schema.minProperties === 'number' && Number.isFinite(schema.minProperties)) {
+      base.minProperties = schema.minProperties + 1;
+    }
+    for (const combiner of ['allOf', 'anyOf', 'oneOf'] as const) {
+      const branches = schema[combiner];
+      if (Array.isArray(branches)) {
+        base[combiner] = branches.map((branch) => allowAssistantSummaryInBranch(branch, 0));
+      }
+    }
+  }
+
   return {
-    ...schema,
+    ...base,
     type: 'object',
     properties: {
       ...existingProperties,
-      [ASSISTANT_SUMMARY_FIELD]: {
-        type: 'string',
-        description: ASSISTANT_SUMMARY_DESCRIPTION,
-      },
+      [ASSISTANT_SUMMARY_FIELD]: ASSISTANT_SUMMARY_PROPERTY,
     },
     required,
   };
@@ -102,7 +158,6 @@ function formatRelayedTool(raw: unknown): Tool | undefined {
     inputSchema,
     ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
-    ...(isRecord(raw.outputSchema) ? { outputSchema: raw.outputSchema as Tool['outputSchema'] } : {}),
     ...(isRecord(raw.annotations) ? { annotations: raw.annotations as Tool['annotations'] } : {}),
   };
   return tool;

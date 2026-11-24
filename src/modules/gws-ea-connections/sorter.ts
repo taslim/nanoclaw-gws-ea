@@ -179,9 +179,9 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
 
     const model = await resolveExternalEmailModel(groupId);
     const version = sorterVersion(model);
-    const threadId = `${APP_SORT_THREAD_PREFIX}${job.appId}:${pin.listHash}`;
-    const { session } = await resolveSystemSession(groupId, threadId);
     const sortId = `sort-${randomUUID()}`;
+    const threadId = `${APP_SORT_THREAD_PREFIX}${job.appId}:${pin.listHash}:${sortId}`;
+    const { session } = await resolveSystemSession(groupId, threadId);
     const startedAt = new Date(now()).toISOString();
 
     await store.recordToolSortStart({

@@ -909,6 +909,8 @@ export class ConnectionsStore {
       at,
     );
     db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id);
+    db.prepare('DELETE FROM app_pins WHERE app_id = ?').run(app.id);
+    db.prepare('DELETE FROM app_tools WHERE app_id = ?').run(app.id);
     db.prepare('DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL').run(app.id);
     if (grant.kind === 'oauth' && sealedAccess) {
       db.prepare(
@@ -1431,7 +1433,9 @@ export class ConnectionsStore {
             `INSERT INTO app_pins (app_id, instructions, list_hash, pinned_at, confirmed_at, reviewed_list_hash, reviewed_at)
               VALUES (?, ?, ?, ?, ?, NULL, NULL)
               ON CONFLICT(app_id) DO UPDATE SET instructions = excluded.instructions, list_hash = excluded.list_hash,
-                pinned_at = excluded.pinned_at, confirmed_at = excluded.confirmed_at`,
+                pinned_at = excluded.pinned_at, confirmed_at = excluded.confirmed_at,
+                reviewed_list_hash = CASE WHEN app_pins.list_hash = excluded.list_hash THEN app_pins.reviewed_list_hash ELSE NULL END,
+                reviewed_at = CASE WHEN app_pins.list_hash = excluded.list_hash THEN app_pins.reviewed_at ELSE NULL END`,
           ).run(appId, input.instructions, nextListHash, pinnedAt, at);
 
           const pinRow = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
@@ -1479,6 +1483,13 @@ export class ConnectionsStore {
             const row = selectTool.get(appId, update.name);
             if (!row || row.definition_hash !== update.definitionHash) continue;
             const principalOverride = update.source === 'principal' || update.source === 'approved_request';
+            if (
+              !principalOverride &&
+              row.label !== null &&
+              (row.label_source === 'principal' || row.label_source === 'approved_request')
+            ) {
+              continue;
+            }
             const floorLocked = !principalOverride && row.principal_floor === 1 && update.label === 'just_do';
             const label: ToolLabel = floorLocked ? 'ask_first' : update.label;
             const labelSource: ToolLabelSource = floorLocked ? 'principal' : update.source;
@@ -1723,8 +1734,11 @@ export class ConnectionsStore {
     );
   }
 
-  /** Records an in-flight direct ("just do it") call; replays of the same request id may run again. */
-  async recordDirectCallStart(input: {
+  /**
+   * Atomically claims a direct ("just do it") call before sending anything upstream. Replays find the existing row
+   * so settled outcomes are returned without re-invoking upstream or overwriting stored history.
+   */
+  async claimDirectCall(input: {
     readonly id: string;
     readonly appId: string;
     readonly grantGeneration: number;
@@ -1732,20 +1746,26 @@ export class ConnectionsStore {
     readonly definitionHash: string;
     readonly argsHash: string;
     readonly at?: string;
-  }): Promise<void> {
+  }): Promise<ClaimApprovedCallResult> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
-    await this.use((db) =>
+    return this.use((db) =>
       db
-        .transaction(() => {
+        .transaction((): ClaimApprovedCallResult => {
+          const existing = db.prepare<[string], RelayCallRow>('SELECT * FROM relay_calls WHERE id = ?').get(input.id);
+          if (existing) {
+            const record = toRelayCall(existing);
+            return record.state === 'executing'
+              ? { status: 'already_executing', record }
+              : { status: 'already_settled', record };
+          }
+          const appExists = db.prepare<[string], { id: string }>('SELECT id FROM apps WHERE id = ?').get(input.appId);
+          if (!appExists) return { status: 'app_not_found' };
           db.prepare(
             `INSERT INTO relay_calls
               (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,
                created_at, updated_at)
-              VALUES (?, NULL, ?, ?, ?, ?, ?, 'executing', NULL, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET grant_generation = excluded.grant_generation,
-                definition_hash = excluded.definition_hash, args_hash = excluded.args_hash,
-                state = 'executing', outcome_json = NULL, updated_at = excluded.updated_at`,
+              VALUES (?, NULL, ?, ?, ?, ?, ?, 'executing', NULL, ?, ?)`,
           ).run(
             input.id,
             input.appId,
@@ -1756,6 +1776,18 @@ export class ConnectionsStore {
             at,
             at,
           );
+          return { status: 'claimed' };
+        })
+        .immediate(),
+    );
+  }
+
+  /** Removes a direct relay_calls record when pre-send verification reroutes the call before any upstream send. */
+  async deleteRelayCall(id: string): Promise<void> {
+    await this.use((db) =>
+      db
+        .transaction(() => {
+          db.prepare('DELETE FROM relay_calls WHERE id = ? AND approval_id IS NULL').run(id);
         })
         .immediate(),
     );
@@ -1788,9 +1820,12 @@ export class ConnectionsStore {
           );
           if (row && row.approval_id === null) {
             db.prepare(
-              `DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL AND id NOT IN (
-                SELECT id FROM relay_calls WHERE app_id = ? AND approval_id IS NULL ORDER BY updated_at DESC LIMIT ?
-              )`,
+              `DELETE FROM relay_calls
+                WHERE app_id = ? AND approval_id IS NULL AND state != 'executing' AND id NOT IN (
+                  SELECT id FROM relay_calls
+                    WHERE app_id = ? AND approval_id IS NULL AND state != 'executing'
+                    ORDER BY updated_at DESC LIMIT ?
+                )`,
             ).run(row.app_id, row.app_id, MAX_RECENT_DIRECT_CALLS_PER_APP);
           }
         })

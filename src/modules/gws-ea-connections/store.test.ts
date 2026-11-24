@@ -624,4 +624,120 @@ describe('tool pinning, principal floors, and call claims', () => {
     });
     expect(deletedClaim).toEqual({ status: 'app_not_found' });
   });
+
+  it('clears reviewed marker on catalog flip-flop, protects principal choices from late sorter replies, excludes executing rows from pruning, and clears pins on replaceGrant while keeping floors', async () => {
+    const app = await store.create(LEDGERLY);
+    await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+
+    const pinH1 = await store.pinTools(app.id, {
+      instructions: 'v1',
+      tools: [
+        { name: 'list_items', description: 'List v1', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const listH1 = pinH1.tools.find((t) => t.name === 'list_items')!.definitionHash;
+    const placeH1 = pinH1.tools.find((t) => t.name === 'place_order')!.definitionHash;
+
+    // Principal sets list_items -> just_do and place_order -> ask_first, then reviews H1.
+    await store.setToolLabel(app.id, 'list_items', 'just_do', 'principal', { expectedHash: listH1 });
+    await store.setToolLabel(app.id, 'place_order', 'ask_first', 'principal', { expectedHash: placeH1 });
+    expect(await store.markToolsReviewed(app.id, pinH1.pin.listHash)).toBe(true);
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
+
+    // A late sorter reply must NOT overwrite principal just_do OR principal ask_first source/reason.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'list_items',
+        definitionHash: listH1,
+        label: 'ask_first',
+        source: 'sorter',
+        reason: 'Late sorter override attempt',
+      },
+      {
+        name: 'place_order',
+        definitionHash: placeH1,
+        label: 'ask_first',
+        source: 'sorter',
+        reason: 'Late sorter reason overwrite attempt',
+      },
+    ]);
+    expect(await store.getTool(app.id, 'list_items')).toMatchObject({
+      label: 'just_do',
+      labelSource: 'principal',
+    });
+    expect(await store.getTool(app.id, 'place_order')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+      reason: 'Set to ask first',
+    });
+
+    // H1 -> H2 -> H1 must clear reviewed_list_hash so restoring H1 still needs review.
+    await store.pinTools(app.id, {
+      instructions: 'v2',
+      tools: [
+        { name: 'list_items', description: 'List v2', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const restoredH1 = await store.pinTools(app.id, {
+      instructions: 'v1',
+      tools: [
+        { name: 'list_items', description: 'List v1', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    expect(restoredH1.pin.listHash).toBe(pinH1.pin.listHash);
+    expect(restoredH1.pin.needsReview).toBe(true);
+
+    // Executing direct calls must never be pruned when >30 direct calls settle.
+    const executingId = 'direct:sess:still-running';
+    expect(
+      await store.claimDirectCall({
+        id: executingId,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'list_items',
+        definitionHash: listH1,
+        argsHash: 'exec-hash',
+        at: '2026-11-23T12:00:00.000Z',
+      }),
+    ).toEqual({ status: 'claimed' });
+    for (let i = 0; i < 35; i += 1) {
+      const id = `direct:sess:done-${i}`;
+      const at = new Date(Date.parse('2026-11-23T12:01:00.000Z') + i * 1000).toISOString();
+      await store.claimDirectCall({
+        id,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'list_items',
+        definitionHash: listH1,
+        argsHash: `h-${i}`,
+        at,
+      });
+      await store.settleRelayCall(id, { state: 'completed', outcomeJson: JSON.stringify({ ok: i }), at });
+    }
+    // Re-claiming the still-executing row proves it was not pruned.
+    expect(
+      await store.claimDirectCall({
+        id: executingId,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'list_items',
+        definitionHash: listH1,
+        argsHash: 'exec-hash',
+      }),
+    ).toMatchObject({ status: 'already_executing' });
+
+    // Replacing the grant clears app_pins and app_tools while preserving app_tool_floors.
+    const latest = await store.get(app.id);
+    await store.connect(latest.id, latest.version, { kind: 'token', token: 'new-account-token' });
+    expect(await store.getPin(app.id)).toBeUndefined();
+    expect(await store.listTools(app.id)).toEqual([]);
+    const postReconnectPin = await store.pinTools(app.id, {
+      instructions: 'v1',
+      tools: [{ name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } }],
+    });
+    expect(postReconnectPin.tools[0]?.principalFloor).toBe(true);
+  });
 });

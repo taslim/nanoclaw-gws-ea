@@ -1,5 +1,11 @@
 import { log } from '../../log.js';
-import { admissionDependencies, admitAppUrl, type AdmissionDependencies, type AdmissionRefusal } from './admit.js';
+import {
+  APP_CREDENTIAL_PREFIX,
+  admissionDependencies,
+  admitAppUrl,
+  type AdmissionDependencies,
+  type AdmissionRefusal,
+} from './admit.js';
 import {
   applyMainServers,
   MainServersUnreadableError,
@@ -27,6 +33,7 @@ import {
   type PreparedAuthorization,
   type SignInServer,
 } from './oauth.js';
+import { gatewayHostCredentials, type OperatorCredentials } from './operator.js';
 import { checkPastedToken, probeApp } from './probe.js';
 import {
   ConnectionsStoreError,
@@ -112,6 +119,8 @@ export interface ConnectionOperationsOptions {
   readonly onConnected?: (app: ConnectionApp) => Promise<void>;
   /** Runs when an app is disconnected, removed or reconnected, e.g. to close its relay client and withdraw cards. */
   readonly onDisconnected?: (appId: string) => Promise<void>;
+  /** Optional gateway credential handle for retiring legacy `gws-ea-app-` credentials when removing an app. */
+  readonly gateway?: OperatorCredentials | null;
 }
 
 /** What the page and the home summary show; it holds no URL and nothing sealed. */
@@ -236,6 +245,7 @@ export class ConnectionOperations {
   private readonly documentsServed: () => boolean;
   private readonly onConnected: (app: ConnectionApp) => Promise<void>;
   private readonly onDisconnected: (appId: string) => Promise<void>;
+  private readonly gateway: OperatorCredentials | null | undefined;
 
   constructor(options: ConnectionOperationsOptions) {
     this.store = options.store;
@@ -249,6 +259,7 @@ export class ConnectionOperations {
     this.operators = options.operatorServers ?? mainOperatorServers;
     this.applyMain = options.applyMain ?? applyMainServers;
     this.documentsServed = options.clientDocumentsServed;
+    this.gateway = options.gateway;
     this.onConnected =
       options.onConnected ??
       (async (app) => {
@@ -497,6 +508,30 @@ export class ConnectionOperations {
     });
   }
 
+  /** Best-effort cleanup of any legacy `gws-ea-app-` gateway credentials on the removed app's host. */
+  private async retireGatewayAppCredentials(appId: string, host: string): Promise<void> {
+    if (this.gateway === null) return;
+    /* eslint-disable no-catch-all/no-catch-all -- best-effort gateway cleanup must never block removing an app */
+    try {
+      const gateway = this.gateway ?? gatewayHostCredentials();
+      if (!gateway) return;
+      const held = await gateway.listForHost(host);
+      const legacyIds = held.filter(({ name }) => name.startsWith(APP_CREDENTIAL_PREFIX)).map(({ id }) => id);
+      if (legacyIds.length === 0) return;
+      const removals = await gateway.removeById(legacyIds);
+      if (removals.some(({ outcome }) => outcome === 'failed')) {
+        log.warn('Could not retire all legacy gateway app credentials during removal', { appId, host });
+      }
+    } catch (error) {
+      log.warn('Could not retire legacy gateway app credentials during removal', {
+        appId,
+        host,
+        error: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+  }
+
   /** Disconnects, then forgets the app and its client; a server that refuses revocation does not stop it. */
   async remove(id: string, version: number): Promise<void> {
     return withAppLock(id, async () => {
@@ -504,6 +539,7 @@ export class ConnectionOperations {
       const { app, released } = await this.store.disconnect(id, version);
       await this.notifyDisconnected(app.id);
       await revokeGrant(before.issuer, released, this.oauth);
+      await this.retireGatewayAppCredentials(app.id, before.host);
       await this.store.remove(app.id, app.version);
       await this.apply();
     });

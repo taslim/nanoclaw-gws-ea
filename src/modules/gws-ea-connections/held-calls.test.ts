@@ -49,6 +49,7 @@ import {
   HELD_APP_CALL_ACTION,
   HELD_CALL_ANSWER,
   registerHeldAppCallHandlers,
+  renderCompactArgs,
 } from './held-calls.js';
 import { ConnectionOperations } from './operations.js';
 import { startAppRelay, stopAppRelay, type AppRelay } from './relay.js';
@@ -433,6 +434,18 @@ describe('held ask-first calls', () => {
     expect(String(reconnNote?.content.text)).toContain('disconnected or reconnected');
     expect(String(reconnNote?.content.text)).toContain('nothing was sent');
 
+    // Reconnect cleared the old pin and labels; pin and label again before opening the withdrawal test card.
+    const postReconnPin = await relay!.pinApp(app.id);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'confirm_checkout',
+        definitionHash: postReconnPin.tools.find((t) => t.name === 'confirm_checkout')!.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
     await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -443,16 +456,28 @@ describe('held ask-first calls', () => {
     const withdrawId = deliveredCards[3]!.questionId;
     expect((await getPendingApprovalsByAction(HELD_APP_CALL_ACTION)).map((r) => r.approval_id)).toContain(withdrawId);
 
+    const retiredIds: string[] = [];
     const ops = new ConnectionOperations({
       store,
       webHostname: HOSTNAME,
       clientDocumentsServed: () => true,
       applyMain: async () => false,
+      gateway: {
+        listForHost: async () => [
+          { id: 'gw-app-1', name: 'gws-ea-app-old' },
+          { id: 'gw-other', name: 'operator-cred' },
+        ],
+        removeById: async (ids) => {
+          retiredIds.push(...ids);
+          return ids.map((id) => ({ id, outcome: 'removed' as const }));
+        },
+      },
     });
     const editsBeforeRemove = editedCards.length;
     const latest = await store.get(app.id);
     await ops.remove(latest.id, latest.version);
 
+    expect(retiredIds).toEqual(['gw-app-1']);
     expect(await getPendingApprovalsByAction(HELD_APP_CALL_ACTION)).toEqual([]);
     expect(editedCards.length).toBeGreaterThan(editsBeforeRemove);
   });
@@ -613,5 +638,36 @@ describe('held ask-first calls', () => {
     await respondToCard(deliveredCards[1]!.questionId, 'approve');
     expect(lazyCalls).toBe(1);
     expect(fake.toolCalls.filter((c) => c.name === 'confirm_checkout')).toHaveLength(1);
+  });
+
+  it('preserves argument boundaries in compact rendering and withholds truncated cards when web hostname is unavailable', async () => {
+    const injected = renderCompactArgs({ note: 'Leave at reception\nquantity: 50' });
+    const separate = renderCompactArgs({ note: 'Leave at reception', quantity: 50 });
+    expect(injected.text).not.toBe(separate.text);
+    expect(injected.text).toContain('note: "Leave at reception\\nquantity: 50"');
+    expect(separate.text).toContain('note: "Leave at reception"\nquantity: 50');
+
+    const { app } = await setupFoodApp();
+    await stopAppRelay();
+    const noWebHold = createHoldCallHandler({
+      store,
+      webHostname: async () => undefined,
+    });
+    relay = startAppRelay({
+      store,
+      egress: endpoints.egress,
+      onHoldCall: noWebHold,
+    });
+
+    const outcome = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_noweb', delivery_notes: 'very long notes '.repeat(160) },
+      summary: 'Confirm big order without web page',
+      session: mainSession,
+      requestId: 'req-noweb-long',
+    });
+    expect(outcome).toMatchObject({ status: 'unsent', reason: 'details_unavailable' });
+    expect(deliveredCards).toHaveLength(0);
   });
 });
