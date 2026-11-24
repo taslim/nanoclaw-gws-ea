@@ -348,7 +348,7 @@ function unwrapEnvelope(root: Record<string, unknown>): {
       break;
     }
     if (!canUnwrap) break;
-    current = hoistedMessage && !hasSummaryOrMessage(envVal) ? { message: hoistedMessage, ...envVal } : envVal;
+    current = hoistedMessage && !hasSummaryOrMessage(envVal) ? { ...envVal, message: hoistedMessage } : envVal;
     unwrapped = true;
   }
   return { value: current, unwrapped };

@@ -257,7 +257,7 @@ describe('held-card distiller', () => {
     const withMessageNoSummary = JSON.stringify({
       status: 'success',
       message: 'Transfer ready to send.',
-      data: { recipient: 'Alex', amount: 250 },
+      data: { message: '   ', recipient: 'Alex', amount: 250 },
     });
     const msgOut = renderDistilledContext(withMessageNoSummary, new Set());
     expect(msgOut.text).toContain('Message: Transfer ready to send.');
