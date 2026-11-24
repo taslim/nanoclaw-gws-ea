@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { canonicalJson } from './canonical.js';
 import { ConnectionsStoreError, SIGN_IN_TTL_MS, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
 
@@ -289,6 +290,9 @@ describe('grants', () => {
     const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
     if (!claim) throw new Error('Expected a claim');
     await store.completeSignIn(claim, oauthGrant(SENTINELS.refresh, SENTINELS.access));
+    expect(raw((db) => db.prepare('SELECT generation FROM access_tokens WHERE app_id = ?').all(app.id))).toEqual([
+      { generation: 2 },
+    ]);
     raw((db) => db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id), { writable: true });
     expect(await store.currentGrant(app.id)).toMatchObject({ generation: 2, hasAccessToken: false });
     expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
@@ -728,6 +732,37 @@ describe('tool pinning, principal floors, and call claims', () => {
         argsHash: 'exec-hash',
       }),
     ).toMatchObject({ status: 'already_executing' });
+    // Evicted older direct call keeps its replay-protection claim with outcomeJson cleared, while recent calls keep cached JSON.
+    const evictedClaim = await store.claimDirectCall({
+      id: 'direct:sess:done-0',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'list_items',
+      definitionHash: listH1,
+      argsHash: 'h-0',
+    });
+    expect(evictedClaim).toMatchObject({
+      status: 'already_settled',
+      record: { id: 'direct:sess:done-0', state: 'completed', outcomeJson: null },
+    });
+    const recentClaim = await store.claimDirectCall({
+      id: 'direct:sess:done-34',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'list_items',
+      definitionHash: listH1,
+      argsHash: 'h-34',
+    });
+    expect(recentClaim).toMatchObject({
+      status: 'already_settled',
+      record: { id: 'direct:sess:done-34', state: 'completed', outcomeJson: JSON.stringify({ ok: 34 }) },
+    });
+
+    // markToolsReviewed blocks while an unsettled fallback retry is still pending, then allows once attempts finish.
+    await store.markToolSortFailed(app.id, [{ name: 'list_items', definitionHash: listH1 }], { maxAttempts: 2 });
+    expect(await store.markToolsReviewed(app.id, restoredH1.pin.listHash)).toBe(false);
+    await store.markToolSortFailed(app.id, [{ name: 'list_items', definitionHash: listH1 }], { maxAttempts: 2 });
+    expect(await store.markToolsReviewed(app.id, restoredH1.pin.listHash)).toBe(true);
 
     // Replacing the grant clears app_pins and app_tools while preserving app_tool_floors.
     const latest = await store.get(app.id);
@@ -739,5 +774,28 @@ describe('tool pinning, principal floors, and call claims', () => {
       tools: [{ name: 'place_order', description: 'Order v1', inputSchema: { type: 'object', properties: {} } }],
     });
     expect(postReconnectPin.tools[0]?.principalFloor).toBe(true);
+    // Stale grant generation label writes must be ignored even when definitionHash matches.
+    expect(
+      await store.applyToolLabels(
+        app.id,
+        [
+          {
+            name: 'place_order',
+            definitionHash: postReconnectPin.tools[0]!.definitionHash,
+            label: 'just_do',
+            source: 'sorter',
+            reason: 'Stale gen 1 sort',
+          },
+        ],
+        { expectedGrantGeneration: 1 },
+      ),
+    ).toBe(0);
+    expect((await store.getTool(app.id, 'place_order'))?.label).toBeNull();
+  });
+
+  it('rejects unpaired UTF-16 surrogates in canonicalJson while preserving valid surrogate pairs', () => {
+    expect(() => canonicalJson('lone-\uD800-surrogate')).toThrow(TypeError);
+    expect(() => canonicalJson({ ['key-\uDC00']: 1 })).toThrow(TypeError);
+    expect(canonicalJson({ emoji: '😀' })).toBe('{"emoji":"😀"}');
   });
 });

@@ -101,7 +101,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await relay.closeAll();
+  await relay.drain(500);
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
@@ -785,10 +785,11 @@ describe('host relay core', () => {
       },
     });
     const origToolsList = fake.mcpOverride;
-    fake.mcpOverride = (incoming) => {
+    fake.mcpOverride = async (incoming) => {
       if (disconnectOnce && incoming.body.includes('"tools/list"')) {
         disconnectOnce = false;
-        void store.get(app.id).then((latest) => ops.disconnect(latest.id, latest.version));
+        const latest = await store.get(app.id);
+        await ops.disconnect(latest.id, latest.version);
       }
       return origToolsList?.(incoming);
     };
@@ -1052,6 +1053,9 @@ describe('host relay core', () => {
         session,
         requestId: 'req-flipped',
       });
+      await vi.waitFor(async () => {
+        expect(await store.getRelayCall(`direct:${session.id}:req-flipped`)).toMatchObject({ state: 'executing' });
+      });
       await store.setToolLabel(app.id, 'search_menu', 'ask_first', 'principal', {
         expectedHash: toolDefinitionHash(SEARCH_TOOL),
       });
@@ -1083,6 +1087,9 @@ describe('host relay core', () => {
         args: { query: 'should-not-send-after-disconnect' },
         session,
         requestId: 'req-disconn',
+      });
+      await vi.waitFor(async () => {
+        expect(await store.getRelayCall(`direct:${session.id}:req-disconn`)).toMatchObject({ state: 'executing' });
       });
       const currentApp = await store.get(app.id);
       await store.disconnect(currentApp.id, currentApp.version);
@@ -1130,6 +1137,260 @@ describe('host relay core', () => {
       expect(fake.toolCalls.filter((c) => c.arguments.query === 'never-send-post-drain')).toHaveLength(0);
     } finally {
       await localRelay.closeAll();
+    }
+  });
+
+  it('terminates discarded sessions, rejects >50-page catalogs, returns settled replays after label flips, preserves colliding assistant_summary args, and classifies handshake vs pending-fetch failures', async () => {
+    // 1) Stateful server session IDs are terminated via DELETE on fresh-handshake refresh and closeAll.
+    const deletedSessions: string[] = [];
+    let sessionSeq = 0;
+    const collidingTool = {
+      name: 'record_note',
+      description: 'Store a note that includes an upstream assistant_summary field.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          assistant_summary: { type: 'string' },
+          id: { type: 'string' },
+        },
+        required: ['assistant_summary', 'id'],
+      },
+    };
+    const fake = new FakeMcpApp({
+      appUrl: OPEN_URL,
+      issuer: 'https://recipes.example.test',
+      allowUnauthenticated: true,
+      tools: [SEARCH_TOOL, collidingTool],
+    });
+    const sessionHandler = fake.handle;
+    endpoints.use(async (req) => {
+      if (req.host === 'recipes.example.test' && req.method === 'DELETE' && req.path === '/mcp') {
+        const sid = req.headers['mcp-session-id'];
+        if (typeof sid === 'string') deletedSessions.push(sid);
+        return { status: 204 };
+      }
+      const reply = await sessionHandler(req);
+      if (reply && req.method === 'POST' && req.body.includes('"initialize"')) {
+        sessionSeq += 1;
+        return {
+          ...reply,
+          headers: { ...reply.headers, 'mcp-session-id': `sess-up-${sessionSeq}` },
+        };
+      }
+      return reply;
+    });
+
+    const app = await connectOpenApp();
+    await relay.pinApp(app.id);
+    await relay.pinApp(app.id);
+    expect(deletedSessions).toContain('sess-up-1');
+
+    // 2) Settled direct call replay returns the cached result even after the tool is flipped to ask_first.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_menu',
+        definitionHash: toolDefinitionHash(SEARCH_TOOL),
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Lookup',
+      },
+      {
+        name: 'record_note',
+        definitionHash: toolDefinitionHash(collidingTool),
+        label: 'just_do',
+        source: 'principal',
+        reason: 'Allowed by principal',
+      },
+    ]);
+    const settledDirect = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_menu',
+      args: { query: 'before-flip' },
+      session,
+      requestId: 'req-flip-replay',
+    });
+    expect(settledDirect.status).toBe('completed');
+    await store.setToolLabel(app.id, 'search_menu', 'ask_first', 'principal', {
+      expectedHash: toolDefinitionHash(SEARCH_TOOL),
+    });
+    const replayedAfterFlip = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_menu',
+      args: { query: 'before-flip' },
+      session,
+      requestId: 'req-flip-replay',
+    });
+    expect(replayedAfterFlip).toEqual(expect.objectContaining({ status: 'completed' }));
+    expect(heldCalls).toHaveLength(0);
+
+    // 3) Colliding tool whose pinned schema declares assistant_summary preserves that upstream argument.
+    const collidingOutcome = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'record_note',
+      args: { id: 'n-1', assistant_summary: 'upstream note value' },
+      summary: 'Relay summary text',
+      session,
+      requestId: 'req-colliding-arg',
+    });
+    expect(collidingOutcome.status).toBe('completed');
+    expect(fake.toolCalls.find((c) => c.name === 'record_note')?.arguments).toEqual({
+      id: 'n-1',
+      assistant_summary: 'upstream note value',
+    });
+
+    // 4) Catalog pagination succeeds at 50 pages and fails (preserving existing pin) when page 50 still has nextCursor.
+    let totalPages = 50;
+    fake.mcpOverride = (incoming) => {
+      if (!incoming.body.includes('"tools/list"')) return undefined;
+      const body = JSON.parse(incoming.body) as { id?: number; params?: { cursor?: string } };
+      const pageNum = body.params?.cursor ? Number(body.params.cursor) : 1;
+      const nextCursor = pageNum < totalPages ? String(pageNum + 1) : undefined;
+      return {
+        status: 200,
+        body: {
+          jsonrpc: '2.0',
+          id: body.id,
+          result: {
+            tools: [{ name: `tool_p_${pageNum}`, description: `Page ${pageNum}`, inputSchema: { type: 'object' } }],
+            ...(nextCursor ? { nextCursor } : {}),
+          },
+        },
+      };
+    };
+    const exact50 = await relay.pinApp(app.id);
+    expect(exact50.tools).toHaveLength(50);
+
+    totalPages = 51;
+    await expect(relay.pinApp(app.id)).rejects.toThrow(/exceeded 50 pages/);
+    expect(await store.listTools(app.id)).toHaveLength(50);
+    fake.mcpOverride = undefined;
+
+    // 5) Handshake EgressError (sent: true on initialize) reports tools/call as unsent, not unknown.
+    let releaseStalledInit = (): void => undefined;
+    fake.mcpOverride = async (incoming) => {
+      if (incoming.body.includes('"initialize"')) {
+        await new Promise<void>((resolve) => {
+          releaseStalledInit = resolve;
+        });
+      }
+      return undefined;
+    };
+    const handshakeFailRelay = createAppRelay({
+      store,
+      egress: endpoints.egress,
+      timeoutMs: 60,
+      now: () => clock,
+    });
+    try {
+      await store.pinTools(app.id, { instructions: null, tools: [SEARCH_TOOL] });
+      await store.setToolLabel(app.id, 'search_menu', 'just_do', 'principal', {
+        expectedHash: toolDefinitionHash(SEARCH_TOOL),
+      });
+      const handshakeRes = await handshakeFailRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'hs-fail' },
+        session,
+        requestId: 'req-handshake-unsent',
+      });
+      expect(handshakeRes).toMatchObject({ status: 'unsent', reason: 'timeout' });
+    } finally {
+      releaseStalledInit();
+      fake.mcpOverride = undefined;
+      await handshakeFailRelay.closeAll();
+    }
+
+    // 6) Preflight definition_changed whose replacement is already just_do settles its own claim without deleting it first.
+    let blockFirst = true;
+    let releaseFirst = (): void => undefined;
+    let notifyFirst = (): void => undefined;
+    const defChangeRelay = createAppRelay({
+      store,
+      egress: {
+        ...endpoints.egress,
+        resolve: async (target) => {
+          if (blockFirst) {
+            blockFirst = false;
+            notifyFirst();
+            await new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          return endpoints.egress.resolve!(target);
+        },
+      },
+      now: () => clock,
+    });
+    try {
+      const firstEntered = new Promise<void>((resolve) => {
+        notifyFirst = resolve;
+      });
+      const blocker = defChangeRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'blocker' },
+        session,
+        requestId: 'req-def-blocker',
+      });
+      await firstEntered;
+      const queued = defChangeRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'queued-def-change' },
+        session,
+        requestId: 'req-def-justdo',
+      });
+      await vi.waitFor(async () => {
+        expect(await store.getRelayCall(`direct:${session.id}:req-def-justdo`)).toMatchObject({ state: 'executing' });
+      });
+      const updatedSearch = { ...SEARCH_TOOL, description: 'Updated search menu v2' };
+      await store.pinTools(app.id, { instructions: null, tools: [updatedSearch] });
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'search_menu',
+          definitionHash: toolDefinitionHash(updatedSearch),
+          label: 'just_do',
+          source: 'sorter',
+          reason: 'Updated lookup',
+        },
+      ]);
+      releaseFirst();
+      await blocker;
+      expect(await queued).toMatchObject({ status: 'unsent', reason: 'definition_changed' });
+      expect(await store.getRelayCall(`direct:${session.id}:req-def-justdo`)).toMatchObject({ state: 'unsent' });
+
+      // 7) A transport failure/timeout after fetch started reports unknown, never unsent.
+      let releaseStalledCall = (): void => undefined;
+      fake.mcpOverride = async (incoming) => {
+        if (incoming.body.includes('"tools/call"')) {
+          await new Promise<void>((resolve) => {
+            releaseStalledCall = resolve;
+          });
+        }
+        return undefined;
+      };
+      const pendingFetchRelay = createAppRelay({
+        store,
+        egress: endpoints.egress,
+        timeoutMs: 80,
+        now: () => clock,
+      });
+      try {
+        const timeoutOutcome = await pendingFetchRelay.callTool({
+          serverKey: app.serverKey,
+          toolName: 'search_menu',
+          args: { query: 'timeout-mid-fetch' },
+          session,
+          requestId: 'req-mid-fetch-timeout',
+        });
+        expect(timeoutOutcome).toMatchObject({ status: 'unknown' });
+      } finally {
+        releaseStalledCall();
+        fake.mcpOverride = undefined;
+        await pendingFetchRelay.closeAll();
+      }
+    } finally {
+      await defChangeRelay.closeAll();
     }
   });
 });

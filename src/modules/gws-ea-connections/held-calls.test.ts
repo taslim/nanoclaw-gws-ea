@@ -670,4 +670,87 @@ describe('held ask-first calls', () => {
     expect(outcome).toMatchObject({ status: 'unsent', reason: 'details_unavailable' });
     expect(deliveredCards).toHaveLength(0);
   });
+
+  it('deduplicates concurrent holds for the same invocationId and caps over-long tool names within card limits', async () => {
+    const longToolName = `confirm_${'very_long_segment_'.repeat(160)}`;
+    const confirmTool: FakeToolDefinition = {
+      name: 'confirm_checkout',
+      description: 'Place the food order.',
+      inputSchema: { type: 'object', properties: { checkout_id: { type: 'string' } }, required: ['checkout_id'] },
+    };
+    const longTool: FakeToolDefinition = {
+      name: longToolName,
+      description: 'Place an order with a huge tool name',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    };
+    const fake = new FakeMcpApp({
+      appUrl: FOOD_URL,
+      issuer: 'https://mcp.chow.example.test/',
+      allowUnauthenticated: true,
+      tools: [confirmTool, longTool],
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'Chow', url: FOOD_URL, auth: 'none' });
+    await store.connect(created.id, created.version, { kind: 'none' });
+    const pinned = await store.pinTools(created.id, {
+      instructions: null,
+      tools: [confirmTool, longTool],
+    });
+    await store.applyToolLabels(
+      created.id,
+      pinned.tools.map((tool) => ({
+        name: tool.name,
+        definitionHash: tool.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      })),
+    );
+    const app = await store.get(created.id);
+    relay = startAppRelay({
+      store,
+      egress: endpoints.egress,
+      onHoldCall: createHoldCallHandler({ store, webHostname: async () => HOSTNAME }),
+    });
+
+    // 1) Two concurrent calls with the same invocationId produce a single pending approval and return the same ID.
+    const [first, second] = await Promise.all([
+      relay!.callTool({
+        serverKey: app.serverKey,
+        toolName: 'confirm_checkout',
+        args: { checkout_id: 'chk_concurrent' },
+        summary: 'Place concurrent order',
+        session: mainSession,
+        requestId: 'req-concurrent-same',
+      }),
+      relay!.callTool({
+        serverKey: app.serverKey,
+        toolName: 'confirm_checkout',
+        args: { checkout_id: 'chk_concurrent' },
+        summary: 'Place concurrent order',
+        session: mainSession,
+        requestId: 'req-concurrent-same',
+      }),
+    ]);
+    expect(first.status).toBe('held');
+    expect(second.status).toBe('held');
+    expect(first.status === 'held' ? first.approvalId : undefined).toBe(
+      second.status === 'held' ? second.approvalId : undefined,
+    );
+    expect(deliveredCards).toHaveLength(1);
+
+    // 2) An over-long tool name is capped on the card so title + question never exceed MAX_CARD_QUESTION_LENGTH.
+    const longOutcome = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: longToolName,
+      args: { id: 'o-long-tool', extra: 'x'.repeat(2500) },
+      summary: 'Run long-named tool',
+      session: mainSession,
+      requestId: 'req-overlong-tool',
+    });
+    expect(longOutcome.status).toBe('held');
+    expect(deliveredCards).toHaveLength(2);
+    const longCard = deliveredCards[1]!;
+    expect(longCard.title.length + longCard.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
+  });
 });

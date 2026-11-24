@@ -345,6 +345,14 @@ CREATE INDEX IF NOT EXISTS idx_relay_calls_app_updated ON relay_calls(app_id, gr
 CREATE TABLE IF NOT EXISTS restart_request (
   id INTEGER PRIMARY KEY CHECK(id = 1), applied_at TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS pending_gateway_cleanups (
+  host TEXT PRIMARY KEY, created_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS settled_tool_ask_requests (
+  request_id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  settled_at TEXT NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS meta (
   id INTEGER PRIMARY KEY CHECK(id = 1), key_check BLOB NOT NULL
 ) STRICT;`;
@@ -1110,23 +1118,50 @@ export class ConnectionsStore {
     });
   }
 
-  /** Forgets the app, its client, grant and sign-in in one step. */
-  async remove(id: string, version: number): Promise<ReleaseResult> {
+  /** Forgets the app, its client, grant and sign-in in one step; optionally queues legacy gateway cleanup for its host. */
+  async remove(
+    id: string,
+    version: number,
+    options?: { readonly pendingGatewayCleanup?: boolean; readonly at?: string },
+  ): Promise<ReleaseResult> {
     versionValid(version);
+    const at = options?.at ?? new Date().toISOString();
+    isoValid(at);
     return this.use(async (db) => {
       this.appAt(db, id, version);
       return this.withReadableKey(db, (key) =>
         db
           .transaction(() => {
-            this.appAt(db, id, version);
+            const app = this.appAt(db, id, version);
             const row = this.grantRow(db, id);
             const released = row && this.credentials(row, key);
+            if (options?.pendingGatewayCleanup) {
+              db.prepare(
+                `INSERT INTO pending_gateway_cleanups (host, created_at) VALUES (?, ?)
+                  ON CONFLICT(host) DO NOTHING`,
+              ).run(app.host, at);
+            }
             if (db.prepare('DELETE FROM apps WHERE id = ? AND version = ?').run(id, version).changes !== 1)
               throw new ConnectionsStoreError('app_changed');
             return { released };
           })
           .immediate(),
       );
+    });
+  }
+
+  async listPendingGatewayCleanups(): Promise<readonly string[]> {
+    return this.use((db) =>
+      db
+        .prepare<[], { host: string }>('SELECT host FROM pending_gateway_cleanups ORDER BY created_at, host')
+        .all()
+        .map((row) => row.host),
+    );
+  }
+
+  async clearPendingGatewayCleanup(host: string): Promise<void> {
+    await this.use((db) => {
+      db.prepare('DELETE FROM pending_gateway_cleanups WHERE host = ?').run(host);
     });
   }
 
@@ -1311,21 +1346,30 @@ export class ConnectionsStore {
     });
   }
 
-  async readAppTools(
-    appId: string,
-  ): Promise<
-    | { readonly app: ConnectionApp; readonly pin: AppPin | undefined; readonly tools: readonly PinnedAppTool[] }
+  async readAppTools(appId: string): Promise<
+    | {
+        readonly app: ConnectionApp;
+        readonly grantGeneration: number | undefined;
+        readonly pin: AppPin | undefined;
+        readonly tools: readonly PinnedAppTool[];
+      }
     | undefined
   > {
     return this.use((db) => {
       const row = db.prepare<[string], AppRow>(`SELECT ${APP_COLUMNS} FROM ${APP_FROM} WHERE a.id = ?`).get(appId);
       if (!row) return undefined;
+      const grant = this.grantRow(db, appId);
       const pinRow = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
       const tools = db
         .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? ORDER BY name')
         .all(appId)
         .map(toPinnedTool);
-      return { app: toApp(row), pin: pinRow && toAppPin(pinRow), tools };
+      return {
+        app: toApp(row),
+        grantGeneration: grant?.state === 'live' ? grant.generation : undefined,
+        pin: pinRow && toAppPin(pinRow),
+        tools,
+      };
     });
   }
 
@@ -1458,13 +1502,19 @@ export class ConnectionsStore {
   async applyToolLabels(
     appId: string,
     updates: readonly ToolLabelUpdate[],
-    options: { readonly sorterVersion?: string; readonly at?: string } = {},
+    options: { readonly expectedGrantGeneration?: number; readonly sorterVersion?: string; readonly at?: string } = {},
   ): Promise<number> {
     const at = options.at ?? new Date().toISOString();
     isoValid(at);
     return this.use((db) =>
       db
         .transaction(() => {
+          if (options.expectedGrantGeneration !== undefined) {
+            const grant = this.grantRow(db, appId);
+            if (!grant || grant.state !== 'live' || grant.generation !== options.expectedGrantGeneration) {
+              return 0;
+            }
+          }
           const selectTool = db.prepare<[string, string], AppToolRow>(
             'SELECT * FROM app_tools WHERE app_id = ? AND name = ?',
           );
@@ -1525,7 +1575,12 @@ export class ConnectionsStore {
   async markToolSortFailed(
     appId: string,
     targets: readonly { readonly name: string; readonly definitionHash: string }[],
-    options: { readonly maxAttempts?: number; readonly sorterVersion?: string; readonly at?: string } = {},
+    options: {
+      readonly expectedGrantGeneration?: number;
+      readonly maxAttempts?: number;
+      readonly sorterVersion?: string;
+      readonly at?: string;
+    } = {},
   ): Promise<void> {
     const at = options.at ?? new Date().toISOString();
     isoValid(at);
@@ -1533,6 +1588,12 @@ export class ConnectionsStore {
     await this.use((db) =>
       db
         .transaction(() => {
+          if (options.expectedGrantGeneration !== undefined) {
+            const grant = this.grantRow(db, appId);
+            if (!grant || grant.state !== 'live' || grant.generation !== options.expectedGrantGeneration) {
+              return;
+            }
+          }
           const selectTool = db.prepare<[string, string], AppToolRow>(
             'SELECT * FROM app_tools WHERE app_id = ? AND name = ?',
           );
@@ -1559,6 +1620,71 @@ export class ConnectionsStore {
               target.definitionHash,
             );
           }
+        })
+        .immediate(),
+    );
+  }
+
+  /**
+   * Atomically settles an approved `app_tool_ask` label change once per `requestId`, refusing to overwrite a newer
+   * principal edit on the Connections page or a changed tool definition.
+   */
+  async applyApprovedToolAsk(input: {
+    readonly requestId: string;
+    readonly appId: string;
+    readonly name: string;
+    readonly label: ToolLabel;
+    readonly expectedHash?: string;
+    readonly expectedPriorUpdatedAt?: string;
+    readonly reason?: string;
+    readonly at?: string;
+  }): Promise<'applied' | 'already_settled' | 'definition_changed' | 'principal_changed'> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    const reason = input.reason ?? (input.label === 'ask_first' ? 'Set to ask first' : 'Set to run without asking');
+    const principalFloor = input.label === 'ask_first' ? 1 : 0;
+    return this.use((db) =>
+      db
+        .transaction((): 'applied' | 'already_settled' | 'definition_changed' | 'principal_changed' => {
+          const settled = db
+            .prepare<
+              [string],
+              { request_id: string }
+            >('SELECT request_id FROM settled_tool_ask_requests WHERE request_id = ?')
+            .get(input.requestId);
+          if (settled) return 'already_settled';
+          const row = db
+            .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+            .get(input.appId, input.name);
+          if (!row || (input.expectedHash !== undefined && row.definition_hash !== input.expectedHash)) {
+            return 'definition_changed';
+          }
+          if (
+            input.expectedPriorUpdatedAt !== undefined &&
+            row.label_source === 'principal' &&
+            row.updated_at !== input.expectedPriorUpdatedAt
+          ) {
+            return 'principal_changed';
+          }
+          db.prepare(
+            `UPDATE app_tools SET label = ?, label_source = 'approved_request', reason = ?, principal_floor = ?,
+              unsettled = 0, updated_at = ?
+              WHERE app_id = ? AND name = ?`,
+          ).run(input.label, reason, principalFloor, at, input.appId, input.name);
+          if (principalFloor === 1) {
+            db.prepare(
+              `INSERT INTO app_tool_floors (app_id, name, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(app_id, name) DO UPDATE SET updated_at = excluded.updated_at`,
+            ).run(input.appId, input.name, at);
+          } else {
+            db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?').run(input.appId, input.name);
+          }
+          db.prepare('INSERT INTO settled_tool_ask_requests (request_id, app_id, settled_at) VALUES (?, ?, ?)').run(
+            input.requestId,
+            input.appId,
+            at,
+          );
+          return 'applied';
         })
         .immediate(),
     );
@@ -1616,7 +1742,10 @@ export class ConnectionsStore {
           if (!pin) return false;
           if (expectedListHash !== undefined && pin.list_hash !== expectedListHash) return false;
           const unsorted = db
-            .prepare<[string], { n: number }>('SELECT COUNT(*) AS n FROM app_tools WHERE app_id = ? AND label IS NULL')
+            .prepare<
+              [string],
+              { n: number }
+            >('SELECT COUNT(*) AS n FROM app_tools WHERE app_id = ? AND (label IS NULL OR unsettled = 1)')
             .get(appId);
           if ((unsorted?.n ?? 0) > 0) return false;
           return (
@@ -1782,6 +1911,13 @@ export class ConnectionsStore {
     );
   }
 
+  async getRelayCall(id: string): Promise<RelayCallRecord | undefined> {
+    return this.use((db) => {
+      const row = db.prepare<[string], RelayCallRow>('SELECT * FROM relay_calls WHERE id = ?').get(id);
+      return row ? toRelayCall(row) : undefined;
+    });
+  }
+
   /** Removes a direct relay_calls record when pre-send verification reroutes the call before any upstream send. */
   async deleteRelayCall(id: string): Promise<void> {
     await this.use((db) =>
@@ -1820,12 +1956,13 @@ export class ConnectionsStore {
           );
           if (row && row.approval_id === null) {
             db.prepare(
-              `DELETE FROM relay_calls
-                WHERE app_id = ? AND approval_id IS NULL AND state != 'executing' AND id NOT IN (
-                  SELECT id FROM relay_calls
-                    WHERE app_id = ? AND approval_id IS NULL AND state != 'executing'
-                    ORDER BY updated_at DESC LIMIT ?
-                )`,
+              `UPDATE relay_calls SET outcome_json = NULL
+                WHERE app_id = ? AND approval_id IS NULL AND state != 'executing' AND outcome_json IS NOT NULL
+                  AND id NOT IN (
+                    SELECT id FROM relay_calls
+                      WHERE app_id = ? AND approval_id IS NULL AND state != 'executing'
+                      ORDER BY updated_at DESC, id DESC LIMIT ?
+                  )`,
             ).run(row.app_id, row.app_id, MAX_RECENT_DIRECT_CALLS_PER_APP);
           }
         })

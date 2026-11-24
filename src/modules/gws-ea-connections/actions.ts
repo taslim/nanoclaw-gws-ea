@@ -60,7 +60,7 @@ export interface AppActionDependencies {
 const ADD_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'url', 'name']);
 /** The approved request also carries the app's id, so it deletes exactly the app the principal saw. */
 const DELETE_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'app', 'id']);
-const TOOL_ASK_APPROVAL_BOUND_FIELDS = ['id', 'definitionHash'] as const;
+const TOOL_ASK_APPROVAL_BOUND_FIELDS = ['id', 'definitionHash', 'priorUpdatedAt'] as const;
 const TOOL_ASK_FIELDS: ReadonlySet<string> = new Set([
   'action',
   'requestId',
@@ -189,6 +189,7 @@ interface ToolAskRequest {
   readonly reason?: string;
   readonly id?: string;
   readonly definitionHash?: string;
+  readonly priorUpdatedAt?: string;
 }
 
 function fieldsOnly(content: Record<string, unknown>, allowed: ReadonlySet<string>, takes: string): void {
@@ -233,6 +234,8 @@ function toolAskRequest(content: Record<string, unknown>, requestId: string): To
   if (content.id !== undefined && typeof content.id !== 'string') throw invalidArgs('Invalid app id.');
   if (content.definitionHash !== undefined && typeof content.definitionHash !== 'string')
     throw invalidArgs('Invalid definition hash.');
+  if (content.priorUpdatedAt !== undefined && typeof content.priorUpdatedAt !== 'string')
+    throw invalidArgs('Invalid tool version.');
   const reason =
     typeof content.reason === 'string' && content.reason.trim() ? content.reason.trim().slice(0, 200) : undefined;
   return {
@@ -243,6 +246,7 @@ function toolAskRequest(content: Record<string, unknown>, requestId: string): To
     ...(reason === undefined ? {} : { reason }),
     ...(typeof content.id === 'string' ? { id: content.id } : {}),
     ...(typeof content.definitionHash === 'string' ? { definitionHash: content.definitionHash } : {}),
+    ...(typeof content.priorUpdatedAt === 'string' ? { priorUpdatedAt: content.priorUpdatedAt } : {}),
   };
 }
 
@@ -595,6 +599,7 @@ export function createAppActions(dependencies: AppActionDependencies) {
       id: app.id,
       tool: tool.name,
       definitionHash: tool.definitionHash,
+      priorUpdatedAt: tool.updatedAt,
       ask_first: request.askFirst,
       ...(request.reason === undefined ? {} : { reason: request.reason }),
     };
@@ -623,13 +628,23 @@ export function createAppActions(dependencies: AppActionDependencies) {
     if (!app || app.id !== request.id)
       return `The principal approved changing ${request.app}.${request.tool}, but that app is no longer there.`;
     const nextLabel = request.askFirst ? 'ask_first' : 'just_do';
-    const updated = await context.store.setToolLabel(app.id, request.tool, nextLabel, 'approved_request', {
-      expectedHash: request.definitionHash,
+    const outcome = await context.store.applyApprovedToolAsk({
+      requestId: request.requestId,
+      appId: app.id,
+      name: request.tool,
+      label: nextLabel,
+      ...(request.definitionHash === undefined ? {} : { expectedHash: request.definitionHash }),
+      ...(request.priorUpdatedAt === undefined ? {} : { expectedPriorUpdatedAt: request.priorUpdatedAt }),
     });
-    if (!updated) {
+    if (outcome === 'definition_changed') {
       return `The principal approved changing ${app.name}.${request.tool}, but the tool definition changed since approval was requested, so nothing changed.`;
     }
-    await notifyMainToolsChanged(context.store);
+    if (outcome === 'principal_changed') {
+      return `The principal already updated ${app.name}.${request.tool} on their Connections page, so nothing changed.`;
+    }
+    if (outcome === 'applied') {
+      await notifyMainToolsChanged(context.store);
+    }
     return request.askFirst
       ? `The principal approved asking first before ${app.name}.${request.tool}.`
       : `The principal approved running ${app.name}.${request.tool} without asking first.`;

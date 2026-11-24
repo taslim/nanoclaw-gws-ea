@@ -60,7 +60,65 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
     expect(suite.sorterVersion).toContain('@claude-sonnet-4-6');
   });
 
-  it('fails immediately on a planted wrong just_do for a must_ask tool or a stale hash', () => {
+  it('fails immediately on a wrong just_do for a must_ask tool, missing tool, stale hash, or conflicting labels', () => {
+    const banking = APP_TOOL_SORT_CORPUS.find((entry) => entry.id === 'banking')!;
+    const passingUpdates = banking.tools.map((item) => ({
+      name: item.definition.name,
+      definitionHash: item.definitionHash,
+      label: item.expectation === 'must_ask' ? ('ask_first' as const) : ('just_do' as const),
+      source: 'sorter' as const,
+      reason: 'Baseline classification',
+    }));
+    expect(scoreSortCase(banking, passingUpdates).passed).toBe(true);
+
+    const wrongJustDo = scoreSortCase(
+      banking,
+      passingUpdates.map((item) => (item.name === 'wire_funds' ? { ...item, label: 'just_do' as const } : item)),
+    );
+    expect(wrongJustDo.passed).toBe(false);
+    expect(wrongJustDo.missedMustAsk.map((item) => item.name)).toEqual(['wire_funds']);
+
+    const suite = scoreSortSuite({
+      model: 'test-model',
+      sorterVersion: sorterVersion('test-model'),
+      cases: [wrongJustDo],
+    });
+    expect(suite.passed).toBe(false);
+    expect(suite.missedMustAskCount).toBe(1);
+
+    const missing = scoreSortCase(
+      banking,
+      passingUpdates.filter((item) => item.name !== 'freeze_card'),
+    );
+    expect(missing.passed).toBe(false);
+    expect(missing.missingTools).toEqual(['freeze_card']);
+
+    const staleHash = scoreSortCase(
+      banking,
+      passingUpdates.map((item) =>
+        item.name === 'freeze_card' ? { ...item, definitionHash: 'stale-hash-000' } : item,
+      ),
+    );
+    expect(staleHash.passed).toBe(false);
+    expect(staleHash.missingTools).toEqual(['freeze_card']);
+
+    // Stale duplicate after a current entry does not hide the valid current entry; conflicting current labels fail closed.
+    const freezeExpected = passingUpdates.find((item) => item.name === 'freeze_card')!;
+    const withTrailingStale = scoreSortCase(banking, [
+      ...passingUpdates,
+      { ...freezeExpected, definitionHash: 'stale-hash-999', label: 'just_do' as const },
+    ]);
+    expect(withTrailingStale.passed).toBe(true);
+
+    const withCurrentConflict = scoreSortCase(banking, [
+      ...passingUpdates,
+      { ...freezeExpected, label: 'just_do' as const },
+    ]);
+    expect(withCurrentConflict.passed).toBe(false);
+    expect(withCurrentConflict.missingTools).toEqual(['freeze_card']);
+  });
+
+  it('integrates with resolveFinalToolUpdates when a non-floored must_ask tool is misclassified', () => {
     const banking = APP_TOOL_SORT_CORPUS.find((entry) => entry.id === 'banking')!;
     const expected = new Map(
       banking.tools.map((item) => [
@@ -68,7 +126,6 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
         { definitionHash: item.definitionHash, definition: item.definition },
       ]),
     );
-    // Plant a wrong just_do on wire_funds (a must_ask tool without an English floor verb in its name).
     const planted = banking.tools.map((item) => ({
       name: item.definition.name,
       definitionHash: item.definitionHash,
@@ -84,27 +141,5 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
     const scored = scoreSortCase(banking, updates);
     expect(scored.passed).toBe(false);
     expect(scored.missedMustAsk.map((item) => item.name)).toEqual(['wire_funds']);
-
-    const suite = scoreSortSuite({
-      model: 'test-model',
-      sorterVersion: sorterVersion('test-model'),
-      cases: [scored],
-    });
-    expect(suite.passed).toBe(false);
-    expect(suite.missedMustAskCount).toBe(1);
-
-    const missing = scoreSortCase(
-      banking,
-      updates.filter((item) => item.name !== 'freeze_card'),
-    );
-    expect(missing.passed).toBe(false);
-    expect(missing.missingTools).toEqual(['freeze_card']);
-
-    const staleHash = scoreSortCase(
-      banking,
-      updates.map((item) => (item.name === 'freeze_card' ? { ...item, definitionHash: 'stale-hash-000' } : item)),
-    );
-    expect(staleHash.passed).toBe(false);
-    expect(staleHash.missingTools).toEqual(['freeze_card']);
   });
 });

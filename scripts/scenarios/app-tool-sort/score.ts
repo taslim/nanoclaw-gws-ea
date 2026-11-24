@@ -45,14 +45,25 @@ export function scoreSortCase(
   sortCase: SortEvalCase,
   updates: readonly Pick<ToolLabelUpdate, 'name' | 'definitionHash' | 'label' | 'source' | 'reason'>[],
 ): SortCaseScore {
-  const byName = new Map(updates.map((update) => [update.name, update]));
+  const expectedHashes = new Map(sortCase.tools.map((expected) => [expected.definition.name, expected.definitionHash]));
+  const byName = new Map<string, (typeof updates)[number]>();
+  const conflicted = new Set<string>();
+  for (const update of updates) {
+    if (update.definitionHash !== expectedHashes.get(update.name)) continue;
+    const previous = byName.get(update.name);
+    if (!previous) {
+      byName.set(update.name, update);
+    } else if (previous.label !== update.label) {
+      conflicted.add(update.name);
+    }
+  }
   const outcomes: ScoredToolOutcome[] = [];
   const missedMustAsk: ScoredToolOutcome[] = [];
   const unnecessaryAsks: ScoredToolOutcome[] = [];
   const missingTools: string[] = [];
 
   for (const expected of sortCase.tools) {
-    const actual = byName.get(expected.definition.name);
+    const actual = conflicted.has(expected.definition.name) ? undefined : byName.get(expected.definition.name);
     const valid = actual !== undefined && actual.definitionHash === expected.definitionHash;
     const outcome: ScoredToolOutcome = valid
       ? {

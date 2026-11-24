@@ -13,6 +13,7 @@ import '../modules/index.js';
 
 export const APP_RELAY_ACTION = 'app_relay';
 export const ASSISTANT_SUMMARY_FIELD = 'assistant_summary';
+export const FALLBACK_ASSISTANT_SUMMARY_PREFIX = 'nanoclaw_assistant_summary';
 export const ASSISTANT_SUMMARY_DESCRIPTION = 'What this will do, in one line.';
 
 export const DEFAULT_INIT_TIMEOUT_MS = 3_000;
@@ -56,20 +57,49 @@ const ASSISTANT_SUMMARY_PROPERTY = {
   description: ASSISTANT_SUMMARY_DESCRIPTION,
 } as const;
 
-function allowAssistantSummaryInBranch(subschema: unknown, depth: number): unknown {
+export function pickAssistantSummaryField(properties: Record<string, unknown>): string {
+  if (!Object.prototype.hasOwnProperty.call(properties, ASSISTANT_SUMMARY_FIELD)) {
+    return ASSISTANT_SUMMARY_FIELD;
+  }
+  if (!Object.prototype.hasOwnProperty.call(properties, FALLBACK_ASSISTANT_SUMMARY_PREFIX)) {
+    return FALLBACK_ASSISTANT_SUMMARY_PREFIX;
+  }
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${FALLBACK_ASSISTANT_SUMMARY_PREFIX}_${suffix}`;
+    if (!Object.prototype.hasOwnProperty.call(properties, candidate)) return candidate;
+  }
+}
+
+function allowSummaryInPropertyNames(propertyNames: unknown, summaryField: string): unknown {
+  if (propertyNames === undefined || propertyNames === true) return propertyNames;
+  if (propertyNames === false) return { const: summaryField };
+  if (isRecord(propertyNames)) {
+    return { anyOf: [propertyNames, { const: summaryField }] };
+  }
+  return propertyNames;
+}
+
+function allowAssistantSummaryInBranch(subschema: unknown, summaryField: string, depth: number): unknown {
   if (depth > 4 || !isRecord(subschema)) return subschema;
   let changed = false;
   const next: Record<string, unknown> = { ...subschema };
 
   const subProps = isRecord(subschema.properties) ? subschema.properties : undefined;
-  const hasSummary = subProps !== undefined && Object.prototype.hasOwnProperty.call(subProps, ASSISTANT_SUMMARY_FIELD);
+  const hasSummary = subProps !== undefined && Object.prototype.hasOwnProperty.call(subProps, summaryField);
 
   if (!hasSummary && (subschema.additionalProperties === false || subschema.unevaluatedProperties === false)) {
     next.properties = {
       ...(subProps ?? {}),
-      [ASSISTANT_SUMMARY_FIELD]: ASSISTANT_SUMMARY_PROPERTY,
+      [summaryField]: ASSISTANT_SUMMARY_PROPERTY,
     };
     changed = true;
+  }
+  if (!hasSummary && Object.prototype.hasOwnProperty.call(subschema, 'propertyNames')) {
+    const updatedNames = allowSummaryInPropertyNames(subschema.propertyNames, summaryField);
+    if (updatedNames !== subschema.propertyNames) {
+      next.propertyNames = updatedNames;
+      changed = true;
+    }
   }
   if (!hasSummary && typeof subschema.maxProperties === 'number' && Number.isFinite(subschema.maxProperties)) {
     next.maxProperties = subschema.maxProperties + 1;
@@ -82,7 +112,7 @@ function allowAssistantSummaryInBranch(subschema: unknown, depth: number): unkno
   for (const combiner of ['allOf', 'anyOf', 'oneOf'] as const) {
     const branches = subschema[combiner];
     if (Array.isArray(branches)) {
-      const updated = branches.map((branch) => allowAssistantSummaryInBranch(branch, depth + 1));
+      const updated = branches.map((branch) => allowAssistantSummaryInBranch(branch, summaryField, depth + 1));
       if (updated.some((entry, index) => entry !== branches[index])) {
         next[combiner] = updated;
         changed = true;
@@ -92,18 +122,23 @@ function allowAssistantSummaryInBranch(subschema: unknown, depth: number): unkno
   return changed ? next : subschema;
 }
 
-export function withAssistantSummarySchema(schema: Record<string, unknown>): Tool['inputSchema'] {
+export function withAssistantSummarySchema(
+  schema: Record<string, unknown>,
+  summaryField?: string,
+): Tool['inputSchema'] {
   const existingProperties = isRecord(schema.properties) ? schema.properties : {};
-  const alreadyPresent = Object.prototype.hasOwnProperty.call(existingProperties, ASSISTANT_SUMMARY_FIELD);
+  const field = summaryField ?? pickAssistantSummaryField(existingProperties);
+  const alreadyPresent = Object.prototype.hasOwnProperty.call(existingProperties, field);
   const existingRequired = Array.isArray(schema.required)
     ? schema.required.filter((entry): entry is string => typeof entry === 'string')
     : [];
-  const required = existingRequired.includes(ASSISTANT_SUMMARY_FIELD)
-    ? [...existingRequired]
-    : [...existingRequired, ASSISTANT_SUMMARY_FIELD];
+  const required = existingRequired.includes(field) ? [...existingRequired] : [...existingRequired, field];
 
   const base: Record<string, unknown> = { ...schema };
   if (!alreadyPresent) {
+    if (Object.prototype.hasOwnProperty.call(schema, 'propertyNames')) {
+      base.propertyNames = allowSummaryInPropertyNames(schema.propertyNames, field);
+    }
     if (typeof schema.maxProperties === 'number' && Number.isFinite(schema.maxProperties)) {
       base.maxProperties = schema.maxProperties + 1;
     }
@@ -113,31 +148,38 @@ export function withAssistantSummarySchema(schema: Record<string, unknown>): Too
     for (const combiner of ['allOf', 'anyOf', 'oneOf'] as const) {
       const branches = schema[combiner];
       if (Array.isArray(branches)) {
-        base[combiner] = branches.map((branch) => allowAssistantSummaryInBranch(branch, 0));
+        base[combiner] = branches.map((branch) => allowAssistantSummaryInBranch(branch, field, 0));
       }
     }
   }
 
+  const properties: Record<string, object> = {};
+  for (const [key, value] of Object.entries(existingProperties)) {
+    if (isRecord(value)) properties[key] = value;
+  }
+  properties[field] = ASSISTANT_SUMMARY_PROPERTY;
+
   return {
     ...base,
     type: 'object',
-    properties: {
-      ...existingProperties,
-      [ASSISTANT_SUMMARY_FIELD]: ASSISTANT_SUMMARY_PROPERTY,
-    },
+    properties,
     required,
   };
 }
 
-export function extractSummaryAndArgs(rawArgs: Record<string, unknown> | undefined): {
+export function extractSummaryAndArgs(
+  rawArgs: Record<string, unknown> | undefined,
+  summaryField: string | null = ASSISTANT_SUMMARY_FIELD,
+): {
   readonly args: Record<string, unknown>;
   readonly summary?: string;
 } {
   if (!rawArgs) return { args: {} };
+  if (summaryField === null) return { args: { ...rawArgs } };
   const args: Record<string, unknown> = {};
   let summary: string | undefined;
   for (const [key, value] of Object.entries(rawArgs)) {
-    if (key === ASSISTANT_SUMMARY_FIELD) {
+    if (key === summaryField) {
       if (typeof value === 'string' && value.trim().length > 0) summary = value.trim();
       continue;
     }
@@ -146,12 +188,14 @@ export function extractSummaryAndArgs(rawArgs: Record<string, unknown> | undefin
   return summary === undefined ? { args } : { args, summary };
 }
 
-function formatRelayedTool(raw: unknown): Tool | undefined {
+function formatRelayedTool(raw: unknown): { readonly tool: Tool; readonly summaryField: string | null } | undefined {
   if (!isRecord(raw) || typeof raw.name !== 'string' || !isRecord(raw.inputSchema)) return undefined;
   const label = raw.label === 'ask_first' || raw.label === 'just_do' ? raw.label : null;
+  const existingProperties = isRecord(raw.inputSchema.properties) ? raw.inputSchema.properties : {};
+  const summaryField = label === 'ask_first' ? pickAssistantSummaryField(existingProperties) : null;
   const inputSchema =
-    label === 'ask_first'
-      ? withAssistantSummarySchema(raw.inputSchema)
+    summaryField !== null
+      ? withAssistantSummarySchema(raw.inputSchema, summaryField)
       : ({ ...raw.inputSchema, type: 'object' } as Tool['inputSchema']);
   const tool: Tool = {
     name: raw.name,
@@ -160,7 +204,7 @@ function formatRelayedTool(raw: unknown): Tool | undefined {
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
     ...(isRecord(raw.annotations) ? { annotations: raw.annotations as Tool['annotations'] } : {}),
   };
-  return tool;
+  return { tool, summaryField };
 }
 
 export async function fetchAppInstructions(serverKey: string, deps: AppRelayDeps): Promise<string | undefined> {
@@ -202,7 +246,9 @@ function mapCallOutcome(result: ActionRequestResult): CallToolResult {
     case 'not-sent':
       return errorToolResult(result.reason);
     case 'cancelled':
-      return errorToolResult('The app tool call was cancelled.');
+      return errorToolResult(
+        'Waiting for this app tool call was cancelled; the call may still complete on the host — check before retrying.',
+      );
     case 'timeout':
       return errorToolResult('The host did not answer this app tool call in time; check before retrying.');
     case 'answered':
@@ -233,6 +279,7 @@ export async function createAppRelayServer(serverKey: string, overrides: Partial
     },
   );
   let lastToolsVersion: string | undefined;
+  const toolSummaryFields = new Map<string, string | null>();
 
   server.setRequestHandler(ListToolsRequestSchema, async (_request, context) => {
     const result = await deps.run(() =>
@@ -253,15 +300,24 @@ export async function createAppRelayServer(serverKey: string, overrides: Partial
     }
     const rawTools =
       isRecord(result.frame.data) && Array.isArray(result.frame.data.tools) ? result.frame.data.tools : [];
-    const tools = rawTools.flatMap((entry) => {
+    const nextSummaryFields = new Map<string, string | null>();
+    const tools: Tool[] = [];
+    for (const entry of rawTools) {
       const formatted = formatRelayedTool(entry);
-      return formatted ? [formatted] : [];
-    });
+      if (!formatted) continue;
+      nextSummaryFields.set(formatted.tool.name, formatted.summaryField);
+      tools.push(formatted.tool);
+    }
+    toolSummaryFields.clear();
+    for (const [name, field] of nextSummaryFields) toolSummaryFields.set(name, field);
     return { tools };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, context) => {
-    const { args, summary } = extractSummaryAndArgs(request.params.arguments);
+    const summaryField = toolSummaryFields.has(request.params.name)
+      ? toolSummaryFields.get(request.params.name)!
+      : ASSISTANT_SUMMARY_FIELD;
+    const { args, summary } = extractSummaryAndArgs(request.params.arguments, summaryField);
     const result = await deps.run(() =>
       deps.request(
         APP_RELAY_ACTION,

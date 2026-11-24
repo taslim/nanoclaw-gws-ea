@@ -251,7 +251,7 @@ function toolRow(app: ConnectionApp, tool: PinnedAppTool): string {
 }
 
 function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
-  const hasUnsorted = tools.some((tool) => tool.label === null);
+  const hasUnsorted = tools.some((tool) => tool.label === null || tool.unsettled);
   const reviewBadge = pin
     ? hasUnsorted
       ? renderBadge('Being set up', 'neutral')

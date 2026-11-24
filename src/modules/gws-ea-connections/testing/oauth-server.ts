@@ -32,7 +32,7 @@ export interface FakeReply {
   readonly body?: unknown;
 }
 
-export type FakeHandler = (request: FakeRequest) => FakeReply | undefined;
+export type FakeHandler = (request: FakeRequest) => FakeReply | undefined | Promise<FakeReply | undefined>;
 
 export interface FakeEndpoints {
   readonly egress: Partial<EgressDependencies>;
@@ -87,30 +87,35 @@ export async function startFakeEndpoints(hosts: readonly string[]): Promise<Fake
     const chunks: Buffer[] = [];
     incoming.on('data', (chunk: Buffer) => chunks.push(chunk));
     incoming.on('end', () => {
-      const request: FakeRequest = {
-        host: (incoming.headers.host ?? '').replace(/:443$/u, ''),
-        method: incoming.method ?? '',
-        path: incoming.url ?? '',
-        headers: incoming.headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-      };
-      requests.push(request);
-      let reply: FakeReply = { status: 404, body: { error: 'not_found' } };
-      for (const handler of handlers) {
-        const answer = handler(request);
-        if (answer) {
-          reply = answer;
-          break;
+      void (async () => {
+        const request: FakeRequest = {
+          host: (incoming.headers.host ?? '').replace(/:443$/u, ''),
+          method: incoming.method ?? '',
+          path: incoming.url ?? '',
+          headers: incoming.headers,
+          body: Buffer.concat(chunks).toString('utf8'),
+        };
+        requests.push(request);
+        let reply: FakeReply = { status: 404, body: { error: 'not_found' } };
+        for (const handler of handlers) {
+          const answer = await handler(request);
+          if (answer) {
+            reply = answer;
+            break;
+          }
         }
-      }
-      const text =
-        typeof reply.body === 'string' ? reply.body : reply.body === undefined ? '' : JSON.stringify(reply.body);
-      const json = typeof reply.body !== 'string' && reply.body !== undefined;
-      outgoing.writeHead(reply.status, {
-        ...(json ? { 'content-type': 'application/json' } : {}),
-        ...reply.headers,
+        const text =
+          typeof reply.body === 'string' ? reply.body : reply.body === undefined ? '' : JSON.stringify(reply.body);
+        const json = typeof reply.body !== 'string' && reply.body !== undefined;
+        outgoing.writeHead(reply.status, {
+          ...(json ? { 'content-type': 'application/json' } : {}),
+          ...reply.headers,
+        });
+        outgoing.end(text);
+      })().catch((error: unknown) => {
+        if (!outgoing.headersSent) outgoing.writeHead(500, { 'content-type': 'application/json' });
+        outgoing.end(JSON.stringify({ error: error instanceof Error ? error.message : 'handler_failed' }));
       });
-      outgoing.end(text);
     });
   });
   server.listen(0, '127.0.0.1');
@@ -222,7 +227,7 @@ export class FakeMcpApp {
   readonly toolCalls: RecordedToolCall[] = [];
   tools: FakeToolDefinition[];
   instructions: string | undefined;
-  mcpOverride: ((request: FakeRequest) => FakeReply | undefined) | undefined;
+  mcpOverride: ((request: FakeRequest) => FakeReply | undefined | Promise<FakeReply | undefined>) | undefined;
   onToolCall: ((call: RecordedToolCall) => FakeToolResult | FakeReply | undefined) | undefined;
   private readonly refreshTokens = new Map<string, string>();
   private readonly codes = new Map<string, PendingCode>();
@@ -350,8 +355,8 @@ export class FakeMcpApp {
     return undefined;
   };
 
-  private mcp(request: FakeRequest): FakeReply {
-    const overridden = this.mcpOverride?.(request);
+  private async mcp(request: FakeRequest): Promise<FakeReply> {
+    const overridden = await this.mcpOverride?.(request);
     if (overridden) return overridden;
     const bearer = /^Bearer (.+)$/u.exec(request.headers.authorization ?? '')?.[1];
     if (!this.allowUnauthenticated && (bearer === undefined || !this.accessTokens.has(bearer)))

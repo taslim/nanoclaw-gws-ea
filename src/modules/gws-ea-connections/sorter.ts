@@ -81,12 +81,14 @@ function parseSortToolsPayload(content: Record<string, unknown>): readonly Parse
 interface PendingSort {
   readonly sortId: string;
   readonly appId: string;
+  readonly grantGeneration: number;
   readonly listHash: string;
   readonly sessionId: string;
   readonly threadId: string;
   readonly sorterVersion: string;
   readonly expected: ReadonlyMap<string, { readonly definitionHash: string; readonly definition: ToolDefinition }>;
   readonly waiters: Array<() => void>;
+  readonly isActive: () => boolean;
   readonly claim: () => boolean;
   readonly finish: () => void;
 }
@@ -139,6 +141,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       definitionHash: info.definitionHash,
     }));
     await store.markToolSortFailed(pending.appId, targets, {
+      expectedGrantGeneration: pending.grantGeneration,
       maxAttempts,
       sorterVersion: pending.sorterVersion,
       at,
@@ -146,16 +149,36 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
     await store.finishToolSort(pending.sortId, status, at);
   }
 
+  function finishCancelled(pending: PendingSort): void {
+    const at = new Date(now()).toISOString();
+    void store
+      .finishToolSort(pending.sortId, 'failed', at)
+      .catch((error: unknown) => {
+        hostLog.warn('Could not record cancelled app tool sort', { appId: pending.appId, error });
+      })
+      .finally(() => pending.finish());
+  }
+
+  function flushQueue(): void {
+    while (queue.length > 0) {
+      const job = queue.shift()!;
+      for (const notify of job.waiters) notify();
+    }
+  }
+
   async function runOneSort(job: QueuedSortJob): Promise<void> {
     if (stopped || dependencies.signal?.aborted) return;
     let pin: Awaited<ReturnType<ConnectionsStore['getPin']>>;
     let allTools: readonly PinnedAppTool[];
+    let grantGeneration: number | undefined;
     try {
-      const app = await store.get(job.appId);
-      if (app.status !== 'connected') return;
-      pin = await store.getPin(job.appId);
-      if (!pin) return;
-      allTools = await store.listTools(job.appId);
+      const snapshot = await store.readAppTools(job.appId);
+      if (!snapshot || snapshot.app.status !== 'connected' || !snapshot.pin || snapshot.grantGeneration === undefined) {
+        return;
+      }
+      pin = snapshot.pin;
+      allTools = snapshot.tools;
+      grantGeneration = snapshot.grantGeneration;
     } catch (error) {
       if (error instanceof ConnectionsStoreError) return;
       throw error;
@@ -172,7 +195,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       await store.markToolSortFailed(
         job.appId,
         targets.map((t) => ({ name: t.name, definitionHash: t.definitionHash })),
-        { maxAttempts, at: new Date(now()).toISOString() },
+        { expectedGrantGeneration: grantGeneration, maxAttempts, at: new Date(now()).toISOString() },
       );
       return;
     }
@@ -203,18 +226,20 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       const waiters: Array<() => void> = [];
 
       const onAbort = (): void => {
-        if (pending.claim()) pending.finish();
+        if (pending.claim()) finishCancelled(pending);
       };
 
       const pending: PendingSort = {
         sortId,
         appId: job.appId,
+        grantGeneration,
         listHash: pin.listHash,
         sessionId: session.id,
         threadId,
         sorterVersion: version,
         expected,
         waiters,
+        isActive: () => !claimed && !stopped && !dependencies.signal?.aborted,
         claim: () => {
           if (claimed) return false;
           claimed = true;
@@ -234,7 +259,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       activeSort = pending;
 
       if (stopped || dependencies.signal?.aborted) {
-        if (pending.claim()) pending.finish();
+        if (pending.claim()) finishCancelled(pending);
         return;
       }
 
@@ -264,8 +289,9 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
           } catch (error) {
             if (!isUniqueViolation(error)) throw error;
           }
+          if (!pending.isActive()) return;
           const woke = await requestWake(session, 'inbound-message');
-          if (!woke && !stopped && !dependencies.signal?.aborted) {
+          if (!woke && pending.isActive()) {
             hostLog.warn('App tool sorter session could not wake', { appId: job.appId });
             if (pending.claim()) {
               try {
@@ -307,6 +333,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
           }
         }
       } finally {
+        if (stopped || dependencies.signal?.aborted) flushQueue();
         running = false;
         drainPromise = undefined;
       }
@@ -396,22 +423,39 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
 
       const at = new Date(now()).toISOString();
       const { updates, missing } = resolveFinalToolUpdates(pending.expected, entries);
+      let labelsCommitted = false;
+      let sortFinished = false;
       try {
         if (updates.length > 0) {
-          await store.applyToolLabels(pending.appId, updates, {
+          const applied = await store.applyToolLabels(pending.appId, updates, {
+            expectedGrantGeneration: pending.grantGeneration,
             sorterVersion: pending.sorterVersion,
             at,
           });
-          await notifyMainToolsChanged(store);
+          labelsCommitted = true;
+          if (applied > 0) await notifyMainToolsChanged(store);
         }
         if (missing.length > 0) {
           await store.markToolSortFailed(pending.appId, missing, {
+            expectedGrantGeneration: pending.grantGeneration,
             maxAttempts,
             sorterVersion: pending.sorterVersion,
             at,
           });
         }
         await store.finishToolSort(pending.sortId, missing.length === 0 ? 'completed' : 'failed', at);
+        sortFinished = true;
+      } catch (error) {
+        if (!sortFinished) {
+          await store.finishToolSort(pending.sortId, 'failed', at).catch((finishError: unknown) => {
+            hostLog.warn('Could not mark failed app tool sort after reply error', {
+              appId: pending.appId,
+              labelsCommitted,
+              error: finishError,
+            });
+          });
+        }
+        throw error;
       } finally {
         pending.finish();
       }
@@ -421,11 +465,8 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
     async stop(): Promise<void> {
       stopped = true;
       const pending = activeSort;
-      if (pending?.claim()) pending.finish();
-      while (queue.length > 0) {
-        const job = queue.shift()!;
-        for (const notify of job.waiters) notify();
-      }
+      if (pending?.claim()) finishCancelled(pending);
+      flushQueue();
       if (drainPromise) await drainPromise;
     },
   };

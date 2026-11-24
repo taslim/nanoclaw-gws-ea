@@ -576,6 +576,56 @@ describe('app_tool_ask', () => {
     expect(cards).toEqual([]);
     expect(await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).toEqual([]);
   });
+
+  it('does not revert a principal label change when a restart replays an already-settled app_tool_ask approval', async () => {
+    const created = await store.create({ name: 'Food', url: RECIPES, auth: 'token' });
+    await store.connect(created.id, created.version, { kind: 'token', token: 'tok-replay' });
+    const v1 = normalizeToolDefinition({
+      name: 'confirm_checkout',
+      description: 'Place the food order.',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [v1] });
+    const hash = pinned.tools[0]!.definitionHash;
+    await store.applyToolLabels(created.id, [
+      {
+        name: 'confirm_checkout',
+        definitionHash: hash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'confirm_checkout',
+      ask_first: false,
+    });
+    const row = await onlyApproval(APP_TOOL_ASK_ACTION);
+    await transitionPendingApprovalStatus(row.approval_id, 'pending', 'approved');
+    const handler = getApprovalHandler(APP_TOOL_ASK_ACTION);
+    if (!handler) throw new Error('app_tool_ask has no approval handler');
+
+    // First execution settles the approved change to just_do (simulating crash before pending_approvals delete).
+    await handler({
+      session,
+      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      approval: { ...row, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('just_do');
+
+    // Principal later flips the tool back to ask_first on the Connections page.
+    await store.setToolLabel(created.id, 'confirm_checkout', 'ask_first', 'principal', { expectedHash: hash });
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
+
+    // Restart replays the approved row: must NOT revert the principal's ask_first choice.
+    await resumeApprovedApprovals();
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
+    expect((await store.getTool(created.id, 'confirm_checkout'))?.labelSource).toBe('principal');
+  });
 });
 
 describe("main's self-modification path", () => {

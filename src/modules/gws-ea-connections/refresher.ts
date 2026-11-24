@@ -261,17 +261,57 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     }
   }
 
-  async function sweepGatewayAppCredentials(app: ConnectionApp, held: readonly GatewayHostCredential[]) {
-    if (!gateway) return;
+  async function sweepGatewayAppCredentials(
+    held: readonly GatewayHostCredential[],
+    logFields: Readonly<Record<string, string>>,
+  ): Promise<boolean> {
+    if (!gateway) return true;
     const gatewayAppCredentials = held.filter(({ name }) => name.startsWith(APP_CREDENTIAL_PREFIX));
-    if (gatewayAppCredentials.length === 0) return;
+    if (gatewayAppCredentials.length === 0) return true;
     const removals = await gateway.removeById(gatewayAppCredentials.map(({ id }) => id));
-    if (removals.some(({ outcome }) => outcome === 'failed'))
+    if (removals.some(({ outcome }) => outcome === 'failed')) {
       log.warn('Could not remove a gateway app credential; retrying', {
-        appId: app.id,
+        ...logFields,
         code: 'remove_failed',
       });
-    else log.info('Removed gateway app credentials', { appId: app.id });
+      return false;
+    }
+    log.info('Removed gateway app credentials', logFields);
+    return true;
+  }
+
+  async function sweepPendingGatewayCleanups(): Promise<void> {
+    if (!gateway) return;
+    let hosts: readonly string[];
+    try {
+      hosts = await store.listPendingGatewayCleanups();
+    } catch (error) {
+      if (!(error instanceof ConnectionsStoreError)) throw error;
+      log.warn('Connections store unavailable', { code: error.reason });
+      return;
+    }
+    for (const pendingHost of hosts) {
+      if (dependencies.signal?.aborted) return;
+      let held: readonly GatewayHostCredential[] | undefined;
+      try {
+        held = await gateway.listForHost(pendingHost);
+        /* eslint-disable-next-line no-catch-all/no-catch-all -- background retry loop logs by code and retries next tick */
+      } catch (error) {
+        log.warn('Could not list app credentials; retrying', {
+          code: failureCode(error, 'gateway_failed'),
+        });
+        continue;
+      }
+      try {
+        const cleaned = await sweepGatewayAppCredentials(held, {});
+        if (cleaned) await store.clearPendingGatewayCleanup(pendingHost);
+        /* eslint-disable-next-line no-catch-all/no-catch-all -- background retry loop logs by code and retries next tick */
+      } catch (error) {
+        log.warn('Could not remove gateway app credentials; retrying', {
+          code: failureCode(error, 'remove_failed'),
+        });
+      }
+    }
   }
 
   async function reconcileApp(appId: string, host: string | undefined): Promise<void> {
@@ -294,9 +334,9 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         });
         if (held) {
           const listed = held;
-          await attempt(app.id, 'Could not remove gateway app credentials; retrying', 'remove_failed', () =>
-            sweepGatewayAppCredentials(app, listed),
-          );
+          await attempt(app.id, 'Could not remove gateway app credentials; retrying', 'remove_failed', async () => {
+            await sweepGatewayAppCredentials(listed, { appId: app.id });
+          });
         }
       }
       if (!live || live.kind !== app.auth) return;
@@ -321,6 +361,9 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
       for (const app of apps) {
         if (dependencies.signal?.aborted) return;
         await reconcileApp(app.id, host);
+      }
+      if (!dependencies.signal?.aborted) {
+        await sweepPendingGatewayCleanups();
       }
       if (!dependencies.signal?.aborted) {
         await applyStore();

@@ -119,9 +119,21 @@ function ensureConnectionsRuntime(
     else hostSignal.addEventListener('abort', () => controller.abort(), { once: true });
   }
   const signal = controller.signal;
-  runtimePromise = (async (): Promise<ConnectionsRuntime | undefined> => {
+  const start = async (): Promise<ConnectionsRuntime | undefined> => {
+    let restartStarted = false;
+    let reconnectStarted = false;
+    let sorterStarted = false;
+    let refresherStarted = false;
+    const rollbackStarted = async (): Promise<void> => {
+      if (refresherStarted) await stopConnectionsRefresher();
+      if (sorterStarted) await stopAppToolSorter();
+      if (reconnectStarted) await stopReconnectNotes();
+      if (restartStarted) await stopRestartChecks();
+    };
     try {
+      if (signal.aborted) return undefined;
       const store = await getConnectionsStore();
+      if (signal.aborted) return undefined;
       try {
         await store.sweepExpiredSignIns();
       } catch (error) {
@@ -129,10 +141,18 @@ function ensureConnectionsRuntime(
         if (!(error instanceof ConnectionsStoreError)) throw error;
         log.warn('Expired connection sign-ins not swept', { reason: error.reason });
       }
+      if (signal.aborted) return undefined;
       // Armed first, so a restart a previous host left pending and one this apply records are both served.
       startRestartChecks(store, signal);
+      restartStarted = true;
       await startReconnectNotes(store, signal);
+      reconnectStarted = true;
+      if (signal.aborted) {
+        await rollbackStarted();
+        return undefined;
+      }
       const sorter = startAppToolSorter({ store, signal });
+      sorterStarted = true;
       startConnectionsRefresher(store, signal, {
         onRefused: oweReconnectNote,
         onDisconnected: async (appId) => {
@@ -142,6 +162,11 @@ function ensureConnectionsRuntime(
         onTick: () => sorter.enqueuePending(),
         clientDocumentsServed,
       });
+      refresherStarted = true;
+      if (signal.aborted) {
+        await rollbackStarted();
+        return undefined;
+      }
       const relay = startAppRelay({
         store,
         onToolsNeedSort: (appId, listHash) => {
@@ -151,15 +176,20 @@ function ensureConnectionsRuntime(
       });
       return { store, sorter, relay };
     } catch (error) {
-      runtimePromise = undefined;
+      await rollbackStarted();
+      if (runtimePromise === started) runtimePromise = undefined;
       if (error instanceof ConnectionsStoreError) {
         log.warn('Connections store unavailable', { reason: error.reason });
         return undefined;
       }
       throw error;
+    } finally {
+      if (signal.aborted && runtimePromise === started) runtimePromise = undefined;
     }
-  })();
-  return runtimePromise;
+  };
+  const started = start();
+  runtimePromise = started;
+  return started;
 }
 
 /**
@@ -206,10 +236,12 @@ onHostStart(async ({ signal }) => {
 });
 
 onHostShutdown(async () => {
+  const pending = runtimePromise;
   runtimeController?.abort();
   runtimeController = undefined;
   runtimePromise = undefined;
   hostHookConsumed = false;
+  if (pending) await pending.catch(() => undefined);
   await drainRelayActions();
 });
 onHostShutdown(stopAppToolSorter);

@@ -18,7 +18,6 @@ import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { APP_SERVER_PREFIX } from './apply.js';
-import { ASSISTANT_SUMMARY_FIELD } from './canonical.js';
 import { getAppRelay, RELAY_SHUTDOWN_WAIT_MS, type AppRelay } from './relay.js';
 import { ConnectionsStoreError } from './store.js';
 
@@ -70,13 +69,7 @@ function parseRelayRequest(content: Record<string, unknown>): ParsedRelayRequest
   if (rawArgs !== undefined && !isRecord(rawArgs)) {
     throw invalidArgs('arguments must be a JSON object.');
   }
-  const cleanArgs: Record<string, unknown> = {};
-  if (rawArgs) {
-    for (const [key, value] of Object.entries(rawArgs)) {
-      if (key === ASSISTANT_SUMMARY_FIELD) continue;
-      cleanArgs[key] = value;
-    }
-  }
+  const cleanArgs: Record<string, unknown> = rawArgs ? { ...rawArgs } : {};
   const rawSummary = content.summary;
   if (rawSummary !== undefined && typeof rawSummary !== 'string') {
     throw invalidArgs('summary must be a string.');

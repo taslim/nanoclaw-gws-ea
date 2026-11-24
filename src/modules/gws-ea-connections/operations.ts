@@ -509,25 +509,28 @@ export class ConnectionOperations {
   }
 
   /** Best-effort cleanup of any legacy `gws-ea-app-` gateway credentials on the removed app's host. */
-  private async retireGatewayAppCredentials(appId: string, host: string): Promise<void> {
-    if (this.gateway === null) return;
+  private async retireGatewayAppCredentials(appId: string, host: string): Promise<boolean> {
+    if (this.gateway === null) return true;
     /* eslint-disable no-catch-all/no-catch-all -- best-effort gateway cleanup must never block removing an app */
     try {
       const gateway = this.gateway ?? gatewayHostCredentials();
-      if (!gateway) return;
+      if (!gateway) return true;
       const held = await gateway.listForHost(host);
       const legacyIds = held.filter(({ name }) => name.startsWith(APP_CREDENTIAL_PREFIX)).map(({ id }) => id);
-      if (legacyIds.length === 0) return;
+      if (legacyIds.length === 0) return true;
       const removals = await gateway.removeById(legacyIds);
       if (removals.some(({ outcome }) => outcome === 'failed')) {
         log.warn('Could not retire all legacy gateway app credentials during removal', { appId, host });
+        return false;
       }
+      return true;
     } catch (error) {
       log.warn('Could not retire legacy gateway app credentials during removal', {
         appId,
         host,
         error: error instanceof Error ? error.name : 'unknown',
       });
+      return false;
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
@@ -539,8 +542,8 @@ export class ConnectionOperations {
       const { app, released } = await this.store.disconnect(id, version);
       await this.notifyDisconnected(app.id);
       await revokeGrant(before.issuer, released, this.oauth);
-      await this.retireGatewayAppCredentials(app.id, before.host);
-      await this.store.remove(app.id, app.version);
+      const gatewayCleaned = await this.retireGatewayAppCredentials(app.id, before.host);
+      await this.store.remove(app.id, app.version, { pendingGatewayCleanup: !gatewayCleaned });
       await this.apply();
     });
   }

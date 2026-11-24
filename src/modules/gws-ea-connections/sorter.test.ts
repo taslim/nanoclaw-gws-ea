@@ -31,7 +31,7 @@ import type { Session } from '../../types.js';
 import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 import { ensureExternalEmailGroup } from '../gws-ea-external-email/group.js';
 import '../gws-ea-profile/index.js';
-import { normalizeToolDefinition, type ToolDefinition } from './canonical.js';
+import { normalizeToolDefinition, toolDefinitionHash, type ToolDefinition } from './canonical.js';
 import {
   APP_SORT_THREAD_PREFIX,
   createAppToolSorter,
@@ -41,6 +41,7 @@ import {
   READ_EXEMPT_NOUN_VERBS,
   READ_LEADING_VERBS,
   registerSortToolsAction,
+  resolveFinalToolUpdates,
   SORT_TOOLS_ACTION,
   sorterVersion,
   tokenizeToolName,
@@ -447,6 +448,8 @@ describe('isolated tool sorter session lifecycle', () => {
     const bad = await sendSortTools({ tools: [{ name: 'search_menu', label: 'bogus' }] }, wokeSession!);
     expect(bad.ok).toBe(false);
     await attempt2;
+    const sortsAfterAttempt2 = await store.listToolSorts(app.id);
+    expect(sortsAfterAttempt2.at(-1)?.status).toBe('failed');
     expect(await store.getTool(app.id, 'search_menu')).toMatchObject({
       label: 'ask_first',
       labelSource: 'fallback',
@@ -905,5 +908,96 @@ describe('exhaustive deterministic floor coverage', () => {
     );
     await revertedJob;
     expect(await store.getTool(app.id, 'search_menu')).toMatchObject({ label: 'just_do', unsettled: false });
+  });
+
+  it('catches graphQL and prefixItems floors, rejects conflicting labels, resolves queued waiters on abort, and blocks stale-generation writes', async () => {
+    // 1) graphQL camelCase variant and prefixItems action enum both trip deterministic floors.
+    expect(evaluateToolFloors(toolDef('graphQL', 'Query endpoint')).floor).toBe(true);
+    expect(
+      evaluateToolFloors(
+        toolDef('batch_tuple', 'Run tuple', {
+          inputSchema: {
+            type: 'object',
+            properties: {
+              steps: {
+                type: 'array',
+                prefixItems: [{ type: 'object', properties: { op: { type: 'string', enum: ['read', 'write'] } } }],
+              },
+            },
+          },
+        }),
+      ).floor,
+    ).toBe(true);
+
+    // 2) Conflicting classifications for the same current hash fail closed (missing), while stale-hash entries are ignored.
+    const safeDef = toolDef('lookup_item', 'Look up an item');
+    const safeHash = toolDefinitionHash(safeDef);
+    const expected = new Map([['lookup_item', { definitionHash: safeHash, definition: safeDef }]]);
+    const conflict = resolveFinalToolUpdates(expected, [
+      { name: 'lookup_item', definitionHash: safeHash, label: 'just_do', reason: 'Read' },
+      { name: 'lookup_item', definitionHash: safeHash, label: 'ask_first', reason: 'Mutates' },
+    ]);
+    expect(conflict.updates).toEqual([]);
+    expect(conflict.missing).toEqual([{ name: 'lookup_item', definitionHash: safeHash }]);
+
+    const staleIgnored = resolveFinalToolUpdates(expected, [
+      { name: 'lookup_item', definitionHash: 'stale-hash', label: 'ask_first', reason: 'Old' },
+      { name: 'lookup_item', definitionHash: safeHash, label: 'just_do', reason: 'Current read' },
+    ]);
+    expect(staleIgnored.missing).toEqual([]);
+    expect(staleIgnored.updates).toMatchObject([{ name: 'lookup_item', label: 'just_do' }]);
+
+    // 3) Signal abort drains queued enqueue() promises and finalizes the pending sort row without incrementing attempts.
+    const appA = await createConnectedApp('AppA', 'https://appa.example.test/mcp', [toolDef('list_a', 'List A')]);
+    const appB = await createConnectedApp('AppB', 'https://appb.example.test/mcp', [toolDef('list_b', 'List B')]);
+    const controller = new AbortController();
+    let wokeA: Session | undefined;
+    vi.mocked(requestWake).mockImplementation(async (session) => {
+      if (!wokeA) wokeA = session;
+      return true;
+    });
+    sorter = createAppToolSorter({ store, timeoutMs: 30_000, signal: controller.signal });
+    registerSortToolsAction({ sorter: () => sorter });
+    const jobA = sorter.enqueue(appA.app.id, appA.pin.listHash);
+    const jobB = sorter.enqueue(appB.app.id, appB.pin.listHash);
+    await vi.waitFor(() => expect(wokeA).toBeDefined());
+    controller.abort();
+    await Promise.all([jobA, jobB]);
+    expect((await store.listToolSorts(appA.app.id)).at(-1)?.status).toBe('failed');
+    expect((await store.getTool(appA.app.id, 'list_a'))?.sortAttempts).toBe(0);
+
+    // 4) A sort started under generation 1 cannot write labels into generation 2's re-pinned tools.
+    const genApp = await createConnectedApp('GenApp', 'https://gen.example.test/mcp', [toolDef('read_v1', 'Read')]);
+    let wokeGen: Session | undefined;
+    vi.mocked(requestWake).mockImplementation(async (session) => {
+      wokeGen = session;
+      return true;
+    });
+    sorter = createAppToolSorter({ store, timeoutMs: 5_000 });
+    registerSortToolsAction({ sorter: () => sorter });
+    const genJob = sorter.enqueue(genApp.app.id, genApp.pin.listHash);
+    await vi.waitFor(() => expect(wokeGen).toBeDefined());
+    // Replace grant (gen 1 -> gen 2) and re-pin the exact same tool definition.
+    const latest = await store.get(genApp.app.id);
+    await store.connect(latest.id, latest.version, { kind: 'token', token: 'tok-gen-2' });
+    const repinned = await store.pinTools(genApp.app.id, {
+      instructions: null,
+      tools: [toolDef('read_v1', 'Read')],
+    });
+    await sendSortTools(
+      {
+        tools: [
+          {
+            name: 'read_v1',
+            definition_hash: repinned.tools[0]!.definitionHash,
+            label: 'just_do',
+            reason: 'Gen 1 reply arriving during gen 2',
+          },
+        ],
+      },
+      wokeGen!,
+    );
+    await genJob;
+    expect((await store.getTool(genApp.app.id, 'read_v1'))?.label).toBeNull();
   });
 });

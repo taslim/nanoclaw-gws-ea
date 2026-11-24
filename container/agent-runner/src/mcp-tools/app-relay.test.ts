@@ -11,6 +11,7 @@ import { getAgentMailbox } from '../mailbox/index.js';
 import {
   ASSISTANT_SUMMARY_FIELD,
   createAppRelayServer,
+  FALLBACK_ASSISTANT_SUMMARY_PREFIX,
   withAssistantSummarySchema,
   type AppRelayRequestFn,
 } from './app-relay.js';
@@ -332,7 +333,12 @@ describe('app-relay stdio MCP server', () => {
         isError: true,
       });
       expect(await client.callTool({ name: 'search_menu', arguments: {} })).toEqual({
-        content: [{ type: 'text', text: 'The app tool call was cancelled.' }],
+        content: [
+          {
+            type: 'text',
+            text: 'Waiting for this app tool call was cancelled; the call may still complete on the host — check before retrying.',
+          },
+        ],
         isError: true,
       });
       expect(await client.callTool({ name: 'search_menu', arguments: {} })).toEqual({
@@ -420,6 +426,117 @@ describe('app-relay stdio MCP server', () => {
         arguments: { id: 'o-1', [ASSISTANT_SUMMARY_FIELD]: 'Confirm order o-1' },
       });
       expect(held).toEqual({ content: [{ type: 'text', text: 'Asked principal.' }] });
+    } finally {
+      await close();
+    }
+  });
+
+  it('keeps propertyNames compatible with summary, preserves colliding upstream assistant_summary args, and reports cancelled calls as uncertain', async () => {
+    // 1) propertyNames permits the relay summary field at top level and inside branches.
+    const propNamesSchema = withAssistantSummarySchema({
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+      propertyNames: { enum: ['id'] },
+      allOf: [{ propertyNames: { enum: ['id'] } }],
+    });
+    expect(propNamesSchema.propertyNames).toEqual({
+      anyOf: [{ enum: ['id'] }, { const: ASSISTANT_SUMMARY_FIELD }],
+    });
+    expect(((propNamesSchema.allOf as Record<string, unknown>[])[0] as Record<string, unknown>).propertyNames).toEqual({
+      anyOf: [{ enum: ['id'] }, { const: ASSISTANT_SUMMARY_FIELD }],
+    });
+
+    // 2) A tool whose upstream schema declares assistant_summary uses a collision-safe relay summary field
+    //    and forwards the upstream assistant_summary argument unchanged.
+    const calls: RecordedRequest[] = [];
+    const { client, close } = await connectRelay(async (action, fields, options) => {
+      calls.push({ action, fields, options });
+      if (fields.op === 'initialize') {
+        return { status: 'answered', frame: { id: 'req-init', ok: true, data: { instructions: null } } };
+      }
+      if (fields.op === 'tools/list') {
+        return {
+          status: 'answered',
+          frame: {
+            id: 'req-list',
+            ok: true,
+            data: {
+              toolsVersion: 'v-col',
+              tools: [
+                {
+                  name: 'colliding_tool',
+                  description: 'Upstream tool with its own assistant_summary parameter',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      [ASSISTANT_SUMMARY_FIELD]: { type: 'string', description: 'Upstream note' },
+                      id: { type: 'string' },
+                    },
+                    required: [ASSISTANT_SUMMARY_FIELD, 'id'],
+                    propertyNames: { enum: [ASSISTANT_SUMMARY_FIELD, 'id'] },
+                  },
+                  label: 'ask_first',
+                },
+                {
+                  name: 'cancel_tool',
+                  description: 'Tool whose wait gets cancelled',
+                  inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+                  label: 'just_do',
+                },
+              ],
+            },
+          },
+        };
+      }
+      if (fields.tool === 'cancel_tool') {
+        return { status: 'cancelled' };
+      }
+      return {
+        status: 'answered',
+        frame: { id: 'req-call', ok: true, data: { status: 'held', text: 'Asked principal.' } },
+      };
+    });
+    try {
+      const listed = await client.listTools();
+      const colliding = listed.tools.find((t) => t.name === 'colliding_tool')!;
+      const props = colliding.inputSchema.properties as Record<string, Record<string, unknown>>;
+      expect(props[ASSISTANT_SUMMARY_FIELD]).toEqual({ type: 'string', description: 'Upstream note' });
+      expect(props[FALLBACK_ASSISTANT_SUMMARY_PREFIX]).toEqual({
+        type: 'string',
+        description: 'What this will do, in one line.',
+      });
+      expect(colliding.inputSchema.required).toEqual([
+        ASSISTANT_SUMMARY_FIELD,
+        'id',
+        FALLBACK_ASSISTANT_SUMMARY_PREFIX,
+      ]);
+      expect(colliding.inputSchema.propertyNames).toEqual({
+        anyOf: [{ enum: [ASSISTANT_SUMMARY_FIELD, 'id'] }, { const: FALLBACK_ASSISTANT_SUMMARY_PREFIX }],
+      });
+
+      await client.callTool({
+        name: 'colliding_tool',
+        arguments: {
+          id: 'item-9',
+          [ASSISTANT_SUMMARY_FIELD]: 'upstream value must survive',
+          [FALLBACK_ASSISTANT_SUMMARY_PREFIX]: 'Confirm item 9',
+        },
+      });
+      const callReq = calls.find((c) => c.fields.op === 'tools/call' && c.fields.tool === 'colliding_tool')!;
+      expect(callReq.fields.arguments).toEqual({
+        id: 'item-9',
+        [ASSISTANT_SUMMARY_FIELD]: 'upstream value must survive',
+      });
+      expect(callReq.fields.summary).toBe('Confirm item 9');
+
+      // 3) Cancelled wait warns that execution may still complete on the host.
+      const cancelled = await client.callTool({ name: 'cancel_tool', arguments: { id: 'c-1' } });
+      expect(cancelled.isError).toBe(true);
+      const cancelledText = (cancelled.content as Array<{ text?: string }>)[0]?.text ?? '';
+      expect(cancelledText).toContain('Waiting');
+      expect(cancelledText).toContain('may still complete');
+      expect(cancelledText).toContain('check before retrying');
     } finally {
       await close();
     }

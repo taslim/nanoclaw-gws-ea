@@ -27,6 +27,28 @@ function compareCodeUnits(a: string, b: string): number {
   return 0;
 }
 
+/** RFC 8785 Section 3.2.2.2 forbids unpaired UTF-16 surrogates in canonical JSON. */
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < value.length ? value.charCodeAt(i + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function canonicalString(value: string): string {
+  if (hasUnpairedSurrogate(value)) {
+    throw new TypeError('Unpaired surrogates cannot be canonicalized as JSON');
+  }
+  return JSON.stringify(value);
+}
+
 /** RFC 8785 JSON Canonicalization Scheme (JCS) serialization. */
 export function canonicalJson(value: unknown): string {
   if (value === null) return 'null';
@@ -37,7 +59,7 @@ export function canonicalJson(value: unknown): string {
       if (!Number.isFinite(value)) throw new TypeError('Non-finite numbers cannot be canonicalized as JSON');
       return Object.is(value, -0) ? '0' : JSON.stringify(value);
     case 'string':
-      return JSON.stringify(value);
+      return canonicalString(value);
     case 'object': {
       if (Array.isArray(value)) {
         return `[${value.map((item) => (item === undefined ? 'null' : canonicalJson(item))).join(',')}]`;
@@ -46,7 +68,7 @@ export function canonicalJson(value: unknown): string {
       const keys = Object.keys(record)
         .filter((key) => record[key] !== undefined)
         .sort(compareCodeUnits);
-      return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+      return `{${keys.map((key) => `${canonicalString(key)}:${canonicalJson(record[key])}`).join(',')}}`;
     }
     default:
       throw new TypeError(`Unsupported JSON value type: ${typeof value}`);

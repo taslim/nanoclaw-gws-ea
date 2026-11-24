@@ -82,7 +82,7 @@ const INJECTION_PATTERNS: readonly RegExp[] = [
 ];
 
 export function tokenizeToolName(name: string): string[] {
-  const normalized = name.replace(/GraphQL/gu, 'Graphql');
+  const normalized = name.replace(/graphql/giu, 'Graphql');
   const rawSegments = normalized.split(/[^A-Za-z0-9]+/u).filter((segment) => segment.length > 0);
   const tokens: string[] = [];
   for (const segment of rawSegments) {
@@ -121,6 +121,16 @@ function schemaHasActionEnum(schema: unknown, depth = 0): { readonly matched: bo
     }
   }
   if (isRecord(schema.items) && check(schema.items)) return { matched: true, truncated };
+  if (Array.isArray(schema.items)) {
+    for (const entry of schema.items) {
+      if (check(entry)) return { matched: true, truncated };
+    }
+  }
+  if (Array.isArray(schema.prefixItems)) {
+    for (const entry of schema.prefixItems) {
+      if (check(entry)) return { matched: true, truncated };
+    }
+  }
   for (const defsKey of ['$defs', 'definitions'] as const) {
     const defs = schema[defsKey];
     if (isRecord(defs)) {
@@ -140,7 +150,7 @@ function schemaHasActionEnum(schema: unknown, depth = 0): { readonly matched: bo
   return { matched: false, truncated };
 }
 
-function schemaUsesReservedSummary(schema: Record<string, unknown>): boolean {
+export function schemaUsesReservedSummary(schema: Record<string, unknown>): boolean {
   return isRecord(schema.properties) && Object.hasOwn(schema.properties, ASSISTANT_SUMMARY_FIELD);
 }
 
@@ -307,16 +317,30 @@ export function resolveFinalToolUpdates(
   readonly updates: readonly ToolLabelUpdate[];
   readonly missing: readonly { readonly name: string; readonly definitionHash: string }[];
 } {
-  const seen = new Set<string>();
-  const updates: ToolLabelUpdate[] = [];
+  const matched = new Map<string, ParsedSortToolEntry>();
+  const conflicted = new Set<string>();
   for (const entry of entries) {
     const target = expected.get(entry.name);
-    if (!target || target.definitionHash !== entry.definitionHash || seen.has(entry.name)) continue;
-    seen.add(entry.name);
+    if (!target || target.definitionHash !== entry.definitionHash) continue;
+    const previous = matched.get(entry.name);
+    if (!previous) {
+      matched.set(entry.name, entry);
+    } else if (previous.label !== entry.label) {
+      conflicted.add(entry.name);
+    }
+  }
+  const updates: ToolLabelUpdate[] = [];
+  const missing: { readonly name: string; readonly definitionHash: string }[] = [];
+  for (const [name, target] of expected) {
+    const entry = matched.get(name);
+    if (!entry || conflicted.has(name)) {
+      missing.push({ name, definitionHash: target.definitionHash });
+      continue;
+    }
     const floor = evaluateToolFloors(target.definition);
     if (floor.floor) {
       updates.push({
-        name: entry.name,
+        name,
         definitionHash: target.definitionHash,
         label: 'ask_first',
         source: 'floor',
@@ -324,17 +348,13 @@ export function resolveFinalToolUpdates(
       });
     } else {
       updates.push({
-        name: entry.name,
+        name,
         definitionHash: target.definitionHash,
         label: entry.label,
         source: 'sorter',
         reason: entry.reason,
       });
     }
-  }
-  const missing: { readonly name: string; readonly definitionHash: string }[] = [];
-  for (const [name, target] of expected) {
-    if (!seen.has(name)) missing.push({ name, definitionHash: target.definitionHash });
   }
   return { updates, missing };
 }

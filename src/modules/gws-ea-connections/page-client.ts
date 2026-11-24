@@ -63,9 +63,10 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         keepScroll: true,
         afterSwap: data => {
           const toolName = typeof data.tool === 'string' ? data.tool : '';
-          const nextLabel = data.label === 'ask_first' ? 'Ask first' : 'Just do it';
           const moved = [...document.querySelectorAll('button[data-switch-name]')].find(button => button.dataset.switchName === toolName);
           moved?.focus();
+          const stateText = moved?.querySelector('.switch-state')?.textContent?.trim();
+          const nextLabel = stateText || (moved ? (moved.getAttribute('aria-checked') === 'true' ? 'Ask first' : 'Just do it') : (data.label === 'ask_first' ? 'Ask first' : 'Just do it'));
           kit.announce(toolName ? toolName + ': ' + nextLabel : nextLabel);
         },
       });

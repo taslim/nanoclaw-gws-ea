@@ -44,6 +44,7 @@ const CARD_SAFE_BUDGET = MAX_CARD_QUESTION_LENGTH - 120;
 const APP_CONTEXT_STORAGE_MAX = 64 * 1024;
 const RESULT_NOTE_MAX = 32_000;
 const SUMMARY_CARD_MAX = 280;
+const TOOL_CARD_MAX = 120;
 
 const SOFT_HYPHEN = 0x00ad;
 const COMBINING_GRAPHEME_JOINER = 0x034f;
@@ -233,7 +234,8 @@ async function buildHeldCallCard(input: {
   readonly timezone: string;
   readonly readHostname: () => Promise<string | undefined>;
 }): Promise<BuiltHeldCallCard> {
-  const title = `Allow ${input.appName} to run ${input.toolName}?`.slice(0, 120);
+  const displayToolName = cap(input.toolName, TOOL_CARD_MAX);
+  const title = `Allow ${input.appName} to run ${displayToolName}?`.slice(0, 120);
   const { text: renderedArgs, hasInvisible: argsHasInvisible } = renderCompactArgs(input.args);
   const summaryOut = input.summary && input.summary.trim() ? escapeInvisibleChars(input.summary.trim()) : undefined;
   const contextOut = input.appContext ? escapeInvisibleChars(input.appContext.text) : undefined;
@@ -248,12 +250,14 @@ async function buildHeldCallCard(input: {
 
   const headerLines = [
     `App: ${input.appName} (${input.appHost})`,
-    `Tool: ${input.toolName}`,
+    `Tool: ${displayToolName}`,
     summaryLine,
     ...(invisibleLine ? [invisibleLine] : []),
   ];
 
-  const contextHeader = input.appContext ? `From ${input.appName} (${input.appContext.toolName}):\n` : '';
+  const contextHeader = input.appContext
+    ? `From ${input.appName} (${cap(input.appContext.toolName, TOOL_CARD_MAX)}):\n`
+    : '';
   const fullParts = [
     ...headerLines,
     `Arguments:\n${renderedArgs}`,
@@ -280,8 +284,11 @@ async function buildHeldCallCard(input: {
     'Arguments:\n'.length +
     contextHeader.length +
     16;
-  const maxBody = Math.max(40, MAX_CARD_QUESTION_LENGTH - overhead);
-  const targetBody = Math.min(maxBody, Math.max(40, CARD_SAFE_BUDGET - overhead));
+  const available = MAX_CARD_QUESTION_LENGTH - overhead;
+  if (available < 40) {
+    return { kind: 'unreachable_details' };
+  }
+  const targetBody = Math.min(available, Math.max(40, CARD_SAFE_BUDGET - overhead));
   const argsBudget = contextOut ? Math.max(20, Math.floor(targetBody * 0.6)) : targetBody;
   const contextBudget = contextOut ? Math.max(20, targetBody - argsBudget) : 0;
 
@@ -375,98 +382,116 @@ export function createHoldCallHandler(dependencies: {
 }): HoldCallHandler {
   const readHostname = dependencies.webHostname ?? defaultWebHostname;
   const now = dependencies.now ?? Date.now;
+  const invocationQueues = new Map<string, Promise<unknown>>();
+
+  async function withInvocationLock<T>(invocationId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = invocationQueues.get(invocationId) ?? Promise.resolve();
+    const run = previous.then(operation, operation);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    invocationQueues.set(invocationId, tail);
+    try {
+      return await run;
+    } finally {
+      if (invocationQueues.get(invocationId) === tail) invocationQueues.delete(invocationId);
+    }
+  }
 
   return async (input: HoldCallInput): Promise<RelayCallOutcome> => {
     const invocationId = `${input.session.id}:${input.requestId}`;
-    const existing = await findPendingByInvocation(invocationId);
-    if (existing) {
-      return { status: 'held', text: HELD_CALL_ANSWER, approvalId: existing.approval_id };
-    }
+    return withInvocationLock(invocationId, async () => {
+      const existing = await findPendingByInvocation(invocationId);
+      if (existing) {
+        return { status: 'held', text: HELD_CALL_ANSWER, approvalId: existing.approval_id };
+      }
 
-    const [conversation, approverUserId] = await Promise.all([resolveMainConversation(), principalApproverUserId()]);
-    if (typeof conversation === 'string') {
-      return {
-        status: 'unsent',
-        reason: conversation,
-        text: 'Could not reach the principal to ask for approval; nothing was sent.',
+      const [conversation, approverUserId] = await Promise.all([resolveMainConversation(), principalApproverUserId()]);
+      if (typeof conversation === 'string') {
+        return {
+          status: 'unsent',
+          reason: conversation,
+          text: 'Could not reach the principal to ask for approval; nothing was sent.',
+        };
+      }
+      if (!approverUserId) {
+        return {
+          status: 'unsent',
+          reason: 'no_principal',
+          text: 'No verified principal is configured to approve app actions; nothing was sent.',
+        };
+      }
+
+      const needles = new Set<string>();
+      collectArgStrings(input.args, needles);
+      const expiresAt = new Date(now() + HELD_CALL_TTL_MS).toISOString();
+      const [recent, timezone] = await Promise.all([
+        needles.size > 0
+          ? dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20)
+          : Promise.resolve([]),
+        resolvePrincipalZoneAt(expiresAt),
+      ]);
+      const appContext = matchNeedlesInRecent(needles, recent);
+      const viewId = `held-${now()}-${randomBytes(4).toString('hex')}`;
+
+      const card = await buildHeldCallCard({
+        viewId,
+        appName: input.app.name,
+        appHost: input.app.host,
+        toolName: input.tool.name,
+        args: input.args,
+        summary: input.summary,
+        appContext,
+        expiresAt,
+        timezone,
+        readHostname,
+      });
+      if (card.kind === 'unreachable_details') {
+        return {
+          status: 'unsent',
+          reason: 'details_unavailable',
+          text: 'This action has too many details to show on an approval card, and the Connections page is unavailable to review them in full; nothing was sent.',
+        };
+      }
+
+      const payload: HeldAppCallPayload = {
+        viewId,
+        invocationId,
+        appId: input.app.id,
+        appName: input.app.name,
+        appHost: input.app.host,
+        grantGeneration: input.grantGeneration,
+        toolName: input.tool.name,
+        definitionHash: input.tool.definitionHash,
+        canonicalArgs: input.canonicalArgs,
+        argsHash: input.argsHash,
+        summary: input.summary ?? null,
+        appContext,
+        expiresAt,
       };
-    }
-    if (!approverUserId) {
-      return {
-        status: 'unsent',
-        reason: 'no_principal',
-        text: 'No verified principal is configured to approve app actions; nothing was sent.',
-      };
-    }
 
-    const needles = new Set<string>();
-    collectArgStrings(input.args, needles);
-    const expiresAt = new Date(now() + HELD_CALL_TTL_MS).toISOString();
-    const [recent, timezone] = await Promise.all([
-      needles.size > 0
-        ? dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20)
-        : Promise.resolve([]),
-      resolvePrincipalZoneAt(expiresAt),
-    ]);
-    const appContext = matchNeedlesInRecent(needles, recent);
-    const viewId = `held-${now()}-${randomBytes(4).toString('hex')}`;
+      const deliveredId = await requestApproval({
+        session: conversation.session,
+        agentName: 'Assistant',
+        action: HELD_APP_CALL_ACTION,
+        payload: payload as unknown as Record<string, unknown>,
+        title: card.title,
+        question: card.question,
+        details: { facts: { app: input.app.name, tool: input.tool.name } },
+        approverUserId,
+        expiresAt,
+      });
 
-    const card = await buildHeldCallCard({
-      viewId,
-      appName: input.app.name,
-      appHost: input.app.host,
-      toolName: input.tool.name,
-      args: input.args,
-      summary: input.summary,
-      appContext,
-      expiresAt,
-      timezone,
-      readHostname,
+      if (!deliveredId) {
+        return {
+          status: 'unsent',
+          reason: 'delivery_failed',
+          text: 'Could not send the approval request to the principal; nothing was sent.',
+        };
+      }
+      return { status: 'held', text: HELD_CALL_ANSWER, approvalId: deliveredId };
     });
-    if (card.kind === 'unreachable_details') {
-      return {
-        status: 'unsent',
-        reason: 'details_unavailable',
-        text: 'This action has too many details to show on an approval card, and the Connections page is unavailable to review them in full; nothing was sent.',
-      };
-    }
-
-    const payload: HeldAppCallPayload = {
-      viewId,
-      invocationId,
-      appId: input.app.id,
-      appName: input.app.name,
-      appHost: input.app.host,
-      grantGeneration: input.grantGeneration,
-      toolName: input.tool.name,
-      definitionHash: input.tool.definitionHash,
-      canonicalArgs: input.canonicalArgs,
-      argsHash: input.argsHash,
-      summary: input.summary ?? null,
-      appContext,
-      expiresAt,
-    };
-
-    const deliveredId = await requestApproval({
-      session: conversation.session,
-      agentName: 'Assistant',
-      action: HELD_APP_CALL_ACTION,
-      payload: payload as unknown as Record<string, unknown>,
-      title: card.title,
-      question: card.question,
-      details: { facts: { app: input.app.name, tool: input.tool.name } },
-      approverUserId,
-      expiresAt,
-    });
-
-    if (!deliveredId) {
-      return {
-        status: 'unsent',
-        reason: 'delivery_failed',
-        text: 'Could not send the approval request to the principal; nothing was sent.',
-      };
-    }
-    return { status: 'held', text: HELD_CALL_ANSWER, approvalId: deliveredId };
   };
 }
 

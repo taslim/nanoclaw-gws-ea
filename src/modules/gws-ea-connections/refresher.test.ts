@@ -13,6 +13,7 @@ import { appCredentialName } from './admit.js';
 import { applyMainServers, appRelayServerEntry } from './apply.js';
 import { withAppLock } from './locks.js';
 import { appRedirectUri, type ConnectionFetches } from './oauth.js';
+import { ConnectionOperations } from './operations.js';
 import {
   createConnectionsRefresher,
   REFRESH_TICK_MS,
@@ -504,6 +505,20 @@ describe('on-demand renewal', () => {
     expect(gateway.held.size).toBe(0);
   });
 
+  it('renews on demand via ensureToken when the stored access-token row is missing even before expiry', async () => {
+    const tokens = serveApp(LEDGERLY);
+    const app = await oauthApp('Ledgerly', LEDGERLY, {
+      refreshToken: 'sentinel-refresh-missing-row',
+      issuedAt: START,
+      expiresAt: START + 60 * MINUTE,
+    });
+    const refresher = createConnectionsRefresher(dependencies());
+
+    expect(await refresher.ensureToken(app.id)).toEqual({ generation: 1, token: 'sentinel-access-1' });
+    expect(tokens.presented).toEqual(['sentinel-refresh-missing-row']);
+    expect(await storedTokenOf(app)).toBe('sentinel-access-1');
+  });
+
   it('returns a pasted token directly from the store without calling the gateway or any endpoint', async () => {
     const app = await tokenApp('Notes', NOTES);
     const refresher = createConnectionsRefresher(dependencies());
@@ -931,5 +946,35 @@ describe('shutdown', () => {
       const grant = await store.readGrant((await store.apps())[0]?.id ?? '', 1);
       expect(grant?.kind === 'oauth' ? grant.refreshToken : undefined).toBe('sentinel-refresh-1');
     });
+  });
+
+  it('retries retiring legacy gateway credentials for a removed app on a later refresher tick', async () => {
+    const app = await tokenApp('Ledgerly', LEDGERLY);
+    const held = gateway.put('gws-ea-app-legacy-1', app.host, 'sentinel-legacy-token');
+    gateway.failingRemovals.add(held.id);
+
+    const ops = new ConnectionOperations({
+      store,
+      webHostname: 'juno.example.test',
+      clientDocumentsServed: () => true,
+      gateway,
+      applyMain: async () => false,
+    });
+    await ops.remove(app.id, (await store.get(app.id)).version);
+    expect(await store.apps()).toEqual([]);
+    expect(await store.listPendingGatewayCleanups()).toEqual([app.host]);
+    expect(gateway.held.size).toBe(1);
+
+    // While removals still fail, the pending cleanup stays queued.
+    const refresher = createConnectionsRefresher(dependencies());
+    await refresher.tick();
+    expect(await store.listPendingGatewayCleanups()).toEqual([app.host]);
+    expect(gateway.held.size).toBe(1);
+
+    // Once the gateway recovers, the next tick sweeps the host and clears the durable cleanup record.
+    gateway.failingRemovals.delete(held.id);
+    await refresher.tick();
+    expect(await store.listPendingGatewayCleanups()).toEqual([]);
+    expect(gateway.held.size).toBe(0);
   });
 });

@@ -42,6 +42,36 @@ interface RawSortEntry {
   readonly reason: string;
 }
 
+function parseRawSortEntries(rawTools: readonly unknown[]): readonly ParsedSortToolEntry[] {
+  const entries: ParsedSortToolEntry[] = [];
+  for (const raw of rawTools) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new Error('Sorter CLI returned a non-object tool entry.');
+    }
+    const record = raw as Record<string, unknown>;
+    const { name, definition_hash: definitionHash, label, reason } = record;
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new Error('Sorter CLI returned a tool entry without a non-empty name.');
+    }
+    if (typeof definitionHash !== 'string' || !definitionHash.trim()) {
+      throw new Error(`Sorter CLI returned a tool entry for "${name}" without a non-empty definition_hash.`);
+    }
+    if (label !== 'ask_first' && label !== 'just_do') {
+      throw new Error(`Sorter CLI returned an invalid label for "${name}": ${String(label)}`);
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new Error(`Sorter CLI returned a tool entry for "${name}" without a non-empty reason.`);
+    }
+    entries.push({
+      name: name.trim(),
+      definitionHash: definitionHash.trim(),
+      label,
+      reason: reason.trim(),
+    });
+  }
+  return entries;
+}
+
 interface ClaudeCliJsonResult {
   readonly subtype?: string;
   readonly is_error?: boolean;
@@ -86,12 +116,15 @@ async function runClaudeSort(
     '--mcp-config',
     emptyMcp,
     '--strict-mcp-config',
+    '--setting-sources',
+    '',
     '--no-session-persistence',
     ...(model ? ['--model', model] : []),
   ];
 
   const stdout = await new Promise<string>((resolve, reject) => {
     const child = spawn(claudePath, args, {
+      cwd: os.tmpdir(),
       env: { ...process.env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', ENABLE_CLAUDEAI_MCP_SERVERS: 'false' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -104,7 +137,7 @@ async function runClaudeSort(
       err += chunk.toString('utf8');
     });
     child.once('error', reject);
-    child.once('exit', (code) => {
+    child.once('close', (code) => {
       if (code !== 0) reject(new Error(`claude exited ${code}: ${err.slice(0, 500)}`));
       else resolve(out);
     });
@@ -114,21 +147,16 @@ async function runClaudeSort(
   const parsed = JSON.parse(stdout) as ClaudeCliJsonResult;
   if (parsed.is_error) throw new Error(`claude returned error: ${parsed.result ?? parsed.subtype ?? 'unknown'}`);
 
-  let rawTools = parsed.structured_output?.tools;
+  let rawTools: unknown = parsed.structured_output?.tools;
   if (!Array.isArray(rawTools) && typeof parsed.result === 'string' && parsed.result.trim()) {
-    const inner = JSON.parse(parsed.result) as { tools?: readonly RawSortEntry[] };
+    const inner = JSON.parse(parsed.result) as { tools?: unknown };
     rawTools = inner.tools;
   }
   if (!Array.isArray(rawTools)) throw new Error('Sorter CLI returned no structured tools array.');
 
   const modelKeys = Object.keys(parsed.modelUsage ?? {});
   const resolvedModel = model || modelKeys[0] || 'default';
-  const entries: ParsedSortToolEntry[] = rawTools.map((entry) => ({
-    name: entry.name,
-    definitionHash: entry.definition_hash,
-    label: entry.label,
-    reason: entry.reason,
-  }));
+  const entries = parseRawSortEntries(rawTools);
   return { entries, resolvedModel, costUsd: parsed.total_cost_usd ?? 0 };
 }
 
@@ -198,6 +226,8 @@ async function main(): Promise<void> {
     flags.get('--out') ?? path.join(os.tmpdir(), `app-tool-sort-${new Date().toISOString().replace(/[:.]/g, '-')}`),
   );
   fs.mkdirSync(outDir, { recursive: true });
+  const reportPath = path.join(outDir, 'results.json');
+  fs.rmSync(reportPath, { force: true });
 
   const results = new Array<Awaited<ReturnType<typeof evaluateCase>>>(selected.length);
   let cursor = 0;
@@ -245,7 +275,6 @@ async function main(): Promise<void> {
       missingCount: rawSuite.missingCount,
     },
   };
-  const reportPath = path.join(outDir, 'results.json');
   fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 
   console.log('');
