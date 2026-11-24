@@ -17,6 +17,12 @@ interface WebMountBase {
   readonly methods: readonly WebMethod[];
 }
 
+/** Context passed when an outbound guard checks a principal-only subpath link under a principal page mount. */
+export interface PrincipalSubpathLinkContext {
+  /** True only for host-authored terminal edits of an already-posted approval card (`operation: 'edit'`). */
+  readonly terminalCardEdit?: boolean;
+}
+
 /** Served only after the web module has verified the principal, on every request. */
 export interface PrincipalPageMount extends WebMountBase {
   readonly audience: 'principal';
@@ -30,6 +36,11 @@ export interface PrincipalPageMount extends WebMountBase {
   readonly linkGuard: GuardedAction;
   /** Returned beside the link, so they must never carry a credential. */
   readonly linkFacts?: () => Promise<Readonly<Record<string, unknown>>>;
+  /**
+   * Optional principal-only subpath allowance for canonical `https://<host><pathname>` URLs below `path`
+   * (no query, hash, or credentials). Defaults to refusing every subpath below `path`.
+   */
+  readonly allowSubpathLink?: (pathname: string, context?: PrincipalSubpathLinkContext) => Promise<boolean>;
 }
 
 /** Authorizes its own readers; the web module only enforces sandboxing of authored content. */

@@ -1,12 +1,12 @@
 import { getDb } from '../../db/connection.js';
 import type { OutboundGuardDecision, OutboundSend } from '../../delivery.js';
-import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
+import { isRecord, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import type { ChatMember } from '../gws-ea-chats/roster.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
 import { resolveAudience } from '../gws-ea-privacy/audience.js';
 import { linkTargets, messageStrings } from '../gws-ea-privacy/outbound.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
-import { mountCovers, principalPages } from '../gws-ea-web/mounts.js';
+import { mountCovers, normalizeWebPathname, principalPages } from '../gws-ea-web/mounts.js';
 import { principalPageUrl } from '../gws-ea-web/page-link.js';
 import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
 
@@ -15,6 +15,8 @@ interface ArtifactLinkCheckRequest {
   readonly recipients: readonly string[];
   readonly unknownRecipients?: boolean;
   readonly nonPrincipalChatMembers?: boolean;
+  /** True only when `judgeArtifactSend` checks a `chat-sdk` terminal approval card edit. */
+  readonly terminalCardEdit?: boolean;
 }
 type ArtifactLinkCheck = { readonly allowed: true } | { readonly allowed: false; readonly reason: string };
 const URLS = /https?:\/\/[^\s<>"'`\\]+/giu;
@@ -92,9 +94,19 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
       return refuse(written);
     const page = principalPages().find(({ path }) => mountCovers(path, url.pathname));
     if (page) {
-      // Only a page's own address leaves the host: anything below it, such as a sign-in return, never does.
+      // Only a page's own address — or a canonical subpath the page explicitly allows (e.g. a live held-call view) —
+      // leaves the host, and only toward the principal alone.
       const exact = principalPageUrl(config.hostname, page);
-      if (!principalOnly || written !== exact)
+      const canonicalSubpathAllowed =
+        principalOnly &&
+        written !== exact &&
+        written === `https://${config.hostname}${url.pathname}` &&
+        normalizeWebPathname(url.pathname) === url.pathname &&
+        page.allowSubpathLink !== undefined &&
+        (await page.allowSubpathLink(url.pathname, {
+          ...(request.terminalCardEdit === true ? { terminalCardEdit: true } : {}),
+        }));
+      if (!principalOnly || (written !== exact && !canonicalSubpathAllowed))
         return {
           allowed: false,
           reason: `Only the principal's own ${page.title} page address, ${exact}, can be sent, and only to the principal. Send it directly to the principal or send without it.`,
@@ -144,6 +156,29 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
   return { allowed: true };
 }
 
+function isTerminalApprovalCardEdit(send: OutboundSend): boolean {
+  if (send.kind !== 'chat-sdk' || (send.files && send.files.length > 0)) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(send.content);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return false;
+  }
+  return (
+    isRecord(parsed) &&
+    parsed.operation === 'edit' &&
+    typeof parsed.questionId === 'string' &&
+    parsed.questionId.length > 0 &&
+    typeof parsed.messageId === 'string' &&
+    parsed.messageId.length > 0 &&
+    isRecord(parsed.terminalCard) &&
+    typeof parsed.terminalCard.title === 'string' &&
+    typeof parsed.terminalCard.question === 'string' &&
+    typeof parsed.terminalCard.resolution === 'string'
+  );
+}
+
 /** Last local check at the adapter boundary, after handoff and any later revoke or membership change. */
 export async function judgeArtifactSend(send: OutboundSend): Promise<OutboundGuardDecision> {
   // The inbox builds its final outside recipients and checks them in sendToOutside.
@@ -180,6 +215,10 @@ export async function judgeArtifactSend(send: OutboundSend): Promise<OutboundGua
         : [];
     audience = await artifactAudienceForMembers(members);
   }
-  const checked = await checkArtifactLinksOpenable({ texts, ...audience });
+  const checked = await checkArtifactLinksOpenable({
+    texts,
+    ...audience,
+    ...(isTerminalApprovalCardEdit(send) ? { terminalCardEdit: true } : {}),
+  });
   return checked.allowed ? { effect: 'allow' } : { effect: 'refuse', reason: checked.reason };
 }

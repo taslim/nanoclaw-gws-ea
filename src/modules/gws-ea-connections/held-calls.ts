@@ -960,6 +960,19 @@ export async function getPendingHeldCallApproval(
   return undefined;
 }
 
+/** True only when `viewId` names a live, unexpired held-call approval routed to a verified principal. */
+export async function isLiveHeldCallView(
+  viewId: string,
+  now: () => number = activeDependencies.now ?? Date.now,
+): Promise<boolean> {
+  const db = getDb();
+  if (!(await db.hasTable('pending_approvals')) || !(await db.hasTable('gws_ea_principal_users'))) return false;
+  const held = await getPendingHeldCallApproval(viewId, now);
+  if (!held || held.expired) return false;
+  if ((held.payload.viewId ?? held.approval.approval_id) !== viewId) return false;
+  return Boolean(held.approval.approver_user_id && (await isVerifiedPrincipalUser(held.approval.approver_user_id)));
+}
+
 async function resolveCardThreadId(approval: PendingApproval): Promise<string | null> {
   if (!approval.session_id || !approval.channel_type || !approval.platform_id) return null;
   const session = await getSession(approval.session_id);

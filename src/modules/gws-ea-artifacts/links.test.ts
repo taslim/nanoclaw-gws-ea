@@ -13,8 +13,11 @@ vi.mock('../../config.js', async (original) => ({
 }));
 vi.mock('../../log.js', () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 import '../index.js';
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
+import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import { upsertUser } from '../permissions/db/users.js';
+import { HELD_APP_CALL_ACTION, type HeldAppCallPayload } from '../gws-ea-connections/held-calls.js';
 import { saveArtifact, prepareArtifactSource } from './db.js';
 import { checkArtifactLinksOpenable } from './links.js';
 import { checkLinksOpenable } from '../gws-ea-workspace/link-access.js';
@@ -149,6 +152,151 @@ it('allows each registered principal page at its exact address toward the princi
     allowed: false,
     reason: expect.stringContaining('Connections page address, https://aya.example.com/connections,'),
   });
+});
+
+it('allows a canonical live held-call link only toward the principal, and refuses expired, resolved, unknown, non-principal, or non-canonical links', async () => {
+  const now = new Date().toISOString();
+  const futureExpiry = new Date(Date.now() + 3600_000).toISOString();
+  const pastExpiry = new Date(Date.now() - 60_000).toISOString();
+  const principalUser = 'gchat:users/principal-1';
+  await upsertUser({ id: principalUser, kind: 'human', display_name: 'Principal', created_at: now });
+  await bindVerifiedPrincipalUser(principalUser, now);
+
+  const insertHeld = async (opts: {
+    approvalId: string;
+    viewId: string;
+    status?: 'pending' | 'approved';
+    expiresAt?: string;
+    approverUserId?: string;
+  }) => {
+    const payload: HeldAppCallPayload = {
+      viewId: opts.viewId,
+      invocationId: `session:req-${opts.viewId}`,
+      appId: '11111111-1111-4111-8111-111111111111',
+      appName: 'Bistro',
+      appHost: 'mcp.bistro.example.test',
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: 'defhash-1',
+      canonicalArgs: '{"checkout_id":"chk_1"}',
+      argsHash: 'argshash-1',
+      summary: 'Confirm order',
+      appContext: null,
+      expiresAt: opts.expiresAt ?? futureExpiry,
+    };
+    await createPendingApproval({
+      approval_id: opts.approvalId,
+      session_id: 'session',
+      request_id: `req-${opts.viewId}`,
+      action: HELD_APP_CALL_ACTION,
+      payload: JSON.stringify(payload),
+      title: 'Allow Bistro to run confirm_checkout?',
+      question: 'Confirm order',
+      options_json: JSON.stringify([{ value: 'approve', label: 'Approve' }]),
+      status: opts.status ?? 'pending',
+      created_at: now,
+      expires_at: opts.expiresAt ?? futureExpiry,
+      approver_user_id: opts.approverUserId ?? principalUser,
+    });
+  };
+
+  await insertHeld({ approvalId: 'appr-live-1', viewId: 'held-live-1' });
+  await insertHeld({ approvalId: 'appr-expired-1', viewId: 'held-expired-1', expiresAt: pastExpiry });
+  await insertHeld({ approvalId: 'appr-approved-1', viewId: 'held-approved-1', status: 'approved' });
+  await insertHeld({
+    approvalId: 'appr-other-1',
+    viewId: 'held-other-1',
+    approverUserId: 'gchat:users/not-principal',
+  });
+
+  const liveUrl = 'https://aya.example.com/connections/held/held-live-1';
+  expect((await check(liveUrl, ['principal@example.com'])).allowed).toBe(true);
+  // Non-principal, mixed audience, unknown, disabled policy, or non-canonical URL variants are all refused.
+  expect((await check(liveUrl, ['juno@example.com'])).allowed).toBe(false);
+  expect((await check(liveUrl, ['principal@example.com', 'juno@example.com'])).allowed).toBe(false);
+  expect(
+    (
+      await checkArtifactLinksOpenable({
+        texts: [liveUrl],
+        recipients: ['principal@example.com'],
+        unknownRecipients: true,
+      })
+    ).allowed,
+  ).toBe(false);
+  expect(
+    (
+      await checkArtifactLinksOpenable({
+        texts: [liveUrl],
+        recipients: ['principal@example.com'],
+        nonPrincipalChatMembers: true,
+      })
+    ).allowed,
+  ).toBe(false);
+  for (const variant of [
+    `${liveUrl}/`,
+    `${liveUrl}?foo=bar`,
+    `${liveUrl}#section`,
+    'https://aya.example.com/connections/held/held%2dlive-1',
+    'https://aya.example.com/connections/held/appr-live-1',
+    'https://aya.example.com/connections/held/held-expired-1',
+    'https://aya.example.com/connections/held/held-approved-1',
+    'https://aya.example.com/connections/held/held-other-1',
+    'https://aya.example.com/connections/held/held-unknown-1',
+  ]) {
+    expect((await check(variant, ['principal@example.com'])).allowed, variant).toBe(false);
+  }
+  policy(false);
+  expect((await check(liveUrl, ['principal@example.com'])).allowed).toBe(false);
+  policy(true);
+
+  // Terminal approval-card edit toward the principal's DM allows canonical /connections/held/<id> even after deletion,
+  // while still refusing callbacks and non-principal targets.
+  const { createMessagingGroup } = await import('../../db/messaging-groups.js');
+  const { upsertUserDm } = await import('../permissions/db/user-dms.js');
+  const { setDeliveryAdapter, OutboundRefusedError } = await import('../../delivery.js');
+  await createMessagingGroup({
+    id: 'mg-principal-dm',
+    channel_type: 'gchat',
+    platform_id: 'spaces/dm-principal',
+    name: 'Principal DM',
+    is_group: 0,
+    unknown_sender_policy: 'strict',
+    created_at: now,
+  });
+  await upsertUserDm({
+    user_id: principalUser,
+    channel_type: 'gchat',
+    messaging_group_id: 'mg-principal-dm',
+    resolved_at: now,
+  });
+  const deliver = vi.fn(async () => undefined);
+  const channel = setDeliveryAdapter({ deliver });
+  const deletedViewUrl = 'https://aya.example.com/connections/held/held-already-deleted';
+  const terminalEditPayload = (url: string) =>
+    JSON.stringify({
+      operation: 'edit',
+      questionId: 'appr-deleted',
+      messageId: 'msg-1',
+      text: `Allow Bistro?\n\nReview: ${url}\n\n❌ Rejected`,
+      terminalCard: { title: 'Allow Bistro?', question: `Review: ${url}`, resolution: '❌ Rejected' },
+    });
+  await channel.deliver('gchat', 'spaces/dm-principal', null, 'chat-sdk', terminalEditPayload(deletedViewUrl));
+  expect(deliver).toHaveBeenCalledTimes(1);
+  // Callback path is still refused even in a terminal card edit to the principal.
+  await expect(
+    channel.deliver(
+      'gchat',
+      'spaces/dm-principal',
+      null,
+      'chat-sdk',
+      terminalEditPayload('https://aya.example.com/connections/callback/mcp.bistro.example.test'),
+    ),
+  ).rejects.toBeInstanceOf(OutboundRefusedError);
+  // Non-principal room is still refused even in a terminal card edit.
+  await expect(
+    channel.deliver('gchat', 'spaces/other-room', null, 'chat-sdk', terminalEditPayload(deletedViewUrl)),
+  ).rejects.toBeInstanceOf(OutboundRefusedError);
+  expect(deliver).toHaveBeenCalledTimes(1);
 });
 it('denies stale hash, pending/revoked state, expiry, disable and deleted content even for the principal', async () => {
   const url = `${base}/share/${shareId}`;
