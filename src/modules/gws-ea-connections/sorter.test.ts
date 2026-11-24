@@ -39,6 +39,10 @@ import {
   APP_SORT_THREAD_PREFIX,
   createAppToolSorter,
   evaluateToolFloors,
+  FLOOR_VERBS,
+  PASSTHROUGH_TOKENS,
+  READ_EXEMPT_NOUN_VERBS,
+  READ_LEADING_VERBS,
   registerSortToolsAction,
   SORT_TOOLS_ACTION,
   sorterVersion,
@@ -601,5 +605,101 @@ describe('isolated tool sorter session lifecycle', () => {
 
     expect((await store.getTool(first.app.id, 'get_one'))?.label).toBe('just_do');
     expect((await store.getTool(second.app.id, 'get_two'))?.label).toBe('just_do');
+  });
+});
+
+describe('exhaustive deterministic floor coverage', () => {
+  it('triggers a floor on every verb in FLOOR_VERBS across snake_case and camelCase', () => {
+    for (const verb of FLOOR_VERBS) {
+      const snake = evaluateToolFloors(toolDef(`${verb}_item`, 'Perform item operation'));
+      expect(snake.floor, `${verb}_item`).toBe(true);
+
+      const camel = evaluateToolFloors(toolDef(`user${verb[0]!.toUpperCase()}${verb.slice(1)}`, 'Perform operation'));
+      expect(camel.floor, `camel ${verb}`).toBe(true);
+    }
+  });
+
+  it('exempts READ_EXEMPT_NOUN_VERBS only under READ_LEADING_VERBS, while still flooring non-exempt verbs', () => {
+    for (const reader of READ_LEADING_VERBS) {
+      for (const noun of READ_EXEMPT_NOUN_VERBS) {
+        const result = evaluateToolFloors(toolDef(`${reader}_${noun}_details`, 'Read details'));
+        expect(result.floor, `${reader}_${noun}_details`).toBe(false);
+      }
+      // A non-exempt floor verb after a read verb still triggers the floor.
+      const mixed = evaluateToolFloors(toolDef(`${reader}_and_claim`, 'Read and claim voucher'));
+      expect(mixed.floor, `${reader}_and_claim`).toBe(true);
+    }
+    // Without a leading read verb, even noun-like verbs trigger the floor.
+    for (const noun of READ_EXEMPT_NOUN_VERBS) {
+      const result = evaluateToolFloors(toolDef(`${noun}_now`, 'Act immediately'));
+      expect(result.floor, `${noun}_now`).toBe(true);
+    }
+  });
+
+  it('triggers a floor on every token in PASSTHROUGH_TOKENS even with a leading read verb or readOnlyHint', () => {
+    for (const token of PASSTHROUGH_TOKENS) {
+      const direct = evaluateToolFloors(
+        toolDef(`${token}_custom`, 'General endpoint', { annotations: { readOnlyHint: true } }),
+      );
+      expect(direct.floor, `${token}_custom`).toBe(true);
+
+      const withRead = evaluateToolFloors(toolDef(`get_${token}_result`, 'General endpoint'));
+      expect(withRead.floor, `get_${token}_result`).toBe(true);
+    }
+  });
+
+  it('triggers a floor on every action-dispatching enum key, nested schemas, reserved summary, and annotations', () => {
+    for (const key of [
+      'action',
+      'operation',
+      'op',
+      'method',
+      'command',
+      'verb',
+      'http_method',
+      'httpMethod',
+      'mutation',
+    ]) {
+      const flat = evaluateToolFloors(
+        toolDef('manage_item', 'Manage record', {
+          inputSchema: { type: 'object', properties: { [key]: { type: 'string', enum: ['a', 'b'] } } },
+        }),
+      );
+      expect(flat.floor, `flat ${key}`).toBe(true);
+    }
+
+    const nested = evaluateToolFloors(
+      toolDef('batch_records', 'Batch records', {
+        inputSchema: {
+          type: 'object',
+          properties: {
+            items: {
+              type: 'array',
+              items: { type: 'object', properties: { op: { type: 'string', enum: ['read', 'write'] } } },
+            },
+          },
+        },
+      }),
+    );
+    expect(nested.floor).toBe(true);
+
+    const reserved = evaluateToolFloors(
+      toolDef('inspect_record', 'Inspect record', {
+        inputSchema: { type: 'object', properties: { assistant_summary: { type: 'string' } } },
+      }),
+    );
+    expect(reserved.floor).toBe(true);
+    expect(reserved.flagged).toBe(true);
+
+    expect(
+      evaluateToolFloors(toolDef('inspect_record', 'Inspect record', { annotations: { readOnlyHint: false } })).floor,
+    ).toBe(true);
+    expect(
+      evaluateToolFloors(toolDef('inspect_record', 'Inspect record', { annotations: { destructiveHint: true } })).floor,
+    ).toBe(true);
+    expect(
+      evaluateToolFloors(toolDef('inspect_record', 'Inspect record', { annotations: { openWorldHint: true } })).floor,
+    ).toBe(false);
+    expect(evaluateToolFloors(toolDef('inspect_record', 'Inspect record')).floor).toBe(false);
   });
 });
