@@ -7,21 +7,54 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createPendingApproval,
+  createSession,
+  getDb,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
+import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { createWebHandler } from '../gws-ea-web/server.js';
+import { upsertUser } from '../permissions/db/users.js';
 import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
-import { HELD_APP_CALL_ACTION, type HeldAppCallPayload } from './held-calls.js';
+import { canonicalArgsHash } from './canonical.js';
+import {
+  HELD_APP_CALL_ACTION,
+  registerHeldAppCallHandlers,
+  type HeldAppCallPayload,
+  type PendingHeldCallItem,
+} from './held-calls.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
-import type { ConnectionApp, ConnectionsStore } from './store.js';
+import type { AppRelay } from './relay.js';
+import { toolLabelsHash, type ConnectionApp, type ConnectionsStore } from './store.js';
+
+const deliveryAdapterOverride = vi.hoisted(() => ({
+  active: false,
+  adapter: null as ReturnType<typeof getDeliveryAdapter>,
+}));
+
+vi.mock('../../delivery.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../delivery.js')>();
+  return {
+    ...actual,
+    getDeliveryAdapter: () =>
+      deliveryAdapterOverride.active ? deliveryAdapterOverride.adapter : actual.getDeliveryAdapter(),
+  };
+});
 import {
   FakeMcpApp,
   startFakeEndpoints,
@@ -209,6 +242,8 @@ beforeEach(async () => {
   documentPort = await listen(documentServer);
 });
 afterEach(async () => {
+  deliveryAdapterOverride.active = false;
+  deliveryAdapterOverride.adapter = null;
   server.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
   documentServer.closeAllConnections();
@@ -435,7 +470,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
     expect(signInRow(connected.id)).toBeUndefined();
 
     const list = await request('/connections?outcome=connected');
-    expect(list.body).toContain('App connected. Your assistant can use it from your next message.');
+    expect(list.body).toContain('App connected. Ready from your next message.');
     expect(list.body).toContain('Connected');
     assertNoSentinels();
   });
@@ -666,7 +701,7 @@ describe('client details the server refuses', () => {
     const changed = await post('/connections/change-client', { id: stored.id, version: String(stored.version) });
     expect(changed.status).toBe(200);
     expect(changed.headers['x-page-location']).toBe(`/connections/app/${stored.id}/connect`);
-    expect(changed.body).toContain('Client details removed. Enter new ones to sign in.');
+    expect(changed.body).toContain('Client details cleared. Enter new ones to sign in.');
     expect(changed.body).toContain('name="clientId"');
     expect(await onlyApp()).toMatchObject({ hasClient: false, clientEntered: false });
     expect(signInRow(stored.id)).toBeUndefined();
@@ -695,7 +730,7 @@ describe('client details the server refuses', () => {
 });
 
 describe('apps whose server takes client documents', () => {
-  const unavailable = 'Your assistant can’t sign in to this app right now. Try again in a few minutes.';
+  const unavailable = 'Can’t sign in to this app right now. Try again in a few minutes.';
   const assistantRefused = 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.';
 
   /** The server expires a registration's secret, so it refuses that client at the exchange. */
@@ -1123,10 +1158,10 @@ describe('sign-in returns', () => {
   it('renders each outcome’s constant message once, and the script strips it from the address', async () => {
     const messages = {
       connected: 'App connected.',
-      cancelled: 'Sign-in was cancelled, so nothing changed.',
-      expired: 'That sign-in expired or was already used.',
-      failed: 'Sign-in didn’t finish, so nothing changed.',
-      client_refused: 'The sign-in service didn’t accept the client details, so they were removed.',
+      cancelled: 'Sign-in cancelled. Nothing changed.',
+      expired: 'Sign-in expired. Connect again to start over.',
+      failed: 'Sign-in didn’t finish. Try connecting again.',
+      client_refused: 'Client details were rejected and cleared. Connect again to enter new ones.',
       assistant_client_refused: 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.',
     };
     for (const [code, message] of Object.entries(messages)) {
@@ -1302,7 +1337,7 @@ describe('managing apps', () => {
     await post('/connections/add', { url: RECIPES, name: '' });
     const list = (await request('/connections')).body;
     expect(list).toContain(
-      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete app" data-confirm-message="Your assistant will stop using it, and its sign-in and any client details you entered will be forgotten. You can add it again later."',
+      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete" data-confirm-message="Your assistant will lose access, and saved sign-in and client details will be removed. You can add it again anytime."',
     );
     expect(list).not.toMatch(/action="\/connections\/disconnect" data-send data-confirm/u);
   });
@@ -1337,7 +1372,7 @@ describe('managing apps', () => {
     ] as const) {
       const reply = await post(route, data);
       expect(reply.status).toBe(409);
-      expect(reply.body).toContain('This app changed after you opened the page.');
+      expect(reply.body).toContain('This app changed in another tab.');
     }
     const signIn = await post('/connections/sign-in', reference);
     expect(signIn.status).toBe(409);
@@ -1357,11 +1392,7 @@ describe('the add dialog', () => {
     ['one of the assistant’s own services', 'https://api.anthropic.com/mcp', 'That address belongs to your assistant'],
     ['an operator server’s host', 'https://tasks.example.test/other', 'already uses this address'],
     ['a server that does not answer', 'https://down.example.test/mcp', 'The app didn’t respond.'],
-    [
-      'a server whose sign-in is unusable',
-      'https://recipes.example.test/mcp',
-      'a kind of sign-in your assistant doesn’t support',
-    ],
+    ['a server whose sign-in is unusable', 'https://recipes.example.test/mcp', 'sign-in method isn’t supported'],
   ])('refuses %s with a constant message and stores nothing', async (_case, url, message) => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
       tasks: { type: 'http', url: `https://tasks.example.test/mcp?key=${SENTINEL_QUERY}` },
@@ -1460,7 +1491,7 @@ describe('page states', () => {
 describe('operator servers', () => {
   const ledgerlyEntry = { type: 'http', url: LEDGERLY };
   const confirmation =
-    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="Your assistant will stop using it, and its saved access to app.ledgerly.example.test will be deleted. Your operator can add it back."';
+    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="Your assistant will stop using it and saved access to app.ledgerly.example.test will be removed. Your operator can add it back."';
   const disconnectLedgerly = () =>
     post('/connections/disconnect-operator', { key: 'ledgerly', host: 'app.ledgerly.example.test' });
 
@@ -1475,7 +1506,7 @@ describe('operator servers', () => {
 
     const reply = await disconnectLedgerly();
     expect(reply.status).toBe(200);
-    expect(reply.body).toContain('App disconnected. Your assistant can’t use it anymore.');
+    expect(reply.body).toContain('App disconnected.');
     expect(reply.body).not.toContain('Added by your operator');
     expect(await mainServers()).toEqual({});
     expect([...gateway.held.keys()]).toEqual(['ledger-bearer']);
@@ -1501,7 +1532,7 @@ describe('operator servers', () => {
 
     gateway.failingIds.clear();
     const retried = await disconnectLedgerly();
-    expect(retried.body).toContain('App disconnected. Your assistant can’t use it anymore.');
+    expect(retried.body).toContain('App disconnected.');
     expect(await mainServers()).toEqual({});
     expect(gateway.held.size).toBe(0);
   });
@@ -1518,7 +1549,7 @@ describe('operator servers', () => {
     const failed = await disconnectLedgerly();
     expect(failed.body).toContain('so it’s still connected. Try again.');
     expect(failed.body).not.toContain('>Try again</button>');
-    expect(failed.body).toContain('its saved access to mcp.ledger.example.test will be deleted.');
+    expect(failed.body).toContain('saved access to mcp.ledger.example.test will be removed.');
   });
 
   it('shows Can’t disconnect on a gateway that cannot list and remove credentials by host', async () => {
@@ -1552,7 +1583,7 @@ describe('operator servers', () => {
     ]) {
       const reply = await post('/connections/disconnect-operator', submission);
       expect(reply.status).toBe(409);
-      expect(reply.body).toContain('This app changed after you opened the page.');
+      expect(reply.body).toContain('This app changed in another tab.');
     }
     expect(await mainServers()).toEqual({ ...servers, recipes: { type: 'http', url: RECIPES } });
     expect([...gateway.held.keys()]).toEqual(held);
@@ -1580,17 +1611,94 @@ describe('home status and link facts', () => {
     updatedAt: '2026-11-14T00:00:00.000Z',
   });
 
-  it('summarizes unavailable, then apps needing reconnecting, then connected apps, then none yet', async () => {
+  it('summarizes unavailable, then pending approvals, then reconnecting, then review needed, then connected apps, then none yet', async () => {
     const operator = { key: 'ledgerly', url: 'https://app.ledgerly.example.test/mcp' };
-    expect(await connectionsStatus(listing({ canChange: false, apps: [app('needs_reconnecting', 'Notes')] }))).toBe(
-      'Unavailable',
+    const recipes = app('connected', 'Recipes');
+    const pendingStub = (viewId: string): PendingHeldCallItem => ({
+      viewId,
+      approval: {
+        approval_id: `appr-${viewId}`,
+        session_id: 'sess-1',
+        request_id: 'req-1',
+        action: HELD_APP_CALL_ACTION,
+        payload: '{}',
+        title: 'Allow Recipes?',
+        question: 'Allow?',
+        options_json: '[]',
+        status: 'pending',
+        created_at: '2026-11-24T00:00:00.000Z',
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+        approver_user_id: 'gchat:users/morgan',
+        agent_group_id: MAIN,
+        channel_type: 'gchat',
+        platform_id: 'spaces/dm',
+        instance: null,
+        platform_message_id: null,
+      },
+      payload: {
+        viewId,
+        invocationId: `inv-${viewId}`,
+        appId: recipes.id,
+        appName: 'Recipes',
+        appHost: recipes.host,
+        grantGeneration: 1,
+        toolName: 'order_groceries',
+        definitionHash: 'def-1',
+        canonicalArgs: '{}',
+        argsHash: 'args-1',
+        summary: 'Place grocery order',
+        appContext: null,
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      },
+    });
+    expect(
+      await connectionsStatus(
+        listing({
+          canChange: false,
+          apps: [app('needs_reconnecting', 'Notes')],
+          pendingApprovals: [pendingStub('h1')],
+        }),
+      ),
+    ).toBe('Unavailable');
+    expect(
+      await connectionsStatus(
+        listing({
+          apps: [app('needs_reconnecting', 'Notes'), recipes],
+          pendingApprovals: [pendingStub('h1')],
+        }),
+      ),
+    ).toBe('1 approval waiting');
+    expect(
+      await connectionsStatus(
+        listing({
+          apps: [recipes],
+          pendingApprovals: [pendingStub('h1'), pendingStub('h2')],
+        }),
+      ),
+    ).toBe('2 approvals waiting');
+    expect(await connectionsStatus(listing({ apps: [app('needs_reconnecting', 'Notes'), recipes] }))).toBe(
+      '1 app needs reconnecting',
     );
     expect(
-      await connectionsStatus(listing({ apps: [app('needs_reconnecting', 'Notes'), app('connected', 'Recipes')] })),
-    ).toBe('1 app needs reconnecting');
-    expect(await connectionsStatus(listing({ apps: [app('connected', 'Recipes')], operators: [operator] }))).toBe(
-      '2 apps connected',
-    );
+      await connectionsStatus(
+        listing({
+          apps: [recipes],
+          pins: {
+            [recipes.id]: {
+              appId: recipes.id,
+              instructions: null,
+              listHash: 'hash-1',
+              pinnedAt: '2026-11-23T12:00:00.000Z',
+              confirmedAt: '2026-11-23T12:00:00.000Z',
+              reviewedListHash: null,
+              reviewedAt: null,
+              needsReview: true,
+            },
+          },
+        }),
+      ),
+    ).toBe('1 app needs review');
+    expect(await connectionsStatus(listing({ apps: [recipes], operators: [operator] }))).toBe('2 apps connected');
     expect(await connectionsStatus(listing({ apps: [app('not_connected', 'Notes')] }))).toBe('No apps yet');
   });
 
@@ -1667,14 +1775,28 @@ describe('home status and link facts', () => {
 });
 
 describe('tool approvals review and held-call details', () => {
-  it('leads to the review view after connecting, flips switches immediately without a card, clears and restores review marker', async () => {
+  it('leads to the review view after connecting, serves live tools-status, flips switches immediately, clears and restores review marker', async () => {
     serve(recipesServer);
     await post('/connections/add', { url: RECIPES, name: '' });
     let app = await onlyApp();
     const connectReply = await post('/connections/connect', { id: app.id, version: String(app.version) });
     expect(connectReply.status).toBe(200);
     expect(connectReply.headers['x-page-location']).toBe(`/connections/app/${app.id}/tools`);
-    expect(connectReply.body).toContain('When I’ll check with you first');
+    expect(connectReply.body).toContain('<h1>Recipes</h1>');
+    expect(connectReply.body).toContain('data-tools-polling="true"');
+
+    // Before pinning, tools-status reports pinned=false and refuses non-principal readers.
+    const unpinnedStatus = await request(`/connections/app/${app.id}/tools-status`);
+    expect(unpinnedStatus.status).toBe(200);
+    expect(JSON.parse(unpinnedStatus.body)).toMatchObject({
+      appId: app.id,
+      pinned: false,
+      hasUnsorted: true,
+      tools: [],
+    });
+    expect(
+      (await request(`/connections/app/${app.id}/tools-status`, 'GET', { 'cf-access-jwt-assertion': READER })).status,
+    ).toBe(404);
 
     app = await onlyApp();
     const pinned = await store.pinTools(app.id, {
@@ -1696,6 +1818,7 @@ describe('tool approvals review and held-call details', () => {
         definitionHash: hashes.get('search_recipes')!,
         label: 'just_do',
         source: 'sorter',
+        summary: 'Search recipes by keyword',
         reason: 'Read-only search',
       },
       {
@@ -1703,29 +1826,41 @@ describe('tool approvals review and held-call details', () => {
         definitionHash: hashes.get('order_groceries')!,
         label: 'ask_first',
         source: 'floor',
+        summary: 'Place a paid grocery order',
         reason: 'Places an order',
       },
     ]);
 
     const listBefore = await request('/connections');
-    expect(listBefore.body).toContain('Needs review');
+    expect(listBefore.body.split('<script')[0]).toContain('>Checking…</span>');
     expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
     const factsBefore = await connectionsLinkFacts(() => operations().listing());
     expect(factsBefore.apps[0]?.needsReview).toBe(true);
     expect(factsBefore.apps[0]?.tools).toEqual([
-      { name: 'order_groceries', label: 'ask_first', reason: 'Places an order' },
-      { name: 'search_recipes', label: 'just_do', reason: 'Read-only search' },
+      { name: 'order_groceries', label: 'ask_first', summary: 'Place a paid grocery order', reason: 'Places an order' },
+      { name: 'search_recipes', label: 'just_do', summary: 'Search recipes by keyword', reason: 'Read-only search' },
       { name: 'sync_pantry', label: 'unsorted', reason: null },
     ]);
 
     const reviewWhileUnsorted = await request(`/connections/app/${app.id}/tools?outcome=connected`);
     expect(reviewWhileUnsorted.status).toBe(200);
-    expect(reviewWhileUnsorted.body).toContain('When I’ll check with you first');
-    expect(reviewWhileUnsorted.body).toContain('Read-only search');
-    expect(reviewWhileUnsorted.body).toContain('Places an order');
-    expect(reviewWhileUnsorted.body).toContain('Being set up');
-    expect(reviewWhileUnsorted.body).not.toContain('Looks right');
-    expect((await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash })).status).toBe(409);
+    expect(reviewWhileUnsorted.body).toContain('<h1>Recipes</h1>');
+    expect(reviewWhileUnsorted.body).toContain('Search recipes by keyword');
+    expect(reviewWhileUnsorted.body).toContain('Place a paid grocery order');
+    expect(reviewWhileUnsorted.body.split('<script')[0]).toContain(
+      '<span class="badge badge-checking">Checking…</span>',
+    );
+    expect(reviewWhileUnsorted.body).toContain('data-tools-polling="true"');
+    expect(reviewWhileUnsorted.body).toContain('data-review-form hidden');
+    expect(
+      (
+        await post('/connections/review-tools', {
+          id: app.id,
+          listHash: pinned.pin.listHash,
+          labelsHash: toolLabelsHash(await store.listTools(app.id)),
+        })
+      ).status,
+    ).toBe(409);
 
     const staleToggle = await post('/connections/tool-label', {
       id: app.id,
@@ -1735,17 +1870,28 @@ describe('tool approvals review and held-call details', () => {
     });
     expect(staleToggle.status).toBe(409);
 
-    const flipDown = await post('/connections/tool-label', {
-      id: app.id,
+    // JSON toggle returns a lightweight JSON payload (never a full-table labelsHash) and preserves the sharp tool summary.
+    const flipDownJson = await post(
+      '/connections/tool-label',
+      {
+        id: app.id,
+        tool: 'order_groceries',
+        label: 'just_do',
+        definitionHash: hashes.get('order_groceries')!,
+      },
+      { accept: 'application/json' },
+    );
+    expect(flipDownJson.status).toBe(200);
+    expect(JSON.parse(flipDownJson.body)).toEqual({
+      ok: true,
       tool: 'order_groceries',
       label: 'just_do',
       definitionHash: hashes.get('order_groceries')!,
     });
-    expect(flipDown.status).toBe(200);
-    expect(flipDown.headers['x-page-saved']).toBe('true');
     expect(await store.getTool(app.id, 'order_groceries')).toMatchObject({
       label: 'just_do',
       labelSource: 'principal',
+      summary: 'Place a paid grocery order',
     });
 
     const flipUp = await post('/connections/tool-label', {
@@ -1755,32 +1901,78 @@ describe('tool approvals review and held-call details', () => {
       definitionHash: hashes.get('search_recipes')!,
     });
     expect(flipUp.status).toBe(200);
+    expect(flipUp.headers['x-page-saved']).toBe('true');
     expect(await store.getTool(app.id, 'search_recipes')).toMatchObject({
       label: 'ask_first',
       labelSource: 'principal',
+      summary: 'Search recipes by keyword',
     });
 
-    // Once the remaining unsorted tool receives a label, Looks right becomes available and confirms review.
+    // Once the remaining unsorted tool receives a label, Confirm becomes visible and tools-status settles.
     await store.applyToolLabels(app.id, [
       {
         name: 'sync_pantry',
         definitionHash: hashes.get('sync_pantry')!,
         label: 'just_do',
         source: 'sorter',
+        summary: 'Sync your pantry inventory',
         reason: 'Syncs pantry list',
       },
     ]);
+    const settledStatus = await request(`/connections/app/${app.id}/tools-status`);
+    expect(settledStatus.status).toBe(200);
+    const settledPayload = JSON.parse(settledStatus.body) as { labelsHash: string };
+    expect(settledPayload).toMatchObject({
+      pinned: true,
+      needsReview: true,
+      hasUnsorted: false,
+      listHash: pinned.pin.listHash,
+      labelsHash: toolLabelsHash(await store.listTools(app.id)),
+    });
+    const listReady = await request('/connections');
+    expect(listReady.body).toContain('Needs review');
+
     const reviewReady = await request(`/connections/app/${app.id}/tools`);
     expect(reviewReady.status).toBe(200);
-    expect(reviewReady.body).toContain('Looks right');
+    expect(reviewReady.body).toContain('data-tools-polling="false"');
+    expect(reviewReady.body).toContain('>Confirm</button>');
+    expect(reviewReady.body).not.toContain('data-review-form hidden');
 
-    const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
+    const staleReview = await post('/connections/review-tools', {
+      id: app.id,
+      listHash: 'stale-hash',
+      labelsHash: settledPayload.labelsHash,
+    });
     expect(staleReview.status).toBe(409);
 
-    const confirmed = await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash });
+    // If a tool label changes in the background on the same listHash, Confirm with the old labelsHash is rejected.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'sync_pantry',
+        definitionHash: hashes.get('sync_pantry')!,
+        label: 'ask_first',
+        source: 'sorter',
+        summary: 'Sync your pantry inventory',
+        reason: 'Updated classification',
+      },
+    ]);
+    const staleLabelsReview = await post('/connections/review-tools', {
+      id: app.id,
+      listHash: pinned.pin.listHash,
+      labelsHash: settledPayload.labelsHash,
+    });
+    expect(staleLabelsReview.status).toBe(409);
+    expect((await store.getPin(app.id))?.needsReview).toBe(true);
+
+    const freshLabelsHash = toolLabelsHash(await store.listTools(app.id));
+    const confirmed = await post('/connections/review-tools', {
+      id: app.id,
+      listHash: pinned.pin.listHash,
+      labelsHash: freshLabelsHash,
+    });
     expect(confirmed.status).toBe(200);
     expect(confirmed.headers['x-page-location']).toBe('/connections');
-    expect(confirmed.body).not.toContain('Needs review');
+    expect(confirmed.body.split('<script')[0]).not.toContain('Needs review');
     expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(false);
 
     await store.pinTools(app.id, {
@@ -1799,8 +1991,31 @@ describe('tool approvals review and held-call details', () => {
       ],
     });
     const listAfterChange = await request('/connections');
-    expect(listAfterChange.body).toContain('Needs review');
+    expect(listAfterChange.body.split('<script')[0]).toContain('>Checking…</span>');
     expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(true);
+
+    // A pinned app that needs reconnecting routes its primary row link to /connect (for mobile) while keeping Tool approvals in the menu.
+    const grant = await store.currentGrant(app.id);
+    await store.markRefused(app.id, grant?.generation ?? 0);
+    const listReconnect = await request('/connections');
+    expect(listReconnect.body).toContain(`class="app-link" href="/connections/app/${app.id}/connect"`);
+    expect(listReconnect.body).toContain(`role="menuitem" tabindex="-1" href="/connections/app/${app.id}/tools"`);
+
+    // A disconnected unpinned app on /tools does not spin in Checking… or poll forever; it offers Connect.
+    serve(notesServer);
+    await post('/connections/add', { url: NOTES, name: 'Notes' });
+    const notesApp = (await store.apps()).find((a) => a.name === 'Notes')!;
+    const disconnectedTools = await request(`/connections/app/${notesApp.id}/tools`);
+    expect(disconnectedTools.status).toBe(200);
+    expect(disconnectedTools.body).toContain('data-tools-polling="false"');
+    expect(disconnectedTools.body.split('<script')[0]).not.toContain('Checking…');
+    expect(disconnectedTools.body).toContain(`/connections/app/${notesApp.id}/connect`);
+    const disconnectedStatus = await request(`/connections/app/${notesApp.id}/tools-status`);
+    expect(JSON.parse(disconnectedStatus.body)).toMatchObject({
+      status: 'not_connected',
+      pinned: false,
+      hasUnsorted: false,
+    });
   });
 
   it('shows full untruncated arguments and app words on /connections/held/<id> only to the principal', async () => {
@@ -1811,8 +2026,8 @@ describe('tool approvals review and held-call details', () => {
       viewId,
       invocationId: 'sess-1:req-1',
       appId: randomUUID(),
-      appName: 'Chowdeck',
-      appHost: 'mcp.chowdeck.example.test',
+      appName: 'Bistro',
+      appHost: 'mcp.bistro.example.test',
       grantGeneration: 1,
       toolName: 'confirm_checkout',
       definitionHash: 'defhash-1',
@@ -1821,10 +2036,10 @@ describe('tool approvals review and held-call details', () => {
         delivery_notes: longNotes,
       }),
       argsHash: 'argshash-1',
-      summary: 'Confirm Jollof Rice order for Morgan',
+      summary: 'Confirm lunch order for Morgan',
       appContext: {
         toolName: 'prepare_checkout',
-        text: 'Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.',
+        text: 'Prepared checkout chk_999: 1x Grain Bowl, total $18.50.',
       },
       expiresAt: '2026-11-24T12:00:00.000Z',
     };
@@ -1834,7 +2049,7 @@ describe('tool approvals review and held-call details', () => {
       request_id: 'req-1',
       action: HELD_APP_CALL_ACTION,
       payload: JSON.stringify(payload),
-      title: 'Allow Chowdeck to run confirm_checkout?',
+      title: 'Allow Bistro to run confirm_checkout?',
       question: 'Truncated preview',
       options_json: JSON.stringify([{ value: 'approve', label: 'Approve' }]),
       status: 'pending',
@@ -1844,11 +2059,13 @@ describe('tool approvals review and held-call details', () => {
 
     const view = await request(`/connections/held/${viewId}`);
     expect(view.status).toBe(200);
-    expect(view.body).toContain('Chowdeck · confirm_checkout');
-    expect(view.body).toContain('Confirm Jollof Rice order for Morgan');
+    expect(view.body).toContain('<h1>Confirm checkout</h1>');
+    expect(view.body).toContain('Bistro');
+    expect(view.body).toContain('confirm_checkout');
+    expect(view.body).toContain('Confirm lunch order for Morgan');
     expect(view.body).toContain('[U+200B]');
     expect(view.body).toContain(longNotes);
-    expect(view.body).toContain('Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.');
+    expect(view.body).toContain('Prepared checkout chk_999: 1x Grain Bowl, total $18.50.');
 
     const readerView = await request(`/connections/held/${viewId}`, 'GET', {
       'cf-access-jwt-assertion': READER,
@@ -1860,4 +2077,1238 @@ describe('tool approvals review and held-call details', () => {
     expect(unknownView.status).toBe(404);
     expect(unknownView.body).toBe('');
   });
+
+  it('surfaces pending approvals on /connections and lets the principal Approve or Decline directly via POST /connections/held-decision', async () => {
+    const principalUser = 'gchat:users/morgan';
+    await upsertUser({
+      id: principalUser,
+      kind: 'human',
+      display_name: 'Morgan',
+      created_at: '2026-11-24T00:00:00.000Z',
+    });
+    await bindVerifiedPrincipalUser(principalUser, '2026-11-24T00:00:00.000Z');
+    await createMessagingGroup({
+      id: 'mg-dm',
+      channel_type: 'gchat',
+      platform_id: 'spaces/dm-morgan',
+      name: 'Morgan DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: '2026-11-24T00:00:00.000Z',
+    });
+    await createSession({
+      id: 'sess-main-web',
+      agent_group_id: MAIN,
+      messaging_group_id: 'mg-dm',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      created_at: '2026-11-24T00:00:00.000Z',
+      last_active: '2026-11-24T00:00:00.000Z',
+    });
+
+    const previousAdapter = getDeliveryAdapter();
+    const editedCards: string[] = [];
+    const executedCalls: string[] = [];
+    const writtenNotes: string[] = [];
+    const executeApprovedCall: AppRelay['executeApprovedCall'] = async (input) => {
+      executedCalls.push(`${input.toolName}:${JSON.stringify(input.args)}`);
+      return {
+        status: 'completed',
+        result: { content: [{ type: 'text', text: 'Order placed #8841' }] },
+      };
+    };
+
+    try {
+      deliveryAdapterOverride.adapter = {
+        deliver: async (_channelType, _platformId, _threadId, _format, content) => {
+          editedCards.push(content);
+          return undefined;
+        },
+      };
+      deliveryAdapterOverride.active = true;
+      registerHeldAppCallHandlers({
+        relay: () => ({ executeApprovedCall }) as AppRelay,
+        writeNote: async (note) => {
+          writtenNotes.push(note.text);
+          return 'written';
+        },
+      });
+
+      const insertHeld = async (viewId: string, summary: string, expiresAt: string) => {
+        const args = { checkout_id: `chk_${viewId}` };
+        const { canonical, hash } = canonicalArgsHash(args);
+        const payload: HeldAppCallPayload = {
+          viewId,
+          invocationId: `sess-main-web:req-${viewId}`,
+          appId: randomUUID(),
+          appName: 'Bistro',
+          appHost: 'mcp.bistro.example.test',
+          grantGeneration: 1,
+          toolName: 'confirm_checkout',
+          definitionHash: 'defhash-1',
+          canonicalArgs: canonical,
+          argsHash: hash,
+          summary,
+          appContext: null,
+          expiresAt,
+        };
+        await createPendingApproval({
+          approval_id: `appr-${viewId}`,
+          session_id: 'sess-main-web',
+          request_id: `req-${viewId}`,
+          action: HELD_APP_CALL_ACTION,
+          payload: JSON.stringify(payload),
+          title: 'Allow Bistro to run confirm_checkout?',
+          question: 'Order details',
+          options_json: JSON.stringify([
+            { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+            { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+          ]),
+          status: 'pending',
+          created_at: new Date().toISOString(),
+          expires_at: expiresAt,
+          approver_user_id: principalUser,
+          channel_type: 'gchat',
+          platform_id: 'spaces/dm-morgan',
+          platform_message_id: `msg-${viewId}`,
+        });
+      };
+
+      const futureExpiry = new Date(Date.now() + 3600_000).toISOString();
+      const pastExpiry = new Date(Date.now() - 60_000).toISOString();
+      await insertHeld('held-live-approve', 'Place lunch order', futureExpiry);
+      await insertHeld('held-live-decline', 'Place extra drink order', futureExpiry);
+      await insertHeld('held-already-expired', 'Stale expired order', pastExpiry);
+
+      // Connections list surfaces pending unexpired approvals at top and omits expired ones.
+      const list = await request('/connections');
+      expect(list.status).toBe(200);
+      expect(list.body).toContain('Waiting for approval');
+      expect(list.body).toContain('/connections/held/held-live-approve');
+      expect(list.body).toContain('Place lunch order');
+      expect(list.body).toContain('/connections/held/held-live-decline');
+      expect(list.body).not.toContain('Stale expired order');
+
+      // Pending detail page renders direct Approve & Decline forms with no chat bounce-back notice.
+      const detail = await request('/connections/held/held-live-approve');
+      expect(detail.status).toBe(200);
+      expect(detail.body).toContain('action="/connections/held-decision"');
+      expect(detail.body).toContain('>Approve</button>');
+      expect(detail.body).toContain('>Decline</button>');
+      expect(detail.body).not.toContain('Reply 👍 or 👎 in chat');
+
+      // Expired detail page renders Expired state without Approve/Decline buttons.
+      const expiredDetail = await request('/connections/held/held-already-expired');
+      expect(expiredDetail.status).toBe(200);
+      expect(expiredDetail.body).toContain('Expired');
+      expect(expiredDetail.body).not.toContain('action="/connections/held-decision"');
+
+      // Non-principal reader and cross-site POST are refused with empty 404.
+      const readerPost = await request(
+        '/connections/held-decision',
+        'POST',
+        { ...postHeaders, 'cf-access-jwt-assertion': READER },
+        JSON.stringify({ viewId: 'held-live-approve', decision: 'approve' }),
+      );
+      expect(readerPost.status).toBe(404);
+      expect(readerPost.body).toBe('');
+      const crossSite = await request(
+        '/connections/held-decision',
+        'POST',
+        { ...postHeaders, 'sec-fetch-site': 'cross-site' },
+        JSON.stringify({ viewId: 'held-live-approve', decision: 'approve' }),
+      );
+      expect(crossSite.status).toBe(404);
+      expect(executedCalls).toEqual([]);
+
+      // Invalid decision is refused with empty 404 (kit InvalidSubmission).
+      const invalidDecision = await post('/connections/held-decision', {
+        viewId: 'held-live-approve',
+        decision: 'maybe',
+      });
+      expect(invalidDecision.status).toBe(404);
+      expect(invalidDecision.body).toBe('');
+      expect(executedCalls).toEqual([]);
+
+      // Approve from web executes once, edits chat card in place, and navigates to reloadable /connections?outcome=approved.
+      const approved = await post('/connections/held-decision', {
+        viewId: 'held-live-approve',
+        decision: 'approve',
+      });
+      expect(approved.status).toBe(200);
+      expect(approved.headers['x-page-saved']).toBe('true');
+      expect(approved.headers['x-page-location']).toBe('/connections?outcome=approved');
+      expect(approved.body).toContain('Approved. Your assistant has the result.');
+      expect(approved.body).not.toContain('Place lunch order');
+      expect(approved.body).toContain('Place extra drink order');
+      expect(executedCalls).toEqual(['confirm_checkout:{"checkout_id":"chk_held-live-approve"}']);
+      expect(editedCards.some((entry) => entry.includes('Approved'))).toBe(true);
+      expect(writtenNotes.some((note) => note.includes('Order placed #8841'))).toBe(true);
+      const reloadedApproved = await request('/connections?outcome=approved');
+      expect(reloadedApproved.status).toBe(200);
+      expect(reloadedApproved.body).toContain('Approved. Your assistant has the result.');
+
+      // Re-submitting the already-answered request does not re-execute and navigates cleanly to /connections.
+      const replay = await post('/connections/held-decision', {
+        viewId: 'held-live-approve',
+        decision: 'approve',
+      });
+      expect(replay.status).toBe(200);
+      expect(replay.headers['x-page-saved']).toBeUndefined();
+      expect(replay.headers['x-page-location']).toBe('/connections');
+      expect(replay.body).toContain('This request is no longer pending.');
+      expect(executedCalls).toHaveLength(1);
+
+      // Decline from web does not execute, edits chat card in place, and navigates to reloadable /connections?outcome=declined.
+      const declined = await post('/connections/held-decision', {
+        viewId: 'held-live-decline',
+        decision: 'reject',
+      });
+      expect(declined.status).toBe(200);
+      expect(declined.headers['x-page-saved']).toBe('true');
+      expect(declined.headers['x-page-location']).toBe('/connections?outcome=declined');
+      expect(declined.body).toContain('Declined. Nothing was sent.');
+      expect(declined.body).not.toContain('Waiting for approval');
+      expect(executedCalls).toHaveLength(1);
+      expect(editedCards.some((entry) => entry.includes('Rejected'))).toBe(true);
+      const reloadedDeclined = await request('/connections?outcome=declined');
+      expect(reloadedDeclined.status).toBe(200);
+      expect(reloadedDeclined.body).toContain('Declined. Nothing was sent.');
+
+      // Reloading /connections succeeds cleanly with no pending approvals left.
+      const listAfter = await request('/connections');
+      expect(listAfter.status).toBe(200);
+      expect(listAfter.body).not.toContain('Waiting for approval');
+    } finally {
+      deliveryAdapterOverride.active = false;
+      deliveryAdapterOverride.adapter = null;
+      registerHeldAppCallHandlers();
+    }
+    expect(getDeliveryAdapter()).toBe(previousAdapter);
+  });
+
+  it.skipIf(!chromePath).each([
+    { label: 'mobile', width: 375, height: 812 },
+    { label: 'desktop', width: 1280, height: 800 },
+  ])(
+    'live-polls unsorted tools to ready, toggles in place without re-sorting, and renders native $label layout in Chrome',
+    async ({ label, width, height }) => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          {
+            name: 'confirm_checkout',
+            description: 'Place the order and charge the card.',
+            inputSchema: { type: 'object', properties: {} },
+          },
+          {
+            name: 'create_cart',
+            description: 'Create a temporary draft cart.',
+            inputSchema: { type: 'object', properties: {} },
+            annotations: { readOnlyHint: false },
+          },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width, height } });
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+
+        // Initially unsorted: shows Checking shimmer and hides Confirm.
+        expect(await page.locator('[data-tools-app]').getAttribute('data-tools-polling')).toBe('true');
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+
+        // Backend sorter finishes asynchronously: UI updates live without a manual reload!
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'confirm_checkout',
+            definitionHash: hashes.get('confirm_checkout')!,
+            label: 'ask_first',
+            source: 'floor',
+            summary: 'Place order and charge card',
+            reason: 'Charges saved card',
+          },
+          {
+            name: 'create_cart',
+            definitionHash: hashes.get('create_cart')!,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Start a draft order cart',
+            reason: 'Reversible draft cart step',
+          },
+        ]);
+
+        await expect
+          .poll(() => page.locator('[data-tools-app]').getAttribute('data-tools-polling'), { timeout: 5000 })
+          .toBe('false');
+        await expect
+          .poll(() => page.locator('[data-tool-row="create_cart"] [data-tool-desc]').textContent(), { timeout: 5000 })
+          .toBe('Start a draft order cart');
+        await expect
+          .poll(() => page.locator('[data-tool-row="confirm_checkout"] [data-tool-desc]').textContent(), {
+            timeout: 5000,
+          })
+          .toBe('Place order and charge card');
+        expect(pageErrors).toEqual([]);
+
+        // Mobile vs Desktop native layout invariants.
+        const isMobile = label === 'mobile';
+        expect(await page.locator('.tools-card-head').isVisible()).toBe(!isMobile);
+        expect(await page.locator('.tools-mobile-strip').isVisible()).toBe(isMobile);
+        expect(await page.locator('.review-header-form button').isVisible()).toBe(!isMobile);
+        expect(await page.locator('.review-dock button').isVisible()).toBe(isMobile);
+        expect(await page.locator('[data-tool-row="create_cart"] .tool-slug').isVisible()).toBe(!isMobile);
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+
+        // Touch target check: all visible buttons/switches are >= 44px on mobile.
+        if (isMobile) {
+          const undersized = await page.evaluate<string[]>(
+            `[...document.querySelectorAll('button, a.app-link')].filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (r.width < 44 || r.height < 44); }).map(el => el.getAttribute('aria-label') || el.textContent)`,
+          );
+          expect(undersized).toEqual([]);
+        }
+
+        // Optimistic in-place switch toggle: flips without reordering rows or showing an #outcome jump banner.
+        const orderBefore = await page
+          .locator('[data-tool-row]')
+          .evaluateAll((els) => els.map((el) => el.getAttribute('data-tool-row')));
+        const cartSwitch = page.locator('button[data-switch-name="create_cart"]');
+        expect(await cartSwitch.getAttribute('aria-checked')).toBe('false');
+        await cartSwitch.click();
+        await expect.poll(() => cartSwitch.getAttribute('aria-checked')).toBe('true');
+        await expect.poll(async () => (await store.getTool(app.id, 'create_cart'))?.label).toBe('ask_first');
+        const orderAfter = await page
+          .locator('[data-tool-row]')
+          .evaluateAll((els) => els.map((el) => el.getAttribute('data-tool-row')));
+        expect(orderAfter).toEqual(orderBefore);
+        expect(await page.locator('#outcome').isVisible()).toBe(false);
+
+        // Confirm review works via the viewport-appropriate Confirm button.
+        const confirmBtn = isMobile ? page.locator('.review-dock button') : page.locator('.review-header-form button');
+        await confirmBtn.click();
+        await page.waitForURL(`https://${HOST}/connections`);
+        expect((await store.getPin(app.id))?.needsReview).toBe(false);
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+
+        // Held call approval surfaced on /connections and directly approvable in Chrome on both mobile & desktop.
+        const principalUser = 'gchat:users/morgan';
+        await upsertUser({
+          id: principalUser,
+          kind: 'human',
+          display_name: 'Morgan',
+          created_at: '2026-11-24T00:00:00.000Z',
+        });
+        await bindVerifiedPrincipalUser(principalUser, '2026-11-24T00:00:00.000Z');
+        await createMessagingGroup({
+          id: `mg-dm-${label}`,
+          channel_type: 'gchat',
+          platform_id: 'spaces/dm-morgan',
+          name: 'Morgan DM',
+          is_group: 0,
+          unknown_sender_policy: 'strict',
+          created_at: '2026-11-24T00:00:00.000Z',
+        });
+        await createSession({
+          id: `sess-chrome-${label}`,
+          agent_group_id: MAIN,
+          messaging_group_id: `mg-dm-${label}`,
+          thread_id: null,
+          agent_provider: null,
+          status: 'active',
+          container_status: 'stopped',
+          created_at: '2026-11-24T00:00:00.000Z',
+          last_active: '2026-11-24T00:00:00.000Z',
+        });
+        const chromeExecuted: string[] = [];
+        const chromeExecuteApproved: AppRelay['executeApprovedCall'] = async (input) => {
+          chromeExecuted.push(input.toolName);
+          return { status: 'completed', result: { content: [{ type: 'text', text: 'Done' }] } };
+        };
+        try {
+          registerHeldAppCallHandlers({
+            relay: () => ({ executeApprovedCall: chromeExecuteApproved }) as AppRelay,
+            writeNote: async () => 'written',
+          });
+          const heldViewId = `held-chrome-${label}`;
+          const { canonical, hash } = canonicalArgsHash({ checkout_id: 'chk_chrome' });
+          const heldPayload: HeldAppCallPayload = {
+            viewId: heldViewId,
+            invocationId: `sess-chrome-${label}:req-1`,
+            appId: app.id,
+            appName: 'Bistro',
+            appHost: app.host,
+            grantGeneration: 1,
+            toolName: 'confirm_checkout',
+            definitionHash: hashes.get('confirm_checkout')!,
+            canonicalArgs: canonical,
+            argsHash: hash,
+            summary: 'Place lunch order from Corner Kitchen',
+            appContext: null,
+            expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+          };
+          await createPendingApproval({
+            approval_id: `appr-${heldViewId}`,
+            session_id: `sess-chrome-${label}`,
+            request_id: 'req-1',
+            action: HELD_APP_CALL_ACTION,
+            payload: JSON.stringify(heldPayload),
+            title: 'Allow Bistro to run confirm_checkout?',
+            question: 'Order details',
+            options_json: JSON.stringify([{ label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' }]),
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            expires_at: heldPayload.expiresAt,
+            approver_user_id: principalUser,
+            channel_type: 'gchat',
+            platform_id: 'spaces/dm-morgan',
+          });
+
+          const heldDeclineId = `held-chrome-decline-${label}`;
+          const { canonical: declineCanonical, hash: declineHash } = canonicalArgsHash({
+            checkout_id: 'chk_chrome_decline',
+          });
+          const declinePayload: HeldAppCallPayload = {
+            ...heldPayload,
+            viewId: heldDeclineId,
+            invocationId: `sess-chrome-${label}:req-2`,
+            canonicalArgs: declineCanonical,
+            argsHash: declineHash,
+            summary: 'Place dessert order from Corner Kitchen',
+          };
+          await createPendingApproval({
+            approval_id: `appr-${heldDeclineId}`,
+            session_id: `sess-chrome-${label}`,
+            request_id: 'req-2',
+            action: HELD_APP_CALL_ACTION,
+            payload: JSON.stringify(declinePayload),
+            title: 'Allow Bistro to run confirm_checkout?',
+            question: 'Dessert order details',
+            options_json: JSON.stringify([{ label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' }]),
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            expires_at: declinePayload.expiresAt,
+            approver_user_id: principalUser,
+            channel_type: 'gchat',
+            platform_id: 'spaces/dm-morgan',
+          });
+
+          await page.goto(`https://${HOST}/connections`);
+          expect(await page.locator('#pending-approvals-heading').isVisible()).toBe(true);
+          expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+          await page.locator(`a.approval-link[href="/connections/held/${heldViewId}"]`).click();
+          await page.waitForURL(`https://${HOST}/connections/held/${heldViewId}`);
+          expect(await page.locator('.held-actions-header').isVisible()).toBe(!isMobile);
+          expect(await page.locator('.held-dock').isVisible()).toBe(isMobile);
+          expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+          if (isMobile) {
+            const undersizedHeld = await page.evaluate<string[]>(
+              `[...document.querySelectorAll('button, a.back-link')].filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (r.width < 44 || r.height < 44); }).map(el => el.getAttribute('aria-label') || el.textContent)`,
+            );
+            expect(undersizedHeld).toEqual([]);
+          }
+          const approveBtn = isMobile
+            ? page.locator('.held-dock button.button-primary')
+            : page.locator('.held-actions-header button.button-primary');
+          await approveBtn.click();
+          await page.waitForURL(`https://${HOST}/connections?outcome=approved`);
+          await expect
+            .poll(() => page.locator('#outcome').textContent(), { timeout: 5000 })
+            .toContain('Approved. Your assistant has the result.');
+          expect(await page.locator('.held-dock').count()).toBe(0);
+          expect(await page.locator('.held-actions-header').count()).toBe(0);
+          // Reloading preserves the approval confirmation banner.
+          const reloadedApproved = await page.reload();
+          expect(reloadedApproved?.status()).toBe(200);
+          expect(await page.locator('#outcome').textContent()).toContain('Approved. Your assistant has the result.');
+          expect(chromeExecuted).toEqual(['confirm_checkout']);
+
+          // Declining directly from the held detail view also preserves its confirmation banner across reload.
+          await page.locator(`a.approval-link[href="/connections/held/${heldDeclineId}"]`).click();
+          await page.waitForURL(`https://${HOST}/connections/held/${heldDeclineId}`);
+          const declineBtn = isMobile
+            ? page.locator('.held-dock button.button-secondary')
+            : page.locator('.held-actions-header button.button-secondary');
+          await declineBtn.click();
+          await page.waitForURL(`https://${HOST}/connections?outcome=declined`);
+          await expect
+            .poll(() => page.locator('#outcome').textContent(), { timeout: 5000 })
+            .toContain('Declined. Nothing was sent.');
+          const reloadedDeclined = await page.reload();
+          expect(reloadedDeclined?.status()).toBe(200);
+          expect(await page.locator('#outcome').textContent()).toContain('Declined. Nothing was sent.');
+          expect(chromeExecuted).toEqual(['confirm_checkout']);
+          expect(pageErrors).toEqual([]);
+        } finally {
+          registerHeldAppCallHandlers();
+        }
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!chromePath)(
+    'moves focus to back-link when polling empties tools, keeps uncertain switches locked on 500 + status failures, and reconciles after concurrent toggles',
+    async () => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          {
+            name: 'alpha_tool',
+            description: 'First settled tool',
+            inputSchema: { type: 'object', properties: {} },
+          },
+          {
+            name: 'beta_tool',
+            description: 'Second settled tool',
+            inputSchema: { type: 'object', properties: {} },
+          },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'alpha_tool',
+          definitionHash: hashes.get('alpha_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read alpha state',
+          reason: 'Read-only',
+        },
+        {
+          name: 'beta_tool',
+          definitionHash: hashes.get('beta_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read beta state',
+          reason: 'Read-only',
+        },
+      ]);
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        let mode: 'normal' | 'concurrent_recover' | 'fail_forever' | 'empty_poll' = 'concurrent_recover';
+        let statusAttempts = 0;
+        let markBetaStarted: (() => void) | undefined;
+        const betaStarted = new Promise<void>((resolve) => {
+          markBetaStarted = resolve;
+        });
+        let releaseBeta: (() => void) | undefined;
+
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+
+          if (sent.method() === 'POST' && url.pathname === '/connections/tool-label') {
+            const parsed = JSON.parse(body ?? '{}') as { tool?: string };
+            if (parsed.tool === 'alpha_tool' && (mode === 'concurrent_recover' || mode === 'fail_forever')) {
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Temporary server error' }),
+              });
+              return;
+            }
+            if (parsed.tool === 'beta_tool' && mode === 'concurrent_recover') {
+              markBetaStarted?.();
+              await new Promise<void>((resolve) => {
+                releaseBeta = resolve;
+              });
+            }
+          }
+
+          if (sent.method() === 'GET' && url.pathname === `/connections/app/${app.id}/tools-status`) {
+            if (mode === 'concurrent_recover') {
+              statusAttempts += 1;
+              if (statusAttempts === 1) {
+                await route.fulfill({
+                  status: 503,
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ error: 'Unavailable' }),
+                });
+                return;
+              }
+            } else if (mode === 'fail_forever') {
+              statusAttempts += 1;
+              await route.fulfill({
+                status: 503,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ error: 'Unavailable' }),
+              });
+              return;
+            } else if (mode === 'empty_poll') {
+              await route.fulfill({
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  appId: app.id,
+                  status: 'connected',
+                  pinned: true,
+                  listHash: pinned.pin.listHash,
+                  labelsHash: toolLabelsHash([]),
+                  needsReview: false,
+                  hasUnsorted: false,
+                  tools: [],
+                }),
+              });
+              return;
+            }
+          }
+
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+
+        // 1) Concurrent toggle + 500 + failed first tools-status: alpha stays locked while uncertain,
+        //    reconciliation waits until beta completes (never dropped), retries past the first 503, and restores server truth.
+        const betaSwitch = page.locator('button[data-switch-name="beta_tool"]');
+        const alphaSwitch = page.locator('button[data-switch-name="alpha_tool"]');
+        const confirmBtn = page.locator('.review-header-form button');
+        await betaSwitch.click();
+        await betaStarted;
+        await alphaSwitch.click();
+        await expect.poll(() => alphaSwitch.isDisabled(), { timeout: 3000 }).toBe(true);
+        expect(await alphaSwitch.locator('.switch-state').textContent()).toBe('Checking…');
+        expect(await confirmBtn.isDisabled()).toBe(true);
+        expect(statusAttempts).toBe(0);
+
+        // Release the concurrent beta toggle; reconciliation now fires, retries past the first 503, and restores truth.
+        releaseBeta?.();
+        await expect.poll(() => statusAttempts, { timeout: 6000 }).toBeGreaterThanOrEqual(2);
+        await expect.poll(() => alphaSwitch.isDisabled(), { timeout: 6000 }).toBe(false);
+        expect(await alphaSwitch.getAttribute('aria-checked')).toBe('false');
+        expect(await alphaSwitch.locator('.switch-state').textContent()).toBe('Auto');
+        expect(await betaSwitch.getAttribute('aria-checked')).toBe('true');
+        expect(await confirmBtn.isDisabled()).toBe(false);
+
+        // 2) Persistent status failure keeps the uncertain switch disabled and shows recovery guidance.
+        mode = 'fail_forever';
+        statusAttempts = 0;
+        await alphaSwitch.click();
+        await expect.poll(() => statusAttempts, { timeout: 7000 }).toBeGreaterThanOrEqual(3);
+        await expect
+          .poll(() => page.locator('#outcome').textContent(), { timeout: 7000 })
+          .toContain('Couldn’t confirm the saved state. Reload the page before changing tools again.');
+        expect(await alphaSwitch.isDisabled()).toBe(true);
+        expect(await alphaSwitch.locator('.switch-state').textContent()).toBe('Unconfirmed');
+        expect(await confirmBtn.isDisabled()).toBe(true);
+
+        // 3) When polling transitions a focused tool list to empty, focus moves cleanly to .back-link.
+        mode = 'normal';
+        await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            {
+              name: 'transient_tool',
+              description: 'Temporary tool being checked',
+              inputSchema: { type: 'object', properties: {} },
+            },
+          ],
+        });
+        mode = 'empty_poll';
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        const transientSwitch = page.locator('button[data-switch-name="transient_tool"]');
+        await transientSwitch.focus();
+        await expect
+          .poll(() => page.locator('[data-tools-empty]').textContent(), { timeout: 5000 })
+          .toContain('No tools listed by this app.');
+        expect(await page.evaluate<boolean>('document.activeElement?.classList.contains("back-link") ?? false')).toBe(
+          true,
+        );
+        expect(pageErrors).toEqual([]);
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!chromePath)(
+    'keeps Confirm locked until a full snapshot renders unseen label changes, discards stale pre-toggle polls, and isolates reconciliation from poll shutdown',
+    async () => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+          { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'alpha_tool',
+          definitionHash: hashes.get('alpha_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read alpha state',
+          reason: 'Read-only',
+        },
+        {
+          name: 'beta_tool',
+          definitionHash: hashes.get('beta_tool')!,
+          label: 'ask_first',
+          source: 'sorter',
+          summary: 'Modify beta state',
+          reason: 'External write',
+        },
+      ]);
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        let scenario: 'unseen_label' | 'delayed_pre_toggle_poll' | 'poll_shutdown_vs_reconcile' = 'unseen_label';
+        let holdStatus = false;
+        let markStatusHeld: (() => void) | undefined;
+        let statusHeld = new Promise<void>((resolve) => {
+          markStatusHeld = resolve;
+        });
+        let releaseStatus: (() => void) | undefined;
+        let stalePollStartedResolve: (() => void) | undefined;
+        let stalePollStarted = new Promise<void>((resolve) => {
+          stalePollStartedResolve = resolve;
+        });
+        let releaseStalePoll: (() => void) | undefined;
+        let statusRequestCount = 0;
+        let reconcileFailCount = 0;
+
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+
+          if (sent.method() === 'POST' && url.pathname === '/connections/tool-label') {
+            if (scenario === 'delayed_pre_toggle_poll') {
+              // Simulate a toggle that commits in the store, then fails with 500 on the wire.
+              await operations().setToolLabel(app.id, 'alpha_tool', 'ask_first', {
+                expectedHash: hashes.get('alpha_tool')!,
+              });
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Ambiguous failure after save' }),
+              });
+              return;
+            }
+            if (scenario === 'poll_shutdown_vs_reconcile') {
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Ambiguous failure' }),
+              });
+              return;
+            }
+          }
+
+          if (sent.method() === 'GET' && url.pathname === `/connections/app/${app.id}/tools-status`) {
+            statusRequestCount += 1;
+            if (scenario === 'unseen_label' && holdStatus) {
+              markStatusHeld?.();
+              await new Promise<void>((resolve) => {
+                releaseStatus = resolve;
+              });
+            } else if (scenario === 'delayed_pre_toggle_poll') {
+              if (statusRequestCount === 1) {
+                // Capture the pre-toggle snapshot (alpha_tool = just_do) and hold it until after the 500 toggle!
+                const staleBody = JSON.stringify({
+                  appId: app.id,
+                  status: 'connected',
+                  pinned: true,
+                  listHash: pinned.pin.listHash,
+                  labelsHash: toolLabelsHash(await store.listTools(app.id)),
+                  needsReview: true,
+                  hasUnsorted: false,
+                  tools: [
+                    {
+                      name: 'alpha_tool',
+                      displayName: 'Alpha tool',
+                      definitionHash: hashes.get('alpha_tool')!,
+                      label: 'just_do',
+                      unsettled: false,
+                      description: 'Read alpha state',
+                    },
+                    {
+                      name: 'beta_tool',
+                      displayName: 'Beta tool',
+                      definitionHash: hashes.get('beta_tool')!,
+                      label: 'ask_first',
+                      unsettled: false,
+                      description: 'Modify beta state',
+                    },
+                  ],
+                });
+                stalePollStartedResolve?.();
+                await new Promise<void>((resolve) => {
+                  releaseStalePoll = resolve;
+                });
+                await route.fulfill({
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                  body: staleBody,
+                });
+                return;
+              }
+              if (statusRequestCount === 2) {
+                // Hold the post-toggle reconciliation until the delayed stale poll has been delivered first!
+                markStatusHeld?.();
+                await new Promise<void>((resolve) => {
+                  releaseStatus = resolve;
+                });
+              }
+            } else if (scenario === 'poll_shutdown_vs_reconcile') {
+              if (statusRequestCount === 1) {
+                // First in-flight poll will finish as 'settled' (calling stopToolsPolling) AFTER reconcile starts.
+                stalePollStartedResolve?.();
+                await new Promise<void>((resolve) => {
+                  releaseStalePoll = resolve;
+                });
+              } else {
+                // Reconciliation attempts fail with 503 — must NOT be cancelled by poll #1 completing!
+                reconcileFailCount += 1;
+                await route.fulfill({
+                  status: 503,
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ error: 'Unavailable' }),
+                });
+                return;
+              }
+            }
+          }
+
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+
+        // 1) Unseen background label change on beta_tool while principal toggles alpha_tool:
+        //    Confirm stays disabled (and retains the old labelsHash) until full tools-status renders beta_tool's new label.
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        const initialLabelsHash = await page.locator('[data-review-labels-hash]').first().inputValue();
+        expect(await page.locator('button[data-switch-name="beta_tool"]').getAttribute('aria-checked')).toBe('true');
+
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'beta_tool',
+            definitionHash: hashes.get('beta_tool')!,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Modify beta state',
+            reason: 'Background reclassification',
+          },
+        ]);
+        holdStatus = true;
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        await statusHeld;
+        // Alpha flipped optimistically, but Confirm MUST remain disabled and NOT carry the unseen hash yet!
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').getAttribute('aria-checked')).toBe('true');
+        expect(await page.locator('.review-header-form button').isDisabled()).toBe(true);
+        expect(await page.locator('[data-review-labels-hash]').first().inputValue()).toBe(initialLabelsHash);
+
+        // Release full status snapshot -> beta_tool visibly updates to Auto, hash refreshes, Confirm unlocks & succeeds!
+        holdStatus = false;
+        releaseStatus?.();
+        await expect.poll(() => page.locator('.review-header-form button').isDisabled(), { timeout: 5000 }).toBe(false);
+        expect(await page.locator('button[data-switch-name="beta_tool"]').getAttribute('aria-checked')).toBe('false');
+        expect(await page.locator('[data-review-labels-hash]').first().inputValue()).not.toBe(initialLabelsHash);
+        await page.locator('.review-header-form button').click();
+        await page.waitForURL(`https://${HOST}/connections`);
+        expect((await store.getPin(app.id))?.needsReview).toBe(false);
+
+        // 2) Delayed pre-toggle tools-status arriving after an ambiguous 500 save is discarded (never clears uncertain lock with stale label).
+        scenario = 'delayed_pre_toggle_poll';
+        statusRequestCount = 0;
+        statusHeld = new Promise<void>((resolve) => {
+          markStatusHeld = resolve;
+        });
+        // Reset alpha_tool to just_do and leave beta_tool checking so initial page polls.
+        await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            { name: 'alpha_tool', description: 'First tool (v2)', inputSchema: { type: 'object', properties: {} } },
+            { name: 'beta_tool', description: 'Second tool (v2)', inputSchema: { type: 'object', properties: {} } },
+          ],
+        });
+        const repinned = await store.listTools(app.id);
+        hashes.clear();
+        for (const t of repinned) hashes.set(t.name, t.definitionHash);
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'alpha_tool',
+            definitionHash: hashes.get('alpha_tool')!,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Read alpha state',
+            reason: 'Read-only',
+          },
+        ]);
+
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        await stalePollStarted; // Poll #1 is in flight with alpha_tool = just_do!
+        await page.locator('button[data-switch-name="alpha_tool"]').click(); // Commits ask_first then returns 500!
+        await statusHeld; // Reconcile #2 is now in flight; alpha_tool is uncertain & disabled.
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').isDisabled()).toBe(true);
+
+        // Deliver the stale pre-toggle poll #1 first — it MUST be discarded, NOT clear the lock or paint 'Auto'!
+        releaseStalePoll?.();
+        await page.waitForTimeout(150);
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').isDisabled()).toBe(true);
+        expect(await page.locator('button[data-switch-name="alpha_tool"] .switch-state').textContent()).toBe(
+          'Checking…',
+        );
+
+        // Now deliver post-toggle reconcile #2 -> alpha_tool resolves to its true committed label ('Ask first').
+        releaseStatus?.();
+        await expect
+          .poll(() => page.locator('button[data-switch-name="alpha_tool"]').isDisabled(), { timeout: 5000 })
+          .toBe(false);
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').getAttribute('aria-checked')).toBe('true');
+        expect(await page.locator('button[data-switch-name="alpha_tool"] .switch-state').textContent()).toBe(
+          'Ask first',
+        );
+
+        // 3) Settled poll shutdown does not cancel reconciliation retries when reconciliation fails.
+        scenario = 'poll_shutdown_vs_reconcile';
+        statusRequestCount = 0;
+        reconcileFailCount = 0;
+        stalePollStarted = new Promise<void>((resolve) => {
+          stalePollStartedResolve = resolve;
+        });
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        await stalePollStarted; // In-flight poll #1 started.
+        // Settle beta_tool in store so poll #1 would return 'settled', then trigger ambiguous toggle on alpha_tool.
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'beta_tool',
+            definitionHash: hashes.get('beta_tool')!,
+            label: 'ask_first',
+            source: 'sorter',
+            summary: 'Modify beta state',
+            reason: 'External write',
+          },
+        ]);
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        await expect.poll(() => reconcileFailCount, { timeout: 4000 }).toBeGreaterThanOrEqual(1);
+        // Release poll #1 while reconcile retry timer is pending — must NOT cancel reconciliation!
+        releaseStalePoll?.();
+        await expect.poll(() => reconcileFailCount, { timeout: 7000 }).toBeGreaterThanOrEqual(3);
+        await expect
+          .poll(() => page.locator('#outcome').textContent(), { timeout: 7000 })
+          .toContain('Couldn’t confirm the saved state. Reload the page before changing tools again.');
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').isDisabled()).toBe(true);
+        expect(await page.locator('button[data-switch-name="alpha_tool"] .switch-state').textContent()).toBe(
+          'Unconfirmed',
+        );
+        expect(pageErrors).toEqual([]);
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!chromePath)(
+    'restarts polling when reconciliation discovers a newly unsorted tool, and locks the live rebuilt switch after an in-flight list rebuild + 500',
+    async () => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+          { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'alpha_tool',
+          definitionHash: hashes.get('alpha_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read alpha state',
+          reason: 'Read-only',
+        },
+        {
+          name: 'beta_tool',
+          definitionHash: hashes.get('beta_tool')!,
+          label: 'ask_first',
+          source: 'sorter',
+          summary: 'Modify beta state',
+          reason: 'External write',
+        },
+      ]);
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        let scenario: 'reconcile_restarts_polling' | 'rebuild_during_toggle' = 'reconcile_restarts_polling';
+        let toggleStartedResolve: (() => void) | undefined;
+        let toggleStarted = new Promise<void>((resolve) => {
+          toggleStartedResolve = resolve;
+        });
+        let releaseToggle500: (() => void) | undefined;
+        let rebuildStatusCount = 0;
+        let postRebuildFailCount = 0;
+
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+
+          if (scenario === 'rebuild_during_toggle') {
+            if (sent.method() === 'POST' && url.pathname === '/connections/tool-label') {
+              toggleStartedResolve?.();
+              await new Promise<void>((resolve) => {
+                releaseToggle500 = resolve;
+              });
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Ambiguous failure after rebuild' }),
+              });
+              return;
+            }
+            if (sent.method() === 'GET' && url.pathname === `/connections/app/${app.id}/tools-status`) {
+              rebuildStatusCount += 1;
+              if (rebuildStatusCount === 1) {
+                // While alpha_tool toggle is in flight, return an expanded tool list (forcing needsRebuild).
+                const currentTools = await store.listTools(app.id);
+                const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+                const parsed = JSON.parse(reply.body) as { tools: Record<string, unknown>[] };
+                parsed.tools = [
+                  ...parsed.tools,
+                  {
+                    name: 'delta_tool',
+                    displayName: 'Delta tool',
+                    definitionHash: `delta-${currentTools.length}`,
+                    label: null,
+                    unsettled: true,
+                    description: '',
+                  },
+                ];
+                await route.fulfill({
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ ...parsed, hasUnsorted: true }),
+                });
+                return;
+              }
+              postRebuildFailCount += 1;
+              await route.fulfill({
+                status: 503,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ error: 'Unavailable' }),
+              });
+              return;
+            }
+          }
+
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+
+        // 1) Start settled (polling stopped). A catalog refresh adds unsorted gamma_tool.
+        //    Principal toggles alpha_tool -> reconciliation sees 'checking', restarts polling, and settles gamma_tool live!
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        expect(await page.locator('[data-tools-app]').getAttribute('data-tools-polling')).toBe('false');
+
+        const repinned = await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'gamma_tool', description: 'Third tool', inputSchema: { type: 'object', properties: {} } },
+          ],
+        });
+        const gammaHash = repinned.tools.find((t) => t.name === 'gamma_tool')!.definitionHash;
+
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        // Reconciliation must discover gamma_tool (Checking…) AND restart polling!
+        await expect
+          .poll(() => page.locator('[data-tools-app]').getAttribute('data-tools-polling'), { timeout: 5000 })
+          .toBe('true');
+        await expect.poll(() => page.locator('[data-tool-row="gamma_tool"]').count(), { timeout: 5000 }).toBe(1);
+
+        // Now backend sorts gamma_tool -> restarted polling settles it live without a reload!
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'gamma_tool',
+            definitionHash: gammaHash,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Inspect gamma status',
+            reason: 'Read-only',
+          },
+        ]);
+        await expect
+          .poll(() => page.locator('[data-tools-app]').getAttribute('data-tools-polling'), { timeout: 5000 })
+          .toBe('false');
+        await expect
+          .poll(() => page.locator('[data-tool-row="gamma_tool"] [data-tool-desc]').textContent(), { timeout: 5000 })
+          .toBe('Inspect gamma status');
+
+        // 2) While a toggle is in flight, a polling status rebuilds the list (adding delta_tool); then toggle returns 500
+        //    and subsequent status reads fail -> the VISIBLE rebuilt alpha_tool switch must lock in Checking… -> Unconfirmed!
+        scenario = 'rebuild_during_toggle';
+        rebuildStatusCount = 0;
+        postRebuildFailCount = 0;
+        toggleStarted = new Promise<void>((resolve) => {
+          toggleStartedResolve = resolve;
+        });
+        // Add an unsorted tool so the loaded page starts polling.
+        await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'gamma_tool', description: 'Third tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'pending_tool', description: 'Unsorted tool', inputSchema: { type: 'object', properties: {} } },
+          ],
+        });
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        await toggleStarted;
+        // Wait for the in-flight poll to rebuild the list with delta_tool while alpha_tool's POST is still pending!
+        await expect.poll(() => page.locator('[data-tool-row="delta_tool"]').count(), { timeout: 5000 }).toBe(1);
+
+        // Now alpha_tool's POST returns 500, and all subsequent status reads fail with 503.
+        releaseToggle500?.();
+        const visibleAlpha = page.locator('button[data-switch-name="alpha_tool"]');
+        await expect.poll(() => visibleAlpha.isDisabled(), { timeout: 4000 }).toBe(true);
+        await expect.poll(() => postRebuildFailCount, { timeout: 7000 }).toBeGreaterThanOrEqual(3);
+        await expect
+          .poll(() => page.locator('#outcome').textContent(), { timeout: 7000 })
+          .toContain('Couldn’t confirm the saved state. Reload the page before changing tools again.');
+        expect(await visibleAlpha.isDisabled()).toBe(true);
+        expect(await visibleAlpha.locator('.switch-state').textContent()).toBe('Unconfirmed');
+        expect(pageErrors).toEqual([]);
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
 });

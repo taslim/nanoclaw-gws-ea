@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildSortPrompt,
+  normalizeToolSummary,
   resolveFinalToolUpdates,
   sorterVersion,
   type ParsedSortToolEntry,
@@ -23,11 +24,12 @@ const SORT_OUTPUT_SCHEMA = JSON.stringify({
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['name', 'definition_hash', 'label', 'reason'],
+        required: ['name', 'definition_hash', 'label', 'summary', 'reason'],
         properties: {
           name: { type: 'string' },
           definition_hash: { type: 'string' },
           label: { type: 'string', enum: ['ask_first', 'just_do'] },
+          summary: { type: 'string' },
           reason: { type: 'string' },
         },
       },
@@ -39,6 +41,7 @@ interface RawSortEntry {
   readonly name: string;
   readonly definition_hash: string;
   readonly label: 'ask_first' | 'just_do';
+  readonly summary: string;
   readonly reason: string;
 }
 
@@ -49,7 +52,7 @@ function parseRawSortEntries(rawTools: readonly unknown[]): readonly ParsedSortT
       throw new Error('Sorter CLI returned a non-object tool entry.');
     }
     const record = raw as Record<string, unknown>;
-    const { name, definition_hash: definitionHash, label, reason } = record;
+    const { name, definition_hash: definitionHash, label, summary, reason } = record;
     if (typeof name !== 'string' || !name.trim()) {
       throw new Error('Sorter CLI returned a tool entry without a non-empty name.');
     }
@@ -59,6 +62,10 @@ function parseRawSortEntries(rawTools: readonly unknown[]): readonly ParsedSortT
     if (label !== 'ask_first' && label !== 'just_do') {
       throw new Error(`Sorter CLI returned an invalid label for "${name}": ${String(label)}`);
     }
+    const cleanSummary = typeof summary === 'string' ? normalizeToolSummary(summary) : '';
+    if (!cleanSummary) {
+      throw new Error(`Sorter CLI returned an invalid or empty summary for "${name}".`);
+    }
     if (typeof reason !== 'string' || !reason.trim()) {
       throw new Error(`Sorter CLI returned a tool entry for "${name}" without a non-empty reason.`);
     }
@@ -66,6 +73,7 @@ function parseRawSortEntries(rawTools: readonly unknown[]): readonly ParsedSortT
       name: name.trim(),
       definitionHash: definitionHash.trim(),
       label,
+      summary: cleanSummary,
       reason: reason.trim(),
     });
   }
@@ -191,6 +199,7 @@ async function evaluateCase(
     definitionHash: entry.definitionHash,
     label: entry.label,
     source: 'sorter' as const,
+    summary: entry.summary,
     reason: entry.reason,
   }));
 

@@ -51,9 +51,11 @@ import {
   getPendingHeldCallApproval,
   HELD_APP_CALL_ACTION,
   HELD_CALL_ANSWER,
+  listPendingHeldCallApprovals,
   registerHeldAppCallHandlers,
   renderCompactArgs,
   resolveDetailsHostname,
+  resolveHeldCallFromWeb,
   withdrawHeldAppCalls,
 } from './held-calls.js';
 import { ConnectionOperations } from './operations.js';
@@ -133,7 +135,7 @@ async function setupFoodApp(tools: readonly FakeToolDefinition[] = [PREPARE_TOOL
           content: [
             {
               type: 'text',
-              text: 'Prepared checkout chk_order_7788: 1x Jollof Rice from Mama Put, total NGN 4,500.',
+              text: 'Prepared checkout chk_order_7788: 1x Grain Bowl from Corner Kitchen, total $18.50.',
             },
           ],
         };
@@ -146,7 +148,7 @@ async function setupFoodApp(tools: readonly FakeToolDefinition[] = [PREPARE_TOOL
   fake.accessTokens.add('food-secret-token');
   endpoints.use(fake.handle);
 
-  const created = await store.create({ name: 'Chowdeck', url: FOOD_URL, auth: 'token' });
+  const created = await store.create({ name: 'Bistro', url: FOOD_URL, auth: 'token' });
   const connected = await store.connect(created.id, created.version, { kind: 'token', token: 'food-secret-token' });
 
   const holdHandler = createHoldCallHandler({
@@ -245,7 +247,7 @@ describe('held ask-first calls', () => {
     const prepared = await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'prepare_checkout',
-      args: { item: 'Jollof Rice' },
+      args: { item: 'Grain Bowl' },
       session: mainSession,
       requestId: 'req-prep-1',
     });
@@ -256,7 +258,7 @@ describe('held ask-first calls', () => {
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
       args: { checkout_id: 'chk_order_7788' },
-      summary: 'Place Jollof Rice order for NGN 4,500',
+      summary: 'Place Grain Bowl order for $18.50',
       session: mainSession,
       requestId: 'req-confirm-1',
     });
@@ -267,12 +269,14 @@ describe('held ask-first calls', () => {
 
     expect(deliveredCards).toHaveLength(1);
     const card = deliveredCards[0]!;
-    expect(card.title).toContain('Chowdeck');
+    expect(card.title).toContain('Bistro');
     expect(card.title).toContain('confirm_checkout');
     expect(card.question).toContain('chk_order_7788');
-    expect(card.question).toContain('Prepared checkout chk_order_7788: 1x Jollof Rice from Mama Put, total NGN 4,500.');
+    expect(card.question).toContain(
+      'Prepared checkout chk_order_7788: 1x Grain Bowl from Corner Kitchen, total $18.50.',
+    );
     expect(card.question).toContain("Assistant's description:");
-    expect(card.question).toContain('Place Jollof Rice order for NGN 4,500');
+    expect(card.question).toContain('Place Grain Bowl order for $18.50');
     expect(card.question).toContain('Expires:');
 
     await respondToCard(card.questionId, 'approve');
@@ -690,12 +694,12 @@ describe('held ask-first calls', () => {
     };
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test/',
+      issuer: 'https://mcp.bistro.example.test/',
       allowUnauthenticated: true,
       tools: [confirmTool, longTool],
     });
     endpoints.use(fake.handle);
-    const created = await store.create({ name: 'Chow', url: FOOD_URL, auth: 'none' });
+    const created = await store.create({ name: 'Bistro', url: FOOD_URL, auth: 'none' });
     await store.connect(created.id, created.version, { kind: 'none' });
     const pinned = await store.pinTools(created.id, {
       instructions: null,
@@ -1056,7 +1060,7 @@ describe('held ask-first calls', () => {
       agentName: 'Assistant',
       action: APP_TOOL_ASK_ACTION,
       payload: { id: app.id, app: app.serverKey, tool: 'confirm_checkout', ask_first: false },
-      title: 'Stop asking before Chow runs confirm_checkout?',
+      title: 'Stop asking before Bistro runs confirm_checkout?',
       question: 'Allow confirm_checkout without asking?',
       details: { facts: { app: app.name, tool: 'confirm_checkout' } },
       approverUserId: PRINCIPAL_USER,
@@ -1079,5 +1083,114 @@ describe('held ask-first calls', () => {
     expect((await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).filter((r) => r.status === 'pending')).toHaveLength(
       0,
     );
+  });
+
+  it('lists pending held calls for the principal and resolves Approve and Decline directly from web', async () => {
+    const { app, fake } = await setupFoodApp();
+
+    const held1 = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_web_approve' },
+      summary: 'Place dinner order',
+      session: mainSession,
+      requestId: 'req-web-approve',
+    });
+    const held2 = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_web_decline' },
+      summary: 'Place duplicate order',
+      session: mainSession,
+      requestId: 'req-web-decline',
+    });
+    expect(held1.status).toBe('held');
+    expect(held2.status).toBe('held');
+
+    const listed = await listPendingHeldCallApprovals();
+    expect(listed).toHaveLength(2);
+    const approveItem = listed.find((item) => item.payload.summary === 'Place dinner order')!;
+    const declineItem = listed.find((item) => item.payload.summary === 'Place duplicate order')!;
+    expect(approveItem).toBeDefined();
+    expect(declineItem).toBeDefined();
+
+    // Approve directly from web: executes once, edits chat card in place, writes main note.
+    const approved = await resolveHeldCallFromWeb(approveItem.viewId, 'approve');
+    expect(approved.status).toBe('approved');
+    expect(fake.toolCalls.filter((call) => call.name === 'confirm_checkout')).toHaveLength(1);
+    expect(editedCards.some((card) => card.text.includes('Approved'))).toBe(true);
+    expect(readMainMessages().some((msg) => JSON.stringify(msg.content).includes('chk_web_approve'))).toBe(true);
+    expect((await listPendingHeldCallApprovals()).map((item) => item.viewId)).toEqual([declineItem.viewId]);
+
+    // A second web click or late chat response cannot execute the call a second time.
+    expect(await resolveHeldCallFromWeb(approveItem.viewId, 'approve')).toEqual({ status: 'not_found' });
+    await handleApprovalsResponse({
+      questionId: approveItem.approval.approval_id,
+      value: 'approve',
+      userId: PRINCIPAL_USER,
+      channelType: 'gchat',
+      platformId: 'spaces/dm-morgan',
+      threadId: null,
+    });
+    expect(fake.toolCalls.filter((call) => call.name === 'confirm_checkout')).toHaveLength(1);
+
+    // Decline directly from web: does not execute, edits chat card in place, writes decline note.
+    const declined = await resolveHeldCallFromWeb(declineItem.viewId, 'reject');
+    expect(declined.status).toBe('declined');
+    expect(fake.toolCalls.filter((call) => call.name === 'confirm_checkout')).toHaveLength(1);
+    expect(editedCards.some((card) => card.text.includes('Rejected'))).toBe(true);
+    expect(readMainMessages().some((msg) => JSON.stringify(msg.content).includes('declined'))).toBe(true);
+    expect(await listPendingHeldCallApprovals()).toHaveLength(0);
+  });
+
+  it('refuses expired and unauthorized web decisions without executing the held call', async () => {
+    const { app, fake } = await setupFoodApp();
+
+    const heldExpired = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_web_expired' },
+      summary: 'Expired order',
+      session: mainSession,
+      requestId: 'req-web-expired',
+    });
+    expect(heldExpired.status).toBe('held');
+    const [expiredItem] = await listPendingHeldCallApprovals();
+    expect(expiredItem).toBeDefined();
+
+    const afterExpiry = Date.now() + 25 * 60 * 60_000;
+    registerHeldAppCallHandlers({ relay: () => relay, store: () => store, now: () => afterExpiry });
+    expect(await listPendingHeldCallApprovals(() => afterExpiry)).toHaveLength(0);
+    expect((await getPendingHeldCallApproval(expiredItem!.viewId, () => afterExpiry))?.expired).toBe(true);
+
+    const expiredResult = await resolveHeldCallFromWeb(expiredItem!.viewId, 'approve');
+    expect(expiredResult.status).toBe('expired');
+    expect(fake.toolCalls).toHaveLength(0);
+
+    // Restore normal clock, hold a new call, then rotate verified principal so old approval is unauthorized.
+    registerHeldAppCallHandlers({ relay: () => relay, store: () => store });
+    const heldAuth = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_web_unauth' },
+      summary: 'Order before principal change',
+      session: mainSession,
+      requestId: 'req-web-unauth',
+    });
+    expect(heldAuth.status).toBe('held');
+    const [authItem] = await listPendingHeldCallApprovals();
+    expect(authItem).toBeDefined();
+
+    await getDb().run('DELETE FROM gws_ea_principal_users WHERE user_id = ?', PRINCIPAL_USER);
+    await upsertUser({
+      id: 'gchat:users/other',
+      kind: 'human',
+      display_name: 'Other Principal',
+      created_at: new Date().toISOString(),
+    });
+    await bindVerifiedPrincipalUser('gchat:users/other', new Date().toISOString());
+    expect(await listPendingHeldCallApprovals()).toHaveLength(0);
+    expect(await resolveHeldCallFromWeb(authItem!.viewId, 'approve')).toEqual({ status: 'unauthorized' });
+    expect(fake.toolCalls).toHaveLength(0);
   });
 });

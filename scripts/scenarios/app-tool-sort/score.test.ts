@@ -135,6 +135,7 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
           : item.expectation === 'must_ask'
             ? ('ask_first' as const)
             : ('just_do' as const),
+      summary: 'Planted summary',
       reason: 'Planted classification',
     }));
     const { updates } = resolveFinalToolUpdates(expected, planted);

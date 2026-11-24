@@ -38,7 +38,7 @@ import type { ConnectionApp, ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeToolDefinition } from './testing/oauth-server.js';
 import { testConnectionsStore } from './testing/store.js';
 
-const FOOD_URL = 'https://mcp.chow.example.test/mcp';
+const FOOD_URL = 'https://mcp.bistro.example.test/mcp';
 const OPEN_URL = 'https://recipes.example.test/mcp';
 const SENTINEL_ACCESS = 'sentinel-relay-access-token-X9k4';
 const SENTINEL_PASTED = 'sentinel-relay-pasted-token-M2p7';
@@ -65,7 +65,7 @@ let heldCalls: HoldCallInput[];
 let sortNotifications: { appId: string; listHash: string }[];
 
 beforeAll(async () => {
-  endpoints = await startFakeEndpoints(['mcp.chow.example.test', 'recipes.example.test']);
+  endpoints = await startFakeEndpoints(['mcp.bistro.example.test', 'recipes.example.test']);
 });
 afterAll(async () => {
   await endpoints.close();
@@ -109,16 +109,16 @@ afterEach(async () => {
 async function connectOAuthApp(fake: FakeMcpApp): Promise<ConnectionApp> {
   fake.accessTokens.add(SENTINEL_ACCESS);
   const created = await store.create({
-    name: 'Chow',
+    name: 'Bistro',
     url: FOOD_URL,
     auth: 'oauth',
-    issuer: 'https://mcp.chow.example.test/',
+    issuer: 'https://mcp.bistro.example.test/',
   });
   const { state } = await store.startSignIn(created.id, created.version, {
     principalId: 'gchat:users/morgan',
     verifier: 'verifier-'.padEnd(48, 'x'),
-    issuer: 'https://mcp.chow.example.test/',
-    redirectUri: 'https://juno.example.test/connections/callback/mcp.chow.example.test',
+    issuer: 'https://mcp.bistro.example.test/',
+    redirectUri: 'https://juno.example.test/connections/callback/mcp.bistro.example.test',
     resource: FOOD_URL,
   });
   const claim = await store.claimSignIn(state, { host: created.host, principalId: 'gchat:users/morgan' });
@@ -135,7 +135,7 @@ async function connectOAuthApp(fake: FakeMcpApp): Promise<ConnectionApp> {
 }
 
 async function connectPastedApp(): Promise<ConnectionApp> {
-  const created = await store.create({ name: 'Chow', url: FOOD_URL, auth: 'token' });
+  const created = await store.create({ name: 'Bistro', url: FOOD_URL, auth: 'token' });
   const { app } = await store.connect(created.id, created.version, { kind: 'token', token: SENTINEL_PASTED });
   return app;
 }
@@ -205,7 +205,7 @@ describe('host relay core', () => {
   it('runs a just-do call with the host-held bearer token, never opens a GET stream, and records the call', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       instructions: 'Use search_menu before checkout.',
       tools: [SEARCH_TOOL, CHECKOUT_TOOL],
     });
@@ -235,7 +235,7 @@ describe('host relay core', () => {
       op: 'tools/call',
       serverKey: app.serverKey,
       tool: 'search_menu',
-      arguments: { query: 'jollof' },
+      arguments: { query: 'pasta' },
     });
 
     expect(response.ok).toBe(true);
@@ -243,11 +243,11 @@ describe('host relay core', () => {
       status: 'completed',
       result: {
         content: [
-          { type: 'text', text: JSON.stringify({ ok: true, tool: 'search_menu', arguments: { query: 'jollof' } }) },
+          { type: 'text', text: JSON.stringify({ ok: true, tool: 'search_menu', arguments: { query: 'pasta' } }) },
         ],
       },
     });
-    expect(fake.toolCalls).toEqual([{ name: 'search_menu', arguments: { query: 'jollof' }, bearer: SENTINEL_ACCESS }]);
+    expect(fake.toolCalls).toEqual([{ name: 'search_menu', arguments: { query: 'pasta' }, bearer: SENTINEL_ACCESS }]);
     expect(endpoints.requests.filter((r) => r.method === 'GET' && r.path === '/mcp')).toEqual([]);
     expect(await store.recentCompletedResults(app.id, 1)).toHaveLength(1);
   });
@@ -255,7 +255,7 @@ describe('host relay core', () => {
   it('refuses calls from any non-main agent group before touching the app', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [SEARCH_TOOL],
     });
     endpoints.use(fake.handle);
@@ -288,7 +288,7 @@ describe('host relay core', () => {
   it('answers "still being set up" for an unsorted tool with no card and no upstream call', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [SEARCH_TOOL],
     });
     endpoints.use(fake.handle);
@@ -314,7 +314,7 @@ describe('host relay core', () => {
   it('routes an ask-first tool to the hold handler without calling upstream', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [CHECKOUT_TOOL],
     });
     endpoints.use(fake.handle);
@@ -355,7 +355,7 @@ describe('host relay core', () => {
   it('re-reads tools/list before a just-do call after 10 minutes and stops the call when a definition changed', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [SEARCH_TOOL],
     });
     endpoints.use(fake.handle);
@@ -393,7 +393,7 @@ describe('host relay core', () => {
   it('serves pinned tools/list and instructions while the app is down, and appends the ask-first suffix', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       instructions: 'Always check availability first.',
       tools: [SEARCH_TOOL, CHECKOUT_TOOL],
     });
@@ -448,7 +448,7 @@ describe('host relay core', () => {
   it('pins a never-pinned app on its first tools/list, leaving every tool unsorted until labelled', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       instructions: 'Menu server instructions.',
       tools: [SEARCH_TOOL],
     });
@@ -482,7 +482,7 @@ describe('host relay core', () => {
   it('executes an approved call once with an in-flight record, replays return stored outcome, and executing-replay reports unknown', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [CHECKOUT_TOOL],
     });
     endpoints.use(fake.handle);
@@ -536,7 +536,7 @@ describe('host relay core', () => {
   it('reports an oversized approved-call response as too_large rather than unknown', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [CHECKOUT_TOOL],
       onToolCall: () => ({
         content: [{ type: 'text', text: 'x'.repeat(20_000) }],
@@ -575,7 +575,7 @@ describe('host relay core', () => {
   it('relays pasted-token and no-auth principal apps through the same label gate', async () => {
     const pastedFake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [SEARCH_TOOL],
     });
     pastedFake.accessTokens.add(SENTINEL_PASTED);
@@ -633,7 +633,7 @@ describe('host relay core', () => {
   it('renews OAuth token on cold-handshake 401 for both pinApp and tools/call without deadlocking sign-in', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       registration: true,
       tools: [SEARCH_TOOL],
     });
@@ -673,7 +673,7 @@ describe('host relay core', () => {
           await oauthRelay.closeApp(appId);
         },
       });
-      const added = await ops.add({ url: FOOD_URL, name: 'Chow' });
+      const added = await ops.add({ url: FOOD_URL, name: 'Bistro' });
       if (added.status !== 'added') throw new Error(`add failed: ${added.reason}`);
       const started = await ops.startSignIn(added.app.id, added.app.version, 'gchat:users/morgan');
       if (started.status !== 'started') throw new Error(`startSignIn failed: ${started.reason}`);
@@ -725,7 +725,7 @@ describe('host relay core', () => {
   it('serializes concurrent operations per app so a sibling refresh/401 cannot corrupt an in-flight call or retry a sent mutation', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
-      issuer: 'https://mcp.chow.example.test',
+      issuer: 'https://mcp.bistro.example.test',
       tools: [SEARCH_TOOL, CHECKOUT_TOOL],
     });
     endpoints.use(fake.handle);

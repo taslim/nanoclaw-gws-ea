@@ -146,6 +146,9 @@ const POLICY: Policy = {
     'gws-ea-chats/handoffs.ts': {
       delivered_session_id: 'a column in the optional SQL delivery filter, read only by the host',
     },
+    'gws-ea-connections/page-client.ts': {
+      needs_reconnecting: 'an app status value checked by the browser client script',
+    },
     'gws-ea-connections/store.ts': {
       needs_reconnecting: 'an app status value in the host-only SQL column list',
       not_connected: 'an app status value in the host-only SQL column list',

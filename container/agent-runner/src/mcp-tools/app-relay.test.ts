@@ -171,7 +171,7 @@ describe('app-relay stdio MCP server', () => {
         arguments: {
           checkout_id: 'chk_99',
           tip: 200,
-          [ASSISTANT_SUMMARY_FIELD]: 'Place Jollof order for NGN 4,500',
+          [ASSISTANT_SUMMARY_FIELD]: 'Place lunch order for $18.50',
         },
       });
 
@@ -183,7 +183,7 @@ describe('app-relay stdio MCP server', () => {
         serverKey: SERVER_KEY,
         tool: 'confirm_checkout',
         arguments: { checkout_id: 'chk_99', tip: 200 },
-        summary: 'Place Jollof order for NGN 4,500',
+        summary: 'Place lunch order for $18.50',
       });
       expect(JSON.stringify(calls[0]!.fields.arguments)).not.toContain(ASSISTANT_SUMMARY_FIELD);
     } finally {

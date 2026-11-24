@@ -1,21 +1,24 @@
 import { randomBytes } from 'node:crypto';
 
-import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
+import { APPROVE_OPTION, MAX_CARD_QUESTION_LENGTH, REJECT_OPTION } from '../../channels/ask-question.js';
 import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
-import { getPendingApproval, getPendingApprovalsByAction } from '../../db/sessions.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getPendingApproval, getPendingApprovalsByAction, getSession } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { formatLocalTime, resolveTimezone } from '../../timezone.js';
 import type { PendingApproval } from '../../types.js';
-import { withdrawApproval } from '../approvals/lifecycle.js';
+import { expireApproval, withdrawApproval } from '../approvals/lifecycle.js';
 import {
+  approvalCardThread,
   registerApprovalHandler,
   registerApprovalResolvedHandler,
   requestApproval,
   type ApprovalResolvedEvent,
 } from '../approvals/primitive.js';
 import { quoted } from '../approvals/request-text.js';
+import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
@@ -889,18 +892,159 @@ export async function withdrawToolAskApprovals(
   return count;
 }
 
+export interface PendingHeldCallItem {
+  readonly viewId: string;
+  readonly approval: PendingApproval;
+  readonly payload: HeldAppCallPayload;
+}
+
+export type HeldCallDecisionResult =
+  | { readonly status: 'approved'; readonly payload: HeldAppCallPayload }
+  | { readonly status: 'declined'; readonly payload: HeldAppCallPayload }
+  | { readonly status: 'expired'; readonly payload: HeldAppCallPayload }
+  | {
+      readonly status: 'already_resolved';
+      readonly resolvedAs: 'approved' | 'declined' | 'withdrawn' | 'unknown';
+      readonly payload: HeldAppCallPayload;
+    }
+  | { readonly status: 'not_found' }
+  | { readonly status: 'unauthorized' };
+
+function isExpiredHeldCall(approval: PendingApproval, payload: HeldAppCallPayload, nowMs: number): boolean {
+  const payloadExpiry = Date.parse(payload.expiresAt);
+  if (Number.isFinite(payloadExpiry) && payloadExpiry <= nowMs) return true;
+  if (approval.expires_at) {
+    const rowExpiry = Date.parse(approval.expires_at);
+    if (Number.isFinite(rowExpiry) && rowExpiry <= nowMs) return true;
+  }
+  return false;
+}
+
+export async function listPendingHeldCallApprovals(
+  now: () => number = activeDependencies.now ?? Date.now,
+): Promise<readonly PendingHeldCallItem[]> {
+  const db = getDb();
+  if (!(await db.hasTable('pending_approvals')) || !(await db.hasTable('gws_ea_principal_users'))) return [];
+  const rows = await getPendingApprovalsByAction(HELD_APP_CALL_ACTION);
+  const nowMs = now();
+  const items: PendingHeldCallItem[] = [];
+  for (const approval of rows) {
+    if (approval.status !== 'pending') continue;
+    if (!approval.approver_user_id || !(await isVerifiedPrincipalUser(approval.approver_user_id))) continue;
+    const payload = parseHeldCallPayload(approval.payload);
+    if (!payload) continue;
+    if (isExpiredHeldCall(approval, payload, nowMs)) continue;
+    items.push({ viewId: payload.viewId ?? approval.approval_id, approval, payload });
+  }
+  items.sort((left, right) => right.approval.created_at.localeCompare(left.approval.created_at));
+  return items;
+}
+
 export async function getPendingHeldCallApproval(
   viewOrApprovalId: string,
-): Promise<{ readonly approval: PendingApproval; readonly payload: HeldAppCallPayload } | undefined> {
+  now: () => number = activeDependencies.now ?? Date.now,
+): Promise<
+  { readonly approval: PendingApproval; readonly payload: HeldAppCallPayload; readonly expired: boolean } | undefined
+> {
   if (!(await getDb().hasTable('pending_approvals'))) return undefined;
   const rows = await getPendingApprovalsByAction(HELD_APP_CALL_ACTION);
+  const nowMs = now();
   for (const approval of rows) {
     if (approval.status !== 'pending') continue;
     const payload = parseHeldCallPayload(approval.payload);
     if (!payload) continue;
     if (payload.viewId === viewOrApprovalId || approval.approval_id === viewOrApprovalId) {
-      return { approval, payload };
+      return { approval, payload, expired: isExpiredHeldCall(approval, payload, nowMs) };
     }
   }
   return undefined;
+}
+
+async function resolveCardThreadId(approval: PendingApproval): Promise<string | null> {
+  if (!approval.session_id || !approval.channel_type || !approval.platform_id) return null;
+  const session = await getSession(approval.session_id);
+  if (!session?.messaging_group_id) return null;
+  const group = await getMessagingGroup(session.messaging_group_id);
+  if (
+    !group ||
+    group.channel_type !== approval.channel_type ||
+    group.platform_id !== approval.platform_id ||
+    (approval.instance !== null && group.instance !== approval.instance)
+  ) {
+    return null;
+  }
+  return approvalCardThread(session, group);
+}
+
+/**
+ * Resolves a pending held app call directly from the principal's Connections page using the same atomic approval
+ * response pipeline as chat 👍/👎, editing the chat card in place and recording its outcome.
+ */
+export async function resolveHeldCallFromWeb(
+  viewOrApprovalId: string,
+  decision: 'approve' | 'reject',
+): Promise<HeldCallDecisionResult> {
+  const now = activeDependencies.now ?? Date.now;
+  const found = await getPendingHeldCallApproval(viewOrApprovalId, now);
+  if (!found) return { status: 'not_found' };
+  const { approval, payload, expired } = found;
+  const approverUserId = approval.approver_user_id;
+  if (!approverUserId || !(await isVerifiedPrincipalUser(approverUserId))) {
+    return { status: 'unauthorized' };
+  }
+  if (!approval.session_id || !(await getSession(approval.session_id))) {
+    return { status: 'not_found' };
+  }
+  if ((await expireApproval(approval.approval_id, new Date(now()).toISOString())) || expired) {
+    return { status: 'expired', payload };
+  }
+  const threadId = await resolveCardThreadId(approval);
+  const canEditCard = Boolean(approval.platform_message_id && approval.channel_type && approval.platform_id);
+  const handled = await handleApprovalsResponse({
+    questionId: approval.approval_id,
+    value: decision === 'approve' ? APPROVE_OPTION : REJECT_OPTION,
+    userId: approverUserId,
+    channelType: approval.channel_type ?? 'web',
+    platformId: approval.platform_id ?? '',
+    threadId,
+    ...(approval.platform_message_id ? { messageId: approval.platform_message_id } : {}),
+    ...(approval.instance ? { instance: approval.instance } : {}),
+    deferResolution: canEditCard,
+  });
+
+  const store = (await activeDependencies.store?.()) ?? lastHoldStore;
+  const [currentRow, relayCall, invocation] = await Promise.all([
+    getPendingApproval(approval.approval_id).catch(() => undefined),
+    store ? store.getRelayCall(approval.approval_id).catch(() => undefined) : Promise.resolve(undefined),
+    store ? store.getRelayInvocation(payload.invocationId).catch(() => undefined) : Promise.resolve(undefined),
+  ]);
+
+  if (currentRow?.status === 'expired' || invocation?.state === 'expired') {
+    return { status: 'expired', payload };
+  }
+  if (invocation?.state === 'withdrawn') {
+    return { status: 'already_resolved', resolvedAs: 'withdrawn', payload };
+  }
+
+  if (decision === 'approve') {
+    if (
+      currentRow?.status === 'rejected' ||
+      currentRow?.status === 'awaiting_reason' ||
+      invocation?.state === 'declined'
+    ) {
+      return { status: 'already_resolved', resolvedAs: 'declined', payload };
+    }
+    if (!handled && relayCall === undefined && invocation?.state !== 'settled') {
+      return { status: 'already_resolved', resolvedAs: 'unknown', payload };
+    }
+    return { status: 'approved', payload };
+  }
+
+  if (currentRow?.status === 'approved' || relayCall !== undefined || invocation?.state === 'settled') {
+    return { status: 'already_resolved', resolvedAs: 'approved', payload };
+  }
+  if (!handled && invocation?.state !== 'declined') {
+    return { status: 'already_resolved', resolvedAs: 'unknown', payload };
+  }
+  return { status: 'declined', payload };
 }

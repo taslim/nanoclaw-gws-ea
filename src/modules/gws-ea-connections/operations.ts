@@ -6,15 +6,15 @@ import {
   type AdmissionDependencies,
   type AdmissionRefusal,
 } from './admit.js';
-import {
-  applyMainServers,
-  MainServersUnreadableError,
-  mainOperatorServers,
-  notifyMainToolsChanged,
-  type OperatorServer,
-} from './apply.js';
+import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
+import { checkRestartSoon } from './idle-restart.js';
 import { withAppLock } from './locks.js';
-import { withdrawHeldAppCalls, withdrawToolAskApprovals } from './held-calls.js';
+import {
+  listPendingHeldCallApprovals,
+  withdrawHeldAppCalls,
+  withdrawToolAskApprovals,
+  type PendingHeldCallItem,
+} from './held-calls.js';
 import { getAppRelay } from './relay.js';
 import {
   appClientDocumentUrl,
@@ -135,6 +135,8 @@ export interface ConnectionsListing {
   readonly pins?: Readonly<Record<string, AppPin>>;
   /** Pinned tools per principal app id, read without Keychain. */
   readonly toolsByApp?: Readonly<Record<string, readonly PinnedAppTool[]>>;
+  /** Pending held-call approvals waiting for the principal. */
+  readonly pendingApprovals?: readonly PendingHeldCallItem[];
 }
 
 export interface ListingSources {
@@ -163,9 +165,17 @@ export async function readListing(
     }
   })();
 
+  const pendingApprovalsPromise = listPendingHeldCallApprovals().catch((): readonly PendingHeldCallItem[] => []);
+
   if (!store) {
-    const { operators } = await operatorsPromise;
-    return { listed: false, canChange: false, apps: [], operators };
+    const [{ operators }, pendingApprovals] = await Promise.all([operatorsPromise, pendingApprovalsPromise]);
+    return {
+      listed: false,
+      canChange: false,
+      apps: [],
+      operators,
+      ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    };
   }
 
   const storePromise = (async () => {
@@ -188,8 +198,19 @@ export async function readListing(
     }
   })();
 
-  const [opResult, storeResult] = await Promise.all([operatorsPromise, storePromise]);
-  if (!storeResult.listed) return { listed: false, canChange: false, apps: [], operators: opResult.operators };
+  const [opResult, storeResult, pendingApprovals] = await Promise.all([
+    operatorsPromise,
+    storePromise,
+    pendingApprovalsPromise,
+  ]);
+  if (!storeResult.listed)
+    return {
+      listed: false,
+      canChange: false,
+      apps: [],
+      operators: opResult.operators,
+      ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    };
   return {
     listed: true,
     canChange: opResult.ok && storeResult.available,
@@ -197,6 +218,7 @@ export async function readListing(
     operators: opResult.operators,
     pins: storeResult.pins,
     toolsByApp: storeResult.toolsByApp,
+    ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
   };
 }
 
@@ -591,12 +613,12 @@ export class ConnectionOperations {
         options?.expectedHash === undefined ? {} : { expectedHash: options.expectedHash },
       ),
     );
-    if (updated) await notifyMainToolsChanged(this.store);
+    if (updated) checkRestartSoon();
     return updated;
   }
 
-  markToolsReviewed(id: string, expectedListHash: string): Promise<boolean> {
-    return withAppLock(id, () => this.store.markToolsReviewed(id, expectedListHash));
+  markToolsReviewed(id: string, expectedListHash: string, expectedLabelsHash?: string): Promise<boolean> {
+    return withAppLock(id, () => this.store.markToolsReviewed(id, expectedListHash, undefined, expectedLabelsHash));
   }
 
   /**
