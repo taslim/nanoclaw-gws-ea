@@ -186,6 +186,7 @@ describe('held-card distiller', () => {
     const zeroTotals = JSON.stringify({
       subtotal: 100,
       discount: 100,
+      TOTAL: 0,
       totalAmount: 0,
       total_amount: 0,
       amountDue: 0,
@@ -193,6 +194,7 @@ describe('held-card distiller', () => {
       small_order: 0,
     });
     const zeroOut = renderDistilledContext(zeroTotals, new Set());
+    expect(zeroOut.text).toContain('TOTAL: 0');
     expect(zeroOut.text).toContain('Total amount: 0');
     expect(zeroOut.text).toContain('Amount due: 0');
     expect(zeroOut.text).not.toContain('Tip amount');

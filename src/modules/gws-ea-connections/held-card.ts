@@ -32,9 +32,14 @@ const TRIVIAL_STATUS_KEYS = new Set(['ok', 'success', 'status', 'code', 'statusC
 const TRIVIAL_STATUS_STRINGS = /^(?:ok|success|succeeded)$/iu;
 
 const KEEP_ZERO_KEY =
-  /(?:^|[_-])(?:total|subtotal|amount|price|cost|payable|due|balance|charge|quantity|qty|count|guests|seats|adults|children|rooms|nights|days|hours|minutes|score|rating|status|code)(?:$|[_-])|(?:Total|Subtotal|Amount|Price|Cost|Payable|Due|Balance|Charge|Quantity|Qty|Count)$/u;
+  /(?:^|[_-])(?:total|subtotal|amount|price|cost|payable|due|balance|charge|quantity|qty|count|guests|seats|adults|children|rooms|nights|days|hours|minutes|score|rating|status|code)(?:$|[_-])/iu;
 
 const OPTIONAL_ZERO_SLOT = /(?:tip|voucher|promo|discount|fee|tax|bag|container|safety|small[_-]?order|surcharge)/iu;
+
+function shouldKeepZeroKey(key: string): boolean {
+  const normalized = key.replace(/([a-z0-9])([A-Z])/gu, '$1_$2');
+  return KEEP_ZERO_KEY.test(normalized) && !OPTIONAL_ZERO_SLOT.test(normalized);
+}
 
 const USER_FACING_ID_KEY =
   /^(?:order|booking|confirmation|reference|ref|invoice|receipt|transaction|ticket|tracking|flight|reservation|case|issue|pr|pull_request)(?:_id|_number|_no|_code|Id|Number|Code)?$/iu;
@@ -445,12 +450,7 @@ function cleanRecord(
       continue;
     }
 
-    if (
-      typeof value === 'number' &&
-      value === 0 &&
-      hasNonZeroNumber &&
-      (!KEEP_ZERO_KEY.test(key) || OPTIONAL_ZERO_SLOT.test(key))
-    ) {
+    if (typeof value === 'number' && value === 0 && hasNonZeroNumber && !shouldKeepZeroKey(key)) {
       state.compacted = true;
       continue;
     }
