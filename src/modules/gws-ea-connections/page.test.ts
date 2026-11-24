@@ -7,7 +7,6 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createChannelDeliveryAdapter } from '../../channels/channel-registry.js';
 import {
   closeDb,
   createAgentGroup,
@@ -19,7 +18,7 @@ import {
   runMigrations,
 } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
@@ -41,7 +40,21 @@ import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
 import type { AppRelay } from './relay.js';
-import type { ConnectionApp, ConnectionsStore } from './store.js';
+import { toolLabelsHash, type ConnectionApp, type ConnectionsStore } from './store.js';
+
+const deliveryAdapterOverride = vi.hoisted(() => ({
+  active: false,
+  adapter: null as ReturnType<typeof getDeliveryAdapter>,
+}));
+
+vi.mock('../../delivery.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../delivery.js')>();
+  return {
+    ...actual,
+    getDeliveryAdapter: () =>
+      deliveryAdapterOverride.active ? deliveryAdapterOverride.adapter : actual.getDeliveryAdapter(),
+  };
+});
 import {
   FakeMcpApp,
   startFakeEndpoints,
@@ -229,6 +242,8 @@ beforeEach(async () => {
   documentPort = await listen(documentServer);
 });
 afterEach(async () => {
+  deliveryAdapterOverride.active = false;
+  deliveryAdapterOverride.adapter = null;
   server.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
   documentServer.closeAllConnections();
@@ -1837,7 +1852,15 @@ describe('tool approvals review and held-call details', () => {
     );
     expect(reviewWhileUnsorted.body).toContain('data-tools-polling="true"');
     expect(reviewWhileUnsorted.body).toContain('data-review-form hidden');
-    expect((await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash })).status).toBe(409);
+    expect(
+      (
+        await post('/connections/review-tools', {
+          id: app.id,
+          listHash: pinned.pin.listHash,
+          labelsHash: toolLabelsHash(await store.listTools(app.id)),
+        })
+      ).status,
+    ).toBe(409);
 
     const staleToggle = await post('/connections/tool-label', {
       id: app.id,
@@ -1847,7 +1870,7 @@ describe('tool approvals review and held-call details', () => {
     });
     expect(staleToggle.status).toBe(409);
 
-    // JSON toggle returns a lightweight JSON payload and preserves the sharp tool summary.
+    // JSON toggle returns a lightweight JSON payload (with fresh labelsHash) and preserves the sharp tool summary.
     const flipDownJson = await post(
       '/connections/tool-label',
       {
@@ -1864,6 +1887,7 @@ describe('tool approvals review and held-call details', () => {
       tool: 'order_groceries',
       label: 'just_do',
       definitionHash: hashes.get('order_groceries')!,
+      labelsHash: toolLabelsHash(await store.listTools(app.id)),
     });
     expect(await store.getTool(app.id, 'order_groceries')).toMatchObject({
       label: 'just_do',
@@ -1898,11 +1922,13 @@ describe('tool approvals review and held-call details', () => {
     ]);
     const settledStatus = await request(`/connections/app/${app.id}/tools-status`);
     expect(settledStatus.status).toBe(200);
-    expect(JSON.parse(settledStatus.body)).toMatchObject({
+    const settledPayload = JSON.parse(settledStatus.body) as { labelsHash: string };
+    expect(settledPayload).toMatchObject({
       pinned: true,
       needsReview: true,
       hasUnsorted: false,
       listHash: pinned.pin.listHash,
+      labelsHash: toolLabelsHash(await store.listTools(app.id)),
     });
     const listReady = await request('/connections');
     expect(listReady.body).toContain('Needs review');
@@ -1913,10 +1939,38 @@ describe('tool approvals review and held-call details', () => {
     expect(reviewReady.body).toContain('>Confirm</button>');
     expect(reviewReady.body).not.toContain('data-review-form hidden');
 
-    const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
+    const staleReview = await post('/connections/review-tools', {
+      id: app.id,
+      listHash: 'stale-hash',
+      labelsHash: settledPayload.labelsHash,
+    });
     expect(staleReview.status).toBe(409);
 
-    const confirmed = await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash });
+    // If a tool label changes in the background on the same listHash, Confirm with the old labelsHash is rejected.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'sync_pantry',
+        definitionHash: hashes.get('sync_pantry')!,
+        label: 'ask_first',
+        source: 'sorter',
+        summary: 'Sync your pantry inventory',
+        reason: 'Updated classification',
+      },
+    ]);
+    const staleLabelsReview = await post('/connections/review-tools', {
+      id: app.id,
+      listHash: pinned.pin.listHash,
+      labelsHash: settledPayload.labelsHash,
+    });
+    expect(staleLabelsReview.status).toBe(409);
+    expect((await store.getPin(app.id))?.needsReview).toBe(true);
+
+    const freshLabelsHash = toolLabelsHash(await store.listTools(app.id));
+    const confirmed = await post('/connections/review-tools', {
+      id: app.id,
+      listHash: pinned.pin.listHash,
+      labelsHash: freshLabelsHash,
+    });
     expect(confirmed.status).toBe(200);
     expect(confirmed.headers['x-page-location']).toBe('/connections');
     expect(confirmed.body.split('<script')[0]).not.toContain('Needs review');
@@ -2068,12 +2122,13 @@ describe('tool approvals review and held-call details', () => {
     };
 
     try {
-      setDeliveryAdapter({
+      deliveryAdapterOverride.adapter = {
         deliver: async (_channelType, _platformId, _threadId, _format, content) => {
           editedCards.push(content);
           return undefined;
         },
-      });
+      };
+      deliveryAdapterOverride.active = true;
       registerHeldAppCallHandlers({
         relay: () => ({ executeApprovedCall }) as AppRelay,
         writeNote: async (note) => {
@@ -2178,20 +2233,23 @@ describe('tool approvals review and held-call details', () => {
       expect(invalidDecision.body).toBe('');
       expect(executedCalls).toEqual([]);
 
-      // Approve from web executes once, edits chat card in place, and navigates to reloadable /connections with confirmation.
+      // Approve from web executes once, edits chat card in place, and navigates to reloadable /connections?outcome=approved.
       const approved = await post('/connections/held-decision', {
         viewId: 'held-live-approve',
         decision: 'approve',
       });
       expect(approved.status).toBe(200);
       expect(approved.headers['x-page-saved']).toBe('true');
-      expect(approved.headers['x-page-location']).toBe('/connections');
+      expect(approved.headers['x-page-location']).toBe('/connections?outcome=approved');
       expect(approved.body).toContain('Approved. Your assistant has the result.');
       expect(approved.body).not.toContain('Place lunch order');
       expect(approved.body).toContain('Place extra drink order');
       expect(executedCalls).toEqual(['confirm_checkout:{"checkout_id":"chk_held-live-approve"}']);
       expect(editedCards.some((entry) => entry.includes('Approved'))).toBe(true);
       expect(writtenNotes.some((note) => note.includes('Order placed #8841'))).toBe(true);
+      const reloadedApproved = await request('/connections?outcome=approved');
+      expect(reloadedApproved.status).toBe(200);
+      expect(reloadedApproved.body).toContain('Approved. Your assistant has the result.');
 
       // Re-submitting the already-answered request does not re-execute and navigates cleanly to /connections.
       const replay = await post('/connections/held-decision', {
@@ -2204,27 +2262,32 @@ describe('tool approvals review and held-call details', () => {
       expect(replay.body).toContain('This request is no longer pending.');
       expect(executedCalls).toHaveLength(1);
 
-      // Decline from web does not execute, edits chat card in place, and navigates to /connections with confirmation.
+      // Decline from web does not execute, edits chat card in place, and navigates to reloadable /connections?outcome=declined.
       const declined = await post('/connections/held-decision', {
         viewId: 'held-live-decline',
         decision: 'reject',
       });
       expect(declined.status).toBe(200);
       expect(declined.headers['x-page-saved']).toBe('true');
-      expect(declined.headers['x-page-location']).toBe('/connections');
+      expect(declined.headers['x-page-location']).toBe('/connections?outcome=declined');
       expect(declined.body).toContain('Declined. Nothing was sent.');
       expect(declined.body).not.toContain('Waiting for approval');
       expect(executedCalls).toHaveLength(1);
       expect(editedCards.some((entry) => entry.includes('Rejected'))).toBe(true);
+      const reloadedDeclined = await request('/connections?outcome=declined');
+      expect(reloadedDeclined.status).toBe(200);
+      expect(reloadedDeclined.body).toContain('Declined. Nothing was sent.');
 
       // Reloading /connections succeeds cleanly with no pending approvals left.
       const listAfter = await request('/connections');
       expect(listAfter.status).toBe(200);
       expect(listAfter.body).not.toContain('Waiting for approval');
     } finally {
-      setDeliveryAdapter(previousAdapter ?? createChannelDeliveryAdapter());
+      deliveryAdapterOverride.active = false;
+      deliveryAdapterOverride.adapter = null;
       registerHeldAppCallHandlers();
     }
+    expect(getDeliveryAdapter()).toBe(previousAdapter);
   });
 
   it.skipIf(!chromePath).each([
@@ -2438,6 +2501,35 @@ describe('tool approvals review and held-call details', () => {
             platform_id: 'spaces/dm-morgan',
           });
 
+          const heldDeclineId = `held-chrome-decline-${label}`;
+          const { canonical: declineCanonical, hash: declineHash } = canonicalArgsHash({
+            checkout_id: 'chk_chrome_decline',
+          });
+          const declinePayload: HeldAppCallPayload = {
+            ...heldPayload,
+            viewId: heldDeclineId,
+            invocationId: `sess-chrome-${label}:req-2`,
+            canonicalArgs: declineCanonical,
+            argsHash: declineHash,
+            summary: 'Place dessert order from Corner Kitchen',
+          };
+          await createPendingApproval({
+            approval_id: `appr-${heldDeclineId}`,
+            session_id: `sess-chrome-${label}`,
+            request_id: 'req-2',
+            action: HELD_APP_CALL_ACTION,
+            payload: JSON.stringify(declinePayload),
+            title: 'Allow Bistro to run confirm_checkout?',
+            question: 'Dessert order details',
+            options_json: JSON.stringify([{ label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' }]),
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            expires_at: declinePayload.expiresAt,
+            approver_user_id: principalUser,
+            channel_type: 'gchat',
+            platform_id: 'spaces/dm-morgan',
+          });
+
           await page.goto(`https://${HOST}/connections`);
           expect(await page.locator('#pending-approvals-heading').isVisible()).toBe(true);
           expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
@@ -2456,20 +2548,244 @@ describe('tool approvals review and held-call details', () => {
             ? page.locator('.held-dock button.button-primary')
             : page.locator('.held-actions-header button.button-primary');
           await approveBtn.click();
-          await page.waitForURL(`https://${HOST}/connections`);
+          await page.waitForURL(`https://${HOST}/connections?outcome=approved`);
           await expect
             .poll(() => page.locator('#outcome').textContent(), { timeout: 5000 })
             .toContain('Approved. Your assistant has the result.');
           expect(await page.locator('.held-dock').count()).toBe(0);
           expect(await page.locator('.held-actions-header').count()).toBe(0);
-          // Reloading the landed /connections URL works cleanly (no 404).
-          const reloaded = await page.reload();
-          expect(reloaded?.status()).toBe(200);
+          // Reloading preserves the approval confirmation banner.
+          const reloadedApproved = await page.reload();
+          expect(reloadedApproved?.status()).toBe(200);
+          expect(await page.locator('#outcome').textContent()).toContain('Approved. Your assistant has the result.');
+          expect(chromeExecuted).toEqual(['confirm_checkout']);
+
+          // Declining directly from the held detail view also preserves its confirmation banner across reload.
+          await page.locator(`a.approval-link[href="/connections/held/${heldDeclineId}"]`).click();
+          await page.waitForURL(`https://${HOST}/connections/held/${heldDeclineId}`);
+          const declineBtn = isMobile
+            ? page.locator('.held-dock button.button-secondary')
+            : page.locator('.held-actions-header button.button-secondary');
+          await declineBtn.click();
+          await page.waitForURL(`https://${HOST}/connections?outcome=declined`);
+          await expect
+            .poll(() => page.locator('#outcome').textContent(), { timeout: 5000 })
+            .toContain('Declined. Nothing was sent.');
+          const reloadedDeclined = await page.reload();
+          expect(reloadedDeclined?.status()).toBe(200);
+          expect(await page.locator('#outcome').textContent()).toContain('Declined. Nothing was sent.');
           expect(chromeExecuted).toEqual(['confirm_checkout']);
           expect(pageErrors).toEqual([]);
         } finally {
           registerHeldAppCallHandlers();
         }
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!chromePath)(
+    'moves focus to back-link when polling empties tools, keeps uncertain switches locked on 500 + status failures, and reconciles after concurrent toggles',
+    async () => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          {
+            name: 'alpha_tool',
+            description: 'First settled tool',
+            inputSchema: { type: 'object', properties: {} },
+          },
+          {
+            name: 'beta_tool',
+            description: 'Second settled tool',
+            inputSchema: { type: 'object', properties: {} },
+          },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'alpha_tool',
+          definitionHash: hashes.get('alpha_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read alpha state',
+          reason: 'Read-only',
+        },
+        {
+          name: 'beta_tool',
+          definitionHash: hashes.get('beta_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read beta state',
+          reason: 'Read-only',
+        },
+      ]);
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        let mode: 'normal' | 'concurrent_recover' | 'fail_forever' | 'empty_poll' = 'concurrent_recover';
+        let statusAttempts = 0;
+        let markBetaStarted: (() => void) | undefined;
+        const betaStarted = new Promise<void>((resolve) => {
+          markBetaStarted = resolve;
+        });
+        let releaseBeta: (() => void) | undefined;
+
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+
+          if (sent.method() === 'POST' && url.pathname === '/connections/tool-label') {
+            const parsed = JSON.parse(body ?? '{}') as { tool?: string };
+            if (parsed.tool === 'alpha_tool' && (mode === 'concurrent_recover' || mode === 'fail_forever')) {
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Temporary server error' }),
+              });
+              return;
+            }
+            if (parsed.tool === 'beta_tool' && mode === 'concurrent_recover') {
+              markBetaStarted?.();
+              await new Promise<void>((resolve) => {
+                releaseBeta = resolve;
+              });
+            }
+          }
+
+          if (sent.method() === 'GET' && url.pathname === `/connections/app/${app.id}/tools-status`) {
+            if (mode === 'concurrent_recover') {
+              statusAttempts += 1;
+              if (statusAttempts === 1) {
+                await route.fulfill({
+                  status: 503,
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ error: 'Unavailable' }),
+                });
+                return;
+              }
+            } else if (mode === 'fail_forever') {
+              statusAttempts += 1;
+              await route.fulfill({
+                status: 503,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ error: 'Unavailable' }),
+              });
+              return;
+            } else if (mode === 'empty_poll') {
+              await route.fulfill({
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  appId: app.id,
+                  status: 'connected',
+                  pinned: true,
+                  listHash: pinned.pin.listHash,
+                  labelsHash: toolLabelsHash([]),
+                  needsReview: false,
+                  hasUnsorted: false,
+                  tools: [],
+                }),
+              });
+              return;
+            }
+          }
+
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+
+        // 1) Concurrent toggle + 500 + failed first tools-status: alpha stays locked while uncertain,
+        //    reconciliation waits until beta completes (never dropped), retries past the first 503, and restores server truth.
+        const betaSwitch = page.locator('button[data-switch-name="beta_tool"]');
+        const alphaSwitch = page.locator('button[data-switch-name="alpha_tool"]');
+        const confirmBtn = page.locator('.review-header-form button');
+        await betaSwitch.click();
+        await betaStarted;
+        await alphaSwitch.click();
+        await expect.poll(() => alphaSwitch.isDisabled(), { timeout: 3000 }).toBe(true);
+        expect(await alphaSwitch.locator('.switch-state').textContent()).toBe('Checking…');
+        expect(await confirmBtn.isDisabled()).toBe(true);
+        expect(statusAttempts).toBe(0);
+
+        // Release the concurrent beta toggle; reconciliation now fires, retries past the first 503, and restores truth.
+        releaseBeta?.();
+        await expect.poll(() => statusAttempts, { timeout: 6000 }).toBeGreaterThanOrEqual(2);
+        await expect.poll(() => alphaSwitch.isDisabled(), { timeout: 6000 }).toBe(false);
+        expect(await alphaSwitch.getAttribute('aria-checked')).toBe('false');
+        expect(await alphaSwitch.locator('.switch-state').textContent()).toBe('Auto');
+        expect(await betaSwitch.getAttribute('aria-checked')).toBe('true');
+        expect(await confirmBtn.isDisabled()).toBe(false);
+
+        // 2) Persistent status failure keeps the uncertain switch disabled and shows recovery guidance.
+        mode = 'fail_forever';
+        statusAttempts = 0;
+        await alphaSwitch.click();
+        await expect.poll(() => statusAttempts, { timeout: 7000 }).toBeGreaterThanOrEqual(3);
+        await expect
+          .poll(() => page.locator('#outcome').textContent(), { timeout: 7000 })
+          .toContain('Couldn’t confirm the saved state. Reload the page before changing tools again.');
+        expect(await alphaSwitch.isDisabled()).toBe(true);
+        expect(await alphaSwitch.locator('.switch-state').textContent()).toBe('Unconfirmed');
+        expect(await confirmBtn.isDisabled()).toBe(true);
+
+        // 3) When polling transitions a focused tool list to empty, focus moves cleanly to .back-link.
+        mode = 'normal';
+        await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            {
+              name: 'transient_tool',
+              description: 'Temporary tool being checked',
+              inputSchema: { type: 'object', properties: {} },
+            },
+          ],
+        });
+        mode = 'empty_poll';
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        const transientSwitch = page.locator('button[data-switch-name="transient_tool"]');
+        await transientSwitch.focus();
+        await expect
+          .poll(() => page.locator('[data-tools-empty]').textContent(), { timeout: 5000 })
+          .toContain('No tools listed by this app.');
+        expect(await page.evaluate<boolean>('document.activeElement?.classList.contains("back-link") ?? false')).toBe(
+          true,
+        );
+        expect(pageErrors).toEqual([]);
 
         await context.close();
       } finally {

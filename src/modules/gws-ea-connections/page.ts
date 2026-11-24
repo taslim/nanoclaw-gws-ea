@@ -43,6 +43,7 @@ import {
   ConnectionsStoreError,
   getConnectionsStore,
   NAME_MAX,
+  toolLabelsHash,
   type AppPin,
   type ConnectionApp,
   type PinnedAppTool,
@@ -74,7 +75,7 @@ const WRITES = [
 ] as const;
 type WriteAction = (typeof WRITES)[number];
 type Route =
-  | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: SignInReturn }
+  | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: ListOutcome }
   | { readonly kind: 'tools-status'; readonly id: string }
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
@@ -95,8 +96,15 @@ const RETURN_MESSAGES = {
   assistant_client_refused: 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.',
 } satisfies Record<SignInReturn, string>;
 
-function isSignInReturn(code: string | null): code is SignInReturn {
-  return code !== null && Object.hasOwn(RETURN_MESSAGES, code);
+const LIST_OUTCOME_MESSAGES = {
+  ...RETURN_MESSAGES,
+  approved: 'Approved. Your assistant has the result.',
+  declined: 'Declined. Nothing was sent.',
+} as const;
+type ListOutcome = keyof typeof LIST_OUTCOME_MESSAGES;
+
+function isListOutcome(code: string | null): code is ListOutcome {
+  return code !== null && Object.hasOwn(LIST_OUTCOME_MESSAGES, code);
 }
 
 const CHANGED = 'This app changed in another tab. Reload and try again.';
@@ -200,10 +208,10 @@ function storeFailure(error: ConnectionsStoreError): { readonly status: number; 
   }
 }
 
-function singleOutcomeParam(search: string): SignInReturn | undefined {
+function singleOutcomeParam(search: string): ListOutcome | undefined {
   const query = new URLSearchParams(search);
   const code = query.get('outcome');
-  return [...query.keys()].length === 1 && isSignInReturn(code) ? code : undefined;
+  return [...query.keys()].length === 1 && isListOutcome(code) ? code : undefined;
 }
 
 function readRoute(method: string | undefined, url: string | undefined): Route | undefined {
@@ -398,11 +406,12 @@ async function write(
       );
     }
     case 'review-tools': {
-      only(data, ['id', 'listHash']);
+      only(data, ['id', 'listHash', 'labelsHash']);
       const id = text(data, 'id');
       const listHash = text(data, 'listHash').trim();
-      if (!EXACT_APP_ID.test(id) || !listHash) throw new InvalidSubmission();
-      const reviewed = await operations.markToolsReviewed(id, listHash);
+      const labelsHash = text(data, 'labelsHash').trim();
+      if (!EXACT_APP_ID.test(id) || !listHash || !labelsHash) throw new InvalidSubmission();
+      const reviewed = await operations.markToolsReviewed(id, listHash, labelsHash);
       if (!reviewed) return refused({ kind: 'tools', id }, CHANGED, 409);
       return done({ kind: 'list' }, 'Tool approvals saved.');
     }
@@ -424,6 +433,7 @@ function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, to
     status: app.status,
     pinned: pin !== undefined,
     listHash: pin?.listHash ?? null,
+    labelsHash: toolLabelsHash(sorted),
     needsReview: pin?.needsReview ?? false,
     hasUnsorted,
     tools: sorted.map((tool) => ({
@@ -539,11 +549,17 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                   ? 'Already answered. Nothing else was sent.'
                   : 'This request is no longer pending.';
         const saved = decided.status === 'approved' || decided.status === 'declined';
+        const location =
+          decided.status === 'approved'
+            ? '/connections?outcome=approved'
+            : decided.status === 'declined'
+              ? '/connections?outcome=declined'
+              : '/connections';
         const nonce = pageNonce();
         sendPage(response, {
           status: 200,
           nonce,
-          location: '/connections',
+          location,
           saved,
           body: renderConnectionsPage(
             {
@@ -596,7 +612,14 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         try {
           const updated = await operations.setToolLabel(id, tool, label, { expectedHash: definitionHash });
           if (!updated) return sendJson(response, 409, { ok: false, error: CHANGED });
-          return sendJson(response, 200, { ok: true, tool, label, definitionHash });
+          const refreshed = await operations.store.readAppTools(id).catch(() => undefined);
+          return sendJson(response, 200, {
+            ok: true,
+            tool,
+            label,
+            definitionHash,
+            ...(refreshed ? { labelsHash: toolLabelsHash(refreshed.tools) } : {}),
+          });
         } catch (error) {
           if (!(error instanceof ConnectionsStoreError)) throw error;
           const failure = storeFailure(error);
@@ -608,7 +631,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       const operatorDependencies = readOperatorDependencies();
       let result: WriteResult = {
         view: route.kind === 'view' ? route.view : { kind: 'list' },
-        outcome: route.kind === 'view' && route.outcome ? RETURN_MESSAGES[route.outcome] : '',
+        outcome: route.kind === 'view' && route.outcome ? LIST_OUTCOME_MESSAGES[route.outcome] : '',
         status: 200,
         saved: false,
       };

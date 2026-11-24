@@ -50,7 +50,7 @@ import {
   tokenizeToolName,
   type AppToolSorter,
 } from './sorter.js';
-import type { ConnectionsStore } from './store.js';
+import { toolLabelsHash, type ConnectionsStore } from './store.js';
 import { testConnectionsStore } from './testing/store.js';
 
 let directory: string;
@@ -1257,5 +1257,52 @@ describe('exhaustive deterministic floor coverage', () => {
       }),
     ).toBe(false);
     expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it('rejects markToolsReviewed when labels change on the same listHash', async () => {
+    const { app, pin, tools } = await createConnectedApp('LabelRace', 'https://label-race.example.test/mcp', [
+      toolDef('search_items', 'Search catalog'),
+      toolDef('update_item', 'Update catalog item'),
+    ]);
+    const hashes = new Map(tools.map((t) => [t.name, t.definitionHash]));
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_items',
+        definitionHash: hashes.get('search_items')!,
+        label: 'just_do',
+        source: 'sorter',
+        summary: 'Search catalog',
+        reason: 'Read-only search',
+      },
+      {
+        name: 'update_item',
+        definitionHash: hashes.get('update_item')!,
+        label: 'ask_first',
+        source: 'sorter',
+        summary: 'Update a catalog item',
+        reason: 'Modifies catalog',
+      },
+    ]);
+    const staleLabelsHash = toolLabelsHash(await store.listTools(app.id));
+
+    // A background label update changes one tool's label without changing pin.listHash.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'update_item',
+        definitionHash: hashes.get('update_item')!,
+        label: 'just_do',
+        source: 'sorter',
+        summary: 'Update a catalog item',
+        reason: 'Reclassified',
+      },
+    ]);
+    expect((await store.getPin(app.id))?.listHash).toBe(pin.listHash);
+    expect(await store.markToolsReviewed(app.id, pin.listHash, undefined, staleLabelsHash)).toBe(false);
+    expect((await store.getPin(app.id))?.needsReview).toBe(true);
+
+    const freshLabelsHash = toolLabelsHash(await store.listTools(app.id));
+    expect(freshLabelsHash).not.toBe(staleLabelsHash);
+    expect(await store.markToolsReviewed(app.id, pin.listHash, undefined, freshLabelsHash)).toBe(true);
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
   });
 });

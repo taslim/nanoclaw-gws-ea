@@ -617,8 +617,8 @@ export class ConnectionOperations {
     return updated;
   }
 
-  markToolsReviewed(id: string, expectedListHash: string): Promise<boolean> {
-    return withAppLock(id, () => this.store.markToolsReviewed(id, expectedListHash));
+  markToolsReviewed(id: string, expectedListHash: string, expectedLabelsHash?: string): Promise<boolean> {
+    return withAppLock(id, () => this.store.markToolsReviewed(id, expectedListHash, undefined, expectedLabelsHash));
   }
 
   /**

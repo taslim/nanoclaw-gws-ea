@@ -276,6 +276,17 @@ export interface ConnectionsStoreOptions {
 export const APP_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const SIGN_IN_TTL_MS = 10 * 60_000;
 export const NAME_MAX = 100;
+
+/**
+ * Deterministic digest of a pinned app's current tool labels and settled states. Used alongside `listHash` so a
+ * principal's Confirm submission cannot approve labels that changed in the background after the page was loaded.
+ */
+export function toolLabelsHash(
+  tools: readonly Pick<PinnedAppTool, 'name' | 'definitionHash' | 'label' | 'unsettled'>[],
+): string {
+  const ordered = [...tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return sha256Hex(canonicalJson(ordered.map((tool) => [tool.name, tool.definitionHash, tool.label, tool.unsettled])));
+}
 const SECRET_MAX = 64 * 1024;
 const STATE_MAX = 512;
 const MAX_RECENT_DIRECT_CALLS_PER_APP = 30;
@@ -1921,7 +1932,12 @@ export class ConnectionsStore {
     );
   }
 
-  async markToolsReviewed(appId: string, expectedListHash?: string, at = new Date().toISOString()): Promise<boolean> {
+  async markToolsReviewed(
+    appId: string,
+    expectedListHash?: string,
+    at = new Date().toISOString(),
+    expectedLabelsHash?: string,
+  ): Promise<boolean> {
     isoValid(at);
     return this.use((db) =>
       db
@@ -1929,13 +1945,13 @@ export class ConnectionsStore {
           const pin = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
           if (!pin) return false;
           if (expectedListHash !== undefined && pin.list_hash !== expectedListHash) return false;
-          const unsorted = db
-            .prepare<
-              [string],
-              { n: number }
-            >('SELECT COUNT(*) AS n FROM app_tools WHERE app_id = ? AND (label IS NULL OR unsettled = 1)')
-            .get(appId);
-          if ((unsorted?.n ?? 0) > 0) return false;
+          const rows = db
+            .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? ORDER BY name')
+            .all(appId);
+          if (rows.some((row) => row.label === null || row.unsettled === 1)) return false;
+          if (expectedLabelsHash !== undefined && toolLabelsHash(rows.map(toPinnedTool)) !== expectedLabelsHash) {
+            return false;
+          }
           return (
             db
               .prepare('UPDATE app_pins SET reviewed_list_hash = list_hash, reviewed_at = ? WHERE app_id = ?')

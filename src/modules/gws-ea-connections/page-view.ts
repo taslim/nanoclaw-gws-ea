@@ -19,7 +19,14 @@ import { escapeInvisibleChars, type HeldAppCallPayload, type PendingHeldCallItem
 import type { ConnectionsListing } from './operations.js';
 import { operatorServerHost } from './operator.js';
 import { CONNECTIONS_PAGE_SCRIPT } from './page-client.js';
-import { NAME_MAX, type AppPin, type AppStatus, type ConnectionApp, type PinnedAppTool } from './store.js';
+import {
+  NAME_MAX,
+  toolLabelsHash,
+  type AppPin,
+  type AppStatus,
+  type ConnectionApp,
+  type PinnedAppTool,
+} from './store.js';
 
 export type ConnectionsView =
   | { readonly kind: 'list' }
@@ -385,12 +392,19 @@ function toolsSkeleton(): string {
   return `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list aria-busy="true">${item.repeat(4)}</ul></div>`;
 }
 
-function reviewForm(app: ConnectionApp, pin: AppPin | undefined, className: string, show: boolean): string {
-  return `<form class="${className}" method="post" action="/connections/review-tools" data-send data-review-form${show ? '' : ' hidden'}><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="listHash" value="${escapeHtml(pin?.listHash ?? '')}" data-review-list-hash><button class="button button-primary" type="submit" data-pending-label="Saving…">Confirm</button></form>`;
+function reviewForm(
+  app: ConnectionApp,
+  pin: AppPin | undefined,
+  labelsHash: string,
+  className: string,
+  show: boolean,
+): string {
+  return `<form class="${className}" method="post" action="/connections/review-tools" data-send data-review-form${show ? '' : ' hidden'}><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="listHash" value="${escapeHtml(pin?.listHash ?? '')}" data-review-list-hash><input type="hidden" name="labelsHash" value="${escapeHtml(labelsHash)}" data-review-labels-hash><button class="button button-primary" type="submit" data-pending-label="Saving…">Confirm</button></form>`;
 }
 
 function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
   const sorted = sortToolsForDisplay(tools);
+  const labelsHash = toolLabelsHash(sorted);
   const isConnected = app.status === 'connected';
   const hasUnsorted = isConnected && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
   const showReview = Boolean(isConnected && pin && !hasUnsorted && pin.needsReview);
@@ -407,7 +421,7 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
     !pin || hasUnsorted ? '' : sorted.length === 0 ? 'No tools' : `${askCount} ask first · ${autoCount} auto`;
   const mobileTally = !pin || hasUnsorted ? '' : sorted.length === 0 ? '0 tools' : `${askCount} on · ${autoCount} off`;
   const metadata = `<span class="tools-host">${escapeHtml(app.host)}</span><span class="tools-tally" data-tools-tally${desktopTally ? '' : ' hidden'}>${escapeHtml(desktopTally)}</span><span class="tools-badge-slot" data-tools-badge>${reviewBadge}</span>`;
-  const heading = `${BACK}${renderPageHeading(app.name, metadata, reviewForm(app, pin, 'review-header-form', showReview))}`;
+  const heading = `${BACK}${renderPageHeading(app.name, metadata, reviewForm(app, pin, labelsHash, 'review-header-form', showReview))}`;
   const mobileStrip = `<div class="tools-mobile-strip"><span class="tools-mobile-label">Ask before running</span><span class="tools-mobile-tally" data-tools-mobile-tally${mobileTally ? '' : ' hidden'}>${escapeHtml(mobileTally)}</span></div>`;
   const disconnectedLabel = app.status === 'needs_reconnecting' ? 'Reconnect' : 'Connect';
   const disconnectedPrompt =
@@ -421,7 +435,7 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
     : sorted.length > 0
       ? `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list>${sorted.map((tool) => toolRow(app, tool)).join('')}</ul></div>`
       : '<div class="tools-empty" data-tools-empty>No tools listed by this app.</div>';
-  const mobileDock = reviewForm(app, pin, 'review-dock', showReview);
+  const mobileDock = reviewForm(app, pin, labelsHash, 'review-dock', showReview);
   return `<div class="tools-view" data-tools-app="${escapeHtml(app.id)}" data-tools-polling="${hasUnsorted ? 'true' : 'false'}" data-tools-list-hash="${escapeHtml(pin?.listHash ?? '')}">${heading}${mobileStrip}<section class="section tools-section" aria-label="App tools" data-tools-body>${bodyMarkup}</section>${mobileDock}</div>`;
 }
 

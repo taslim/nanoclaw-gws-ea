@@ -6,11 +6,16 @@
  *   and stops automatically once settled.
  */
 export const CONNECTIONS_PAGE_SCRIPT = String.raw`
-  if (new URLSearchParams(location.search).has('outcome')) history.replaceState(null, '', location.pathname);
+  const initialOutcome = new URLSearchParams(location.search).get('outcome');
+  if (initialOutcome && initialOutcome !== 'approved' && initialOutcome !== 'declined') {
+    history.replaceState(null, '', location.pathname);
+  }
   let signingIn = false;
   const inFlightToggles = new Set();
+  const uncertainTools = new Set();
   let needsPostToggleSync = false;
   let pollTimer;
+  let reconcileTimer;
   let pollGeneration = 0;
 
   async function signIn(form) {
@@ -158,6 +163,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     const button = document.createElement('button');
     button.className = 'switch';
     button.type = 'submit';
+    button.disabled = uncertainTools.has(tool.name);
     button.setAttribute('role', 'switch');
     button.setAttribute('aria-checked', isAskFirst ? 'true' : 'false');
     button.setAttribute('aria-label', 'Ask first for ' + (tool.displayName || tool.name) + ' (' + tool.name + ')');
@@ -222,6 +228,22 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     if (fallback instanceof HTMLElement) fallback.focus({ preventScroll: true });
   }
 
+  function syncReviewHashes(root, listHash, labelsHash) {
+    root.querySelectorAll('[data-review-form]').forEach(form => {
+      const listInput = form.querySelector('[data-review-list-hash]');
+      if (listInput && typeof listHash === 'string') listInput.value = listHash;
+      const labelsInput = form.querySelector('[data-review-labels-hash]');
+      if (labelsInput && typeof labelsHash === 'string') labelsInput.value = labelsHash;
+    });
+  }
+
+  function syncUncertainReviewLock(root) {
+    const locked = uncertainTools.size > 0;
+    root.querySelectorAll('[data-review-form] button[type="submit"]').forEach(button => {
+      if (button instanceof HTMLButtonElement) button.disabled = locked;
+    });
+  }
+
   function applyToolsStatus(root, payload) {
     const appId = root.dataset.toolsApp;
     const wasPolling = root.dataset.toolsPolling === 'true';
@@ -232,6 +254,8 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
 
     const body = root.querySelector('[data-tools-body]');
     if (!payload.pinned && !isConnected && body) {
+      const activeInBody = document.activeElement instanceof Element && body.contains(document.activeElement);
+      uncertainTools.clear();
       const reconnect = payload.status === 'needs_reconnecting';
       renderRecoveryBox(
         body,
@@ -240,15 +264,19 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         reconnect ? 'Reconnect' : 'Connect',
         true,
       );
+      if (activeInBody) restoreToolsFocus(body, undefined);
     } else if (payload.pinned && body) {
       const tools = Array.isArray(payload.tools) ? payload.tools : [];
       if (tools.length === 0) {
+        const activeInBody = document.activeElement instanceof Element && body.contains(document.activeElement);
+        uncertainTools.clear();
         body.textContent = '';
         const empty = document.createElement('div');
         empty.className = 'tools-empty';
         empty.dataset.toolsEmpty = '';
         empty.textContent = 'No tools listed by this app.';
         body.append(empty);
+        if (activeInBody) restoreToolsFocus(body, undefined);
       } else {
         let list = root.querySelector('[data-tools-list]');
         const isSkeleton = Boolean(list?.querySelector('.skeleton-row'));
@@ -258,6 +286,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
           const activeEl = document.activeElement;
           const activeInBody = activeEl instanceof Element && body.contains(activeEl);
           const focusedTool = activeInBody ? activeEl.closest('[data-tool-row]')?.dataset.toolRow : undefined;
+          const present = new Set(tools.map(tool => tool.name));
+          for (const name of [...uncertainTools]) {
+            if (!present.has(name) || !inFlightToggles.has(name)) uncertainTools.delete(name);
+          }
+          if (inFlightToggles.size > 0) needsPostToggleSync = true;
           const card = document.createElement('div');
           card.className = 'tools-card';
           const head = document.createElement('div');
@@ -284,6 +317,9 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
               needsPostToggleSync = true;
               continue;
             }
+            uncertainTools.delete(tool.name);
+            const button = row.querySelector('button[role="switch"]');
+            if (button instanceof HTMLButtonElement) button.disabled = false;
             const isChecking = tool.label === null || tool.unsettled === true;
             const state = isChecking ? 'checking' : tool.label === 'just_do' ? 'just_do' : 'ask_first';
             row.dataset.toolHash = tool.definitionHash;
@@ -300,11 +336,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     updateTallies(root);
 
     const showReview = Boolean(isConnected && payload.pinned && !stillChecking && payload.needsReview === true && payload.listHash);
+    syncReviewHashes(root, payload.listHash, payload.labelsHash);
     root.querySelectorAll('[data-review-form]').forEach(form => {
-      const hashInput = form.querySelector('[data-review-list-hash]');
-      if (hashInput && typeof payload.listHash === 'string') hashInput.value = payload.listHash;
       form.hidden = !showReview;
     });
+    syncUncertainReviewLock(root);
 
     if (wasPolling && !stillChecking) {
       kit.announce(showReview ? 'Tools ready to review.' : isConnected ? 'Tools checked.' : 'App is not connected.');
@@ -314,6 +350,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
 
   function showUnavailableTools(root) {
     root.dataset.toolsPolling = 'false';
+    uncertainTools.clear();
     const badge = root.querySelector('[data-tools-badge]');
     if (badge) badge.textContent = '';
     const desktopTally = root.querySelector('[data-tools-tally]');
@@ -328,7 +365,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     }
     root.querySelectorAll('[data-review-form]').forEach(form => { form.hidden = true; });
     const body = root.querySelector('[data-tools-body]');
-    if (body) renderRecoveryBox(body, 'This app isn’t available right now.', '/connections', 'All apps', false);
+    if (body) {
+      const activeInBody = document.activeElement instanceof Element && body.contains(document.activeElement);
+      renderRecoveryBox(body, 'This app isn’t available right now.', '/connections', 'All apps', false);
+      if (activeInBody) restoreToolsFocus(body, undefined);
+    }
   }
 
   async function fetchToolsStatusOnce(root) {
@@ -345,7 +386,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (response.status === 404) {
         stopToolsPolling();
         showUnavailableTools(root);
-        return 'not_found';
+        return 'missing';
       }
       if (!response.ok) return 'error';
       const payload = await response.json();
@@ -356,12 +397,46 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     }
   }
 
+  function clearReconcileTimer() {
+    if (reconcileTimer) {
+      clearTimeout(reconcileTimer);
+      reconcileTimer = undefined;
+    }
+  }
+
+  function reconcileToolsStatus(root, attempt = 0) {
+    clearReconcileTimer();
+    const gen = pollGeneration;
+    void (async () => {
+      const status = await fetchToolsStatusOnce(root);
+      if (gen !== pollGeneration || !root.isConnected) return;
+      if (status === 'checking') {
+        startToolsPolling();
+        return;
+      }
+      if (status === 'settled' || status === 'missing' || status === null) {
+        stopToolsPolling();
+        return;
+      }
+      if (attempt < 2) {
+        reconcileTimer = setTimeout(() => { reconcileToolsStatus(root, attempt + 1); }, 1500 * (attempt + 1));
+      } else {
+        for (const name of uncertainTools) {
+          const stateNode = [...root.querySelectorAll('[data-tool-row]')].find(r => r.dataset.toolRow === name)?.querySelector('.switch-state');
+          if (stateNode) stateNode.textContent = 'Unconfirmed';
+        }
+        kit.message('Couldn’t confirm the saved state. Reload the page before changing tools again.', true);
+      }
+    })();
+  }
+
   function stopToolsPolling() {
     pollGeneration += 1;
     if (pollTimer) {
       clearTimeout(pollTimer);
       pollTimer = undefined;
     }
+    clearReconcileTimer();
   }
 
   function startToolsPolling() {
@@ -393,7 +468,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (status === 'checking') {
         consecutiveErrors = 0;
         schedule(1500);
-      } else if (status === 'settled' || status === 'not_found' || status === null) {
+      } else if (status === 'settled' || status === 'missing' || status === null) {
         stopToolsPolling();
       } else {
         consecutiveErrors += 1;
@@ -415,7 +490,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     const data = Object.fromEntries(new FormData(form));
     const toolName = typeof data.tool === 'string' ? data.tool : '';
     const nextLabel = data.label === 'just_do' ? 'just_do' : 'ask_first';
-    if (!toolName || inFlightToggles.has(toolName)) return;
+    if (!toolName || inFlightToggles.has(toolName) || uncertainTools.has(toolName)) return;
 
     const prevState = row.dataset.toolState || (nextLabel === 'just_do' ? 'ask_first' : 'just_do');
     const prevDescHidden = row.querySelector('[data-tool-desc]')?.hidden ?? true;
@@ -428,7 +503,20 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     updateTallies(root);
 
     const titleText = row.querySelector('.tool-title')?.textContent?.trim() || toolName;
-    let shouldReconcile = false;
+    const markUncertain = () => {
+      uncertainTools.add(toolName);
+      row.dataset.toolState = 'checking';
+      row.classList.add('is-checking');
+      const button = row.querySelector('button[role="switch"]');
+      if (button instanceof HTMLButtonElement) {
+        button.disabled = true;
+        const stateNode = button.querySelector('.switch-state');
+        if (stateNode) stateNode.textContent = 'Checking…';
+      }
+      updateTallies(root);
+      syncUncertainReviewLock(root);
+      needsPostToggleSync = true;
+    };
     try {
       const response = await fetch(form.action, {
         method: 'POST',
@@ -441,6 +529,9 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         const result = await response.json().catch(() => null);
         const confirmed = result && (result.label === 'ask_first' || result.label === 'just_do') ? result.label : nextLabel;
         applyRowVisual(row, confirmed);
+        if (result && typeof result.labelsHash === 'string') {
+          syncReviewHashes(root, undefined, result.labelsHash);
+        }
         updateTallies(root);
         if (root.isConnected) {
           const outcome = document.getElementById('outcome');
@@ -453,7 +544,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         return;
       }
       if (response.status >= 500) {
-        shouldReconcile = true;
+        markUncertain();
       } else {
         applyRowVisual(row, prevState);
         if (wasChecking) applyRowDescription(row, prevDescText, true);
@@ -464,13 +555,13 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       const errText = errBody && typeof errBody.error === 'string' ? errBody.error : 'Couldn’t save that change. Reload and try again.';
       if (root.isConnected) kit.message(errText, response.status === 409 || response.status >= 500);
     } catch {
-      shouldReconcile = true;
+      markUncertain();
       if (root.isConnected) kit.message('Couldn’t save that change. Reload and try again.', true);
     } finally {
       inFlightToggles.delete(toolName);
-      if ((shouldReconcile || needsPostToggleSync) && inFlightToggles.size === 0 && root.isConnected) {
+      if (needsPostToggleSync && inFlightToggles.size === 0 && root.isConnected) {
         needsPostToggleSync = false;
-        void fetchToolsStatusOnce(root);
+        reconcileToolsStatus(root);
       }
     }
   }
@@ -489,7 +580,12 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     }
   });
 
-  document.addEventListener('kit:swap', () => { startToolsPolling(); });
+  document.addEventListener('kit:swap', () => {
+    inFlightToggles.clear();
+    uncertainTools.clear();
+    needsPostToggleSync = false;
+    startToolsPolling();
+  });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       const root = document.querySelector('[data-tools-app]');
