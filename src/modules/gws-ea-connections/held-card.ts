@@ -54,7 +54,7 @@ const ITEM_QUANTITY_KEYS = ['quantity', 'qty', 'count'] as const;
 
 const PRIORITY_PATTERNS: readonly RegExp[] = [
   /^(?:error|errors|warning|warnings|summary|headline|description|title|action|operation|subject|message)$/iu,
-  /^(?:merchant|vendor|store|restaurant|seller|provider|shop|business|payee|recipient|to|cc|bcc|from|sender|customer|passenger|guest|items?|line_items?|products?|entries|orders?|destination|delivery_address|shipping_address|address|location|origin|pickup|venue|place)(?:_name|Name)?$/iu,
+  /^(?:merchant|vendor|store|restaurant|seller|provider|shop|business|payee|recipient|to|cc|bcc|from|sender|customer|passenger|guest|quote|checkout|cart|booking|reservation|preview|items?|line_items?|products?|entries|orders?|destination|delivery_address|shipping_address|address|location|origin|pickup|venue|place)(?:_name|Name)?$/iu,
   /^(?:currency|total|grand_total|net_total|subtotal|amount|amounts|price|unit_price|cost|fee|fees|tax|taxes|discount|balance|payable|due|payment|payment_method|card|wallet|billing)$/iu,
   /^(?:eta|estimated_.*|delivery_.*|pickup_.*|date|time|start|end|start_time|end_time|when|schedule|window|expires_at|valid_until|deadline)$/iu,
   /^(?:note|notes|instructions|delivery_instructions|comment|memo|status|state|mode|type|kind|confirmed|refundable|cancellable)$/iu,
@@ -62,7 +62,7 @@ const PRIORITY_PATTERNS: readonly RegExp[] = [
 
 const LOW_PRIORITY_KEY = /(?:^id$|_id$|Id$|_hash$|Hash$|fingerprint|token|signature|nonce|cursor)/u;
 
-const MAX_DISTILL_DEPTH = 4;
+const MAX_DISTILL_DEPTH = 6;
 const MAX_ARRAY_ITEMS = 8;
 const MAX_JSON_FIELD_STRING = 280;
 const LEADING_OR_TRAILING_PUNCTUATION = /^[[("'`{<]+|[.,;:!?)\]"'}>]+$/gu;
@@ -299,6 +299,26 @@ function isTrivialWrapperEntry(key: string, value: unknown): boolean {
   return false;
 }
 
+function hasSummaryOrMessage(obj: Record<string, unknown>): boolean {
+  if (
+    (typeof obj.summary === 'string' && obj.summary.trim().length > 0) ||
+    (typeof obj.message === 'string' && obj.message.trim().length > 0)
+  ) {
+    return true;
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    if (ENVELOPE_KEYS.has(k.toLowerCase()) && isRecord(v)) {
+      if (
+        (typeof v.summary === 'string' && v.summary.trim().length > 0) ||
+        (typeof v.message === 'string' && v.message.trim().length > 0)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function unwrapEnvelope(root: Record<string, unknown>): {
   readonly value: Record<string, unknown>;
   readonly unwrapped: boolean;
@@ -312,15 +332,23 @@ function unwrapEnvelope(root: Record<string, unknown>): {
     const [envKey, envVal] = envelopeEntry;
     if (!isRecord(envVal)) break;
     const siblings = entries.filter(([key]) => key !== envKey);
-    if (
-      siblings.some(
-        ([key, val]) =>
-          escapeInvisibleChars(key).hasInvisible || hasAnyInvisible(val) || !isTrivialWrapperEntry(key, val),
-      )
-    ) {
+    let hoistedMessage: string | undefined;
+    let canUnwrap = true;
+    for (const [key, val] of siblings) {
+      if (escapeInvisibleChars(key).hasInvisible || hasAnyInvisible(val)) {
+        canUnwrap = false;
+        break;
+      }
+      if (isTrivialWrapperEntry(key, val)) continue;
+      if (key === 'message' && typeof val === 'string' && hoistedMessage === undefined) {
+        hoistedMessage = val.trim();
+        continue;
+      }
+      canUnwrap = false;
       break;
     }
-    current = envVal;
+    if (!canUnwrap) break;
+    current = hoistedMessage && !hasSummaryOrMessage(envVal) ? { ...envVal, message: hoistedMessage } : envVal;
     unwrapped = true;
   }
   return { value: current, unwrapped };
@@ -526,7 +554,10 @@ function formatScalar(value: unknown, state: DistillState): string {
   if (typeof value === 'string') {
     const escaped = escapeInvisibleChars(value);
     if (escaped.hasInvisible) state.hasInvisible = true;
-    const singleLine = escaped.rendered.replace(/\r\n|\r|\n/gu, '\\n');
+    const singleLine = (escaped.hasInvisible ? escaped.rendered : escaped.rendered.trim()).replace(
+      /\r\n|\r|\n/gu,
+      '\\n',
+    );
     if (!escaped.hasInvisible && isOpaqueToken(singleLine)) {
       state.compacted = true;
       return collapseOpaqueToken(singleLine);

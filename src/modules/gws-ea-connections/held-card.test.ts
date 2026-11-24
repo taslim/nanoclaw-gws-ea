@@ -222,4 +222,47 @@ describe('held-card distiller', () => {
     expect(proseOut.text).toContain('(eyJhbG…sw5c)');
     expect(proseOut.text).toContain(`https://track.example.test/order?token=${SAMPLE_JWT}`);
   });
+
+  it('unwraps status+message+data envelopes, preserves nested quote items, prioritizes quote ahead of payment, and hoists message when no summary exists', () => {
+    const nestedQuote = JSON.stringify({
+      status: 'success',
+      message: 'Checkout ready for confirmation.',
+      data: {
+        checkout_id: SAMPLE_JWT,
+        expires_at: '2026-11-24T22:43:02.492Z',
+        payment: { type: 'wallet', label: 'Wallet' },
+        quote: {
+          currency: 'USD',
+          summary: ' 1x Grain Bowl (Extra avocado)',
+          items: [
+            { item_id: 101, type: 'menu', quantity: 1, pack_id: 1, price: 1850, name: 'Grain Bowl' },
+            { item_id: 102, type: 'group', quantity: 1, pack_id: 1, price: 0, name: 'Extra avocado' },
+          ],
+          destination: { address: '21 Park Ave, Midtown', city: 'Midtown' },
+          amounts: { items: 1850, delivery: 350, small_order: 0, total: 2200 },
+          fingerprint: SAMPLE_SHA256,
+        },
+      },
+    });
+    const out = renderDistilledContext(nestedQuote, new Set([SAMPLE_JWT, SAMPLE_SHA256]));
+    expect(out.text).not.toContain('Status: success');
+    expect(out.text).not.toContain('Data:');
+    expect(out.text).not.toContain('Checkout ready for confirmation.');
+    expect(out.text.indexOf('Quote:')).toBeLessThan(out.text.indexOf('Payment:'));
+    expect(out.text).toContain('Summary: 1x Grain Bowl (Extra avocado)');
+    expect(out.text).toContain('• 1x Grain Bowl (price: 1850, type: menu)');
+    expect(out.text).toContain('• 1x Extra avocado (price: 0, type: group)');
+    expect(out.text).toContain('Amounts: items: 1850, total: 2200, delivery: 350');
+
+    const withMessageNoSummary = JSON.stringify({
+      status: 'success',
+      message: 'Transfer ready to send.',
+      data: { message: '   ', recipient: 'Alex', amount: 250 },
+    });
+    const msgOut = renderDistilledContext(withMessageNoSummary, new Set());
+    expect(msgOut.text).toContain('Message: Transfer ready to send.');
+    expect(msgOut.text).toContain('Recipient: Alex');
+    expect(msgOut.text).toContain('Amount: 250');
+    expect(msgOut.text).not.toContain('Status: success');
+  });
 });
