@@ -1,13 +1,16 @@
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
-import type { PrincipalPageMount, PublicMount } from '../gws-ea-web/mounts.js';
+import type { PrincipalPageMount, PrincipalSubpathLinkContext, PublicMount } from '../gws-ea-web/mounts.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
+import { isLiveHeldCallView } from './held-calls.js';
 import { CLIENT_DOCUMENT_PATH } from './oauth.js';
 import { readListing, type ConnectionsListing } from './operations.js';
 import { createConnectionsPageHandler } from './page.js';
 import { ConnectionsStoreError, getConnectionsStore, type AppStatus, type ToolLabel } from './store.js';
+
+const HELD_LINK_PATH = /^\/connections\/held\/([A-Za-z0-9_-]{4,128})$/u;
 
 export const connectionsPageGuard = defineGuardedAction({
   action: 'gws_ea_connections.connections_page',
@@ -109,6 +112,13 @@ export async function connectionsLinkFacts(
   };
 }
 
+async function allowConnectionsSubpathLink(pathname: string, context?: PrincipalSubpathLinkContext): Promise<boolean> {
+  const match = HELD_LINK_PATH.exec(pathname);
+  if (!match) return false;
+  if (context?.terminalCardEdit === true) return true;
+  return isLiveHeldCallView(match[1]!);
+}
+
 export const connectionsWebMount: PrincipalPageMount = {
   name: 'connections',
   audience: 'principal',
@@ -119,6 +129,7 @@ export const connectionsWebMount: PrincipalPageMount = {
   status: () => connectionsStatus(),
   linkGuard: connectionsPageGuard,
   linkFacts: () => connectionsLinkFacts(),
+  allowSubpathLink: allowConnectionsSubpathLink,
   handler: (config, identity) => createConnectionsPageHandler({ hostname: config.hostname, identity }),
 };
 

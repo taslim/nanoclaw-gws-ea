@@ -40,12 +40,15 @@ import type { PendingApproval, Session } from '../../types.js';
 import { expireApproval } from '../approvals/lifecycle.js';
 import { requestApproval } from '../approvals/primitive.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
+import '../gws-ea-artifacts/index.js';
 import { MAIN, mainSession as getMainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { principalPages, registerWebMount } from '../gws-ea-web/mounts.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { APP_TOOL_ASK_ACTION } from './actions.js';
+import { connectionsWebMount } from './connections-mount.js';
 import {
   createHoldCallHandler,
   getPendingHeldCallApproval,
@@ -233,6 +236,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await stopAppRelay();
   relay = undefined;
   await closeDb();
@@ -1192,5 +1196,89 @@ describe('held ask-first calls', () => {
     expect(await listPendingHeldCallApprovals()).toHaveLength(0);
     expect(await resolveHeldCallFromWeb(authItem!.viewId, 'approve')).toEqual({ status: 'unauthorized' });
     expect(fake.toolCalls).toHaveLength(0);
+  });
+
+  it('delivers and edits long held-call approval cards through the real gws-ea-artifacts:link-access outbound guard', async () => {
+    if (!principalPages().some((page) => page.name === 'connections')) {
+      registerWebMount(connectionsWebMount);
+    }
+    const policyFile = path.join(directory, 'web-policy.json');
+    fs.writeFileSync(
+      policyFile,
+      JSON.stringify({
+        schemaVersion: 1,
+        enabled: true,
+        hostname: HOSTNAME,
+        listenPort: 9123,
+        accessIssuer: 'https://team.cloudflareaccess.com',
+        accessAud: 'aud',
+        cloudflare: { accountId: 'a', applicationId: 'b', operatorConfigFile: '/private/tmp/cf.json' },
+      }),
+      { mode: 0o600 },
+    );
+    vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policyFile);
+    await getDb().run(
+      'INSERT OR IGNORE INTO gws_ea_principal_addresses(email, added_at) VALUES (?, ?)',
+      'morgan@example.test',
+      new Date().toISOString(),
+    );
+
+    const { app, fake } = await setupFoodApp();
+    registerHeldAppCallHandlers({ relay: () => relay, store: () => store });
+    const longNotes = 'delivery instructions '.repeat(120);
+
+    // 1) Long held call delivers cleanly through gws-ea-artifacts:link-access and approves with card edit.
+    const approveHold = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_guard_approve', delivery_notes: longNotes },
+      summary: 'Confirm guarded checkout order',
+      session: mainSession,
+      requestId: 'req-guard-approve',
+    });
+    expect(approveHold.status).toBe('held');
+    expect(deliveredCards).toHaveLength(1);
+    expect(deliveredCards[0]!.question).toContain(`https://${HOSTNAME}/connections/held/`);
+
+    const [approveItem] = await listPendingHeldCallApprovals();
+    expect(approveItem).toBeDefined();
+    const approved = await resolveHeldCallFromWeb(approveItem!.viewId, 'approve');
+    expect(approved.status).toBe('approved');
+    expect(fake.toolCalls.filter((call) => call.name === 'confirm_checkout')).toHaveLength(1);
+    expect(editedCards.some((card) => card.text.includes('Approved'))).toBe(true);
+
+    // 2) Second long held call declines from web and still edits the chat card cleanly after row deletion.
+    const declineHold = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_guard_decline', delivery_notes: longNotes },
+      summary: 'Confirm second guarded order',
+      session: mainSession,
+      requestId: 'req-guard-decline',
+    });
+    expect(declineHold.status).toBe('held');
+    expect(deliveredCards).toHaveLength(2);
+    const [declineItem] = await listPendingHeldCallApprovals();
+    expect(declineItem).toBeDefined();
+    const declined = await resolveHeldCallFromWeb(declineItem!.viewId, 'reject');
+    expect(declined.status).toBe('declined');
+    expect(editedCards.some((card) => card.text.includes('Rejected'))).toBe(true);
+
+    // 3) Third long held call expires and edits the chat card cleanly through the guard.
+    const expireHold = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_guard_expire', delivery_notes: longNotes },
+      summary: 'Confirm expiring guarded order',
+      session: mainSession,
+      requestId: 'req-guard-expire',
+    });
+    expect(expireHold.status).toBe('held');
+    const [expireItem] = await listPendingHeldCallApprovals();
+    expect(expireItem).toBeDefined();
+    expect(
+      await expireApproval(expireItem!.approval.approval_id, new Date(Date.now() + 25 * 60 * 60_000).toISOString()),
+    ).toBe(true);
+    expect(editedCards.some((card) => card.text.includes('Timed out'))).toBe(true);
   });
 });
