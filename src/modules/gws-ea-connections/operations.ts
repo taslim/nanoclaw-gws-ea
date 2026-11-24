@@ -6,13 +6,8 @@ import {
   type AdmissionDependencies,
   type AdmissionRefusal,
 } from './admit.js';
-import {
-  applyMainServers,
-  MainServersUnreadableError,
-  mainOperatorServers,
-  notifyMainToolsChanged,
-  type OperatorServer,
-} from './apply.js';
+import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
+import { checkRestartSoon } from './idle-restart.js';
 import { withAppLock } from './locks.js';
 import {
   listPendingHeldCallApprovals,
@@ -618,7 +613,7 @@ export class ConnectionOperations {
         options?.expectedHash === undefined ? {} : { expectedHash: options.expectedHash },
       ),
     );
-    if (updated) await notifyMainToolsChanged(this.store);
+    if (updated) checkRestartSoon();
     return updated;
   }
 

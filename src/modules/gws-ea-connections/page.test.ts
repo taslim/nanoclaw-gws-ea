@@ -7,6 +7,7 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { createChannelDeliveryAdapter } from '../../channels/channel-registry.js';
 import {
   closeDb,
   createAgentGroup,
@@ -1816,7 +1817,7 @@ describe('tool approvals review and held-call details', () => {
     ]);
 
     const listBefore = await request('/connections');
-    expect(listBefore.body).toContain('Checking…');
+    expect(listBefore.body.split('<script')[0]).toContain('>Checking…</span>');
     expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
     const factsBefore = await connectionsLinkFacts(() => operations().listing());
     expect(factsBefore.apps[0]?.needsReview).toBe(true);
@@ -1831,7 +1832,9 @@ describe('tool approvals review and held-call details', () => {
     expect(reviewWhileUnsorted.body).toContain('<h1>Recipes</h1>');
     expect(reviewWhileUnsorted.body).toContain('Search recipes by keyword');
     expect(reviewWhileUnsorted.body).toContain('Place a paid grocery order');
-    expect(reviewWhileUnsorted.body).toContain('Checking…');
+    expect(reviewWhileUnsorted.body.split('<script')[0]).toContain(
+      '<span class="badge badge-checking">Checking…</span>',
+    );
     expect(reviewWhileUnsorted.body).toContain('data-tools-polling="true"');
     expect(reviewWhileUnsorted.body).toContain('data-review-form hidden');
     expect((await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash })).status).toBe(409);
@@ -1935,8 +1938,31 @@ describe('tool approvals review and held-call details', () => {
       ],
     });
     const listAfterChange = await request('/connections');
-    expect(listAfterChange.body).toContain('Checking…');
+    expect(listAfterChange.body.split('<script')[0]).toContain('>Checking…</span>');
     expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(true);
+
+    // A pinned app that needs reconnecting routes its primary row link to /connect (for mobile) while keeping Tool approvals in the menu.
+    const grant = await store.currentGrant(app.id);
+    await store.markRefused(app.id, grant?.generation ?? 0);
+    const listReconnect = await request('/connections');
+    expect(listReconnect.body).toContain(`class="app-link" href="/connections/app/${app.id}/connect"`);
+    expect(listReconnect.body).toContain(`role="menuitem" tabindex="-1" href="/connections/app/${app.id}/tools"`);
+
+    // A disconnected unpinned app on /tools does not spin in Checking… or poll forever; it offers Connect.
+    serve(notesServer);
+    await post('/connections/add', { url: NOTES, name: 'Notes' });
+    const notesApp = (await store.apps()).find((a) => a.name === 'Notes')!;
+    const disconnectedTools = await request(`/connections/app/${notesApp.id}/tools`);
+    expect(disconnectedTools.status).toBe(200);
+    expect(disconnectedTools.body).toContain('data-tools-polling="false"');
+    expect(disconnectedTools.body.split('<script')[0]).not.toContain('Checking…');
+    expect(disconnectedTools.body).toContain(`/connections/app/${notesApp.id}/connect`);
+    const disconnectedStatus = await request(`/connections/app/${notesApp.id}/tools-status`);
+    expect(JSON.parse(disconnectedStatus.body)).toMatchObject({
+      status: 'not_connected',
+      pinned: false,
+      hasUnsorted: false,
+    });
   });
 
   it('shows full untruncated arguments and app words on /connections/held/<id> only to the principal', async () => {
@@ -2031,12 +2057,6 @@ describe('tool approvals review and held-call details', () => {
 
     const previousAdapter = getDeliveryAdapter();
     const editedCards: string[] = [];
-    setDeliveryAdapter({
-      deliver: async (_channelType, _platformId, _threadId, _format, content) => {
-        editedCards.push(content);
-        return undefined;
-      },
-    });
     const executedCalls: string[] = [];
     const writtenNotes: string[] = [];
     const executeApprovedCall: AppRelay['executeApprovedCall'] = async (input) => {
@@ -2046,61 +2066,68 @@ describe('tool approvals review and held-call details', () => {
         result: { content: [{ type: 'text', text: 'Order placed #8841' }] },
       };
     };
-    registerHeldAppCallHandlers({
-      relay: () => ({ executeApprovedCall }) as AppRelay,
-      writeNote: async (note) => {
-        writtenNotes.push(note.text);
-        return 'written';
-      },
-    });
-
-    const insertHeld = async (viewId: string, summary: string, expiresAt: string) => {
-      const args = { checkout_id: `chk_${viewId}` };
-      const { canonical, hash } = canonicalArgsHash(args);
-      const payload: HeldAppCallPayload = {
-        viewId,
-        invocationId: `sess-main-web:req-${viewId}`,
-        appId: randomUUID(),
-        appName: 'Bistro',
-        appHost: 'mcp.bistro.example.test',
-        grantGeneration: 1,
-        toolName: 'confirm_checkout',
-        definitionHash: 'defhash-1',
-        canonicalArgs: canonical,
-        argsHash: hash,
-        summary,
-        appContext: null,
-        expiresAt,
-      };
-      await createPendingApproval({
-        approval_id: `appr-${viewId}`,
-        session_id: 'sess-main-web',
-        request_id: `req-${viewId}`,
-        action: HELD_APP_CALL_ACTION,
-        payload: JSON.stringify(payload),
-        title: 'Allow Bistro to run confirm_checkout?',
-        question: 'Order details',
-        options_json: JSON.stringify([
-          { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
-          { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
-        ]),
-        status: 'pending',
-        created_at: new Date().toISOString(),
-        expires_at: expiresAt,
-        approver_user_id: principalUser,
-        channel_type: 'gchat',
-        platform_id: 'spaces/dm-morgan',
-        platform_message_id: `msg-${viewId}`,
-      });
-    };
-
-    const futureExpiry = new Date(Date.now() + 3600_000).toISOString();
-    const pastExpiry = new Date(Date.now() - 60_000).toISOString();
-    await insertHeld('held-live-approve', 'Place lunch order', futureExpiry);
-    await insertHeld('held-live-decline', 'Place extra drink order', futureExpiry);
-    await insertHeld('held-already-expired', 'Stale expired order', pastExpiry);
 
     try {
+      setDeliveryAdapter({
+        deliver: async (_channelType, _platformId, _threadId, _format, content) => {
+          editedCards.push(content);
+          return undefined;
+        },
+      });
+      registerHeldAppCallHandlers({
+        relay: () => ({ executeApprovedCall }) as AppRelay,
+        writeNote: async (note) => {
+          writtenNotes.push(note.text);
+          return 'written';
+        },
+      });
+
+      const insertHeld = async (viewId: string, summary: string, expiresAt: string) => {
+        const args = { checkout_id: `chk_${viewId}` };
+        const { canonical, hash } = canonicalArgsHash(args);
+        const payload: HeldAppCallPayload = {
+          viewId,
+          invocationId: `sess-main-web:req-${viewId}`,
+          appId: randomUUID(),
+          appName: 'Bistro',
+          appHost: 'mcp.bistro.example.test',
+          grantGeneration: 1,
+          toolName: 'confirm_checkout',
+          definitionHash: 'defhash-1',
+          canonicalArgs: canonical,
+          argsHash: hash,
+          summary,
+          appContext: null,
+          expiresAt,
+        };
+        await createPendingApproval({
+          approval_id: `appr-${viewId}`,
+          session_id: 'sess-main-web',
+          request_id: `req-${viewId}`,
+          action: HELD_APP_CALL_ACTION,
+          payload: JSON.stringify(payload),
+          title: 'Allow Bistro to run confirm_checkout?',
+          question: 'Order details',
+          options_json: JSON.stringify([
+            { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+            { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+          ]),
+          status: 'pending',
+          created_at: new Date().toISOString(),
+          expires_at: expiresAt,
+          approver_user_id: principalUser,
+          channel_type: 'gchat',
+          platform_id: 'spaces/dm-morgan',
+          platform_message_id: `msg-${viewId}`,
+        });
+      };
+
+      const futureExpiry = new Date(Date.now() + 3600_000).toISOString();
+      const pastExpiry = new Date(Date.now() - 60_000).toISOString();
+      await insertHeld('held-live-approve', 'Place lunch order', futureExpiry);
+      await insertHeld('held-live-decline', 'Place extra drink order', futureExpiry);
+      await insertHeld('held-already-expired', 'Stale expired order', pastExpiry);
+
       // Connections list surfaces pending unexpired approvals at top and omits expired ones.
       const list = await request('/connections');
       expect(list.status).toBe(200);
@@ -2151,15 +2178,17 @@ describe('tool approvals review and held-call details', () => {
       expect(invalidDecision.body).toBe('');
       expect(executedCalls).toEqual([]);
 
-      // Approve from web executes once, edits chat card in place, and returns terminal Approved page.
+      // Approve from web executes once, edits chat card in place, and navigates to reloadable /connections with confirmation.
       const approved = await post('/connections/held-decision', {
         viewId: 'held-live-approve',
         decision: 'approve',
       });
       expect(approved.status).toBe(200);
       expect(approved.headers['x-page-saved']).toBe('true');
-      expect(approved.body).toContain('Approved. Your assistant has the result in chat.');
-      expect(approved.body).not.toContain('action="/connections/held-decision"');
+      expect(approved.headers['x-page-location']).toBe('/connections');
+      expect(approved.body).toContain('Approved. Your assistant has the result.');
+      expect(approved.body).not.toContain('Place lunch order');
+      expect(approved.body).toContain('Place extra drink order');
       expect(executedCalls).toEqual(['confirm_checkout:{"checkout_id":"chk_held-live-approve"}']);
       expect(editedCards.some((entry) => entry.includes('Approved'))).toBe(true);
       expect(writtenNotes.some((note) => note.includes('Order placed #8841'))).toBe(true);
@@ -2175,23 +2204,25 @@ describe('tool approvals review and held-call details', () => {
       expect(replay.body).toContain('This request is no longer pending.');
       expect(executedCalls).toHaveLength(1);
 
-      // Decline from web does not execute, edits chat card in place, and returns terminal Declined page.
+      // Decline from web does not execute, edits chat card in place, and navigates to /connections with confirmation.
       const declined = await post('/connections/held-decision', {
         viewId: 'held-live-decline',
         decision: 'reject',
       });
       expect(declined.status).toBe(200);
       expect(declined.headers['x-page-saved']).toBe('true');
+      expect(declined.headers['x-page-location']).toBe('/connections');
       expect(declined.body).toContain('Declined. Nothing was sent.');
-      expect(declined.body).not.toContain('action="/connections/held-decision"');
+      expect(declined.body).not.toContain('Waiting for approval');
       expect(executedCalls).toHaveLength(1);
       expect(editedCards.some((entry) => entry.includes('Rejected'))).toBe(true);
 
-      // Pending approvals section disappears once all pending approvals are answered.
+      // Reloading /connections succeeds cleanly with no pending approvals left.
       const listAfter = await request('/connections');
+      expect(listAfter.status).toBe(200);
       expect(listAfter.body).not.toContain('Waiting for approval');
     } finally {
-      if (previousAdapter) setDeliveryAdapter(previousAdapter);
+      setDeliveryAdapter(previousAdapter ?? createChannelDeliveryAdapter());
       registerHeldAppCallHandlers();
     }
   });
@@ -2368,45 +2399,45 @@ describe('tool approvals review and held-call details', () => {
           chromeExecuted.push(input.toolName);
           return { status: 'completed', result: { content: [{ type: 'text', text: 'Done' }] } };
         };
-        registerHeldAppCallHandlers({
-          relay: () => ({ executeApprovedCall: chromeExecuteApproved }) as AppRelay,
-          writeNote: async () => 'written',
-        });
-        const heldViewId = `held-chrome-${label}`;
-        const { canonical, hash } = canonicalArgsHash({ checkout_id: 'chk_chrome' });
-        const heldPayload: HeldAppCallPayload = {
-          viewId: heldViewId,
-          invocationId: `sess-chrome-${label}:req-1`,
-          appId: app.id,
-          appName: 'Bistro',
-          appHost: app.host,
-          grantGeneration: 1,
-          toolName: 'confirm_checkout',
-          definitionHash: hashes.get('confirm_checkout')!,
-          canonicalArgs: canonical,
-          argsHash: hash,
-          summary: 'Place lunch order from Corner Kitchen',
-          appContext: null,
-          expiresAt: new Date(Date.now() + 3600_000).toISOString(),
-        };
-        await createPendingApproval({
-          approval_id: `appr-${heldViewId}`,
-          session_id: `sess-chrome-${label}`,
-          request_id: 'req-1',
-          action: HELD_APP_CALL_ACTION,
-          payload: JSON.stringify(heldPayload),
-          title: 'Allow Bistro to run confirm_checkout?',
-          question: 'Order details',
-          options_json: JSON.stringify([{ label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' }]),
-          status: 'pending',
-          created_at: new Date().toISOString(),
-          expires_at: heldPayload.expiresAt,
-          approver_user_id: principalUser,
-          channel_type: 'gchat',
-          platform_id: 'spaces/dm-morgan',
-        });
-
         try {
+          registerHeldAppCallHandlers({
+            relay: () => ({ executeApprovedCall: chromeExecuteApproved }) as AppRelay,
+            writeNote: async () => 'written',
+          });
+          const heldViewId = `held-chrome-${label}`;
+          const { canonical, hash } = canonicalArgsHash({ checkout_id: 'chk_chrome' });
+          const heldPayload: HeldAppCallPayload = {
+            viewId: heldViewId,
+            invocationId: `sess-chrome-${label}:req-1`,
+            appId: app.id,
+            appName: 'Bistro',
+            appHost: app.host,
+            grantGeneration: 1,
+            toolName: 'confirm_checkout',
+            definitionHash: hashes.get('confirm_checkout')!,
+            canonicalArgs: canonical,
+            argsHash: hash,
+            summary: 'Place lunch order from Corner Kitchen',
+            appContext: null,
+            expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+          };
+          await createPendingApproval({
+            approval_id: `appr-${heldViewId}`,
+            session_id: `sess-chrome-${label}`,
+            request_id: 'req-1',
+            action: HELD_APP_CALL_ACTION,
+            payload: JSON.stringify(heldPayload),
+            title: 'Allow Bistro to run confirm_checkout?',
+            question: 'Order details',
+            options_json: JSON.stringify([{ label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' }]),
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            expires_at: heldPayload.expiresAt,
+            approver_user_id: principalUser,
+            channel_type: 'gchat',
+            platform_id: 'spaces/dm-morgan',
+          });
+
           await page.goto(`https://${HOST}/connections`);
           expect(await page.locator('#pending-approvals-heading').isVisible()).toBe(true);
           expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
@@ -2425,11 +2456,15 @@ describe('tool approvals review and held-call details', () => {
             ? page.locator('.held-dock button.button-primary')
             : page.locator('.held-actions-header button.button-primary');
           await approveBtn.click();
+          await page.waitForURL(`https://${HOST}/connections`);
           await expect
             .poll(() => page.locator('#outcome').textContent(), { timeout: 5000 })
-            .toContain('Approved. Your assistant has the result in chat.');
+            .toContain('Approved. Your assistant has the result.');
           expect(await page.locator('.held-dock').count()).toBe(0);
           expect(await page.locator('.held-actions-header').count()).toBe(0);
+          // Reloading the landed /connections URL works cleanly (no 404).
+          const reloaded = await page.reload();
+          expect(reloaded?.status()).toBe(200);
           expect(chromeExecuted).toEqual(['confirm_checkout']);
           expect(pageErrors).toEqual([]);
         } finally {

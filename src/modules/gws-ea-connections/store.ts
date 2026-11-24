@@ -1631,6 +1631,7 @@ export class ConnectionsStore {
           );
           const deleteFloor = db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?');
           let applied = 0;
+          let labelChangedBySorter = false;
           for (const update of updates) {
             const row = selectTool.get(appId, update.name);
             if (!row || row.definition_hash !== update.definitionHash) continue;
@@ -1651,6 +1652,9 @@ export class ConnectionsStore {
             const labelSource: ToolLabelSource = floorLocked ? 'principal' : update.source;
             const reason = floorLocked ? 'Kept as ask first per your earlier choice' : update.reason;
             const principalFloor = principalOverride ? (label === 'ask_first' ? 1 : 0) : row.principal_floor;
+            if (!principalOverride && row.label !== null && row.label !== label) {
+              labelChangedBySorter = true;
+            }
             updateTool.run(
               label,
               labelSource,
@@ -1669,6 +1673,9 @@ export class ConnectionsStore {
               this.bumpToolDecisionRevision(db, appId, update.name);
             }
             applied += 1;
+          }
+          if (labelChangedBySorter) {
+            db.prepare('UPDATE app_pins SET reviewed_list_hash = NULL, reviewed_at = NULL WHERE app_id = ?').run(appId);
           }
           return applied;
         })
@@ -1756,10 +1763,12 @@ export class ConnectionsStore {
               sorter_version = COALESCE(?, sorter_version), unsettled = ?, sort_attempts = ?, updated_at = ?
               WHERE app_id = ? AND name = ? AND definition_hash = ?`,
           );
+          let labelChanged = false;
           for (const target of targets) {
             const row = selectTool.get(appId, target.name);
             if (!row || row.definition_hash !== target.definitionHash) continue;
             if (row.label_source === 'principal' || row.label_source === 'approved_request') continue;
+            if (row.label !== null && row.label !== 'ask_first') labelChanged = true;
             const attempts =
               options.sorterVersion && row.sorter_version !== null && row.sorter_version !== options.sorterVersion
                 ? 1
@@ -1776,6 +1785,9 @@ export class ConnectionsStore {
               target.name,
               target.definitionHash,
             );
+          }
+          if (labelChanged) {
+            db.prepare('UPDATE app_pins SET reviewed_list_hash = NULL, reviewed_at = NULL WHERE app_id = ?').run(appId);
           }
         })
         .immediate(),
@@ -1898,6 +1910,10 @@ export class ConnectionsStore {
               db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?').run(appId, name);
             }
             this.bumpToolDecisionRevision(db, appId, name);
+            db.prepare(
+              `INSERT INTO restart_request (id, applied_at) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET applied_at = max(applied_at, excluded.applied_at)`,
+            ).run(at);
           }
           return updated;
         })

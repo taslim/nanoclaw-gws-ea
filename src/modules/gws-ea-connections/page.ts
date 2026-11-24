@@ -417,7 +417,8 @@ function wantsJson(acceptHeader: string | string[] | undefined): boolean {
 /** Safe display metadata for live polling on the tool-approvals screen; never exposes secrets or raw server prompts. */
 function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]) {
   const sorted = sortToolsForDisplay(tools);
-  const hasUnsorted = !pin || sorted.some((tool) => tool.label === null || tool.unsettled);
+  const hasUnsorted =
+    app.status === 'connected' && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
   return {
     appId: app.id,
     status: app.status,
@@ -524,62 +525,34 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         }
         const decided = await resolveHeldCallFromWeb(viewId, decision);
         if (decided.status === 'unauthorized') return refuse(response);
-        const shell = await readShell();
-        const nonce = pageNonce();
-        if (decided.status === 'not_found') {
-          const listing = await readListing(await openOperations(factory, options.hostname).then((o) => o?.store));
-          sendPage(response, {
-            status: 200,
-            nonce,
-            location: '/connections',
-            saved: false,
-            body: renderConnectionsPage(
-              {
-                view: { kind: 'list' },
-                listing,
-                outcome: 'This request is no longer pending.',
-                error: true,
-                redirectUri: (app) => appRedirectUri(options.hostname, app.host),
-                operatorDisconnect: false,
-              },
-              shell,
-              nonce,
-            ),
-          });
-          return;
-        }
-        const timezone = await resolvePrincipalZoneAt(decided.payload.expiresAt);
+        const [shell, operations] = await Promise.all([readShell(), openOperations(factory, options.hostname)]);
+        const operatorDependencies = readOperatorDependencies();
+        const listing = operations ? await operations.listing() : await readListing(undefined);
         const outcome =
           decided.status === 'approved'
-            ? 'Approved. Your assistant has the result in chat.'
+            ? 'Approved. Your assistant has the result.'
             : decided.status === 'declined'
               ? 'Declined. Nothing was sent.'
               : decided.status === 'expired'
                 ? 'This request expired. Nothing was sent.'
-                : 'Already answered. Nothing else was sent.';
+                : decided.status === 'already_resolved'
+                  ? 'Already answered. Nothing else was sent.'
+                  : 'This request is no longer pending.';
         const saved = decided.status === 'approved' || decided.status === 'declined';
-        const resolution =
-          decided.status === 'approved'
-            ? ('approved' as const)
-            : decided.status === 'declined'
-              ? ('declined' as const)
-              : decided.status === 'expired'
-                ? ('expired' as const)
-                : ('already_resolved' as const);
+        const nonce = pageNonce();
         sendPage(response, {
           status: 200,
           nonce,
-          location: viewLocation({ kind: 'held', approvalId: viewId }),
+          location: '/connections',
           saved,
           body: renderConnectionsPage(
             {
-              view: { kind: 'held', approvalId: viewId },
-              listing: { listed: true, canChange: false, apps: [], operators: [] },
+              view: { kind: 'list' },
+              listing,
               outcome,
               error: !saved,
               redirectUri: (app) => appRedirectUri(options.hostname, app.host),
-              operatorDisconnect: false,
-              heldCall: { approvalId: viewId, payload: decided.payload, timezone, resolution },
+              operatorDisconnect: operations !== undefined && operatorDependencies.credentials !== undefined,
             },
             shell,
             nonce,

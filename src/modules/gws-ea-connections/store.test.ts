@@ -822,10 +822,13 @@ describe('tool pinning, principal floors, and call claims', () => {
     ]);
     expect(await store.getToolDecisionRevision(app.id, 'place_order')).toBe(0);
 
-    // Principal turns Ask-first off on the page (rev 1), then approves request B turning Ask-first back on (rev 2, source=approved_request).
+    // Principal turns Ask-first off on the page (rev 1, atomic restart request), then approves request B turning Ask-first back on (rev 2, source=approved_request).
     await store.setToolLabel(app.id, 'place_order', 'just_do', 'principal', { expectedHash: hash });
     const rev1 = await store.getToolDecisionRevision(app.id, 'place_order');
     expect(rev1).toBe(1);
+    const restartFromPage = await store.pendingRestart();
+    expect(restartFromPage).toBeDefined();
+    expect(await store.clearRestart(restartFromPage!)).toBe(true);
     expect(await store.pendingRestart()).toBeUndefined();
     expect(
       await store.applyApprovedToolAsk({

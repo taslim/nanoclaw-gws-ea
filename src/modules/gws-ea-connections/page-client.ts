@@ -9,6 +9,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   if (new URLSearchParams(location.search).has('outcome')) history.replaceState(null, '', location.pathname);
   let signingIn = false;
   const inFlightToggles = new Set();
+  let needsPostToggleSync = false;
   let pollTimer;
   let pollGeneration = 0;
 
@@ -178,11 +179,14 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     return li;
   }
 
-  function renderBadgeInto(slot, hasUnsorted, needsReview) {
+  function renderBadgeInto(slot, status, hasUnsorted, needsReview) {
     if (!slot) return;
     slot.textContent = '';
     const span = document.createElement('span');
-    if (hasUnsorted) {
+    if (status && status !== 'connected') {
+      span.className = status === 'needs_reconnecting' ? 'badge badge-warning' : 'badge';
+      span.textContent = status === 'needs_reconnecting' ? 'Needs reconnecting' : 'Not connected';
+    } else if (hasUnsorted) {
       span.className = 'badge badge-checking';
       span.textContent = 'Checking…';
     } else if (needsReview) {
@@ -195,15 +199,48 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     slot.append(span);
   }
 
+  function renderRecoveryBox(body, text, href, buttonLabel, primary) {
+    body.textContent = '';
+    const box = document.createElement('div');
+    box.className = 'tools-empty';
+    box.dataset.toolsEmpty = '';
+    const p = document.createElement('p');
+    p.textContent = text;
+    const link = document.createElement('a');
+    link.className = primary ? 'button button-primary' : 'button button-secondary';
+    link.href = href;
+    link.setAttribute('data-navigation', '');
+    link.textContent = buttonLabel;
+    box.append(p, link);
+    body.append(box);
+  }
+
+  function restoreToolsFocus(body, focusedTool) {
+    const switches = [...body.querySelectorAll('button[role="switch"][data-switch-name]')];
+    const match = focusedTool ? switches.find(btn => btn.dataset.switchName === focusedTool) : undefined;
+    const fallback = match || switches[0] || document.querySelector('main .back-link') || document.querySelector('main');
+    if (fallback instanceof HTMLElement) fallback.focus({ preventScroll: true });
+  }
+
   function applyToolsStatus(root, payload) {
     const appId = root.dataset.toolsApp;
     const wasPolling = root.dataset.toolsPolling === 'true';
-    const stillChecking = !payload.pinned || payload.hasUnsorted === true;
+    const isConnected = payload.status === 'connected';
+    const stillChecking = isConnected && (!payload.pinned || payload.hasUnsorted === true);
     root.dataset.toolsPolling = stillChecking ? 'true' : 'false';
     if (typeof payload.listHash === 'string') root.dataset.toolsListHash = payload.listHash;
 
     const body = root.querySelector('[data-tools-body]');
-    if (payload.pinned && body) {
+    if (!payload.pinned && !isConnected && body) {
+      const reconnect = payload.status === 'needs_reconnecting';
+      renderRecoveryBox(
+        body,
+        reconnect ? 'Reconnect this app to load its tools.' : 'Connect this app to load its tools.',
+        '/connections/app/' + encodeURIComponent(appId) + '/connect',
+        reconnect ? 'Reconnect' : 'Connect',
+        true,
+      );
+    } else if (payload.pinned && body) {
       const tools = Array.isArray(payload.tools) ? payload.tools : [];
       if (tools.length === 0) {
         body.textContent = '';
@@ -218,6 +255,9 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         const existingRows = new Map([...root.querySelectorAll('[data-tool-row]')].map(row => [row.dataset.toolRow, row]));
         const needsRebuild = !list || isSkeleton || existingRows.size !== tools.length || tools.some(tool => !existingRows.has(tool.name));
         if (needsRebuild) {
+          const activeEl = document.activeElement;
+          const activeInBody = activeEl instanceof Element && body.contains(activeEl);
+          const focusedTool = activeInBody ? activeEl.closest('[data-tool-row]')?.dataset.toolRow : undefined;
           const card = document.createElement('div');
           card.className = 'tools-card';
           const head = document.createElement('div');
@@ -235,10 +275,15 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
           card.append(head, list);
           body.textContent = '';
           body.append(card);
+          if (activeInBody) restoreToolsFocus(body, focusedTool);
         } else {
           for (const tool of tools) {
             const row = existingRows.get(tool.name);
-            if (!row || inFlightToggles.has(tool.name)) continue;
+            if (!row) continue;
+            if (inFlightToggles.has(tool.name)) {
+              needsPostToggleSync = true;
+              continue;
+            }
             const isChecking = tool.label === null || tool.unsettled === true;
             const state = isChecking ? 'checking' : tool.label === 'just_do' ? 'just_do' : 'ask_first';
             row.dataset.toolHash = tool.definitionHash;
@@ -251,10 +296,10 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       }
     }
 
-    renderBadgeInto(root.querySelector('[data-tools-badge]'), stillChecking, payload.needsReview === true);
+    renderBadgeInto(root.querySelector('[data-tools-badge]'), payload.status, stillChecking, payload.needsReview === true);
     updateTallies(root);
 
-    const showReview = Boolean(payload.pinned && !stillChecking && payload.needsReview === true && payload.listHash);
+    const showReview = Boolean(isConnected && payload.pinned && !stillChecking && payload.needsReview === true && payload.listHash);
     root.querySelectorAll('[data-review-form]').forEach(form => {
       const hashInput = form.querySelector('[data-review-list-hash]');
       if (hashInput && typeof payload.listHash === 'string') hashInput.value = payload.listHash;
@@ -262,9 +307,53 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     });
 
     if (wasPolling && !stillChecking) {
-      kit.announce(showReview ? 'Tools ready to review.' : 'Tools checked.');
+      kit.announce(showReview ? 'Tools ready to review.' : isConnected ? 'Tools checked.' : 'App is not connected.');
     }
     return stillChecking;
+  }
+
+  function showUnavailableTools(root) {
+    root.dataset.toolsPolling = 'false';
+    const badge = root.querySelector('[data-tools-badge]');
+    if (badge) badge.textContent = '';
+    const desktopTally = root.querySelector('[data-tools-tally]');
+    if (desktopTally) {
+      desktopTally.textContent = '';
+      desktopTally.hidden = true;
+    }
+    const mobileTally = root.querySelector('[data-tools-mobile-tally]');
+    if (mobileTally) {
+      mobileTally.textContent = '';
+      mobileTally.hidden = true;
+    }
+    root.querySelectorAll('[data-review-form]').forEach(form => { form.hidden = true; });
+    const body = root.querySelector('[data-tools-body]');
+    if (body) renderRecoveryBox(body, 'This app isn’t available right now.', '/connections', 'All apps', false);
+  }
+
+  async function fetchToolsStatusOnce(root) {
+    const appId = root.dataset.toolsApp;
+    if (!appId || !root.isConnected) return null;
+    try {
+      const response = await fetch('/connections/app/' + encodeURIComponent(appId) + '/tools-status', {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!root.isConnected) return null;
+      if (response.status === 404) {
+        stopToolsPolling();
+        showUnavailableTools(root);
+        return 'not_found';
+      }
+      if (!response.ok) return 'error';
+      const payload = await response.json();
+      if (!root.isConnected) return null;
+      return applyToolsStatus(root, payload) ? 'checking' : 'settled';
+    } catch {
+      return 'error';
+    }
   }
 
   function stopToolsPolling() {
@@ -299,31 +388,14 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         stopToolsPolling();
         return;
       }
-      try {
-        const response = await fetch('/connections/app/' + encodeURIComponent(appId) + '/tools-status', {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-          credentials: 'same-origin',
-          cache: 'no-store',
-        });
-        if (gen !== pollGeneration) return;
-        if (response.status === 404) {
-          stopToolsPolling();
-          return;
-        }
-        if (!response.ok) {
-          consecutiveErrors += 1;
-          schedule(Math.min(8000, 1500 * (consecutiveErrors + 1)));
-          return;
-        }
-        const payload = await response.json();
-        if (gen !== pollGeneration) return;
+      const status = await fetchToolsStatusOnce(currentRoot);
+      if (gen !== pollGeneration) return;
+      if (status === 'checking') {
         consecutiveErrors = 0;
-        const stillChecking = applyToolsStatus(currentRoot, payload);
-        if (stillChecking) schedule(1500);
-        else stopToolsPolling();
-      } catch {
-        if (gen !== pollGeneration) return;
+        schedule(1500);
+      } else if (status === 'settled' || status === 'not_found' || status === null) {
+        stopToolsPolling();
+      } else {
         consecutiveErrors += 1;
         schedule(Math.min(8000, 1500 * (consecutiveErrors + 1)));
       }
@@ -356,6 +428,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     updateTallies(root);
 
     const titleText = row.querySelector('.tool-title')?.textContent?.trim() || toolName;
+    let shouldReconcile = false;
     try {
       const response = await fetch(form.action, {
         method: 'POST',
@@ -369,29 +442,36 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         const confirmed = result && (result.label === 'ask_first' || result.label === 'just_do') ? result.label : nextLabel;
         applyRowVisual(row, confirmed);
         updateTallies(root);
-        const outcome = document.getElementById('outcome');
-        if (outcome && outcome.dataset.error === 'true') {
-          outcome.textContent = '';
-          outcome.hidden = true;
+        if (root.isConnected) {
+          const outcome = document.getElementById('outcome');
+          if (outcome && outcome.dataset.error === 'true') {
+            outcome.textContent = '';
+            outcome.hidden = true;
+          }
+          kit.announce(titleText + ': ' + (confirmed === 'ask_first' ? 'Ask first' : 'Auto'));
         }
-        kit.announce(titleText + ': ' + (confirmed === 'ask_first' ? 'Ask first' : 'Auto'));
         return;
       }
-      applyRowVisual(row, prevState);
-      if (wasChecking) applyRowDescription(row, prevDescText, true);
-      else if (!prevDescHidden) applyRowDescription(row, prevDescText, false);
-      updateTallies(root);
+      if (response.status >= 500) {
+        shouldReconcile = true;
+      } else {
+        applyRowVisual(row, prevState);
+        if (wasChecking) applyRowDescription(row, prevDescText, true);
+        else if (!prevDescHidden) applyRowDescription(row, prevDescText, false);
+        updateTallies(root);
+      }
       const errBody = await response.json().catch(() => null);
       const errText = errBody && typeof errBody.error === 'string' ? errBody.error : 'Couldn’t save that change. Reload and try again.';
-      kit.message(errText, response.status === 409 || response.status >= 500);
+      if (root.isConnected) kit.message(errText, response.status === 409 || response.status >= 500);
     } catch {
-      applyRowVisual(row, prevState);
-      if (wasChecking) applyRowDescription(row, prevDescText, true);
-      else if (!prevDescHidden) applyRowDescription(row, prevDescText, false);
-      updateTallies(root);
-      kit.message('Couldn’t save that change. Reload and try again.', true);
+      shouldReconcile = true;
+      if (root.isConnected) kit.message('Couldn’t save that change. Reload and try again.', true);
     } finally {
       inFlightToggles.delete(toolName);
+      if ((shouldReconcile || needsPostToggleSync) && inFlightToggles.size === 0 && root.isConnected) {
+        needsPostToggleSync = false;
+        void fetchToolsStatusOnce(root);
+      }
     }
   }
 

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildSortPrompt,
+  normalizeToolSummary,
   resolveFinalToolUpdates,
   sorterVersion,
   type ParsedSortToolEntry,
@@ -61,8 +62,9 @@ function parseRawSortEntries(rawTools: readonly unknown[]): readonly ParsedSortT
     if (label !== 'ask_first' && label !== 'just_do') {
       throw new Error(`Sorter CLI returned an invalid label for "${name}": ${String(label)}`);
     }
-    if (typeof summary !== 'string' || !summary.trim()) {
-      throw new Error(`Sorter CLI returned a tool entry for "${name}" without a non-empty summary.`);
+    const cleanSummary = typeof summary === 'string' ? normalizeToolSummary(summary) : '';
+    if (!cleanSummary) {
+      throw new Error(`Sorter CLI returned an invalid or empty summary for "${name}".`);
     }
     if (typeof reason !== 'string' || !reason.trim()) {
       throw new Error(`Sorter CLI returned a tool entry for "${name}" without a non-empty reason.`);
@@ -71,7 +73,7 @@ function parseRawSortEntries(rawTools: readonly unknown[]): readonly ParsedSortT
       name: name.trim(),
       definitionHash: definitionHash.trim(),
       label,
-      summary: summary.trim(),
+      summary: cleanSummary,
       reason: reason.trim(),
     });
   }

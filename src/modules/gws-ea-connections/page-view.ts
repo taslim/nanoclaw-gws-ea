@@ -198,11 +198,13 @@ function appRow(
     app.status === 'connected' && (!pin || (tools ?? []).some((tool) => tool.label === null || tool.unsettled));
   const needsReview = app.status === 'connected' && pin?.needsReview === true;
   const primaryHref =
-    app.status === 'connected' || pin !== undefined
+    app.status === 'connected'
       ? appUrl(app, 'tools')
       : canChange
         ? appUrl(app, 'connect')
-        : undefined;
+        : pin !== undefined
+          ? appUrl(app, 'tools')
+          : undefined;
   const statusPill =
     app.status === 'connected'
       ? needsReview && !hasUnsorted
@@ -389,26 +391,33 @@ function reviewForm(app: ConnectionApp, pin: AppPin | undefined, className: stri
 
 function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
   const sorted = sortToolsForDisplay(tools);
-  const hasUnsorted = !pin || sorted.some((tool) => tool.label === null || tool.unsettled);
-  const showReview = Boolean(pin && !hasUnsorted && pin.needsReview);
+  const isConnected = app.status === 'connected';
+  const hasUnsorted = isConnected && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
+  const showReview = Boolean(isConnected && pin && !hasUnsorted && pin.needsReview);
   const askCount = sorted.filter((tool) => tool.label === 'ask_first' && !tool.unsettled).length;
   const autoCount = sorted.filter((tool) => tool.label === 'just_do' && !tool.unsettled).length;
-  const reviewBadge = hasUnsorted
-    ? '<span class="badge badge-checking">Checking…</span>'
-    : pin.needsReview
-      ? renderBadge('Needs review', 'warning')
-      : renderBadge('Reviewed', 'success');
-  const desktopTally = hasUnsorted
-    ? ''
-    : sorted.length === 0
-      ? 'No tools'
-      : `${askCount} ask first · ${autoCount} auto`;
-  const mobileTally = hasUnsorted ? '' : sorted.length === 0 ? '0 tools' : `${askCount} on · ${autoCount} off`;
+  const reviewBadge = !isConnected
+    ? statusBadge(app.status)
+    : hasUnsorted
+      ? '<span class="badge badge-checking">Checking…</span>'
+      : pin?.needsReview
+        ? renderBadge('Needs review', 'warning')
+        : renderBadge('Reviewed', 'success');
+  const desktopTally =
+    !pin || hasUnsorted ? '' : sorted.length === 0 ? 'No tools' : `${askCount} ask first · ${autoCount} auto`;
+  const mobileTally = !pin || hasUnsorted ? '' : sorted.length === 0 ? '0 tools' : `${askCount} on · ${autoCount} off`;
   const metadata = `<span class="tools-host">${escapeHtml(app.host)}</span><span class="tools-tally" data-tools-tally${desktopTally ? '' : ' hidden'}>${escapeHtml(desktopTally)}</span><span class="tools-badge-slot" data-tools-badge>${reviewBadge}</span>`;
   const heading = `${BACK}${renderPageHeading(app.name, metadata, reviewForm(app, pin, 'review-header-form', showReview))}`;
   const mobileStrip = `<div class="tools-mobile-strip"><span class="tools-mobile-label">Ask before running</span><span class="tools-mobile-tally" data-tools-mobile-tally${mobileTally ? '' : ' hidden'}>${escapeHtml(mobileTally)}</span></div>`;
+  const disconnectedLabel = app.status === 'needs_reconnecting' ? 'Reconnect' : 'Connect';
+  const disconnectedPrompt =
+    app.status === 'needs_reconnecting'
+      ? 'Reconnect this app to load its tools.'
+      : 'Connect this app to load its tools.';
   const bodyMarkup = !pin
-    ? toolsSkeleton()
+    ? isConnected
+      ? toolsSkeleton()
+      : `<div class="tools-empty" data-tools-empty><p>${disconnectedPrompt}</p><a class="button button-primary" href="${escapeHtml(appUrl(app, 'connect'))}" data-navigation>${disconnectedLabel}</a></div>`
     : sorted.length > 0
       ? `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list>${sorted.map((tool) => toolRow(app, tool)).join('')}</ul></div>`
       : '<div class="tools-empty" data-tools-empty>No tools listed by this app.</div>';
@@ -561,6 +570,7 @@ const STYLE = `
 .skeleton-desc { width: min(260px, 78%); height: 12px; margin-top: 6px; opacity: .7; }
 .skeleton-pill { width: 42px; height: 24px; border-radius: 999px; background: var(--fill-strong); animation: pulse-soft 1.4s ease-in-out infinite; }
 .tools-empty { padding: 28px 20px; border-radius: 16px; background: var(--fill); color: var(--muted); font-size: 14px; text-align: center; }
+.tools-empty p { margin-bottom: 16px; }
 
 /* Held call & setup forms */
 .held-actions-header { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }

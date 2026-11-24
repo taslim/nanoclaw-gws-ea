@@ -15,13 +15,20 @@ import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { notifyMainToolsChanged } from './apply.js';
 import type { ToolDefinition } from './canonical.js';
-import { buildSortPrompt, resolveFinalToolUpdates, sorterVersion, type ParsedSortToolEntry } from './sort-rules.js';
+import {
+  buildSortPrompt,
+  normalizeToolSummary,
+  resolveFinalToolUpdates,
+  sorterVersion,
+  type ParsedSortToolEntry,
+} from './sort-rules.js';
 import { ConnectionsStoreError, type ConnectionsStore, type PinnedAppTool } from './store.js';
 
 export {
   buildSortPrompt,
   evaluateToolFloors,
   FLOOR_VERBS,
+  normalizeToolSummary,
   PASSTHROUGH_TOKENS,
   PREPARE_EXEMPT_NOUN_VERBS,
   PREPARE_LEADING_VERBS,
@@ -33,6 +40,7 @@ export {
   sorterVersion,
   STAGING_EXEMPT_VERBS,
   STAGING_TARGET_NOUNS,
+  SUMMARY_MAX,
   tokenizeToolName,
   type ParsedSortToolEntry,
   type ToolFloorResult,
@@ -42,12 +50,7 @@ export const SORT_TOOLS_ACTION = 'sort_tools';
 export const APP_SORT_THREAD_PREFIX = 'system:gws-ea-app-sort:';
 export const DEFAULT_SORT_TIMEOUT_MS = 120_000;
 export const DEFAULT_MAX_SORT_ATTEMPTS = 3;
-const SUMMARY_MAX = 100;
 const REASON_MAX = 200;
-
-function normalizeSummary(raw: string): string {
-  return raw.replace(/\s+/gu, ' ').trim().replace(/\.+$/u, '').trim().slice(0, SUMMARY_MAX);
-}
 
 function parseSortToolsPayload(content: Record<string, unknown>): readonly ParsedSortToolEntry[] {
   const allowedTopKeys = new Set(['action', 'requestId', 'tools']);
@@ -80,12 +83,12 @@ function parseSortToolsPayload(content: Record<string, unknown>): readonly Parse
     const cleanReason = reason.replace(/\s+/gu, ' ').trim().slice(0, REASON_MAX);
     let cleanSummary: string;
     if (summary === undefined) {
-      cleanSummary = normalizeSummary(cleanReason);
+      cleanSummary = normalizeToolSummary(cleanReason);
     } else {
-      if (typeof summary !== 'string' || !summary.trim() || hasControlCharacters(summary.replace(/\s+/gu, ' '))) {
+      if (typeof summary !== 'string') {
         throw invalidArgs('Each tool entry summary must be concise one-line plain text.');
       }
-      cleanSummary = normalizeSummary(summary);
+      cleanSummary = normalizeToolSummary(summary);
       if (!cleanSummary) {
         throw invalidArgs('Each tool entry summary must be concise one-line plain text.');
       }

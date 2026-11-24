@@ -39,6 +39,7 @@ import {
   createAppToolSorter,
   evaluateToolFloors,
   FLOOR_VERBS,
+  normalizeToolSummary,
   PASSTHROUGH_TOKENS,
   READ_EXEMPT_NOUN_VERBS,
   READ_LEADING_VERBS,
@@ -685,8 +686,8 @@ describe('isolated tool sorter session lifecycle', () => {
     expect((await store.getTool(second.app.id, 'get_two'))?.label).toBe('just_do');
   });
 
-  it('automatically re-sorts stale non-principal labels on enqueuePending while preserving principal overrides', async () => {
-    const { app, tools } = await createConnectedApp('CartApp', 'https://cart.example.test/mcp', [
+  it('automatically re-sorts stale non-principal labels on enqueuePending, invalidates review on label change, and preserves principal overrides', async () => {
+    const { app, pin, tools } = await createConnectedApp('CartApp', 'https://cart.example.test/mcp', [
       toolDef('create_cart', 'Create a temporary draft cart', { annotations: { readOnlyHint: false } }),
       toolDef('search_items', 'Search catalog items'),
     ]);
@@ -712,6 +713,9 @@ describe('isolated tool sorter session lifecycle', () => {
       { sorterVersion: 'oldhash00000@claude-sonnet-4-6' },
     );
     await store.setToolLabel(app.id, 'search_items', 'ask_first', 'principal');
+    expect(await store.pendingRestart()).toBeDefined();
+    expect(await store.markToolsReviewed(app.id, pin.listHash)).toBe(true);
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
 
     let wokeSession: Session | undefined;
     vi.mocked(requestWake).mockImplementation(async (session) => {
@@ -751,6 +755,25 @@ describe('isolated tool sorter session lifecycle', () => {
       label: 'ask_first',
       labelSource: 'principal',
     });
+    // Because the sorter changed create_cart's label, the prior confirmation was invalidated for fresh review.
+    expect((await store.getPin(app.id))?.needsReview).toBe(true);
+    // Re-confirming, then applying the same label with a newer summary/version keeps needsReview false.
+    expect(await store.markToolsReviewed(app.id, pin.listHash)).toBe(true);
+    await store.applyToolLabels(
+      app.id,
+      [
+        {
+          name: 'create_cart',
+          definitionHash: byName.get('create_cart')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Start a draft order cart',
+          reason: 'Reversible draft cart step',
+        },
+      ],
+      { sorterVersion: sorterVersion('claude-sonnet-4-6') },
+    );
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
     // Now up to date: enqueuePending sees no stale apps.
     expect(await store.appsNeedingSort(sorterVersion('claude-sonnet-4-6'))).toEqual([]);
   });
@@ -913,6 +936,24 @@ describe('exhaustive deterministic floor coverage', () => {
       evaluateToolFloors(toolDef('inspect_record', 'Inspect record', { annotations: { openWorldHint: true } })).floor,
     ).toBe(false);
     expect(evaluateToolFloors(toolDef('inspect_record', 'Inspect record')).floor).toBe(false);
+
+    // Staging exemptions cover only reversible removal/deletion on staging targets, never order placement or cancellation.
+    expect(evaluateToolFloors(toolDef('remove_from_cart', 'Remove an item from the draft cart')).floor).toBe(false);
+    expect(evaluateToolFloors(toolDef('delete_draft', 'Delete an unsent email draft')).floor).toBe(false);
+    expect(
+      evaluateToolFloors(
+        toolDef('order_cart', 'Submit the cart as a live paid order', { annotations: { readOnlyHint: false } }),
+      ).floor,
+    ).toBe(true);
+    expect(evaluateToolFloors(toolDef('cancel_cart_order', 'Cancel an order')).floor).toBe(true);
+    expect(evaluateToolFloors(toolDef('submit_cart', 'Submit cart for purchase')).floor).toBe(true);
+    expect(evaluateToolFloors(toolDef('send_draft', 'Send the email draft to recipients')).floor).toBe(true);
+
+    // Summary normalization rejects empty/punctuation-only/control-character strings identically across production and evals.
+    expect(normalizeToolSummary('...')).toBe('');
+    expect(normalizeToolSummary('   ...  ')).toBe('');
+    expect(normalizeToolSummary('Search\x00items')).toBe('');
+    expect(normalizeToolSummary('  Search menu items.  ')).toBe('Search menu items');
   });
 
   it('catches instruction smuggling in annotations.title, outputSchema, $defs action enums, and fails closed on deeply nested schemas', () => {

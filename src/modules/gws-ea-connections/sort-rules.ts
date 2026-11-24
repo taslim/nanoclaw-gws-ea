@@ -1,8 +1,20 @@
-import { isRecord } from '../../gws-ea/validation.js';
+import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { ASSISTANT_SUMMARY_FIELD, sha256Hex, type ToolDefinition } from './canonical.js';
 import { testSafeRegex } from './safe-regex.js';
 import type { PinnedAppTool, ToolLabel, ToolLabelUpdate } from './store.js';
+
+export const SUMMARY_MAX = 100;
+
+/**
+ * Normalizes and validates a sorter-produced tool summary. Returns empty string if the input contains control
+ * characters or collapses to empty after trimming whitespace and trailing periods.
+ */
+export function normalizeToolSummary(raw: string): string {
+  const collapsed = raw.replace(/\s+/gu, ' ');
+  if (hasControlCharacters(collapsed)) return '';
+  return collapsed.trim().replace(/\.+$/u, '').trim().slice(0, SUMMARY_MAX);
+}
 
 export const FLOOR_VERBS: ReadonlySet<string> = new Set([
   'send',
@@ -98,7 +110,7 @@ export const STAGING_TARGET_NOUNS: ReadonlySet<string> = new Set([
   'previews',
 ]);
 
-export const STAGING_EXEMPT_VERBS: ReadonlySet<string> = new Set(['remove', 'delete', 'cancel', 'order']);
+export const STAGING_EXEMPT_VERBS: ReadonlySet<string> = new Set(['remove', 'delete']);
 
 export const PASSTHROUGH_TOKENS: ReadonlySet<string> = new Set(['execute', 'run', 'query', 'graphql', 'request']);
 
