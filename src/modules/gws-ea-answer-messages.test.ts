@@ -55,6 +55,11 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       'the response frame keeps its transport error code; the error message tells main what was refused and what to do',
   },
+  'gws-ea-connections/held-card.ts unwrapEnvelope: ...envVal': {
+    kind: 'read-whole',
+    reason:
+      'unwraps a third-party app JSON envelope for card rendering; every field of the resulting record is distilled onto the approval card',
+  },
   'gws-ea-connections/relay-actions.ts errorFrame: code': {
     kind: 'host-only',
     reason:
