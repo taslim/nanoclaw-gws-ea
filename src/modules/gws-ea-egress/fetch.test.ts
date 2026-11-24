@@ -358,10 +358,20 @@ describe('public fetch', () => {
     expect(error.message).not.toContain(SENTINEL);
   });
 
-  it('ends a server that never answers with a timeout', async () => {
+  it('ends a server that never answers with a timeout and marks sent: true after TLS connects', async () => {
     handler = () => undefined;
     const error = await failure(client({ redirect: 'none' }, { timeoutMs: 150 })(`https://${HOST}/token`));
     expect(error.code).toBe('timeout');
+    expect(error.detail?.sent).toBe(true);
+  });
+
+  it('marks pre-connect DNS timeouts with sent: false', async () => {
+    const neverResolve = () => new Promise<never>(() => undefined);
+    const error = await failure(
+      publicFetch({ redirect: 'none' }, { timeoutMs: 80, resolve: neverResolve })(`https://${HOST}/token`),
+    );
+    expect(error.code).toBe('timeout');
+    expect(error.detail?.sent).toBe(false);
   });
 
   it('stops when the caller aborts', async () => {

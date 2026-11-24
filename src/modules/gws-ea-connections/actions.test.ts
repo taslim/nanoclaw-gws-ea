@@ -480,6 +480,102 @@ describe('app_tool_ask', () => {
       text: expect.stringContaining('definition changed'),
     });
   });
+
+  it('refuses operator servers, disconnected apps, missing/unsorted/unchanged tools, control chars, and non-main sessions before posting cards', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', {
+      op_srv: { type: 'http', url: LEDGERLY },
+    });
+    const disconnected = await store.create({ name: 'Paused', url: RECIPES, auth: 'none' });
+    const connected = await store.create({ name: 'Live', url: LARDER, auth: 'token' });
+    await store.connect(connected.id, connected.version, { kind: 'token', token: 'tok-live' });
+    const t1 = normalizeToolDefinition({
+      name: 'unsorted_tool',
+      description: 'Still sorting',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const t2 = normalizeToolDefinition({
+      name: 'already_ask',
+      description: 'Places order',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(connected.id, { instructions: null, tools: [t1, t2] });
+    await store.applyToolLabels(connected.id, [
+      {
+        name: 'already_ask',
+        definitionHash: pinned.tools.find((t) => t.name === 'already_ask')!.definitionHash,
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    const opRes = await send(APP_TOOL_ASK_ACTION, { app: 'op_srv', tool: 'anything', ask_first: true });
+    expect(opRes.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const discRes = await send(APP_TOOL_ASK_ACTION, { app: disconnected.serverKey, tool: 'x', ask_first: true });
+    expect(discRes.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const missingTool = await send(APP_TOOL_ASK_ACTION, { app: connected.serverKey, tool: 'nope', ask_first: true });
+    expect(missingTool.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const unsortedTool = await send(APP_TOOL_ASK_ACTION, {
+      app: connected.serverKey,
+      tool: 'unsorted_tool',
+      ask_first: false,
+    });
+    expect(unsortedTool.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const unchanged = await send(APP_TOOL_ASK_ACTION, {
+      app: connected.serverKey,
+      tool: 'already_ask',
+      ask_first: true,
+    });
+    expect(unchanged.answer).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    const badReason = await send(APP_TOOL_ASK_ACTION, {
+      app: connected.serverKey,
+      tool: 'already_ask',
+      ask_first: false,
+      reason: 'bad\u0007bell',
+    });
+    expect(badReason.answer).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+
+    await createAgentGroup({
+      id: 'other-group',
+      name: 'Other',
+      folder: 'other',
+      agent_provider: 'claude',
+      created_at: '2026-11-23T12:00:00.000Z',
+    });
+    await ensureContainerConfig('other-group');
+    const otherSession: Session = {
+      id: 'sess-other-tool-ask',
+      agent_group_id: 'other-group',
+      messaging_group_id: null,
+      thread_id: 'system:other',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: '2026-11-23T12:00:00.000Z',
+    };
+    await createSession(otherSession);
+    const run = getDeliveryAction(APP_TOOL_ASK_ACTION)!;
+    const reqId = `req-${randomUUID()}`;
+    await run(
+      {
+        action: APP_TOOL_ASK_ACTION,
+        requestId: reqId,
+        app: connected.serverKey,
+        tool: 'already_ask',
+        ask_first: false,
+      },
+      otherSession,
+    );
+
+    expect(cards).toEqual([]);
+    expect(await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).toEqual([]);
+  });
 });
 
 describe("main's self-modification path", () => {

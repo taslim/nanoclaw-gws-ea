@@ -1,6 +1,12 @@
 import { log } from '../../log.js';
 import { admissionDependencies, admitAppUrl, type AdmissionDependencies, type AdmissionRefusal } from './admit.js';
-import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
+import {
+  applyMainServers,
+  MainServersUnreadableError,
+  mainOperatorServers,
+  notifyMainToolsChanged,
+  type OperatorServer,
+} from './apply.js';
 import { withAppLock } from './locks.js';
 import { withdrawHeldAppCalls } from './held-calls.js';
 import { getAppRelay } from './relay.js';
@@ -29,6 +35,7 @@ import {
   type ConnectionApp,
   type ConnectionsStore,
   type GrantCredentials,
+  type PinnedAppTool,
   type ToolLabel,
 } from './store.js';
 
@@ -117,6 +124,8 @@ export interface ConnectionsListing {
   readonly operators: readonly OperatorServer[];
   /** Pinned tool metadata per principal app id, read without Keychain. */
   readonly pins?: Readonly<Record<string, AppPin>>;
+  /** Pinned tools per principal app id, read without Keychain. */
+  readonly toolsByApp?: Readonly<Record<string, readonly PinnedAppTool[]>>;
 }
 
 export interface ListingSources {
@@ -152,13 +161,18 @@ export async function readListing(
 
   const storePromise = (async () => {
     try {
-      const [apps, pinList, availability] = await Promise.all([
+      const [apps, pinList, allTools, availability] = await Promise.all([
         store.apps(),
         store.listPins(),
+        store.listAllTools(),
         options.includeAvailability === false ? Promise.resolve({ available: false }) : store.availability(),
       ]);
       const pins = Object.fromEntries(pinList.map((pin) => [pin.appId, pin]));
-      return { listed: true as const, apps, pins, available: availability.available };
+      const toolsByApp: Record<string, PinnedAppTool[]> = {};
+      for (const tool of allTools) {
+        (toolsByApp[tool.appId] ??= []).push(tool);
+      }
+      return { listed: true as const, apps, pins, toolsByApp, available: availability.available };
     } catch (error) {
       if (!(error instanceof ConnectionsStoreError)) throw error;
       return { listed: false as const };
@@ -173,6 +187,7 @@ export async function readListing(
     apps: storeResult.apps,
     operators: opResult.operators,
     pins: storeResult.pins,
+    toolsByApp: storeResult.toolsByApp,
   };
 }
 
@@ -315,7 +330,7 @@ export class ConnectionOperations {
 
   /** A server without sign-in, or one taking a pasted token; OAuth apps connect through `startSignIn`. */
   async connect(id: string, version: number, input: { readonly token?: string } = {}): Promise<ConnectOutcome> {
-    return withAppLock(id, async () => {
+    const outcome = await withAppLock(id, async (): Promise<ConnectOutcome> => {
       const app = await this.current(id, version);
       if (app.status === 'connected') return refusedConnect('already_connected');
       if (app.auth === 'oauth') return refusedConnect('wrong_method');
@@ -325,8 +340,6 @@ export class ConnectionOperations {
         if (probe.method.kind !== 'none') return refusedConnect('method_changed');
         const result = await this.store.connect(id, version, { kind: 'none' });
         await this.notifyDisconnected(result.app.id);
-        await this.pinConnected(result.app);
-        await this.apply();
         return { status: 'connected', app: result.app };
       }
       const token = input.token?.trim();
@@ -335,10 +348,13 @@ export class ConnectionOperations {
       if (check !== 'valid') return refusedConnect(check === 'refused' ? 'token_refused' : check);
       const result = await this.store.connect(id, version, { kind: 'token', token });
       await this.notifyDisconnected(result.app.id);
-      await this.pinConnected(result.app);
-      await this.apply();
       return { status: 'connected', app: result.app };
     });
+    if (outcome.status === 'connected') {
+      await this.pinConnected(outcome.app);
+      await this.apply();
+    }
+    return outcome;
   }
 
   /**
@@ -420,7 +436,8 @@ export class ConnectionOperations {
     if (states.length !== 1 || !states[0]) return 'expired';
     const claim = await this.store.claimSignIn(states[0], { host, principalId });
     if (!claim) return 'expired';
-    return withAppLock(claim.appId, async () => {
+    let connectedApp: ConnectionApp | undefined;
+    const outcome = await withAppLock(claim.appId, async (): Promise<SignInReturn> => {
       let tokens: IssuedTokens;
       let client: ClientRegistration | undefined;
       let previousIssuer: string | null;
@@ -458,10 +475,14 @@ export class ConnectionOperations {
       }
       await this.notifyDisconnected(completion.app.id);
       await revokeGrant(previousIssuer, completion.replaced, this.oauth);
-      await this.pinConnected(completion.app);
-      await this.apply();
+      connectedApp = completion.app;
       return 'connected';
     });
+    if (outcome === 'connected' && connectedApp) {
+      await this.pinConnected(connectedApp);
+      await this.apply();
+    }
+    return outcome;
   }
 
   /** Revocation is best-effort; the app stays listed, Not connected. */
@@ -506,8 +527,23 @@ export class ConnectionOperations {
     return withAppLock(id, () => this.store.rename(id, version, name));
   }
 
-  setToolLabel(id: string, toolName: string, label: ToolLabel): Promise<boolean> {
-    return withAppLock(id, () => this.store.setToolLabel(id, toolName, label, 'principal'));
+  async setToolLabel(
+    id: string,
+    toolName: string,
+    label: ToolLabel,
+    options?: { readonly expectedHash?: string },
+  ): Promise<boolean> {
+    const updated = await withAppLock(id, () =>
+      this.store.setToolLabel(
+        id,
+        toolName,
+        label,
+        'principal',
+        options?.expectedHash === undefined ? {} : { expectedHash: options.expectedHash },
+      ),
+    );
+    if (updated) await notifyMainToolsChanged(this.store);
+    return updated;
   }
 
   markToolsReviewed(id: string, expectedListHash: string): Promise<boolean> {

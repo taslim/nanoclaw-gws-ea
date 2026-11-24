@@ -120,6 +120,7 @@ async function send(
   const cancel = (): void => control.abort(new EgressError('failed'));
   init?.signal?.addEventListener('abort', cancel, { once: true });
   if (init?.signal?.aborted) cancel();
+  let sent = false;
   let stop!: () => void;
   const stopped = new Promise<never>((_resolve, reject) => {
     stop = () => reject(control.signal.reason);
@@ -127,9 +128,14 @@ async function send(
     if (control.signal.aborted) stop();
   });
   try {
-    return await Promise.race([exchange(options, dependencies, input, init, control.signal), stopped]);
+    return await Promise.race([
+      exchange(options, dependencies, input, init, control.signal, () => {
+        sent = true;
+      }),
+      stopped,
+    ]);
   } catch (error) {
-    throw classify(error, control.signal);
+    throw classify(error, control.signal, sent);
   } finally {
     clearTimeout(timer);
     init?.signal?.removeEventListener('abort', cancel);
@@ -137,11 +143,16 @@ async function send(
   }
 }
 
-function classify(error: unknown, signal: AbortSignal): EgressError {
-  if (signal.aborted && signal.reason instanceof EgressError) return signal.reason;
+function classify(error: unknown, signal: AbortSignal, sent: boolean): EgressError {
+  if (signal.aborted && signal.reason instanceof EgressError) {
+    return new EgressError(signal.reason.code, {
+      ...signal.reason.detail,
+      sent: signal.reason.detail?.sent ?? sent,
+    });
+  }
   if (error instanceof EgressError) return error;
   if (error instanceof RefusedDestination) return new EgressError('refused', { sent: false });
-  return new EgressError('failed');
+  return new EgressError('failed', { sent });
 }
 
 async function outgoing(input: string | URL, init: RequestInit | undefined): Promise<{ url: URL; request: Outgoing }> {
@@ -170,13 +181,14 @@ async function exchange(
   input: string | URL,
   init: RequestInit | undefined,
   signal: AbortSignal,
+  onConnect: () => void,
 ): Promise<Response> {
   const maxBodyBytes = bodyCap(options);
   const { url: first, request } = await outgoing(input, init);
   let url = first;
   let headers = request.headers;
   for (let hop = 0; ; hop += 1) {
-    const reply = await hopOnce(url, { ...request, headers }, dependencies, maxBodyBytes, signal);
+    const reply = await hopOnce(url, { ...request, headers }, dependencies, maxBodyBytes, signal, onConnect);
     if (!REDIRECTS.has(reply.status)) return answer(reply, request.method, options);
     const location = reply.headers.location;
     if (
@@ -208,6 +220,7 @@ async function hopOnce(
   dependencies: EgressDependencies,
   maxBodyBytes: number,
   signal: AbortSignal,
+  onConnect: () => void,
 ): Promise<Reply> {
   pinned(url);
   const destination = await dependencies.resolve(url);
@@ -217,6 +230,7 @@ async function hopOnce(
   const agent = new Agent({
     connect: connector(url.hostname, destination, dependencies, signal, () => {
       connected = true;
+      onConnect();
     }),
     connections: 1,
     headersTimeout: dependencies.timeoutMs,
@@ -336,12 +350,12 @@ function parsesAsJson(text: string): boolean {
 }
 
 function answer(reply: Reply, method: string, options: PublicFetchOptions): Response {
-  if (reply.status < 200 || reply.status > 599) throw new EgressError('failed');
+  if (reply.status < 200 || reply.status > 599) throw new EgressError('failed', { sent: true });
   const body = reply.body ?? Buffer.alloc(0);
   if (options.json && reply.status < 300) {
     const type = reply.headers['content-type'];
     if (typeof type !== 'string' || !JSON_TYPE.test(type) || !parsesAsJson(body.toString('utf8'))) {
-      throw new EgressError('refused');
+      throw new EgressError('refused', { sent: true });
     }
   }
   const headers = new Headers();

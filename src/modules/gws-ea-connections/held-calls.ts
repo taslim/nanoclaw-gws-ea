@@ -17,7 +17,7 @@ import {
 } from '../approvals/primitive.js';
 import { quoted } from '../approvals/request-text.js';
 import { cap, untrusted } from '../gws-ea-inbox/untrusted.js';
-import { principalApproverUserId } from '../gws-ea-profile/db.js';
+import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
   resolveMainConversation,
   writeNoteForMain,
@@ -26,6 +26,7 @@ import {
 } from '../gws-ea-profile/main-note.js';
 import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
+import { canonicalArgsHash } from './canonical.js';
 import {
   getAppRelay,
   type AppRelay,
@@ -93,7 +94,7 @@ export interface HeldAppCallPayload {
 }
 
 export interface HeldCallsDependencies {
-  readonly relay: () => AppRelay | undefined;
+  readonly relay: () => AppRelay | undefined | Promise<AppRelay | undefined>;
   readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
   readonly now?: () => number;
 }
@@ -187,15 +188,6 @@ function matchNeedlesInRecent(
   return null;
 }
 
-export function findMatchingAppContext(
-  args: Record<string, unknown>,
-  recent: readonly RecentRelayResult[],
-): HeldAppCallContext | null {
-  const needles = new Set<string>();
-  collectArgStrings(args, needles);
-  return matchNeedlesInRecent(needles, recent);
-}
-
 function defaultWebHostname(): Promise<string | undefined> {
   return readWebPolicy().then((policy) => (policy.status === 'enabled' ? policy.config.hostname : undefined));
 }
@@ -225,13 +217,15 @@ async function buildHeldCallCard(input: {
   readonly readHostname: () => Promise<string | undefined>;
 }): Promise<{ readonly title: string; readonly question: string }> {
   const title = `Allow ${input.appName} to run ${input.toolName}?`.slice(0, 120);
-  const { text: renderedArgs, hasInvisible } = renderCompactArgs(input.args);
-  const summaryLine =
-    input.summary && input.summary.trim()
-      ? `Assistant's description: ${quoted(input.summary.trim(), SUMMARY_CARD_MAX)}`
-      : "Assistant's description: no summary given";
+  const { text: renderedArgs, hasInvisible: argsHasInvisible } = renderCompactArgs(input.args);
+  const summaryOut = input.summary && input.summary.trim() ? escapeInvisibleChars(input.summary.trim()) : undefined;
+  const contextOut = input.appContext ? escapeInvisibleChars(input.appContext.text) : undefined;
+  const hasInvisible = argsHasInvisible || summaryOut?.hasInvisible === true || contextOut?.hasInvisible === true;
+  const summaryLine = summaryOut
+    ? `Assistant's description: ${quoted(summaryOut.rendered, SUMMARY_CARD_MAX)}`
+    : "Assistant's description: no summary given";
   const invisibleLine = hasInvisible
-    ? 'Warning: arguments contain invisible or hidden characters (shown as [U+...]).'
+    ? 'Warning: call details contain invisible or hidden characters (shown as [U+...]).'
     : undefined;
   const expiryLine = `Expires: ${formatLocalTime(input.expiresAt, input.timezone)}`;
 
@@ -242,10 +236,11 @@ async function buildHeldCallCard(input: {
     ...(invisibleLine ? [invisibleLine] : []),
   ];
 
+  const contextHeader = input.appContext ? `From ${input.appName} (${input.appContext.toolName}):\n` : '';
   const fullParts = [
     ...headerLines,
     `Arguments:\n${renderedArgs}`,
-    ...(input.appContext ? [`From ${input.appName} (${input.appContext.toolName}):\n${input.appContext.text}`] : []),
+    ...(contextOut ? [`${contextHeader}${contextOut.rendered}`] : []),
     expiryLine,
   ];
   const fullQuestion = fullParts.join('\n');
@@ -259,24 +254,23 @@ async function buildHeldCallCard(input: {
     : `/connections/held/${encodeURIComponent(input.approvalId)}`;
   const linkLine = `Full details are too long for this message — review them in full: ${detailsUrl}`;
 
-  const fixedLen =
+  const overhead =
     title.length +
     headerLines.join('\n').length +
     expiryLine.length +
     linkLine.length +
     'Arguments:\n'.length +
-    (input.appContext ? `From ${input.appName} (${input.appContext.toolName}):\n`.length : 0) +
-    64;
-  const remaining = Math.max(160, CARD_SAFE_BUDGET - fixedLen);
-  const argsBudget = input.appContext ? Math.max(100, Math.floor(remaining * 0.6)) : remaining;
-  const contextBudget = input.appContext ? Math.max(80, remaining - argsBudget) : 0;
+    contextHeader.length +
+    16;
+  const maxBody = Math.max(40, MAX_CARD_QUESTION_LENGTH - overhead);
+  const targetBody = Math.min(maxBody, Math.max(40, CARD_SAFE_BUDGET - overhead));
+  const argsBudget = contextOut ? Math.max(20, Math.floor(targetBody * 0.6)) : targetBody;
+  const contextBudget = contextOut ? Math.max(20, targetBody - argsBudget) : 0;
 
   const trimmedParts = [
     ...headerLines,
     `Arguments:\n${cap(renderedArgs, argsBudget)}`,
-    ...(input.appContext
-      ? [`From ${input.appName} (${input.appContext.toolName}):\n${cap(input.appContext.text, contextBudget)}`]
-      : []),
+    ...(contextOut ? [`${contextHeader}${cap(contextOut.rendered, contextBudget)}`] : []),
     linkLine,
     expiryLine,
   ];
@@ -472,7 +466,7 @@ export function registerHeldAppCallHandlers(dependencies: HeldCallsDependencies 
 
   registerApprovalHandler(
     HELD_APP_CALL_ACTION,
-    async ({ approval }) => {
+    async ({ approval, userId, notify }) => {
       const payload = parseHeldCallPayload(approval.payload);
       const writeNote = activeDependencies.writeNote ?? writeNoteForMain;
       const now = activeDependencies.now ?? Date.now;
@@ -480,38 +474,57 @@ export function registerHeldAppCallHandlers(dependencies: HeldCallsDependencies 
         log.warn('Approved held app call had an unreadable payload', { approvalId: approval.approval_id });
         return;
       }
-      const relay = activeDependencies.relay();
       let outcome: RelayCallOutcome;
-      if (!relay) {
+      if (!userId || approval.approver_user_id !== userId || !(await isVerifiedPrincipalUser(userId))) {
         outcome = {
           status: 'unsent',
-          reason: 'relay_unavailable',
-          text: 'The app relay is not running right now, so nothing was sent.',
+          reason: 'principal_changed',
+          text: 'The principal changed before this call ran, so nothing was sent.',
         };
       } else {
-        let args: Record<string, unknown> = {};
+        let parsedArgs: Record<string, unknown> | undefined;
         try {
           const parsed: unknown = JSON.parse(payload.canonicalArgs);
-          if (isRecord(parsed)) args = parsed;
+          if (isRecord(parsed) && canonicalArgsHash(parsed).hash === payload.argsHash) {
+            parsedArgs = parsed;
+          }
         } catch (error) {
           if (!(error instanceof SyntaxError)) throw error;
-          args = {};
         }
-        outcome = await relay.executeApprovedCall({
-          approvalId: approval.approval_id,
-          appId: payload.appId,
-          grantGeneration: payload.grantGeneration,
-          toolName: payload.toolName,
-          definitionHash: payload.definitionHash,
-          args,
-        });
+        if (!parsedArgs) {
+          outcome = {
+            status: 'unsent',
+            reason: 'invalid_payload',
+            text: 'The approved call arguments could not be verified, so nothing was sent.',
+          };
+        } else {
+          const relay = await activeDependencies.relay();
+          if (!relay) {
+            outcome = {
+              status: 'unsent',
+              reason: 'relay_unavailable',
+              text: 'The app relay is not running right now, so nothing was sent.',
+            };
+          } else {
+            outcome = await relay.executeApprovedCall({
+              approvalId: approval.approval_id,
+              appId: payload.appId,
+              grantGeneration: payload.grantGeneration,
+              toolName: payload.toolName,
+              definitionHash: payload.definitionHash,
+              args: parsedArgs,
+            });
+          }
+        }
       }
-      await writeNote({
+      const noteText = formatOutcomeNote(payload, outcome);
+      const written = await writeNote({
         id: `app-call-outcome:${approval.approval_id}`,
         timestamp: new Date(now()).toISOString(),
         wake: true,
-        text: formatOutcomeNote(payload, outcome),
+        text: noteText,
       });
+      if (written === 'no-principal') await notify(noteText);
     },
     {
       restartSafe: true,

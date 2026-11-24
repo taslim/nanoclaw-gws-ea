@@ -1,17 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import path from 'node:path';
 
 import type { ActionRequestOptions, ActionRequestResult } from '../action-request.js';
 import { closeSessionDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { getAgentMailbox } from '../mailbox/index.js';
-import {
-  ASSISTANT_SUMMARY_FIELD,
-  createAppRelayServer,
-  type AppRelayRequestFn,
-} from './app-relay.js';
+import { ASSISTANT_SUMMARY_FIELD, createAppRelayServer, type AppRelayRequestFn } from './app-relay.js';
 
 const SERVER_KEY = 'app_0123456789ab';
 
@@ -68,10 +65,9 @@ describe('app-relay stdio MCP server', () => {
   });
 
   it('still completes initialize without instructions when the host does not answer within the bound', async () => {
-    const { client, close } = await connectRelay(
-      async () => ({ status: 'timeout', requestId: 'req-slow' }),
-      { initTimeoutMs: 25 },
-    );
+    const { client, close } = await connectRelay(async () => ({ status: 'timeout', requestId: 'req-slow' }), {
+      initTimeoutMs: 25,
+    });
     try {
       expect(client.getInstructions()).toBeUndefined();
     } finally {
@@ -267,9 +263,85 @@ describe('app-relay stdio MCP server', () => {
 
       const timedOut = await client.callTool({ name: 'search_menu', arguments: {} });
       expect(timedOut.isError).toBe(true);
-      expect(timedOut.content).toEqual([
-        { type: 'text', text: expect.stringContaining('check before retrying') },
-      ]);
+      expect(timedOut.content).toEqual([{ type: 'text', text: expect.stringContaining('check before retrying') }]);
+    } finally {
+      await close();
+    }
+  });
+
+  it('maps unknown, not-sent, cancelled, and unreadable completed outcomes to errors, fails tools/list errors, and emits tools/list_changed when toolsVersion shifts', async () => {
+    let listChangedCount = 0;
+    const outcomes: ActionRequestResult[] = [
+      { status: 'answered', frame: { id: 'u1', ok: true, data: { status: 'unknown', text: 'Outcome unknown.' } } },
+      { status: 'not-sent', reason: 'Mailbox closed' },
+      { status: 'cancelled' },
+      { status: 'answered', frame: { id: 'u4', ok: true, data: { status: 'completed', result: 'not-an-object' } } },
+      {
+        status: 'answered',
+        frame: {
+          id: 'u5',
+          ok: true,
+          data: { status: 'completed', result: { content: [{ type: 'text', text: 'ok' }] }, toolsVersion: 'v2' },
+        },
+      },
+    ];
+    let callIdx = 0;
+    let failList = false;
+    const { client, close } = await connectRelay(async (_action, fields) => {
+      if (fields.op === 'initialize') {
+        return { status: 'answered', frame: { id: 'i1', ok: true, data: { instructions: null } } };
+      }
+      if (fields.op === 'tools/list') {
+        if (failList)
+          return {
+            status: 'answered',
+            frame: { id: 'l2', ok: false, error: { code: 'forbidden', message: 'Not connected' } },
+          };
+        return {
+          status: 'answered',
+          frame: {
+            id: 'l1',
+            ok: true,
+            data: {
+              toolsVersion: 'v1',
+              tools: [{ name: 'search_menu', inputSchema: { type: 'object', properties: {} }, label: 'just_do' }],
+            },
+          },
+        };
+      }
+      return outcomes[callIdx++]!;
+    });
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      listChangedCount += 1;
+    });
+    try {
+      expect(client.getServerCapabilities()?.tools?.listChanged).toBe(true);
+      await client.listTools();
+
+      expect(await client.callTool({ name: 'search_menu', arguments: {} })).toEqual({
+        content: [{ type: 'text', text: 'Outcome unknown.' }],
+        isError: true,
+      });
+      expect(await client.callTool({ name: 'search_menu', arguments: {} })).toEqual({
+        content: [{ type: 'text', text: 'Mailbox closed' }],
+        isError: true,
+      });
+      expect(await client.callTool({ name: 'search_menu', arguments: {} })).toEqual({
+        content: [{ type: 'text', text: 'The app tool call was cancelled.' }],
+        isError: true,
+      });
+      expect(await client.callTool({ name: 'search_menu', arguments: {} })).toEqual({
+        content: [{ type: 'text', text: 'The app returned an unreadable tool result.' }],
+        isError: true,
+      });
+
+      const shifted = await client.callTool({ name: 'search_menu', arguments: {} });
+      expect(shifted).toEqual({ content: [{ type: 'text', text: 'ok' }] });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(listChangedCount).toBe(1);
+
+      failList = true;
+      await expect(client.listTools()).rejects.toThrow('Not connected');
     } finally {
       await close();
     }

@@ -97,57 +97,102 @@ export function tokenizeToolName(name: string): string[] {
   return tokens;
 }
 
-function schemaHasActionEnum(schema: unknown, depth = 0): boolean {
-  if (depth > 6 || !isRecord(schema)) return false;
+const MAX_SCHEMA_DEPTH = 8;
+const MAX_COLLECTED_TEXTS = 500;
+
+function schemaHasActionEnum(schema: unknown, depth = 0): { readonly matched: boolean; readonly truncated: boolean } {
+  if (!isRecord(schema)) return { matched: false, truncated: false };
+  if (depth > MAX_SCHEMA_DEPTH) return { matched: false, truncated: true };
+  let truncated = false;
+  const check = (node: unknown): boolean => {
+    const res = schemaHasActionEnum(node, depth + 1);
+    if (res.truncated) truncated = true;
+    return res.matched;
+  };
   if (isRecord(schema.properties)) {
     for (const [key, prop] of Object.entries(schema.properties)) {
       const normalizedKey = key.toLowerCase();
       if (ACTION_ENUM_KEYS.has(normalizedKey) && isRecord(prop)) {
-        if (Array.isArray(prop.enum) && prop.enum.length > 0) return true;
-        if (Array.isArray(prop.oneOf) && prop.oneOf.length > 0) return true;
-        if (Array.isArray(prop.anyOf) && prop.anyOf.length > 0) return true;
+        if (Array.isArray(prop.enum) && prop.enum.length > 0) return { matched: true, truncated };
+        if (Array.isArray(prop.oneOf) && prop.oneOf.length > 0) return { matched: true, truncated };
+        if (Array.isArray(prop.anyOf) && prop.anyOf.length > 0) return { matched: true, truncated };
       }
-      if (schemaHasActionEnum(prop, depth + 1)) return true;
+      if (check(prop)) return { matched: true, truncated };
     }
   }
-  if (isRecord(schema.items) && schemaHasActionEnum(schema.items, depth + 1)) return true;
+  if (isRecord(schema.items) && check(schema.items)) return { matched: true, truncated };
+  for (const defsKey of ['$defs', 'definitions'] as const) {
+    const defs = schema[defsKey];
+    if (isRecord(defs)) {
+      for (const def of Object.values(defs)) {
+        if (check(def)) return { matched: true, truncated };
+      }
+    }
+  }
   for (const branch of ['oneOf', 'anyOf', 'allOf'] as const) {
     const list = schema[branch];
-    if (Array.isArray(list) && list.some((entry) => schemaHasActionEnum(entry, depth + 1))) return true;
+    if (Array.isArray(list)) {
+      for (const entry of list) {
+        if (check(entry)) return { matched: true, truncated };
+      }
+    }
   }
-  return false;
+  return { matched: false, truncated };
 }
 
 function schemaUsesReservedSummary(schema: Record<string, unknown>): boolean {
   return isRecord(schema.properties) && Object.hasOwn(schema.properties, ASSISTANT_SUMMARY_FIELD);
 }
 
-function collectTextFields(value: unknown, out: string[], depth = 0): void {
-  if (depth > 6 || out.length > 200) return;
+function collectTextFields(value: unknown, out: string[], state: { truncated: boolean }, depth = 0): void {
+  if (depth > MAX_SCHEMA_DEPTH || out.length >= MAX_COLLECTED_TEXTS) {
+    state.truncated = true;
+    return;
+  }
   if (typeof value === 'string') {
     if (value.trim().length > 0) out.push(value);
     return;
   }
   if (Array.isArray(value)) {
-    for (const entry of value) collectTextFields(entry, out, depth + 1);
+    for (const entry of value) collectTextFields(entry, out, state, depth + 1);
     return;
   }
   if (!isRecord(value)) return;
   for (const [key, entry] of Object.entries(value)) {
-    if (key === 'description' || key === 'title' || key === 'default' || key === 'examples') {
-      collectTextFields(entry, out, depth + 1);
+    if (key.trim().length > 0) {
+      if (out.length >= MAX_COLLECTED_TEXTS) {
+        state.truncated = true;
+        return;
+      }
+      out.push(key);
+    }
+    if (
+      key === 'description' ||
+      key === 'title' ||
+      key === 'default' ||
+      key === 'examples' ||
+      key === 'enum' ||
+      key === 'const'
+    ) {
+      collectTextFields(entry, out, state, depth + 1);
     } else if (typeof entry === 'object' && entry !== null) {
-      collectTextFields(entry, out, depth + 1);
+      collectTextFields(entry, out, state, depth + 1);
     }
   }
 }
 
-function looksLikeInstruction(definition: ToolDefinition): boolean {
+function looksLikeInstruction(definition: ToolDefinition): { readonly matched: boolean; readonly truncated: boolean } {
   const texts: string[] = [];
+  const state = { truncated: false };
   if (definition.title) texts.push(definition.title);
   if (definition.description) texts.push(definition.description);
-  collectTextFields(definition.inputSchema, texts);
-  return texts.some((text) => INJECTION_PATTERNS.some((pattern) => pattern.test(text)));
+  if (definition.annotations?.title) texts.push(definition.annotations.title);
+  collectTextFields(definition.inputSchema, texts, state);
+  if (definition.outputSchema) collectTextFields(definition.outputSchema, texts, state);
+  return {
+    matched: texts.some((text) => INJECTION_PATTERNS.some((pattern) => pattern.test(text))),
+    truncated: state.truncated,
+  };
 }
 
 export interface ToolFloorResult {
@@ -177,8 +222,11 @@ export function evaluateToolFloors(definition: ToolDefinition): ToolFloorResult 
     reasons.push(`General-purpose ${matchedPassthrough[0]} tool can run arbitrary actions`);
   }
 
-  if (schemaHasActionEnum(definition.inputSchema)) {
+  const actionEnum = schemaHasActionEnum(definition.inputSchema);
+  if (actionEnum.matched) {
     reasons.push('Tool accepts an action or operation parameter that can perform multiple actions');
+  } else if (actionEnum.truncated) {
+    reasons.push('Tool input schema is too deeply nested to verify as read-only');
   }
 
   if (schemaUsesReservedSummary(definition.inputSchema)) {
@@ -186,9 +234,12 @@ export function evaluateToolFloors(definition: ToolDefinition): ToolFloorResult 
     reasons.push('Tool schema declares reserved assistant_summary field — flagged to ask first');
   }
 
-  if (looksLikeInstruction(definition)) {
+  const instructionCheck = looksLikeInstruction(definition);
+  if (instructionCheck.matched) {
     suspicious = true;
     reasons.push('Tool description contains instruction-like text — flagged to ask first');
+  } else if (instructionCheck.truncated) {
+    reasons.push('Tool definition is too large or deeply nested to scan completely');
   }
 
   if (definition.annotations?.readOnlyHint === false) {

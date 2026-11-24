@@ -10,13 +10,13 @@ import { registerAppActions } from './actions.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import { connectionsRoot } from './config.js';
 import { clientDocumentsWebMount, connectionsWebMount, operatorAsApp } from './connections-mount.js';
-import { createHoldCallHandler, registerHeldAppCallHandlers } from './held-calls.js';
+import { createHoldCallHandler, registerHeldAppCallHandlers, withdrawHeldAppCalls } from './held-calls.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
-import { registerRelayAction } from './relay-actions.js';
-import { startAppRelay, stopAppRelay } from './relay.js';
-import { registerSortToolsAction, startAppToolSorter, stopAppToolSorter } from './sorter.js';
+import { drainRelayActions, registerRelayAction } from './relay-actions.js';
+import { getAppRelay, startAppRelay, stopAppRelay, type AppRelay } from './relay.js';
+import { registerSortToolsAction, startAppToolSorter, stopAppToolSorter, type AppToolSorter } from './sorter.js';
 import {
   ConnectionsStoreError,
   getConnectionsStore,
@@ -84,47 +84,115 @@ register({
   handler: () => connectionsHealth(),
 });
 
+interface ConnectionsRuntime {
+  readonly store: ConnectionsStore;
+  readonly sorter: AppToolSorter;
+  readonly relay: AppRelay;
+}
+
+let runtimeController: AbortController | undefined;
+let runtimePromise: Promise<ConnectionsRuntime | undefined> | undefined;
+let hostHookConsumed = false;
+
+function ensureConnectionsRuntime(
+  hostSignal?: AbortSignal,
+  forceRestart = false,
+): Promise<ConnectionsRuntime | undefined> {
+  if (!connectionsRoot()) return Promise.resolve(undefined);
+  if (forceRestart) {
+    runtimePromise = undefined;
+    hostHookConsumed = false;
+  }
+  if (hostSignal) {
+    if (hostSignal.aborted) {
+      runtimeController?.abort();
+    } else if (runtimeController) {
+      const controller = runtimeController;
+      hostSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+  }
+  if (runtimePromise) return runtimePromise;
+  const controller = new AbortController();
+  runtimeController = controller;
+  if (hostSignal) {
+    if (hostSignal.aborted) controller.abort();
+    else hostSignal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  const signal = controller.signal;
+  runtimePromise = (async (): Promise<ConnectionsRuntime | undefined> => {
+    try {
+      const store = await getConnectionsStore();
+      try {
+        await store.sweepExpiredSignIns();
+      } catch (error) {
+        // Expired sign-ins are refused when read; a failed sweep must not leave the apps unserved for this host.
+        if (!(error instanceof ConnectionsStoreError)) throw error;
+        log.warn('Expired connection sign-ins not swept', { reason: error.reason });
+      }
+      // Armed first, so a restart a previous host left pending and one this apply records are both served.
+      startRestartChecks(store, signal);
+      await startReconnectNotes(store, signal);
+      const sorter = startAppToolSorter({ store, signal });
+      startConnectionsRefresher(store, signal, {
+        onRefused: oweReconnectNote,
+        onDisconnected: async (appId) => {
+          await getAppRelay()?.closeApp(appId);
+          await withdrawHeldAppCalls(appId);
+        },
+        onTick: () => sorter.enqueuePending(),
+        clientDocumentsServed,
+      });
+      const relay = startAppRelay({
+        store,
+        onToolsNeedSort: (appId, listHash) => {
+          void sorter.enqueue(appId, listHash);
+        },
+        onHoldCall: createHoldCallHandler({ store }),
+      });
+      return { store, sorter, relay };
+    } catch (error) {
+      runtimePromise = undefined;
+      if (error instanceof ConnectionsStoreError) {
+        log.warn('Connections store unavailable', { reason: error.reason });
+        return undefined;
+      }
+      throw error;
+    }
+  })();
+  return runtimePromise;
+}
+
+/**
+ * Ensures the app relay is running before replaying approved calls or handling early inbound requests,
+ * even when the approvals module's startup hook runs before this module's `onHostStart`.
+ */
+export async function ensureAppRelayStarted(): Promise<AppRelay | undefined> {
+  const existing = getAppRelay();
+  if (existing) return existing;
+  const runtime = await ensureConnectionsRuntime();
+  return runtime?.relay ?? getAppRelay();
+}
+
 registerWebMount(connectionsWebMount);
 registerWebMount(clientDocumentsWebMount);
 registerAppActions();
-registerRelayAction();
+registerRelayAction({ relay: ensureAppRelayStarted });
 registerSortToolsAction();
-registerHeldAppCallHandlers();
+registerHeldAppCallHandlers({ relay: ensureAppRelayStarted });
 
 onHostStart(async ({ signal }) => {
   // Only a gws-ea assistant has a store; a plain NanoClaw host has nothing to sweep.
   if (!connectionsRoot()) return;
   try {
-    const store = await getConnectionsStore();
-    try {
-      await store.sweepExpiredSignIns();
-    } catch (error) {
-      // Expired sign-ins are refused when read; a failed sweep must not leave the apps unserved for this host.
-      if (!(error instanceof ConnectionsStoreError)) throw error;
-      log.warn('Expired connection sign-ins not swept', { reason: error.reason });
-    }
-    // Armed first, so a restart a previous host left pending and one this apply records are both served.
-    startRestartChecks(store, signal);
-    await startReconnectNotes(store, signal);
-    const sorter = startAppToolSorter({ store, signal });
-    startConnectionsRefresher(store, signal, {
-      onRefused: oweReconnectNote,
-      onTick: () => sorter.enqueuePending(),
-      clientDocumentsServed,
-    });
-    const relay = startAppRelay({
-      store,
-      onToolsNeedSort: (appId, listHash) => {
-        void sorter.enqueue(appId, listHash);
-      },
-      onHoldCall: createHoldCallHandler({ store }),
-    });
-    await applyMainServers(store);
+    const runtime = await ensureConnectionsRuntime(signal, hostHookConsumed);
+    hostHookConsumed = true;
+    if (!runtime) return;
+    await applyMainServers(runtime.store);
     void (async () => {
       if (signal.aborted) return;
-      await relay.pinUnpinnedApps();
+      await runtime.relay.pinUnpinnedApps();
       if (signal.aborted) return;
-      await sorter.enqueuePending();
+      await runtime.sorter.enqueuePending();
     })().catch((err: unknown) => {
       log.warn('Initial app tool pin/sort failed', {
         reason: err instanceof ConnectionsStoreError ? err.reason : 'failed',
@@ -137,6 +205,13 @@ onHostStart(async ({ signal }) => {
   }
 });
 
+onHostShutdown(async () => {
+  runtimeController?.abort();
+  runtimeController = undefined;
+  runtimePromise = undefined;
+  hostHookConsumed = false;
+  await drainRelayActions();
+});
 onHostShutdown(stopAppToolSorter);
 onHostShutdown(stopAppRelay);
 onHostShutdown(stopConnectionsRefresher);

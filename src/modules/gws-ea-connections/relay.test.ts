@@ -20,11 +20,20 @@ import { createSession } from '../../db/sessions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
+import { EgressError } from '../gws-ea-egress/fetch.js';
 import { mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
 import { canonicalJson, normalizeToolDefinition, toolDefinitionHash } from './canonical.js';
+import { ConnectionOperations } from './operations.js';
+import { createConnectionsRefresher } from './refresher.js';
 import { APP_RELAY_ACTION, registerRelayAction } from './relay-actions.js';
-import { createAppRelay, PIN_FRESHNESS_MS, type AppRelay, type HoldCallInput } from './relay.js';
+import {
+  createAppRelay,
+  PIN_FRESHNESS_MS,
+  UNSORTED_DESCRIPTION_SUFFIX,
+  type AppRelay,
+  type HoldCallInput,
+} from './relay.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeToolDefinition } from './testing/oauth-server.js';
 import { testConnectionsStore } from './testing/store.js';
@@ -412,12 +421,15 @@ describe('host relay core', () => {
 
     const init = await invokeAction({ op: 'initialize', serverKey: app.serverKey });
     expect(init.ok).toBe(true);
-    expect(init.data).toEqual({ instructions: 'Always check availability first.' });
+    expect(init.data).toMatchObject({
+      instructions: expect.stringContaining('Always check availability first.'),
+    });
+    expect(String(init.data?.instructions)).toContain('EXTERNAL_UNTRUSTED_CONTENT');
 
     const listed = await invokeAction({ op: 'tools/list', serverKey: app.serverKey });
     expect(listed.ok).toBe(true);
     expect(listed.data).toMatchObject({
-      instructions: 'Always check availability first.',
+      instructions: expect.stringContaining('Always check availability first.'),
       tools: [
         expect.objectContaining({
           name: 'confirm_checkout',
@@ -446,8 +458,14 @@ describe('host relay core', () => {
     const listed = await invokeAction({ op: 'tools/list', serverKey: app.serverKey });
     expect(listed.ok).toBe(true);
     expect(listed.data).toMatchObject({
-      instructions: 'Menu server instructions.',
-      tools: [expect.objectContaining({ name: 'search_menu', label: null })],
+      instructions: expect.stringContaining('Menu server instructions.'),
+      tools: [
+        expect.objectContaining({
+          name: 'search_menu',
+          label: null,
+          description: expect.stringContaining(UNSORTED_DESCRIPTION_SUFFIX),
+        }),
+      ],
     });
     expect(sortNotifications).toHaveLength(1);
 
@@ -610,5 +628,298 @@ describe('host relay core', () => {
     expect(r2.ok).toBe(true);
     expect(pastedFake.toolCalls[0].bearer).toBe(SENTINEL_PASTED);
     expect(openFake.toolCalls[0].bearer).toBeUndefined();
+  });
+
+  it('renews OAuth token on cold-handshake 401 for both pinApp and tools/call without deadlocking sign-in', async () => {
+    const fake = new FakeMcpApp({
+      appUrl: FOOD_URL,
+      issuer: 'https://mcp.chow.example.test',
+      registration: true,
+      tools: [SEARCH_TOOL],
+    });
+    endpoints.use(fake.handle);
+
+    const refresher = createConnectionsRefresher({
+      store,
+      clientDocumentsServed: () => true,
+      fetches: endpoints.fetches,
+      now: () => clock,
+      apply: async () => false,
+    });
+    const oauthRelay = createAppRelay({
+      store,
+      refresher: () => refresher,
+      egress: endpoints.egress,
+      now: () => clock,
+    });
+    try {
+      const ops = new ConnectionOperations({
+        store,
+        webHostname: 'juno.example.test',
+        fetches: endpoints.fetches,
+        now: () => clock,
+        admission: {
+          appByHost: (host) => store.byHost(host),
+          operatorServers: async () => [],
+          gatewayCredentials: async () => [],
+          protectedHosts: async () => new Set(),
+        },
+        clientDocumentsServed: () => true,
+        applyMain: async () => false,
+        onConnected: async (connected) => {
+          await oauthRelay.pinApp(connected.id);
+        },
+        onDisconnected: async (appId) => {
+          await oauthRelay.closeApp(appId);
+        },
+      });
+      const added = await ops.add({ url: FOOD_URL, name: 'Chow' });
+      if (added.status !== 'added') throw new Error(`add failed: ${added.reason}`);
+      const started = await ops.startSignIn(added.app.id, added.app.version, 'gchat:users/morgan');
+      if (started.status !== 'started') throw new Error(`startSignIn failed: ${started.reason}`);
+      const { query } = fake.approve(started.authorizationUrl);
+
+      // Reject the very first access token on the cold MCP initialize handshake during finishSignIn;
+      // finishSignIn must NOT deadlock on withAppLock while refresher.ensureToken force-renews.
+      let rejectFirstToken = true;
+      const origOverride = fake.mcpOverride;
+      fake.mcpOverride = (incoming) => {
+        if (rejectFirstToken) {
+          rejectFirstToken = false;
+          return { status: 401, body: { error: 'invalid_token' } };
+        }
+        return origOverride?.(incoming);
+      };
+
+      const finish = await ops.finishSignIn(added.app.host, 'gchat:users/morgan', query);
+      expect(finish).toBe('connected');
+      expect((await store.listTools(added.app.id)).map((t) => t.name)).toEqual(['search_menu']);
+
+      await store.applyToolLabels(added.app.id, [
+        {
+          name: 'search_menu',
+          definitionHash: toolDefinitionHash(SEARCH_TOOL),
+          label: 'just_do',
+          source: 'sorter',
+          reason: 'Lookup',
+        },
+      ]);
+
+      // Close cached client so next tools/call starts cold, reject once with 401 on initialize, and verify renewal succeeds.
+      await oauthRelay.closeApp(added.app.id);
+      rejectFirstToken = true;
+      const outcome = await oauthRelay.callTool({
+        serverKey: added.app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'ramen' },
+        session,
+        requestId: 'req-cold-401',
+      });
+      expect(outcome).toMatchObject({ status: 'completed' });
+      expect(fake.toolCalls).toHaveLength(1);
+    } finally {
+      await oauthRelay.closeAll();
+    }
+  });
+
+  it('serializes concurrent operations per app so a sibling refresh/401 cannot corrupt an in-flight call or retry a sent mutation', async () => {
+    const fake = new FakeMcpApp({
+      appUrl: FOOD_URL,
+      issuer: 'https://mcp.chow.example.test',
+      tools: [SEARCH_TOOL, CHECKOUT_TOOL],
+    });
+    endpoints.use(fake.handle);
+    const app = await connectOAuthApp(fake);
+    await relay.pinApp(app.id);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_menu',
+        definitionHash: toolDefinitionHash(SEARCH_TOOL),
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Lookup',
+      },
+      {
+        name: 'confirm_checkout',
+        definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+        label: 'ask_first',
+        source: 'floor',
+        reason: 'Places order',
+      },
+    ]);
+
+    const approved = relay.executeApprovedCall({
+      approvalId: 'apr-concurrent',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+      args: { checkout_id: 'chk_conc' },
+    });
+    const concurrentPin = relay.pinApp(app.id);
+    const [approvedRes, pinRes] = await Promise.all([approved, concurrentPin]);
+    expect(approvedRes.status).toBe('completed');
+    expect(pinRes.tools).toHaveLength(2);
+    expect(fake.toolCalls.filter((c) => c.name === 'confirm_checkout')).toHaveLength(1);
+  });
+
+  it('blocks an approved call when disconnect finishes during pre-send tool confirmation and handles deleted apps cleanly', async () => {
+    const fake = new FakeMcpApp({
+      appUrl: OPEN_URL,
+      issuer: 'https://recipes.example.test',
+      allowUnauthenticated: true,
+      tools: [CHECKOUT_TOOL],
+    });
+    endpoints.use(fake.handle);
+    const app = await connectOpenApp();
+    await relay.pinApp(app.id);
+
+    let disconnectOnce = true;
+    const ops = new ConnectionOperations({
+      store,
+      webHostname: 'juno.example.test',
+      clientDocumentsServed: () => true,
+      applyMain: async () => false,
+      onDisconnected: async (appId) => {
+        await relay.closeApp(appId);
+      },
+    });
+    const origToolsList = fake.mcpOverride;
+    fake.mcpOverride = (incoming) => {
+      if (disconnectOnce && incoming.body.includes('"tools/list"')) {
+        disconnectOnce = false;
+        void store.get(app.id).then((latest) => ops.disconnect(latest.id, latest.version));
+      }
+      return origToolsList?.(incoming);
+    };
+
+    const outcome = await relay.executeApprovedCall({
+      approvalId: 'apr-disconnect-race',
+      appId: app.id,
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+      args: { checkout_id: 'chk_race' },
+    });
+    expect(outcome).toMatchObject({ status: 'unsent', reason: 'grant_changed' });
+    expect(fake.toolCalls).toHaveLength(0);
+
+    const missingOutcome = await relay.executeApprovedCall({
+      approvalId: 'apr-deleted-app',
+      appId: '00000000-0000-0000-0000-000000000000',
+      grantGeneration: 1,
+      toolName: 'confirm_checkout',
+      definitionHash: toolDefinitionHash(CHECKOUT_TOOL),
+      args: { checkout_id: 'chk_gone' },
+    });
+    expect(missingOutcome).toMatchObject({ status: 'unsent', reason: 'app_gone' });
+  });
+
+  it('enforces relay-actions host boundary validation, assistant_summary stripping, deduplication, egress sent classification, and drain on stop', async () => {
+    const fake = new FakeMcpApp({
+      appUrl: OPEN_URL,
+      issuer: 'https://recipes.example.test',
+      allowUnauthenticated: true,
+      tools: [SEARCH_TOOL],
+    });
+    endpoints.use(fake.handle);
+    const app = await connectOpenApp();
+    await relay.pinApp(app.id);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_menu',
+        definitionHash: toolDefinitionHash(SEARCH_TOOL),
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Lookup',
+      },
+    ]);
+
+    // Host boundary must strip assistant_summary even if container sent it inside arguments directly.
+    const stripped = await invokeAction({
+      op: 'tools/call',
+      serverKey: app.serverKey,
+      tool: 'search_menu',
+      arguments: { query: 'tea', assistant_summary: 'should not leak upstream' },
+    });
+    expect(stripped.ok).toBe(true);
+    expect(fake.toolCalls[0]?.arguments).toEqual({ query: 'tea' });
+
+    // Reject invalid op, operator serverKey, and non-object arguments.
+    expect((await invokeAction({ op: 'bogus', serverKey: app.serverKey })).ok).toBe(false);
+    expect((await invokeAction({ op: 'tools/list', serverKey: 'operator_srv' })).ok).toBe(false);
+    expect(
+      (await invokeAction({ op: 'tools/call', serverKey: app.serverKey, tool: 'search_menu', arguments: 'bad' })).ok,
+    ).toBe(false);
+
+    // Concurrent duplicate requestId is deduplicated.
+    const dupId = `req-dup-${randomUUID()}`;
+    const run = getDeliveryAction(APP_RELAY_ACTION)!;
+    const beforeCalls = fake.toolCalls.length;
+    await Promise.all([
+      run(
+        {
+          action: APP_RELAY_ACTION,
+          requestId: dupId,
+          op: 'tools/call',
+          serverKey: app.serverKey,
+          tool: 'search_menu',
+          arguments: { query: 'once' },
+        },
+        session,
+      ),
+      run(
+        {
+          action: APP_RELAY_ACTION,
+          requestId: dupId,
+          op: 'tools/call',
+          serverKey: app.serverKey,
+          tool: 'search_menu',
+          arguments: { query: 'once' },
+        },
+        session,
+      ),
+    ]);
+    await vi.waitFor(() => expect(readResponse(dupId)).toBeDefined());
+    expect(fake.toolCalls.length - beforeCalls).toBe(1);
+
+    // Pre-dial EgressError (sent: false) resolves to unsent; post-connect timeout resolves to unknown.
+    const preDialRelay = createAppRelay({
+      store,
+      egress: {
+        resolve: async () => {
+          throw new EgressError('refused', { sent: false });
+        },
+      },
+      now: () => clock,
+    });
+    try {
+      const unsentRes = await preDialRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'x' },
+        session,
+        requestId: 'req-predial',
+      });
+      expect(unsentRes).toMatchObject({ status: 'unsent' });
+    } finally {
+      await preDialRelay.closeAll();
+    }
+
+    // Relay unavailable returns forbidden error frame.
+    registerRelayAction({ relay: async () => undefined });
+    const unavail = await invokeAction({ op: 'tools/list', serverKey: app.serverKey });
+    expect(unavail).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+
+    // drain() refuses new calls once stopping.
+    await relay.drain(50);
+    const afterDrain = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_menu',
+      args: { query: 'after' },
+      session,
+      requestId: 'req-after-drain',
+    });
+    expect(afterDrain).toMatchObject({ status: 'unsent', reason: 'relay_stopping' });
   });
 });

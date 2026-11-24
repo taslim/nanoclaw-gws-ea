@@ -247,14 +247,17 @@ function toolRow(app: ConnectionApp, tool: PinnedAppTool): string {
   const reason =
     tool.label === null ? 'Being set up' : (tool.reason ?? (tool.label === 'ask_first' ? 'Ask first' : 'Just do it'));
   const stateText = tool.label === null ? 'Being set up' : isAskFirst ? 'Ask first' : 'Just do it';
-  return `<li class="row tool-row"><span class="row-main"><span class="row-title tool-name">${escapeHtml(tool.name)}</span><span class="row-sub tool-reason">${escapeHtml(reason)}</span></span><form method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${tool.name}`, stateText, name: tool.name })}</form></li>`;
+  return `<li class="row tool-row"><span class="row-main"><span class="row-title tool-name">${escapeHtml(tool.name)}</span><span class="row-sub tool-reason">${escapeHtml(reason)}</span></span><form method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}"><input type="hidden" name="definitionHash" value="${escapeHtml(tool.definitionHash)}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${tool.name}`, stateText, name: tool.name })}</form></li>`;
 }
 
 function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
+  const hasUnsorted = tools.some((tool) => tool.label === null);
   const reviewBadge = pin
-    ? pin.needsReview
-      ? renderBadge('Needs review', 'warning')
-      : renderBadge('Reviewed', 'success')
+    ? hasUnsorted
+      ? renderBadge('Being set up', 'neutral')
+      : pin.needsReview
+        ? renderBadge('Needs review', 'warning')
+        : renderBadge('Reviewed', 'success')
     : renderBadge('Being set up', 'neutral');
   const heading = `${BACK}${renderPageHeading('When I’ll check with you first', `<span>${escapeHtml(app.name)}</span><span>${escapeHtml(app.host)}</span>${reviewBadge}`)}`;
   if (!pin) {
@@ -269,9 +272,11 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
     sorted.length > 0
       ? `<section class="section" aria-label="App tools"><ul class="list">${sorted.map((tool) => toolRow(app, tool)).join('')}</ul></section>`
       : notice('This app didn’t list any tools.');
-  const reviewControl = pin.needsReview
-    ? `<form method="post" action="/connections/review-tools" data-send><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="listHash" value="${escapeHtml(pin.listHash)}"><div class="form-actions"><button class="button button-primary" type="submit" data-pending-label="Saving…">Looks right</button><a class="button button-secondary" href="/connections" data-navigation>Back to Connections</a></div></form>`
-    : notice('Tool approvals reviewed. Flip any switch above to change a tool immediately.');
+  const reviewControl = hasUnsorted
+    ? `${notice('Tools are still being set up. Reload in a moment to confirm them.')}<div class="form-actions"><a class="button button-secondary" href="/connections" data-navigation>Back to Connections</a></div>`
+    : pin.needsReview
+      ? `<form method="post" action="/connections/review-tools" data-send><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="listHash" value="${escapeHtml(pin.listHash)}"><div class="form-actions"><button class="button button-primary" type="submit" data-pending-label="Saving…">Looks right</button><a class="button button-secondary" href="/connections" data-navigation>Back to Connections</a></div></form>`
+      : notice('Tool approvals reviewed. Flip any switch above to change a tool immediately.');
   return `${heading}${listMarkup}${reviewControl}`;
 }
 

@@ -88,6 +88,12 @@ async function writeAndRequestRestart<T>(store: ConnectionsStore, write: () => P
   return outcome;
 }
 
+/** Schedules an idle restart of main's containers so live sessions pick up updated tool definitions or labels. */
+export async function notifyMainToolsChanged(store: ConnectionsStore): Promise<void> {
+  await store.requestRestart(new Date().toISOString());
+  checkRestartSoon();
+}
+
 /**
  * Reconciles main's entries to the store and returns whether they changed. Without a canonical main, or before its
  * configuration exists, there is nothing to reconcile.

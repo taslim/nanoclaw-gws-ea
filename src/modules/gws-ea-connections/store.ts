@@ -95,6 +95,7 @@ export interface RelayCallRecord {
 
 export type ClaimApprovedCallResult =
   | { readonly status: 'claimed' }
+  | { readonly status: 'app_not_found' }
   | { readonly status: 'already_executing'; readonly record: RelayCallRecord }
   | { readonly status: 'already_settled'; readonly record: RelayCallRecord };
 
@@ -307,6 +308,12 @@ CREATE TABLE IF NOT EXISTS app_tools (
   principal_floor INTEGER NOT NULL DEFAULT 0 CHECK(principal_floor IN (0,1)),
   unsettled INTEGER NOT NULL DEFAULT 0 CHECK(unsettled IN (0,1)),
   sort_attempts INTEGER NOT NULL DEFAULT 0 CHECK(sort_attempts >= 0),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (app_id, name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS app_tool_floors (
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (app_id, name)
 ) STRICT;
@@ -1287,6 +1294,12 @@ export class ConnectionsStore {
     );
   }
 
+  async listAllTools(): Promise<readonly PinnedAppTool[]> {
+    return this.use((db) =>
+      db.prepare<[], AppToolRow>('SELECT * FROM app_tools ORDER BY app_id, name').all().map(toPinnedTool),
+    );
+  }
+
   async getTool(appId: string, name: string): Promise<PinnedAppTool | undefined> {
     return this.use((db) => {
       const row = db
@@ -1320,27 +1333,49 @@ export class ConnectionsStore {
    */
   async pinTools(
     appId: string,
-    input: { readonly instructions: string | null; readonly tools: readonly ToolDefinition[]; readonly at?: string },
+    input: {
+      readonly instructions: string | null;
+      readonly tools: readonly ToolDefinition[];
+      readonly expectedGrantGeneration?: number;
+      readonly at?: string;
+    },
   ): Promise<PinToolsResult> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
-    const normalized = input.tools.map((tool) => {
+    const deduped = new Map<string, { readonly definition: ToolDefinition; readonly hash: string }>();
+    for (const tool of input.tools) {
       const definition = normalizeToolDefinition(tool);
-      return { definition, hash: sha256Hex(canonicalJson(definition)) };
-    });
+      if (!deduped.has(definition.name)) {
+        deduped.set(definition.name, { definition, hash: sha256Hex(canonicalJson(definition)) });
+      }
+    }
+    const normalized = [...deduped.values()];
     const nextListHash = toolListHash(
       normalized.map(({ definition, hash }) => ({ name: definition.name, definitionHash: hash })),
+      input.instructions,
     );
     return this.use((db) =>
       db
         .transaction((): PinToolsResult => {
           this.app(db, appId);
+          if (input.expectedGrantGeneration !== undefined) {
+            const grant = this.grantRow(db, appId);
+            if (!grant || grant.state !== 'live' || grant.generation !== input.expectedGrantGeneration) {
+              throw new ConnectionsStoreError('app_changed');
+            }
+          }
           const existingPin = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
           const existingTools = new Map(
             db
               .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ?')
               .all(appId)
               .map((row) => [row.name, row]),
+          );
+          const persistedFloors = new Set(
+            db
+              .prepare<[string], { name: string }>('SELECT name FROM app_tool_floors WHERE app_id = ?')
+              .all(appId)
+              .map((row) => row.name),
           );
           const incomingNames = new Set(normalized.map(({ definition }) => definition.name));
           let changed = existingPin?.list_hash !== nextListHash;
@@ -1357,7 +1392,7 @@ export class ConnectionsStore {
             `INSERT INTO app_tools
               (app_id, name, definition_hash, definition_json, label, label_source, reason, sorter_version,
                principal_floor, unsettled, sort_attempts, updated_at)
-              VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 1, 0, ?)`,
+              VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 1, 0, ?)`,
           );
           const updateChangedTool = db.prepare(
             `UPDATE app_tools SET definition_hash = ?, definition_json = ?, label = NULL, label_source = NULL,
@@ -1372,11 +1407,13 @@ export class ConnectionsStore {
           for (const { definition, hash } of normalized) {
             const json = JSON.stringify(definition);
             const prev = existingTools.get(definition.name);
+            const hasPersistedFloor = persistedFloors.has(definition.name);
             if (!prev) {
-              insertTool.run(appId, definition.name, hash, json, at);
+              insertTool.run(appId, definition.name, hash, json, hasPersistedFloor ? 1 : 0, at);
               changed = true;
             } else if (prev.definition_hash !== hash) {
               const keepFloor =
+                hasPersistedFloor ||
                 prev.principal_floor === 1 ||
                 (prev.label === 'ask_first' &&
                   (prev.label_source === 'principal' || prev.label_source === 'approved_request'))
@@ -1432,6 +1469,11 @@ export class ConnectionsStore {
               principal_floor = ?, unsettled = 0, updated_at = ?
               WHERE app_id = ? AND name = ? AND definition_hash = ?`,
           );
+          const upsertFloor = db.prepare(
+            `INSERT INTO app_tool_floors (app_id, name, updated_at) VALUES (?, ?, ?)
+              ON CONFLICT(app_id, name) DO UPDATE SET updated_at = excluded.updated_at`,
+          );
+          const deleteFloor = db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?');
           let applied = 0;
           for (const update of updates) {
             const row = selectTool.get(appId, update.name);
@@ -1453,6 +1495,10 @@ export class ConnectionsStore {
               update.name,
               update.definitionHash,
             );
+            if (principalOverride) {
+              if (principalFloor === 1) upsertFloor.run(appId, update.name, at);
+              else deleteFloor.run(appId, update.name);
+            }
             applied += 1;
           }
           return applied;
@@ -1518,36 +1564,58 @@ export class ConnectionsStore {
     isoValid(at);
     const reason = options.reason ?? (label === 'ask_first' ? 'Set to ask first' : 'Set to run without asking');
     const principalFloor = label === 'ask_first' ? 1 : 0;
-    return this.use((db) => {
-      const row = db
-        .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
-        .get(appId, name);
-      if (!row) return false;
-      if (options.expectedHash !== undefined && row.definition_hash !== options.expectedHash) return false;
-      return (
-        db
-          .prepare(
-            `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, principal_floor = ?, unsettled = 0,
-              updated_at = ?
-              WHERE app_id = ? AND name = ?`,
-          )
-          .run(label, source, reason, principalFloor, at, appId, name).changes === 1
-      );
-    });
+    return this.use((db) =>
+      db
+        .transaction(() => {
+          const row = db
+            .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+            .get(appId, name);
+          if (!row) return false;
+          if (options.expectedHash !== undefined && row.definition_hash !== options.expectedHash) return false;
+          const updated =
+            db
+              .prepare(
+                `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, principal_floor = ?, unsettled = 0,
+                  updated_at = ?
+                  WHERE app_id = ? AND name = ?`,
+              )
+              .run(label, source, reason, principalFloor, at, appId, name).changes === 1;
+          if (updated) {
+            if (principalFloor === 1) {
+              db.prepare(
+                `INSERT INTO app_tool_floors (app_id, name, updated_at) VALUES (?, ?, ?)
+                  ON CONFLICT(app_id, name) DO UPDATE SET updated_at = excluded.updated_at`,
+              ).run(appId, name, at);
+            } else {
+              db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?').run(appId, name);
+            }
+          }
+          return updated;
+        })
+        .immediate(),
+    );
   }
 
   async markToolsReviewed(appId: string, expectedListHash?: string, at = new Date().toISOString()): Promise<boolean> {
     isoValid(at);
-    return this.use((db) => {
-      const pin = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
-      if (!pin) return false;
-      if (expectedListHash !== undefined && pin.list_hash !== expectedListHash) return false;
-      return (
-        db
-          .prepare('UPDATE app_pins SET reviewed_list_hash = list_hash, reviewed_at = ? WHERE app_id = ?')
-          .run(at, appId).changes === 1
-      );
-    });
+    return this.use((db) =>
+      db
+        .transaction(() => {
+          const pin = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
+          if (!pin) return false;
+          if (expectedListHash !== undefined && pin.list_hash !== expectedListHash) return false;
+          const unsorted = db
+            .prepare<[string], { n: number }>('SELECT COUNT(*) AS n FROM app_tools WHERE app_id = ? AND label IS NULL')
+            .get(appId);
+          if ((unsorted?.n ?? 0) > 0) return false;
+          return (
+            db
+              .prepare('UPDATE app_pins SET reviewed_list_hash = list_hash, reviewed_at = ? WHERE app_id = ?')
+              .run(at, appId).changes === 1
+          );
+        })
+        .immediate(),
+    );
   }
 
   async recordToolSortStart(input: {
@@ -1631,6 +1699,8 @@ export class ConnectionsStore {
               ? { status: 'already_executing', record }
               : { status: 'already_settled', record };
           }
+          const appExists = db.prepare<[string], { id: string }>('SELECT id FROM apps WHERE id = ?').get(input.appId);
+          if (!appExists) return { status: 'app_not_found' };
           db.prepare(
             `INSERT INTO relay_calls
               (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,

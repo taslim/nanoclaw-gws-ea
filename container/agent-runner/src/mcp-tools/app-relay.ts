@@ -159,10 +159,7 @@ function mapCallOutcome(result: ActionRequestResult): CallToolResult {
   }
 }
 
-export async function createAppRelayServer(
-  serverKey: string,
-  overrides: Partial<AppRelayDeps> = {},
-): Promise<Server> {
+export async function createAppRelayServer(serverKey: string, overrides: Partial<AppRelayDeps> = {}): Promise<Server> {
   const deps: AppRelayDeps = {
     request: overrides.request ?? requestAction,
     run: overrides.run ?? (async (action) => action()),
@@ -176,10 +173,11 @@ export async function createAppRelayServer(
   const server = new Server(
     { name: serverKey, version: '1.0.0' },
     {
-      capabilities: { tools: {} },
+      capabilities: { tools: { listChanged: true } },
       ...(instructions === undefined ? {} : { instructions }),
     },
   );
+  let lastToolsVersion: string | undefined;
 
   server.setRequestHandler(ListToolsRequestSchema, async (_request, context) => {
     const result = await deps.run(() =>
@@ -195,7 +193,11 @@ export async function createAppRelayServer(
     if (!result.frame.ok) {
       throw new Error(result.frame.error.message);
     }
-    const rawTools = isRecord(result.frame.data) && Array.isArray(result.frame.data.tools) ? result.frame.data.tools : [];
+    if (isRecord(result.frame.data) && typeof result.frame.data.toolsVersion === 'string') {
+      lastToolsVersion = result.frame.data.toolsVersion;
+    }
+    const rawTools =
+      isRecord(result.frame.data) && Array.isArray(result.frame.data.tools) ? result.frame.data.tools : [];
     const tools = rawTools.flatMap((entry) => {
       const formatted = formatRelayedTool(entry);
       return formatted ? [formatted] : [];
@@ -218,6 +220,17 @@ export async function createAppRelayServer(
         { timeoutMs: deps.callTimeoutMs, pollMs: deps.pollMs, signal: context.signal },
       ),
     );
+    if (
+      result.status === 'answered' &&
+      result.frame.ok &&
+      isRecord(result.frame.data) &&
+      typeof result.frame.data.toolsVersion === 'string' &&
+      lastToolsVersion !== undefined &&
+      result.frame.data.toolsVersion !== lastToolsVersion
+    ) {
+      lastToolsVersion = result.frame.data.toolsVersion;
+      void server.sendToolListChanged().catch(() => undefined);
+    }
     return mapCallOutcome(result);
   });
 

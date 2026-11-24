@@ -24,8 +24,10 @@ vi.mock('../../request-wake.js', () => ({
 import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
 import {
   closeDb,
+  createMessagingGroup,
   createSession,
   deleteSession,
+  getDb,
   getPendingApprovalsByAction,
   initTestDb,
   runMigrations,
@@ -37,7 +39,10 @@ import type { PendingApproval, Session } from '../../types.js';
 import { expireApproval } from '../approvals/lifecycle.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { MAIN, mainSession as getMainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
+import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
+import { upsertUserDm } from '../permissions/db/user-dms.js';
+import { upsertUser } from '../permissions/db/users.js';
 import {
   createHoldCallHandler,
   HELD_APP_CALL_ACTION,
@@ -513,5 +518,94 @@ describe('held ask-first calls', () => {
     expect(invisCard.question).toContain('[U+200B]');
     expect(invisCard.question).toContain('[U+202E]');
     expect(invisCard.question.toLowerCase()).toContain('invisible');
+  });
+
+  it('escapes invisible characters in appContext and summary, keeps worst-case cards under 2000 chars, rejects former principals, and supports lazy async relay startup', async () => {
+    const { app, fake } = await setupFoodApp();
+
+    // Seed a direct result containing bidi override characters that will be matched into appContext.
+    fake.onToolCall = (call) => {
+      if (call.name === 'prepare_checkout') {
+        return {
+          content: [{ type: 'text', text: 'Prepared chk_spoof \u202E001$ total\u200B' }],
+        };
+      }
+      return { content: [{ type: 'text', text: 'ok' }] };
+    };
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'prepare_checkout',
+      args: { items: ['soup'] },
+      session: mainSession,
+      requestId: 'req-prep-spoof',
+    });
+
+    // Trigger held call with invisible characters in summary + matched appContext + long values.
+    await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_spoof', huge: 'x'.repeat(2500) },
+      summary: 'Approve \u200Border '.repeat(30),
+      session: mainSession,
+      requestId: 'req-spoof-card',
+    });
+    const spoofCard = deliveredCards[0]!;
+    expect(spoofCard.title.length + spoofCard.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
+    expect(spoofCard.question).toContain('[U+200B]');
+    expect(spoofCard.question).toContain('[U+202E]');
+    expect(spoofCard.question).not.toContain('\u202E');
+    expect(spoofCard.question.toLowerCase()).toContain('invisible');
+
+    // Former principal cannot execute a held call after the assistant's principal changes.
+    await getDb().run('DELETE FROM gws_ea_principal_users');
+    await upsertUser({
+      id: 'gchat:users/new-principal',
+      kind: 'gchat',
+      display_name: 'New Principal',
+      created_at: '2026-11-23T12:05:00.000Z',
+    });
+    await createMessagingGroup({
+      id: 'mg-dm-new',
+      channel_type: 'gchat',
+      platform_id: 'gchat:spaces/new-principal',
+      name: 'New Principal',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: '2026-11-23T12:05:00.000Z',
+    });
+    await upsertUserDm({
+      user_id: 'gchat:users/new-principal',
+      channel_type: 'gchat',
+      messaging_group_id: 'mg-dm-new',
+      resolved_at: '2026-11-23T12:05:00.000Z',
+    });
+    await bindVerifiedPrincipalUser('gchat:users/new-principal', '2026-11-23T12:05:00.000Z');
+    await respondToCard(spoofCard.questionId, 'approve');
+    expect(fake.toolCalls.filter((c) => c.name === 'confirm_checkout')).toHaveLength(0);
+    const principalChangedNote = readMainMessages().find((m) => m.id === `app-call-outcome:${spoofCard.questionId}`);
+    expect(String(principalChangedNote?.content.text)).toContain('principal changed');
+
+    // Restore principal and verify an async lazy relay resolver (startup replay path) executes cleanly.
+    await getDb().run('DELETE FROM gws_ea_principal_users');
+    await bindVerifiedPrincipalUser(PRINCIPAL_USER, '2026-11-23T12:06:00.000Z');
+    const capturedRelay = relay!;
+    let lazyCalls = 0;
+    registerHeldAppCallHandlers({
+      relay: async () => {
+        lazyCalls += 1;
+        return capturedRelay;
+      },
+    });
+    await capturedRelay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_lazy' },
+      summary: 'Confirm lazy order',
+      session: mainSession,
+      requestId: 'req-lazy',
+    });
+    await respondToCard(deliveredCards[1]!.questionId, 'approve');
+    expect(lazyCalls).toBe(1);
+    expect(fake.toolCalls.filter((c) => c.name === 'confirm_checkout')).toHaveLength(1);
   });
 });

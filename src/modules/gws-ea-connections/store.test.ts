@@ -545,3 +545,83 @@ describe('availability', () => {
     expect(await store.availability()).toEqual({ available: true });
   });
 });
+
+describe('tool pinning, principal floors, and call claims', () => {
+  it('deduplicates duplicate tool names, pins server instructions in listHash, preserves principal floor across drop-and-readd, blocks review while unsorted, and returns app_not_found on deleted app claims', async () => {
+    const app = await store.create(LEDGERLY);
+    await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+
+    const pinned = await store.pinTools(app.id, {
+      instructions: 'Initial instructions.',
+      tools: [
+        { name: 'place_order', description: 'Place an order', inputSchema: { type: 'object', properties: {} } },
+        { name: 'place_order', description: 'Duplicate ignored', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    expect(pinned.tools.map((t) => t.name)).toEqual(['list_items', 'place_order']);
+    expect(pinned.tools.find((t) => t.name === 'place_order')?.definition.description).toBe('Place an order');
+
+    // Review confirmation must fail while any tool still has label === null.
+    expect(await store.markToolsReviewed(app.id, pinned.pin.listHash)).toBe(false);
+
+    const placeHash = pinned.tools.find((t) => t.name === 'place_order')!.definitionHash;
+    const listHash = pinned.tools.find((t) => t.name === 'list_items')!.definitionHash;
+    await store.setToolLabel(app.id, 'place_order', 'ask_first', 'principal', { expectedHash: placeHash });
+    await store.setToolLabel(app.id, 'list_items', 'just_do', 'principal', { expectedHash: listHash });
+    expect(await store.markToolsReviewed(app.id, pinned.pin.listHash)).toBe(true);
+    expect((await store.getPin(app.id))?.needsReview).toBe(false);
+
+    // Changing instructions alone must invalidate listHash and restore needsReview.
+    const changedInstructions = await store.pinTools(app.id, {
+      instructions: 'Injected post-review instructions!',
+      tools: [
+        { name: 'place_order', description: 'Place an order', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    expect(changedInstructions.changed).toBe(true);
+    expect(changedInstructions.pin.listHash).not.toBe(pinned.pin.listHash);
+    expect(changedInstructions.pin.needsReview).toBe(true);
+
+    // Dropping place_order and re-adding it must preserve the principal Ask-first floor.
+    await store.pinTools(app.id, {
+      instructions: 'Initial instructions.',
+      tools: [{ name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } }],
+    });
+    const readded = await store.pinTools(app.id, {
+      instructions: 'Initial instructions.',
+      tools: [
+        { name: 'place_order', description: 'Harmless lookup', inputSchema: { type: 'object', properties: {} } },
+        { name: 'list_items', description: 'List items', inputSchema: { type: 'object', properties: {} } },
+      ],
+    });
+    const readdedPlace = readded.tools.find((t) => t.name === 'place_order')!;
+    expect(readdedPlace.principalFloor).toBe(true);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'place_order',
+        definitionHash: readdedPlace.definitionHash,
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Looks harmless now',
+      },
+    ]);
+    expect(await store.getTool(app.id, 'place_order')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+      principalFloor: true,
+    });
+
+    // Claiming an approved call for a deleted app returns app_not_found instead of throwing a FK error.
+    const deletedClaim = await store.claimApprovedCall({
+      approvalId: 'appr-missing-app',
+      appId: '00000000-0000-0000-0000-000000000000',
+      grantGeneration: 1,
+      toolName: 'place_order',
+      definitionHash: placeHash,
+      argsHash: 'abc',
+    });
+    expect(deletedClaim).toEqual({ status: 'app_not_found' });
+  });
+});

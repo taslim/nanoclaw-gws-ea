@@ -13,6 +13,7 @@ import { requestWake } from '../../request-wake.js';
 import { resolveSystemSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
+import { notifyMainToolsChanged } from './apply.js';
 import type { ToolDefinition } from './canonical.js';
 import { buildSortPrompt, resolveFinalToolUpdates, sorterVersion, type ParsedSortToolEntry } from './sort-rules.js';
 import { ConnectionsStoreError, type ConnectionsStore, type PinnedAppTool } from './store.js';
@@ -254,7 +255,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
         try {
           try {
             await writeSessionMessage(groupId, session.id, {
-              id: `app-sort-${pin.listHash}-${attempt}`,
+              id: `app-sort-${sortId}`,
               kind: 'chat',
               timestamp: startedAt,
               content: JSON.stringify({ text: promptText, sender: 'system' }),
@@ -263,13 +264,26 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
           } catch (error) {
             if (!isUniqueViolation(error)) throw error;
           }
-          await requestWake(session, 'inbound-message');
+          const woke = await requestWake(session, 'inbound-message');
+          if (!woke && !stopped && !dependencies.signal?.aborted) {
+            hostLog.warn('App tool sorter session could not wake', { appId: job.appId });
+            if (pending.claim()) {
+              try {
+                await failTargets(pending, 'failed').catch(() => undefined);
+              } finally {
+                pending.finish();
+              }
+            }
+          }
           /* eslint-disable-next-line no-catch-all/no-catch-all -- wake failure marks sort failed and unblocks queue */
         } catch (error) {
           hostLog.warn('Could not wake app tool sorter session', { appId: job.appId, error });
           if (pending.claim()) {
-            await failTargets(pending, 'failed').catch(() => undefined);
-            pending.finish();
+            try {
+              await failTargets(pending, 'failed').catch(() => undefined);
+            } finally {
+              pending.finish();
+            }
           }
         }
       })();
@@ -367,8 +381,11 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
         entries = parseSortToolsPayload(content);
       } catch (error) {
         if (pending.claim()) {
-          await failTargets(pending, 'failed');
-          pending.finish();
+          try {
+            await failTargets(pending, 'failed');
+          } finally {
+            pending.finish();
+          }
         }
         throw error;
       }
@@ -379,21 +396,25 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
 
       const at = new Date(now()).toISOString();
       const { updates, missing } = resolveFinalToolUpdates(pending.expected, entries);
-      if (updates.length > 0) {
-        await store.applyToolLabels(pending.appId, updates, {
-          sorterVersion: pending.sorterVersion,
-          at,
-        });
+      try {
+        if (updates.length > 0) {
+          await store.applyToolLabels(pending.appId, updates, {
+            sorterVersion: pending.sorterVersion,
+            at,
+          });
+          await notifyMainToolsChanged(store);
+        }
+        if (missing.length > 0) {
+          await store.markToolSortFailed(pending.appId, missing, {
+            maxAttempts,
+            sorterVersion: pending.sorterVersion,
+            at,
+          });
+        }
+        await store.finishToolSort(pending.sortId, missing.length === 0 ? 'completed' : 'failed', at);
+      } finally {
+        pending.finish();
       }
-      if (missing.length > 0) {
-        await store.markToolSortFailed(pending.appId, missing, {
-          maxAttempts,
-          sorterVersion: pending.sorterVersion,
-          at,
-        });
-      }
-      await store.finishToolSort(pending.sortId, missing.length === 0 ? 'completed' : 'failed', at);
-      pending.finish();
       return { status: 'accepted', labelled: updates.length, unsettled: missing.length };
     },
 

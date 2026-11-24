@@ -1712,19 +1712,34 @@ describe('tool approvals review and held-call details', () => {
     expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
     const factsBefore = await connectionsLinkFacts(() => operations().listing());
     expect(factsBefore.apps[0]?.needsReview).toBe(true);
+    expect(factsBefore.apps[0]?.tools).toEqual([
+      { name: 'order_groceries', label: 'ask_first', reason: 'Places an order' },
+      { name: 'search_recipes', label: 'just_do', reason: 'Read-only search' },
+      { name: 'sync_pantry', label: 'unsorted', reason: null },
+    ]);
 
-    const review = await request(`/connections/app/${app.id}/tools?outcome=connected`);
-    expect(review.status).toBe(200);
-    expect(review.body).toContain('When I’ll check with you first');
-    expect(review.body).toContain('Read-only search');
-    expect(review.body).toContain('Places an order');
-    expect(review.body).toContain('Being set up');
-    expect(review.body).toContain('Looks right');
+    const reviewWhileUnsorted = await request(`/connections/app/${app.id}/tools?outcome=connected`);
+    expect(reviewWhileUnsorted.status).toBe(200);
+    expect(reviewWhileUnsorted.body).toContain('When I’ll check with you first');
+    expect(reviewWhileUnsorted.body).toContain('Read-only search');
+    expect(reviewWhileUnsorted.body).toContain('Places an order');
+    expect(reviewWhileUnsorted.body).toContain('Being set up');
+    expect(reviewWhileUnsorted.body).not.toContain('Looks right');
+    expect((await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash })).status).toBe(409);
+
+    const staleToggle = await post('/connections/tool-label', {
+      id: app.id,
+      tool: 'order_groceries',
+      label: 'just_do',
+      definitionHash: 'stale-definition-hash',
+    });
+    expect(staleToggle.status).toBe(409);
 
     const flipDown = await post('/connections/tool-label', {
       id: app.id,
       tool: 'order_groceries',
       label: 'just_do',
+      definitionHash: hashes.get('order_groceries')!,
     });
     expect(flipDown.status).toBe(200);
     expect(flipDown.headers['x-page-saved']).toBe('true');
@@ -1737,12 +1752,27 @@ describe('tool approvals review and held-call details', () => {
       id: app.id,
       tool: 'search_recipes',
       label: 'ask_first',
+      definitionHash: hashes.get('search_recipes')!,
     });
     expect(flipUp.status).toBe(200);
     expect(await store.getTool(app.id, 'search_recipes')).toMatchObject({
       label: 'ask_first',
       labelSource: 'principal',
     });
+
+    // Once the remaining unsorted tool receives a label, Looks right becomes available and confirms review.
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'sync_pantry',
+        definitionHash: hashes.get('sync_pantry')!,
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Syncs pantry list',
+      },
+    ]);
+    const reviewReady = await request(`/connections/app/${app.id}/tools`);
+    expect(reviewReady.status).toBe(200);
+    expect(reviewReady.body).toContain('Looks right');
 
     const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
     expect(staleReview.status).toBe(409);

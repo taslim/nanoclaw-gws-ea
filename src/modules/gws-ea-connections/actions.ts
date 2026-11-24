@@ -25,7 +25,7 @@ import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../g
 import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { admissionDependencies, admitAppUrl, hostOf, type AdmissionDependencies } from './admit.js';
-import { APP_SERVER_PREFIX, MainServersUnreadableError, mainOperatorServers } from './apply.js';
+import { APP_SERVER_PREFIX, MainServersUnreadableError, mainOperatorServers, notifyMainToolsChanged } from './apply.js';
 import type { ConnectionOAuthOptions, SignInServer } from './oauth.js';
 import { ConnectionOperations, type AddRefusal, type ConnectRefusal } from './operations.js';
 import { probeApp, type SignInMethod } from './probe.js';
@@ -629,6 +629,7 @@ export function createAppActions(dependencies: AppActionDependencies) {
     if (!updated) {
       return `The principal approved changing ${app.name}.${request.tool}, but the tool definition changed since approval was requested, so nothing changed.`;
     }
+    await notifyMainToolsChanged(context.store);
     return request.askFirst
       ? `The principal approved asking first before ${app.name}.${request.tool}.`
       : `The principal approved running ${app.name}.${request.tool} without asking first.`;

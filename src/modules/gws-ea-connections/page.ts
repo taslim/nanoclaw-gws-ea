@@ -363,13 +363,14 @@ async function write(
       return { ...done({ kind: 'list' }, message), failed: true, retryServer: { key, host } };
     }
     case 'tool-label': {
-      only(data, ['id', 'tool', 'label']);
+      only(data, ['id', 'tool', 'label', 'definitionHash']);
       const id = text(data, 'id');
       const tool = text(data, 'tool').trim();
       const label = text(data, 'label');
-      if (!EXACT_APP_ID.test(id) || !tool || (label !== 'ask_first' && label !== 'just_do'))
+      const definitionHash = text(data, 'definitionHash').trim();
+      if (!EXACT_APP_ID.test(id) || !tool || !definitionHash || (label !== 'ask_first' && label !== 'just_do'))
         throw new InvalidSubmission();
-      const updated = await operations.setToolLabel(id, tool, label);
+      const updated = await operations.setToolLabel(id, tool, label, { expectedHash: definitionHash });
       if (!updated) return refused({ kind: 'tools', id }, CHANGED, 409);
       return done(
         { kind: 'tools', id },

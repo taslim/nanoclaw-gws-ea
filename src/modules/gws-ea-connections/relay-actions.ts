@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 import {
   ANSWER_LATER,
   ActionRefusal,
@@ -17,7 +19,7 @@ import type { Session } from '../../types.js';
 import { readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { APP_SERVER_PREFIX } from './apply.js';
 import { ASSISTANT_SUMMARY_FIELD } from './canonical.js';
-import { getAppRelay, type AppRelay } from './relay.js';
+import { getAppRelay, RELAY_SHUTDOWN_WAIT_MS, type AppRelay } from './relay.js';
 import { ConnectionsStoreError } from './store.js';
 
 export const APP_RELAY_ACTION = 'app_relay';
@@ -107,6 +109,18 @@ function errorFrame(requestId: string, error: unknown): ResponseFrame {
   };
 }
 
+const activeDeferred = new Set<Promise<void>>();
+
+export async function drainRelayActions(waitMs = RELAY_SHUTDOWN_WAIT_MS): Promise<void> {
+  if (activeDeferred.size === 0 || waitMs <= 0) return;
+  const bound = new AbortController();
+  await Promise.race([
+    Promise.allSettled([...activeDeferred]),
+    delay(waitMs, undefined, { signal: bound.signal }).catch(() => undefined),
+  ]);
+  bound.abort();
+}
+
 export function createRelayAction(dependencies: RelayActionDependencies) {
   const inFlight = new Set<string>();
 
@@ -158,9 +172,19 @@ export function createRelayAction(dependencies: RelayActionDependencies) {
     } finally {
       inFlight.delete(key);
     }
+    try {
+      await writeActionResponse(session, requestId, frame);
+      clearOutbox(session.agent_group_id, session.id, requestId);
+    } catch (error) {
+      log.warn('Failed to write app relay response', {
+        op: parsed.op,
+        serverKey: parsed.serverKey,
+        requestId,
+        sessionId: session.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     /* eslint-enable no-catch-all/no-catch-all */
-    await writeActionResponse(session, requestId, frame);
-    clearOutbox(session.agent_group_id, session.id, requestId);
   }
 
   return answeringAction(APP_RELAY_ACTION, async (content, session, requestId) => {
@@ -168,7 +192,12 @@ export function createRelayAction(dependencies: RelayActionDependencies) {
     const key = `${session.id}:${requestId}`;
     if (inFlight.has(key)) return ANSWER_LATER;
     inFlight.add(key);
-    void runDeferred(parsed, session, requestId, key);
+    const task = runDeferred(parsed, session, requestId, key);
+    activeDeferred.add(task);
+    const cleanup = (): void => {
+      activeDeferred.delete(task);
+    };
+    task.then(cleanup, cleanup);
     return ANSWER_LATER;
   });
 }

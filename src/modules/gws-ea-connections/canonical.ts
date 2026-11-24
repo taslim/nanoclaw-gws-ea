@@ -96,11 +96,14 @@ export function toolDefinitionHash(definition: ToolDefinition): string {
   return sha256Hex(canonicalJson(projected));
 }
 
-export function toolListHash(tools: readonly { readonly name: string; readonly definitionHash: string }[]): string {
+export function toolListHash(
+  tools: readonly { readonly name: string; readonly definitionHash: string }[],
+  instructions: string | null = null,
+): string {
   const ordered = [...tools]
     .map(({ name, definitionHash }) => ({ definitionHash, name }))
     .sort((a, b) => compareCodeUnits(a.name, b.name));
-  return sha256Hex(canonicalJson(ordered));
+  return sha256Hex(canonicalJson(instructions === null ? ordered : { instructions, tools: ordered }));
 }
 
 export function canonicalArgsHash(args: Record<string, unknown>): {

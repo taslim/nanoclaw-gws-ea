@@ -53,6 +53,8 @@ export interface ConnectionsRefresherDependencies {
   readonly apply?: (store: ConnectionsStore) => Promise<boolean>;
   /** Heard once per refused generation, under the app's lock, so it records what is owed and returns. */
   readonly onRefused?: (app: RefusedApp) => void | Promise<void>;
+  /** Best-effort cleanup when a grant is refused (e.g., closing cached relay client and withdrawing held cards). */
+  readonly onDisconnected?: (appId: string) => void | Promise<void>;
   /** Called at the end of each tick when not aborted (e.g. retrying unsettled tool sorts). */
   readonly onTick?: () => void | Promise<void>;
   /** The assistant's own web hostname, on which no sign-in endpoint may sit. */
@@ -142,6 +144,7 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   const { store, gateway } = dependencies;
   const apply = dependencies.apply ?? applyMainServers;
   const onRefused = dependencies.onRefused ?? (() => undefined);
+  const onDisconnected = dependencies.onDisconnected ?? (() => undefined);
   const assistantHost = dependencies.assistantHost ?? webHostname;
   const now = dependencies.now ?? Date.now;
   const log = dependencies.log ?? hostLog;
@@ -181,6 +184,9 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     unstored.delete(app.id);
     if (!(await store.markRefused(app.id, generation))) return;
     log.warn('App needs reconnecting', { appId: app.id, code });
+    await attempt(app.id, 'Could not clean up refused app state', 'failed', async () => {
+      await onDisconnected(app.id);
+    });
     await applyStore();
     await attempt(app.id, 'Could not report a refused app', 'failed', async () => {
       await onRefused({ appId: app.id, generation });
