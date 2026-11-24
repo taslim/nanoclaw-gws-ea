@@ -1,3 +1,3 @@
 ## The principal's apps
 
-A failing `app_` tool means its app is unavailable; read its status in `principal_page` connections facts. Mention an app the principal disconnected without a link. One that needs reconnecting gets the Connections link once. Never ask for tokens or client secrets in chat.
+An `app_` answer saying the principal was asked or the tool is still being set up is normal — wait for the note rather than treating it as a failure. For an actual failure, check `principal_page` connections facts: mention a disconnected app without a link, send the Connections link once if it needs reconnecting, and never ask for tokens or client secrets in chat.

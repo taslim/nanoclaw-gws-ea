@@ -158,21 +158,33 @@ assistant by its document at `/oauth-client/<app id>`. A service that
 registers clients itself gets a client for this app alone. Otherwise the page
 shows the redirect URI to register and asks for the client details. The operator does not review these apps: once one is
 connected, main sends it information to use its tools. Main can add or delete an
-app only after the principal approves; connecting happens only on the page.
+app, or ask to change a tool's approval setting, only after the principal approves
+a chat card; connecting happens only on the page.
 
-Credentials never reach an agent. The host keeps refresh tokens, pasted tokens
-and client details in `connections/apps.db` under the instance root, encrypted
-under a per-assistant macOS Keychain key, and it renews access tokens before they
-expire. The gateway holds each app's current access token and injects it on that
-app's host and path. Connected apps need a gateway that can hold, list and
-remove credentials by host; with any other gateway the page lists apps but
-nothing can be added or connected. When a service refuses renewal, the app reads
-Needs reconnecting: main loses its tools and gets a note saying so.
+Principal-app credentials never reach an agent or the credential gateway. The
+host keeps OAuth access tokens, refresh tokens, pasted tokens and client details
+in `connections/apps.db` under the instance root, encrypted under a per-assistant
+macOS Keychain key, and renews access tokens before they expire. Main calls
+principal apps through a container stdio relay to the host, which adds the token
+and forwards calls over the host's public fetch. When a service refuses renewal,
+the app reads Needs reconnecting: main loses its tools and gets a note saying so.
 
-The page also lists the MCP servers the operator added to main, by host. The
-principal can disconnect one: its entry in main's configuration and the
-operator's gateway credentials on its host are removed. The assistant's own model
-and Google credentials stay. Add the server again to restore it.
+Connecting an app pins its tool definitions, sorts each tool in an isolated
+one-shot session with deterministic rule floors into "Ask first" or "Just do it",
+and opens the Connections review view ("When I'll check with you first"). There
+the principal sees each tool's label and reason, flips any tool immediately
+without a card, and confirms "Looks right". An app row carries a Needs review
+marker until confirmed or whenever tool definitions change. Every "Ask first"
+call waits on one bound 👍/👎 card in chat and runs at most once on 👍; long
+arguments link to a principal-only held-call view at `/connections/held/<id>`.
+The managed assistant browser blocks `/connections` alongside `/logins`.
+
+The page also lists the MCP servers the operator added to main, by host. Those
+entries stay outside the principal-app relay. When the gateway supports listing
+and removing credentials by host, the principal can disconnect one: its entry in
+main's configuration and the operator's gateway credentials on its host are
+removed. The assistant's own model and Google credentials stay. Add the server
+again to restore it.
 
 `gws-ea status --details` shows a Connected apps line from the running host:
 the store's state, then each app's name, host, origin and status. When the key
@@ -184,9 +196,10 @@ the store and its Keychain key after stopping the host, without revoking access
 at the apps; an unreachable key is reported as left behind (`connections_key`)
 without failing removal.
 
-Updates and rollbacks preserve the store. Releases that predate it cannot read
-it, so connected apps' access tokens lapse while rolled back; updating again
-resumes renewal.
+Updates and rollbacks preserve the store. Releases that predate host-held access
+tokens cannot read them and expect a published gateway credential, so OAuth
+grants that cannot renew end while rolled back; after rolling forward, reconnect
+those apps on the Connections page.
 
 ## Find and inspect an assistant
 
