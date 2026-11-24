@@ -14,7 +14,7 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
-import { getPendingHeldCallApproval, resolvePrincipalZoneAt } from './held-calls.js';
+import { getPendingHeldCallApproval, resolveHeldCallFromWeb, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
   readListing,
@@ -30,8 +30,23 @@ import {
   type OperatorDisconnectDependencies,
   type OperatorDisconnectOutcome,
 } from './operator.js';
-import { renderConnectionsPage, type ConnectionsPageState, type ConnectionsView } from './page-view.js';
-import { APP_ID_PATTERN, ConnectionsStoreError, getConnectionsStore, NAME_MAX } from './store.js';
+import {
+  humanizeToolName,
+  renderConnectionsPage,
+  sortToolsForDisplay,
+  toolDescription,
+  type ConnectionsPageState,
+  type ConnectionsView,
+} from './page-view.js';
+import {
+  APP_ID_PATTERN,
+  ConnectionsStoreError,
+  getConnectionsStore,
+  NAME_MAX,
+  type AppPin,
+  type ConnectionApp,
+  type PinnedAppTool,
+} from './store.js';
 
 /** Builds the operations for one request; a store that cannot be opened leaves the page listing what it can. */
 export type ConnectionsOperationsFactory = (webHostname: string) => Promise<ConnectionOperations>;
@@ -55,26 +70,28 @@ const WRITES = [
   'disconnect-operator',
   'tool-label',
   'review-tools',
+  'held-decision',
 ] as const;
 type WriteAction = (typeof WRITES)[number];
 type Route =
   | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: SignInReturn }
+  | { readonly kind: 'tools-status'; readonly id: string }
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
 
 const EXACT_APP_ID = new RegExp(`^${APP_ID_PATTERN}$`, 'u');
 const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/(connect|rename|tools)$`, 'u');
+const APP_TOOLS_STATUS = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/tools-status$`, 'u');
 const HELD_VIEW = /^\/connections\/held\/([A-Za-z0-9_-]{4,128})$/u;
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
 /** Each code's one message. Only a refused client says why a sign-in ended: the principal can correct it. */
 const RETURN_MESSAGES = {
-  connected: 'App connected. Your assistant can use it from your next message.',
-  cancelled: 'Sign-in was cancelled, so nothing changed.',
-  expired: 'That sign-in expired or was already used. Connect again to start over.',
-  failed: 'Sign-in didn’t finish, so nothing changed. Try connecting again.',
-  client_refused:
-    'The sign-in service didn’t accept the client details, so they were removed. Connect again to enter new ones.',
+  connected: 'App connected. Ready from your next message.',
+  cancelled: 'Sign-in cancelled. Nothing changed.',
+  expired: 'Sign-in expired. Connect again to start over.',
+  failed: 'Sign-in didn’t finish. Try connecting again.',
+  client_refused: 'Client details were rejected and cleared. Connect again to enter new ones.',
   assistant_client_refused: 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.',
 } satisfies Record<SignInReturn, string>;
 
@@ -82,13 +99,13 @@ function isSignInReturn(code: string | null): code is SignInReturn {
   return code !== null && Object.hasOwn(RETURN_MESSAGES, code);
 }
 
-const CHANGED = 'This app changed after you opened the page. Reload and try again.';
-const STORE_UNAVAILABLE = 'Your apps can’t be loaded right now. Ask your operator.';
+const CHANGED = 'This app changed in another tab. Reload and try again.';
+const STORE_UNAVAILABLE = 'Apps can’t be loaded right now. Ask your operator.';
 const UNREACHABLE = 'The app didn’t respond. Check the address and try again.';
-const UNSUPPORTED = 'This app uses a kind of sign-in your assistant doesn’t support.';
-const HOST_IN_USE = 'Another app already uses this address. Remove it first, then add this one.';
+const UNSUPPORTED = 'This app’s sign-in method isn’t supported.';
+const HOST_IN_USE = 'Another app already uses this address. Remove it first.';
 const OPERATOR_NEEDED = 'Apps can’t be added or connected right now. Ask your operator.';
-const CLIENT_UNAVAILABLE = 'Your assistant can’t sign in to this app right now. Try again in a few minutes.';
+const CLIENT_UNAVAILABLE = 'Can’t sign in to this app right now. Try again in a few minutes.';
 
 function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnected'>): {
   readonly status: number;
@@ -199,6 +216,8 @@ function readRoute(method: string | undefined, url: string | undefined): Route |
   if (method === 'GET') {
     const callback = CALLBACK.exec(pathname);
     if (callback) return { kind: 'callback', host: callback[1], query: new URLSearchParams(search ?? '') };
+    const statusMatch = search === undefined ? APP_TOOLS_STATUS.exec(pathname) : null;
+    if (statusMatch) return { kind: 'tools-status', id: statusMatch[1] };
   }
   if (method !== 'GET' && method !== 'HEAD') return undefined;
   if (pathname === '/connections') {
@@ -291,7 +310,7 @@ interface WriteResult {
 }
 
 async function write(
-  action: Exclude<WriteAction, 'sign-in'>,
+  action: Exclude<WriteAction, 'sign-in' | 'held-decision'>,
   data: Record<string, unknown>,
   operations: ConnectionOperations,
   operatorDependencies: OperatorDisconnectDependencies,
@@ -310,7 +329,7 @@ async function write(
       const added = await operations.add({ url: text(data, 'url'), name: addName });
       if (added.status === 'refused')
         return { ...refused({ kind: 'add' }, addMessage(added.reason)), addName: addName.slice(0, NAME_MAX) };
-      return done({ kind: 'connect', id: added.app.id }, 'App added. Connect it so your assistant can use it.');
+      return done({ kind: 'connect', id: added.app.id }, 'App added. Connect it to start using it.');
     }
     case 'connect': {
       only(data, ['id', 'version'], ['token']);
@@ -330,13 +349,13 @@ async function write(
       const changed = await operations.changeClient(id, version);
       if (changed.status === 'refused')
         return refused({ kind: 'connect', id }, connectMessage(changed.reason), connectRefusalStatus(changed.reason));
-      return done({ kind: 'connect', id }, 'Client details removed. Enter new ones to sign in.');
+      return done({ kind: 'connect', id }, 'Client details cleared. Enter new ones to sign in.');
     }
     case 'disconnect': {
       only(data, ['id', 'version']);
       const { id, version } = appReference(data);
       await operations.disconnect(id, version);
-      return done({ kind: 'list' }, 'App disconnected. Your assistant can’t use it until you connect it again.');
+      return done({ kind: 'list' }, 'App disconnected.');
     }
     case 'delete': {
       only(data, ['id', 'version']);
@@ -356,8 +375,7 @@ async function write(
       if (!key) throw new InvalidSubmission();
       const host = text(data, 'host');
       const outcome = await disconnectOperatorServer(operations.store, { key, host }, operatorDependencies);
-      if (outcome === 'disconnected')
-        return done({ kind: 'list' }, 'App disconnected. Your assistant can’t use it anymore.');
+      if (outcome === 'disconnected') return done({ kind: 'list' }, 'App disconnected.');
       const { status, message } = operatorMessage(outcome);
       if (outcome !== 'credentials_kept') return refused({ kind: 'list' }, message, status);
       return { ...done({ kind: 'list' }, message), failed: true, retryServer: { key, host } };
@@ -365,16 +383,18 @@ async function write(
     case 'tool-label': {
       only(data, ['id', 'tool', 'label', 'definitionHash']);
       const id = text(data, 'id');
-      const tool = text(data, 'tool').trim();
+      const tool = text(data, 'tool');
       const label = text(data, 'label');
       const definitionHash = text(data, 'definitionHash').trim();
-      if (!EXACT_APP_ID.test(id) || !tool || !definitionHash || (label !== 'ask_first' && label !== 'just_do'))
+      if (!EXACT_APP_ID.test(id) || !tool.trim() || !definitionHash || (label !== 'ask_first' && label !== 'just_do'))
         throw new InvalidSubmission();
       const updated = await operations.setToolLabel(id, tool, label, { expectedHash: definitionHash });
       if (!updated) return refused({ kind: 'tools', id }, CHANGED, 409);
       return done(
         { kind: 'tools', id },
-        label === 'ask_first' ? `${tool} will ask first.` : `${tool} will run without asking.`,
+        label === 'ask_first'
+          ? `${humanizeToolName(tool)} will ask first.`
+          : `${humanizeToolName(tool)} runs automatically.`,
       );
     }
     case 'review-tools': {
@@ -384,9 +404,36 @@ async function write(
       if (!EXACT_APP_ID.test(id) || !listHash) throw new InvalidSubmission();
       const reviewed = await operations.markToolsReviewed(id, listHash);
       if (!reviewed) return refused({ kind: 'tools', id }, CHANGED, 409);
-      return done({ kind: 'list' }, 'Tool approvals confirmed.');
+      return done({ kind: 'list' }, 'Tool approvals saved.');
     }
   }
+}
+
+function wantsJson(acceptHeader: string | string[] | undefined): boolean {
+  const value = Array.isArray(acceptHeader) ? acceptHeader.join(',') : (acceptHeader ?? '');
+  return /\bapplication\/json\b/iu.test(value);
+}
+
+/** Safe display metadata for live polling on the tool-approvals screen; never exposes secrets or raw server prompts. */
+function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]) {
+  const sorted = sortToolsForDisplay(tools);
+  const hasUnsorted = !pin || sorted.some((tool) => tool.label === null || tool.unsettled);
+  return {
+    appId: app.id,
+    status: app.status,
+    pinned: pin !== undefined,
+    listHash: pin?.listHash ?? null,
+    needsReview: pin?.needsReview ?? false,
+    hasUnsorted,
+    tools: sorted.map((tool) => ({
+      name: tool.name,
+      displayName: humanizeToolName(tool.name),
+      definitionHash: tool.definitionHash,
+      label: tool.label,
+      unsettled: tool.unsettled,
+      description: toolDescription(tool),
+    })),
+  };
 }
 
 /** A sign-in start answers JSON: the page opens the server's sign-in address itself. */
@@ -452,7 +499,12 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                     error: false,
                     redirectUri: (app) => appRedirectUri(options.hostname, app.host),
                     operatorDisconnect: false,
-                    heldCall: { approvalId: route.view.approvalId, payload: held.payload, timezone },
+                    heldCall: {
+                      approvalId: route.view.approvalId,
+                      payload: held.payload,
+                      timezone,
+                      ...(held.expired ? { resolution: 'expired' as const } : {}),
+                    },
                   },
                   shell,
                   nonce,
@@ -462,7 +514,91 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       }
       if (route.kind === 'write' && !sameOriginJson(request, options.hostname)) return refuse(response);
       const data = route.kind === 'write' ? await readSubmission(request) : undefined;
+      if (route.kind === 'write' && route.action === 'held-decision') {
+        const body = data ?? {};
+        only(body, ['viewId', 'decision']);
+        const viewId = text(body, 'viewId');
+        const decision = text(body, 'decision');
+        if (!/^[A-Za-z0-9_-]{4,128}$/u.test(viewId) || (decision !== 'approve' && decision !== 'reject')) {
+          throw new InvalidSubmission();
+        }
+        const decided = await resolveHeldCallFromWeb(viewId, decision);
+        if (decided.status === 'unauthorized') return refuse(response);
+        const shell = await readShell();
+        const nonce = pageNonce();
+        if (decided.status === 'not_found') {
+          const listing = await readListing(await openOperations(factory, options.hostname).then((o) => o?.store));
+          sendPage(response, {
+            status: 200,
+            nonce,
+            location: '/connections',
+            saved: false,
+            body: renderConnectionsPage(
+              {
+                view: { kind: 'list' },
+                listing,
+                outcome: 'This request is no longer pending.',
+                error: true,
+                redirectUri: (app) => appRedirectUri(options.hostname, app.host),
+                operatorDisconnect: false,
+              },
+              shell,
+              nonce,
+            ),
+          });
+          return;
+        }
+        const timezone = await resolvePrincipalZoneAt(decided.payload.expiresAt);
+        const outcome =
+          decided.status === 'approved'
+            ? 'Approved. Your assistant has the result in chat.'
+            : decided.status === 'declined'
+              ? 'Declined. Nothing was sent.'
+              : decided.status === 'expired'
+                ? 'This request expired. Nothing was sent.'
+                : 'Already answered. Nothing else was sent.';
+        const saved = decided.status === 'approved' || decided.status === 'declined';
+        const resolution =
+          decided.status === 'approved'
+            ? ('approved' as const)
+            : decided.status === 'declined'
+              ? ('declined' as const)
+              : decided.status === 'expired'
+                ? ('expired' as const)
+                : ('already_resolved' as const);
+        sendPage(response, {
+          status: 200,
+          nonce,
+          location: viewLocation({ kind: 'held', approvalId: viewId }),
+          saved,
+          body: renderConnectionsPage(
+            {
+              view: { kind: 'held', approvalId: viewId },
+              listing: { listed: true, canChange: false, apps: [], operators: [] },
+              outcome,
+              error: !saved,
+              redirectUri: (app) => appRedirectUri(options.hostname, app.host),
+              operatorDisconnect: false,
+              heldCall: { approvalId: viewId, payload: decided.payload, timezone, resolution },
+            },
+            shell,
+            nonce,
+          ),
+        });
+        return;
+      }
       const operations = await openOperations(factory, options.hostname);
+      if (route.kind === 'tools-status') {
+        if (!operations) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+        try {
+          const loaded = await operations.store.readAppTools(route.id);
+          if (!loaded) return refuse(response);
+          return sendJson(response, 200, buildToolsStatusPayload(loaded.app, loaded.pin, loaded.tools));
+        } catch (error) {
+          if (error instanceof ConnectionsStoreError) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+          throw error;
+        }
+      }
       if (route.kind === 'callback') {
         if (!operations) return sendReturn(response, 'failed');
         const outcome = await operations.finishSignIn(route.host, principal, route.query);
@@ -474,6 +610,26 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       }
       if (route.kind === 'write' && route.action === 'sign-in')
         return startSignIn(response, data ?? {}, principal, operations);
+      if (route.kind === 'write' && route.action === 'tool-label' && wantsJson(request.headers.accept)) {
+        const body = data ?? {};
+        only(body, ['id', 'tool', 'label', 'definitionHash']);
+        const id = text(body, 'id');
+        const tool = text(body, 'tool');
+        const label = text(body, 'label');
+        const definitionHash = text(body, 'definitionHash').trim();
+        if (!EXACT_APP_ID.test(id) || !tool.trim() || !definitionHash || (label !== 'ask_first' && label !== 'just_do'))
+          throw new InvalidSubmission();
+        if (!operations) return sendJson(response, 503, { ok: false, error: STORE_UNAVAILABLE });
+        try {
+          const updated = await operations.setToolLabel(id, tool, label, { expectedHash: definitionHash });
+          if (!updated) return sendJson(response, 409, { ok: false, error: CHANGED });
+          return sendJson(response, 200, { ok: true, tool, label, definitionHash });
+        } catch (error) {
+          if (!(error instanceof ConnectionsStoreError)) throw error;
+          const failure = storeFailure(error);
+          return sendJson(response, failure.status, { ok: false, error: failure.message });
+        }
+      }
       // Before any write, so a page that cannot be drawn changes nothing.
       const shell = await readShell();
       const operatorDependencies = readOperatorDependencies();
@@ -483,7 +639,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         status: 200,
         saved: false,
       };
-      if (route.kind === 'write' && route.action !== 'sign-in' && data) {
+      if (route.kind === 'write' && route.action !== 'sign-in' && route.action !== 'held-decision' && data) {
         if (!operations) result = { ...result, outcome: STORE_UNAVAILABLE, status: 503 };
         else {
           try {

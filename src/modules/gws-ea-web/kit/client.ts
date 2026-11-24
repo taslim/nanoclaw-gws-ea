@@ -181,6 +181,7 @@ const KIT_SCRIPT = String.raw`
         const locationHeader = response.headers.get('${PAGE_LOCATION_HEADER}');
         if (locationHeader) history.replaceState(null, '', locationHeader);
         watchTitle();
+        document.dispatchEvent(new CustomEvent('kit:swap'));
       };
       if (!options.keepScroll && document.startViewTransition && !calm.matches) await document.startViewTransition(swap).updateCallbackDone;
       else swap();

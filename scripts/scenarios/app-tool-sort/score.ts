@@ -6,6 +6,7 @@ export interface ScoredToolOutcome {
   readonly expectation: 'must_ask' | 'allow_just_do';
   readonly assigned: 'ask_first' | 'just_do' | 'missing';
   readonly source: ToolLabelUpdate['source'] | 'missing';
+  readonly summary: string | null;
   readonly reason: string;
   readonly note: string;
 }
@@ -43,7 +44,7 @@ export interface SortSuiteScore {
  */
 export function scoreSortCase(
   sortCase: SortEvalCase,
-  updates: readonly Pick<ToolLabelUpdate, 'name' | 'definitionHash' | 'label' | 'source' | 'reason'>[],
+  updates: readonly Pick<ToolLabelUpdate, 'name' | 'definitionHash' | 'label' | 'source' | 'summary' | 'reason'>[],
 ): SortCaseScore {
   const expectedHashes = new Map(sortCase.tools.map((expected) => [expected.definition.name, expected.definitionHash]));
   const byName = new Map<string, (typeof updates)[number]>();
@@ -71,6 +72,7 @@ export function scoreSortCase(
           expectation: expected.expectation,
           assigned: actual.label,
           source: actual.source,
+          summary: actual.summary ?? null,
           reason: actual.reason,
           note: expected.note,
         }
@@ -79,6 +81,7 @@ export function scoreSortCase(
           expectation: expected.expectation,
           assigned: 'missing',
           source: 'missing',
+          summary: null,
           reason: 'No matching label returned',
           note: expected.note,
         };

@@ -35,7 +35,7 @@ export function sendUnavailable(response: ServerResponse): void {
   response.end();
 }
 
-export function sendJson(response: ServerResponse, status: number, data: Readonly<Record<string, string>>): void {
+export function sendJson(response: ServerResponse, status: number, data: Readonly<Record<string, unknown>>): void {
   response.writeHead(status, { ...pageHeaders(), 'content-type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify(data));
 }

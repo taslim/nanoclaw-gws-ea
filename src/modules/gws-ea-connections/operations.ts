@@ -14,7 +14,12 @@ import {
   type OperatorServer,
 } from './apply.js';
 import { withAppLock } from './locks.js';
-import { withdrawHeldAppCalls, withdrawToolAskApprovals } from './held-calls.js';
+import {
+  listPendingHeldCallApprovals,
+  withdrawHeldAppCalls,
+  withdrawToolAskApprovals,
+  type PendingHeldCallItem,
+} from './held-calls.js';
 import { getAppRelay } from './relay.js';
 import {
   appClientDocumentUrl,
@@ -135,6 +140,8 @@ export interface ConnectionsListing {
   readonly pins?: Readonly<Record<string, AppPin>>;
   /** Pinned tools per principal app id, read without Keychain. */
   readonly toolsByApp?: Readonly<Record<string, readonly PinnedAppTool[]>>;
+  /** Pending held-call approvals waiting for the principal. */
+  readonly pendingApprovals?: readonly PendingHeldCallItem[];
 }
 
 export interface ListingSources {
@@ -163,9 +170,17 @@ export async function readListing(
     }
   })();
 
+  const pendingApprovalsPromise = listPendingHeldCallApprovals().catch((): readonly PendingHeldCallItem[] => []);
+
   if (!store) {
-    const { operators } = await operatorsPromise;
-    return { listed: false, canChange: false, apps: [], operators };
+    const [{ operators }, pendingApprovals] = await Promise.all([operatorsPromise, pendingApprovalsPromise]);
+    return {
+      listed: false,
+      canChange: false,
+      apps: [],
+      operators,
+      ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    };
   }
 
   const storePromise = (async () => {
@@ -188,8 +203,19 @@ export async function readListing(
     }
   })();
 
-  const [opResult, storeResult] = await Promise.all([operatorsPromise, storePromise]);
-  if (!storeResult.listed) return { listed: false, canChange: false, apps: [], operators: opResult.operators };
+  const [opResult, storeResult, pendingApprovals] = await Promise.all([
+    operatorsPromise,
+    storePromise,
+    pendingApprovalsPromise,
+  ]);
+  if (!storeResult.listed)
+    return {
+      listed: false,
+      canChange: false,
+      apps: [],
+      operators: opResult.operators,
+      ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
+    };
   return {
     listed: true,
     canChange: opResult.ok && storeResult.available,
@@ -197,6 +223,7 @@ export async function readListing(
     operators: opResult.operators,
     pins: storeResult.pins,
     toolsByApp: storeResult.toolsByApp,
+    ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
   };
 }
 

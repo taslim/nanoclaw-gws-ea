@@ -31,12 +31,18 @@ function count(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-/** What needs the principal comes first: an app to reconnect outranks how many work. */
+/** What needs the principal comes first: pending approvals, then reconnecting, then review, then healthy count. */
 export async function connectionsStatus(read: () => Promise<ConnectionsListing> = currentListing): Promise<string> {
   const listing = await read();
   if (!listing.canChange) return 'Unavailable';
+  const pending = listing.pendingApprovals?.length ?? 0;
+  if (pending) return count(pending, 'approval waiting', 'approvals waiting');
   const reconnect = listing.apps.filter((app) => app.status === 'needs_reconnecting').length;
   if (reconnect) return count(reconnect, 'app needs reconnecting', 'apps need reconnecting');
+  const needsReview = listing.apps.filter(
+    (app) => app.status === 'connected' && listing.pins?.[app.id]?.needsReview === true,
+  ).length;
+  if (needsReview) return count(needsReview, 'app needs review', 'apps need review');
   const connected = listing.apps.filter((app) => app.status === 'connected').length + listing.operators.length;
   return connected ? count(connected, 'app connected', 'apps connected') : 'No apps yet';
 }
@@ -44,6 +50,7 @@ export async function connectionsStatus(read: () => Promise<ConnectionsListing> 
 export interface ConnectionToolFact {
   readonly name: string;
   readonly label: ToolLabel | 'unsorted';
+  readonly summary?: string;
   readonly reason: string | null;
 }
 
@@ -53,7 +60,7 @@ export interface ConnectionLinkFact {
   readonly host: string;
   readonly origin: 'principal' | 'operator';
   readonly status: AppStatus;
-  /** Present for pinned principal apps: true until the principal confirms "Looks right" or after definitions change. */
+  /** Present for pinned principal apps: true until the principal confirms review or after definitions change. */
   readonly needsReview?: boolean;
   /** Present for pinned principal apps: current approval label and reason for each pinned tool. */
   readonly tools?: readonly ConnectionToolFact[];
@@ -82,6 +89,7 @@ export async function connectionsLinkFacts(
                 (tool): ConnectionToolFact => ({
                   name: tool.name,
                   label: tool.label ?? 'unsorted',
+                  ...(tool.summary ? { summary: tool.summary } : {}),
                   reason: tool.reason,
                 }),
               )

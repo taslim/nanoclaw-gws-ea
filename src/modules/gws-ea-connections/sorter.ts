@@ -23,12 +23,16 @@ export {
   evaluateToolFloors,
   FLOOR_VERBS,
   PASSTHROUGH_TOKENS,
+  PREPARE_EXEMPT_NOUN_VERBS,
+  PREPARE_LEADING_VERBS,
   READ_EXEMPT_NOUN_VERBS,
   READ_LEADING_VERBS,
   resolveFinalToolUpdates,
   SORTER_PROMPT_HASH,
   SORTER_PROMPT_TEXT,
   sorterVersion,
+  STAGING_EXEMPT_VERBS,
+  STAGING_TARGET_NOUNS,
   tokenizeToolName,
   type ParsedSortToolEntry,
   type ToolFloorResult,
@@ -38,7 +42,12 @@ export const SORT_TOOLS_ACTION = 'sort_tools';
 export const APP_SORT_THREAD_PREFIX = 'system:gws-ea-app-sort:';
 export const DEFAULT_SORT_TIMEOUT_MS = 120_000;
 export const DEFAULT_MAX_SORT_ATTEMPTS = 3;
+const SUMMARY_MAX = 100;
 const REASON_MAX = 200;
+
+function normalizeSummary(raw: string): string {
+  return raw.replace(/\s+/gu, ' ').trim().replace(/\.+$/u, '').trim().slice(0, SUMMARY_MAX);
+}
 
 function parseSortToolsPayload(content: Record<string, unknown>): readonly ParsedSortToolEntry[] {
   const allowedTopKeys = new Set(['action', 'requestId', 'tools']);
@@ -49,13 +58,13 @@ function parseSortToolsPayload(content: Record<string, unknown>): readonly Parse
   if (!Array.isArray(rawTools)) {
     throw invalidArgs('tools must be an array of tool labels.');
   }
-  const allowedEntryKeys = new Set(['name', 'definition_hash', 'label', 'reason']);
+  const allowedEntryKeys = new Set(['name', 'definition_hash', 'label', 'summary', 'reason']);
   const entries: ParsedSortToolEntry[] = [];
   for (const raw of rawTools) {
     if (!isRecord(raw) || Object.keys(raw).some((key) => !allowedEntryKeys.has(key))) {
-      throw invalidArgs('Each tool entry must contain only name, definition_hash, label, and reason.');
+      throw invalidArgs('Each tool entry must contain only name, definition_hash, label, summary, and reason.');
     }
-    const { name, definition_hash: definitionHash, label, reason } = raw;
+    const { name, definition_hash: definitionHash, label, summary, reason } = raw;
     if (typeof name !== 'string' || !name.trim()) {
       throw invalidArgs('Each tool entry requires a non-empty name.');
     }
@@ -68,11 +77,25 @@ function parseSortToolsPayload(content: Record<string, unknown>): readonly Parse
     if (typeof reason !== 'string' || !reason.trim() || hasControlCharacters(reason.replace(/\s+/gu, ' '))) {
       throw invalidArgs('Each tool entry requires a one-line plain-language reason.');
     }
+    const cleanReason = reason.replace(/\s+/gu, ' ').trim().slice(0, REASON_MAX);
+    let cleanSummary: string;
+    if (summary === undefined) {
+      cleanSummary = normalizeSummary(cleanReason);
+    } else {
+      if (typeof summary !== 'string' || !summary.trim() || hasControlCharacters(summary.replace(/\s+/gu, ' '))) {
+        throw invalidArgs('Each tool entry summary must be concise one-line plain text.');
+      }
+      cleanSummary = normalizeSummary(summary);
+      if (!cleanSummary) {
+        throw invalidArgs('Each tool entry summary must be concise one-line plain text.');
+      }
+    }
     entries.push({
       name: name.trim(),
       definitionHash: definitionHash.trim(),
       label,
-      reason: reason.replace(/\s+/gu, ' ').trim().slice(0, REASON_MAX),
+      summary: cleanSummary,
+      reason: cleanReason,
     });
   }
   return entries;
@@ -184,17 +207,15 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       throw error;
     }
 
-    const targets = allTools.filter((tool) => tool.label === null || tool.unsettled);
-    if (targets.length === 0) return;
-
-    const attempt = Math.max(...targets.map((tool) => tool.sortAttempts), 0) + 1;
-    if (attempt > maxAttempts) return;
-
     const groupId = await getExternalEmailAgentGroupId();
     if (!groupId) {
+      const pendingTargets = allTools.filter((tool) => tool.label === null || tool.unsettled);
+      if (pendingTargets.length === 0) return;
+      const pendingAttempt = Math.max(...pendingTargets.map((tool) => tool.sortAttempts), 0) + 1;
+      if (pendingAttempt > maxAttempts) return;
       await store.markToolSortFailed(
         job.appId,
-        targets.map((t) => ({ name: t.name, definitionHash: t.definitionHash })),
+        pendingTargets.map((t) => ({ name: t.name, definitionHash: t.definitionHash })),
         { expectedGrantGeneration: grantGeneration, maxAttempts, at: new Date(now()).toISOString() },
       );
       return;
@@ -202,6 +223,15 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
 
     const model = await resolveExternalEmailModel(groupId);
     const version = sorterVersion(model);
+    const isStaleVersion = (tool: PinnedAppTool): boolean =>
+      tool.sorterVersion !== null &&
+      tool.sorterVersion !== version &&
+      (tool.labelSource === 'sorter' || tool.labelSource === 'floor' || tool.labelSource === 'fallback');
+    const targets = allTools.filter((tool) => tool.label === null || tool.unsettled || isStaleVersion(tool));
+    if (targets.length === 0) return;
+
+    const attempt = Math.max(...targets.map((tool) => (isStaleVersion(tool) ? 0 : tool.sortAttempts)), 0) + 1;
+    if (attempt > maxAttempts) return;
     const sortId = `sort-${randomUUID()}`;
     const threadId = `${APP_SORT_THREAD_PREFIX}${job.appId}:${pin.listHash}:${sortId}`;
     const { session } = await resolveSystemSession(groupId, threadId);
@@ -364,7 +394,9 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       if (stopped || dependencies.signal?.aborted) return;
       let pendingApps: readonly { readonly appId: string; readonly listHash: string }[];
       try {
-        pendingApps = await store.appsNeedingSort();
+        const groupId = await getExternalEmailAgentGroupId();
+        const currentVersion = groupId ? sorterVersion(await resolveExternalEmailModel(groupId)) : undefined;
+        pendingApps = await store.appsNeedingSort(currentVersion);
       } catch (error) {
         if (error instanceof ConnectionsStoreError) return;
         throw error;

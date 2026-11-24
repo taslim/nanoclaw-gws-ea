@@ -7,20 +7,39 @@ import { inspect } from 'node:util';
 import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createPendingApproval,
+  createSession,
+  getDb,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { getDeliveryAdapter, setDeliveryAdapter } from '../../delivery.js';
 import type { GatewayCredentialRemoval } from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
+import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { createWebHandler } from '../gws-ea-web/server.js';
+import { upsertUser } from '../permissions/db/users.js';
 import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
-import { HELD_APP_CALL_ACTION, type HeldAppCallPayload } from './held-calls.js';
+import { canonicalArgsHash } from './canonical.js';
+import {
+  HELD_APP_CALL_ACTION,
+  registerHeldAppCallHandlers,
+  type HeldAppCallPayload,
+  type PendingHeldCallItem,
+} from './held-calls.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
+import type { AppRelay } from './relay.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
 import {
   FakeMcpApp,
@@ -435,7 +454,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
     expect(signInRow(connected.id)).toBeUndefined();
 
     const list = await request('/connections?outcome=connected');
-    expect(list.body).toContain('App connected. Your assistant can use it from your next message.');
+    expect(list.body).toContain('App connected. Ready from your next message.');
     expect(list.body).toContain('Connected');
     assertNoSentinels();
   });
@@ -666,7 +685,7 @@ describe('client details the server refuses', () => {
     const changed = await post('/connections/change-client', { id: stored.id, version: String(stored.version) });
     expect(changed.status).toBe(200);
     expect(changed.headers['x-page-location']).toBe(`/connections/app/${stored.id}/connect`);
-    expect(changed.body).toContain('Client details removed. Enter new ones to sign in.');
+    expect(changed.body).toContain('Client details cleared. Enter new ones to sign in.');
     expect(changed.body).toContain('name="clientId"');
     expect(await onlyApp()).toMatchObject({ hasClient: false, clientEntered: false });
     expect(signInRow(stored.id)).toBeUndefined();
@@ -695,7 +714,7 @@ describe('client details the server refuses', () => {
 });
 
 describe('apps whose server takes client documents', () => {
-  const unavailable = 'Your assistant can’t sign in to this app right now. Try again in a few minutes.';
+  const unavailable = 'Can’t sign in to this app right now. Try again in a few minutes.';
   const assistantRefused = 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.';
 
   /** The server expires a registration's secret, so it refuses that client at the exchange. */
@@ -1123,10 +1142,10 @@ describe('sign-in returns', () => {
   it('renders each outcome’s constant message once, and the script strips it from the address', async () => {
     const messages = {
       connected: 'App connected.',
-      cancelled: 'Sign-in was cancelled, so nothing changed.',
-      expired: 'That sign-in expired or was already used.',
-      failed: 'Sign-in didn’t finish, so nothing changed.',
-      client_refused: 'The sign-in service didn’t accept the client details, so they were removed.',
+      cancelled: 'Sign-in cancelled. Nothing changed.',
+      expired: 'Sign-in expired. Connect again to start over.',
+      failed: 'Sign-in didn’t finish. Try connecting again.',
+      client_refused: 'Client details were rejected and cleared. Connect again to enter new ones.',
       assistant_client_refused: 'The sign-in service didn’t accept your assistant’s client. Connect again to continue.',
     };
     for (const [code, message] of Object.entries(messages)) {
@@ -1302,7 +1321,7 @@ describe('managing apps', () => {
     await post('/connections/add', { url: RECIPES, name: '' });
     const list = (await request('/connections')).body;
     expect(list).toContain(
-      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete app" data-confirm-message="Your assistant will stop using it, and its sign-in and any client details you entered will be forgotten. You can add it again later."',
+      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete" data-confirm-message="Your assistant will lose access, and saved sign-in and client details will be removed. You can add it again anytime."',
     );
     expect(list).not.toMatch(/action="\/connections\/disconnect" data-send data-confirm/u);
   });
@@ -1337,7 +1356,7 @@ describe('managing apps', () => {
     ] as const) {
       const reply = await post(route, data);
       expect(reply.status).toBe(409);
-      expect(reply.body).toContain('This app changed after you opened the page.');
+      expect(reply.body).toContain('This app changed in another tab.');
     }
     const signIn = await post('/connections/sign-in', reference);
     expect(signIn.status).toBe(409);
@@ -1357,11 +1376,7 @@ describe('the add dialog', () => {
     ['one of the assistant’s own services', 'https://api.anthropic.com/mcp', 'That address belongs to your assistant'],
     ['an operator server’s host', 'https://tasks.example.test/other', 'already uses this address'],
     ['a server that does not answer', 'https://down.example.test/mcp', 'The app didn’t respond.'],
-    [
-      'a server whose sign-in is unusable',
-      'https://recipes.example.test/mcp',
-      'a kind of sign-in your assistant doesn’t support',
-    ],
+    ['a server whose sign-in is unusable', 'https://recipes.example.test/mcp', 'sign-in method isn’t supported'],
   ])('refuses %s with a constant message and stores nothing', async (_case, url, message) => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
       tasks: { type: 'http', url: `https://tasks.example.test/mcp?key=${SENTINEL_QUERY}` },
@@ -1460,7 +1475,7 @@ describe('page states', () => {
 describe('operator servers', () => {
   const ledgerlyEntry = { type: 'http', url: LEDGERLY };
   const confirmation =
-    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="Your assistant will stop using it, and its saved access to app.ledgerly.example.test will be deleted. Your operator can add it back."';
+    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="Your assistant will stop using it and saved access to app.ledgerly.example.test will be removed. Your operator can add it back."';
   const disconnectLedgerly = () =>
     post('/connections/disconnect-operator', { key: 'ledgerly', host: 'app.ledgerly.example.test' });
 
@@ -1475,7 +1490,7 @@ describe('operator servers', () => {
 
     const reply = await disconnectLedgerly();
     expect(reply.status).toBe(200);
-    expect(reply.body).toContain('App disconnected. Your assistant can’t use it anymore.');
+    expect(reply.body).toContain('App disconnected.');
     expect(reply.body).not.toContain('Added by your operator');
     expect(await mainServers()).toEqual({});
     expect([...gateway.held.keys()]).toEqual(['ledger-bearer']);
@@ -1501,7 +1516,7 @@ describe('operator servers', () => {
 
     gateway.failingIds.clear();
     const retried = await disconnectLedgerly();
-    expect(retried.body).toContain('App disconnected. Your assistant can’t use it anymore.');
+    expect(retried.body).toContain('App disconnected.');
     expect(await mainServers()).toEqual({});
     expect(gateway.held.size).toBe(0);
   });
@@ -1518,7 +1533,7 @@ describe('operator servers', () => {
     const failed = await disconnectLedgerly();
     expect(failed.body).toContain('so it’s still connected. Try again.');
     expect(failed.body).not.toContain('>Try again</button>');
-    expect(failed.body).toContain('its saved access to mcp.ledger.example.test will be deleted.');
+    expect(failed.body).toContain('saved access to mcp.ledger.example.test will be removed.');
   });
 
   it('shows Can’t disconnect on a gateway that cannot list and remove credentials by host', async () => {
@@ -1552,7 +1567,7 @@ describe('operator servers', () => {
     ]) {
       const reply = await post('/connections/disconnect-operator', submission);
       expect(reply.status).toBe(409);
-      expect(reply.body).toContain('This app changed after you opened the page.');
+      expect(reply.body).toContain('This app changed in another tab.');
     }
     expect(await mainServers()).toEqual({ ...servers, recipes: { type: 'http', url: RECIPES } });
     expect([...gateway.held.keys()]).toEqual(held);
@@ -1580,17 +1595,94 @@ describe('home status and link facts', () => {
     updatedAt: '2026-11-14T00:00:00.000Z',
   });
 
-  it('summarizes unavailable, then apps needing reconnecting, then connected apps, then none yet', async () => {
+  it('summarizes unavailable, then pending approvals, then reconnecting, then review needed, then connected apps, then none yet', async () => {
     const operator = { key: 'ledgerly', url: 'https://app.ledgerly.example.test/mcp' };
-    expect(await connectionsStatus(listing({ canChange: false, apps: [app('needs_reconnecting', 'Notes')] }))).toBe(
-      'Unavailable',
+    const recipes = app('connected', 'Recipes');
+    const pendingStub = (viewId: string): PendingHeldCallItem => ({
+      viewId,
+      approval: {
+        approval_id: `appr-${viewId}`,
+        session_id: 'sess-1',
+        request_id: 'req-1',
+        action: HELD_APP_CALL_ACTION,
+        payload: '{}',
+        title: 'Allow Recipes?',
+        question: 'Allow?',
+        options_json: '[]',
+        status: 'pending',
+        created_at: '2026-11-24T00:00:00.000Z',
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+        approver_user_id: 'gchat:users/morgan',
+        agent_group_id: MAIN,
+        channel_type: 'gchat',
+        platform_id: 'spaces/dm',
+        instance: null,
+        platform_message_id: null,
+      },
+      payload: {
+        viewId,
+        invocationId: `inv-${viewId}`,
+        appId: recipes.id,
+        appName: 'Recipes',
+        appHost: recipes.host,
+        grantGeneration: 1,
+        toolName: 'order_groceries',
+        definitionHash: 'def-1',
+        canonicalArgs: '{}',
+        argsHash: 'args-1',
+        summary: 'Place grocery order',
+        appContext: null,
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      },
+    });
+    expect(
+      await connectionsStatus(
+        listing({
+          canChange: false,
+          apps: [app('needs_reconnecting', 'Notes')],
+          pendingApprovals: [pendingStub('h1')],
+        }),
+      ),
+    ).toBe('Unavailable');
+    expect(
+      await connectionsStatus(
+        listing({
+          apps: [app('needs_reconnecting', 'Notes'), recipes],
+          pendingApprovals: [pendingStub('h1')],
+        }),
+      ),
+    ).toBe('1 approval waiting');
+    expect(
+      await connectionsStatus(
+        listing({
+          apps: [recipes],
+          pendingApprovals: [pendingStub('h1'), pendingStub('h2')],
+        }),
+      ),
+    ).toBe('2 approvals waiting');
+    expect(await connectionsStatus(listing({ apps: [app('needs_reconnecting', 'Notes'), recipes] }))).toBe(
+      '1 app needs reconnecting',
     );
     expect(
-      await connectionsStatus(listing({ apps: [app('needs_reconnecting', 'Notes'), app('connected', 'Recipes')] })),
-    ).toBe('1 app needs reconnecting');
-    expect(await connectionsStatus(listing({ apps: [app('connected', 'Recipes')], operators: [operator] }))).toBe(
-      '2 apps connected',
-    );
+      await connectionsStatus(
+        listing({
+          apps: [recipes],
+          pins: {
+            [recipes.id]: {
+              appId: recipes.id,
+              instructions: null,
+              listHash: 'hash-1',
+              pinnedAt: '2026-11-23T12:00:00.000Z',
+              confirmedAt: '2026-11-23T12:00:00.000Z',
+              reviewedListHash: null,
+              reviewedAt: null,
+              needsReview: true,
+            },
+          },
+        }),
+      ),
+    ).toBe('1 app needs review');
+    expect(await connectionsStatus(listing({ apps: [recipes], operators: [operator] }))).toBe('2 apps connected');
     expect(await connectionsStatus(listing({ apps: [app('not_connected', 'Notes')] }))).toBe('No apps yet');
   });
 
@@ -1667,14 +1759,28 @@ describe('home status and link facts', () => {
 });
 
 describe('tool approvals review and held-call details', () => {
-  it('leads to the review view after connecting, flips switches immediately without a card, clears and restores review marker', async () => {
+  it('leads to the review view after connecting, serves live tools-status, flips switches immediately, clears and restores review marker', async () => {
     serve(recipesServer);
     await post('/connections/add', { url: RECIPES, name: '' });
     let app = await onlyApp();
     const connectReply = await post('/connections/connect', { id: app.id, version: String(app.version) });
     expect(connectReply.status).toBe(200);
     expect(connectReply.headers['x-page-location']).toBe(`/connections/app/${app.id}/tools`);
-    expect(connectReply.body).toContain('When I’ll check with you first');
+    expect(connectReply.body).toContain('<h1>Recipes</h1>');
+    expect(connectReply.body).toContain('data-tools-polling="true"');
+
+    // Before pinning, tools-status reports pinned=false and refuses non-principal readers.
+    const unpinnedStatus = await request(`/connections/app/${app.id}/tools-status`);
+    expect(unpinnedStatus.status).toBe(200);
+    expect(JSON.parse(unpinnedStatus.body)).toMatchObject({
+      appId: app.id,
+      pinned: false,
+      hasUnsorted: true,
+      tools: [],
+    });
+    expect(
+      (await request(`/connections/app/${app.id}/tools-status`, 'GET', { 'cf-access-jwt-assertion': READER })).status,
+    ).toBe(404);
 
     app = await onlyApp();
     const pinned = await store.pinTools(app.id, {
@@ -1696,6 +1802,7 @@ describe('tool approvals review and held-call details', () => {
         definitionHash: hashes.get('search_recipes')!,
         label: 'just_do',
         source: 'sorter',
+        summary: 'Search recipes by keyword',
         reason: 'Read-only search',
       },
       {
@@ -1703,28 +1810,30 @@ describe('tool approvals review and held-call details', () => {
         definitionHash: hashes.get('order_groceries')!,
         label: 'ask_first',
         source: 'floor',
+        summary: 'Place a paid grocery order',
         reason: 'Places an order',
       },
     ]);
 
     const listBefore = await request('/connections');
-    expect(listBefore.body).toContain('Needs review');
+    expect(listBefore.body).toContain('Checking…');
     expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
     const factsBefore = await connectionsLinkFacts(() => operations().listing());
     expect(factsBefore.apps[0]?.needsReview).toBe(true);
     expect(factsBefore.apps[0]?.tools).toEqual([
-      { name: 'order_groceries', label: 'ask_first', reason: 'Places an order' },
-      { name: 'search_recipes', label: 'just_do', reason: 'Read-only search' },
+      { name: 'order_groceries', label: 'ask_first', summary: 'Place a paid grocery order', reason: 'Places an order' },
+      { name: 'search_recipes', label: 'just_do', summary: 'Search recipes by keyword', reason: 'Read-only search' },
       { name: 'sync_pantry', label: 'unsorted', reason: null },
     ]);
 
     const reviewWhileUnsorted = await request(`/connections/app/${app.id}/tools?outcome=connected`);
     expect(reviewWhileUnsorted.status).toBe(200);
-    expect(reviewWhileUnsorted.body).toContain('When I’ll check with you first');
-    expect(reviewWhileUnsorted.body).toContain('Read-only search');
-    expect(reviewWhileUnsorted.body).toContain('Places an order');
-    expect(reviewWhileUnsorted.body).toContain('Being set up');
-    expect(reviewWhileUnsorted.body).not.toContain('Looks right');
+    expect(reviewWhileUnsorted.body).toContain('<h1>Recipes</h1>');
+    expect(reviewWhileUnsorted.body).toContain('Search recipes by keyword');
+    expect(reviewWhileUnsorted.body).toContain('Place a paid grocery order');
+    expect(reviewWhileUnsorted.body).toContain('Checking…');
+    expect(reviewWhileUnsorted.body).toContain('data-tools-polling="true"');
+    expect(reviewWhileUnsorted.body).toContain('data-review-form hidden');
     expect((await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash })).status).toBe(409);
 
     const staleToggle = await post('/connections/tool-label', {
@@ -1735,17 +1844,28 @@ describe('tool approvals review and held-call details', () => {
     });
     expect(staleToggle.status).toBe(409);
 
-    const flipDown = await post('/connections/tool-label', {
-      id: app.id,
+    // JSON toggle returns a lightweight JSON payload and preserves the sharp tool summary.
+    const flipDownJson = await post(
+      '/connections/tool-label',
+      {
+        id: app.id,
+        tool: 'order_groceries',
+        label: 'just_do',
+        definitionHash: hashes.get('order_groceries')!,
+      },
+      { accept: 'application/json' },
+    );
+    expect(flipDownJson.status).toBe(200);
+    expect(JSON.parse(flipDownJson.body)).toEqual({
+      ok: true,
       tool: 'order_groceries',
       label: 'just_do',
       definitionHash: hashes.get('order_groceries')!,
     });
-    expect(flipDown.status).toBe(200);
-    expect(flipDown.headers['x-page-saved']).toBe('true');
     expect(await store.getTool(app.id, 'order_groceries')).toMatchObject({
       label: 'just_do',
       labelSource: 'principal',
+      summary: 'Place a paid grocery order',
     });
 
     const flipUp = await post('/connections/tool-label', {
@@ -1755,24 +1875,40 @@ describe('tool approvals review and held-call details', () => {
       definitionHash: hashes.get('search_recipes')!,
     });
     expect(flipUp.status).toBe(200);
+    expect(flipUp.headers['x-page-saved']).toBe('true');
     expect(await store.getTool(app.id, 'search_recipes')).toMatchObject({
       label: 'ask_first',
       labelSource: 'principal',
+      summary: 'Search recipes by keyword',
     });
 
-    // Once the remaining unsorted tool receives a label, Looks right becomes available and confirms review.
+    // Once the remaining unsorted tool receives a label, Confirm becomes visible and tools-status settles.
     await store.applyToolLabels(app.id, [
       {
         name: 'sync_pantry',
         definitionHash: hashes.get('sync_pantry')!,
         label: 'just_do',
         source: 'sorter',
+        summary: 'Sync your pantry inventory',
         reason: 'Syncs pantry list',
       },
     ]);
+    const settledStatus = await request(`/connections/app/${app.id}/tools-status`);
+    expect(settledStatus.status).toBe(200);
+    expect(JSON.parse(settledStatus.body)).toMatchObject({
+      pinned: true,
+      needsReview: true,
+      hasUnsorted: false,
+      listHash: pinned.pin.listHash,
+    });
+    const listReady = await request('/connections');
+    expect(listReady.body).toContain('Needs review');
+
     const reviewReady = await request(`/connections/app/${app.id}/tools`);
     expect(reviewReady.status).toBe(200);
-    expect(reviewReady.body).toContain('Looks right');
+    expect(reviewReady.body).toContain('data-tools-polling="false"');
+    expect(reviewReady.body).toContain('>Confirm</button>');
+    expect(reviewReady.body).not.toContain('data-review-form hidden');
 
     const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
     expect(staleReview.status).toBe(409);
@@ -1780,7 +1916,7 @@ describe('tool approvals review and held-call details', () => {
     const confirmed = await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash });
     expect(confirmed.status).toBe(200);
     expect(confirmed.headers['x-page-location']).toBe('/connections');
-    expect(confirmed.body).not.toContain('Needs review');
+    expect(confirmed.body.split('<script')[0]).not.toContain('Needs review');
     expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(false);
 
     await store.pinTools(app.id, {
@@ -1799,7 +1935,7 @@ describe('tool approvals review and held-call details', () => {
       ],
     });
     const listAfterChange = await request('/connections');
-    expect(listAfterChange.body).toContain('Needs review');
+    expect(listAfterChange.body).toContain('Checking…');
     expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(true);
   });
 
@@ -1811,8 +1947,8 @@ describe('tool approvals review and held-call details', () => {
       viewId,
       invocationId: 'sess-1:req-1',
       appId: randomUUID(),
-      appName: 'Chowdeck',
-      appHost: 'mcp.chowdeck.example.test',
+      appName: 'Bistro',
+      appHost: 'mcp.bistro.example.test',
       grantGeneration: 1,
       toolName: 'confirm_checkout',
       definitionHash: 'defhash-1',
@@ -1821,10 +1957,10 @@ describe('tool approvals review and held-call details', () => {
         delivery_notes: longNotes,
       }),
       argsHash: 'argshash-1',
-      summary: 'Confirm Jollof Rice order for Morgan',
+      summary: 'Confirm lunch order for Morgan',
       appContext: {
         toolName: 'prepare_checkout',
-        text: 'Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.',
+        text: 'Prepared checkout chk_999: 1x Grain Bowl, total $18.50.',
       },
       expiresAt: '2026-11-24T12:00:00.000Z',
     };
@@ -1834,7 +1970,7 @@ describe('tool approvals review and held-call details', () => {
       request_id: 'req-1',
       action: HELD_APP_CALL_ACTION,
       payload: JSON.stringify(payload),
-      title: 'Allow Chowdeck to run confirm_checkout?',
+      title: 'Allow Bistro to run confirm_checkout?',
       question: 'Truncated preview',
       options_json: JSON.stringify([{ value: 'approve', label: 'Approve' }]),
       status: 'pending',
@@ -1844,11 +1980,13 @@ describe('tool approvals review and held-call details', () => {
 
     const view = await request(`/connections/held/${viewId}`);
     expect(view.status).toBe(200);
-    expect(view.body).toContain('Chowdeck · confirm_checkout');
-    expect(view.body).toContain('Confirm Jollof Rice order for Morgan');
+    expect(view.body).toContain('<h1>Confirm checkout</h1>');
+    expect(view.body).toContain('Bistro');
+    expect(view.body).toContain('confirm_checkout');
+    expect(view.body).toContain('Confirm lunch order for Morgan');
     expect(view.body).toContain('[U+200B]');
     expect(view.body).toContain(longNotes);
-    expect(view.body).toContain('Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.');
+    expect(view.body).toContain('Prepared checkout chk_999: 1x Grain Bowl, total $18.50.');
 
     const readerView = await request(`/connections/held/${viewId}`, 'GET', {
       'cf-access-jwt-assertion': READER,
@@ -1860,4 +1998,449 @@ describe('tool approvals review and held-call details', () => {
     expect(unknownView.status).toBe(404);
     expect(unknownView.body).toBe('');
   });
+
+  it('surfaces pending approvals on /connections and lets the principal Approve or Decline directly via POST /connections/held-decision', async () => {
+    const principalUser = 'gchat:users/morgan';
+    await upsertUser({
+      id: principalUser,
+      kind: 'human',
+      display_name: 'Morgan',
+      created_at: '2026-11-24T00:00:00.000Z',
+    });
+    await bindVerifiedPrincipalUser(principalUser, '2026-11-24T00:00:00.000Z');
+    await createMessagingGroup({
+      id: 'mg-dm',
+      channel_type: 'gchat',
+      platform_id: 'spaces/dm-morgan',
+      name: 'Morgan DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: '2026-11-24T00:00:00.000Z',
+    });
+    await createSession({
+      id: 'sess-main-web',
+      agent_group_id: MAIN,
+      messaging_group_id: 'mg-dm',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      created_at: '2026-11-24T00:00:00.000Z',
+      last_active: '2026-11-24T00:00:00.000Z',
+    });
+
+    const previousAdapter = getDeliveryAdapter();
+    const editedCards: string[] = [];
+    setDeliveryAdapter({
+      deliver: async (_channelType, _platformId, _threadId, _format, content) => {
+        editedCards.push(content);
+        return undefined;
+      },
+    });
+    const executedCalls: string[] = [];
+    const writtenNotes: string[] = [];
+    const executeApprovedCall: AppRelay['executeApprovedCall'] = async (input) => {
+      executedCalls.push(`${input.toolName}:${JSON.stringify(input.args)}`);
+      return {
+        status: 'completed',
+        result: { content: [{ type: 'text', text: 'Order placed #8841' }] },
+      };
+    };
+    registerHeldAppCallHandlers({
+      relay: () => ({ executeApprovedCall }) as AppRelay,
+      writeNote: async (note) => {
+        writtenNotes.push(note.text);
+        return 'written';
+      },
+    });
+
+    const insertHeld = async (viewId: string, summary: string, expiresAt: string) => {
+      const args = { checkout_id: `chk_${viewId}` };
+      const { canonical, hash } = canonicalArgsHash(args);
+      const payload: HeldAppCallPayload = {
+        viewId,
+        invocationId: `sess-main-web:req-${viewId}`,
+        appId: randomUUID(),
+        appName: 'Bistro',
+        appHost: 'mcp.bistro.example.test',
+        grantGeneration: 1,
+        toolName: 'confirm_checkout',
+        definitionHash: 'defhash-1',
+        canonicalArgs: canonical,
+        argsHash: hash,
+        summary,
+        appContext: null,
+        expiresAt,
+      };
+      await createPendingApproval({
+        approval_id: `appr-${viewId}`,
+        session_id: 'sess-main-web',
+        request_id: `req-${viewId}`,
+        action: HELD_APP_CALL_ACTION,
+        payload: JSON.stringify(payload),
+        title: 'Allow Bistro to run confirm_checkout?',
+        question: 'Order details',
+        options_json: JSON.stringify([
+          { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+          { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+        ]),
+        status: 'pending',
+        created_at: new Date().toISOString(),
+        expires_at: expiresAt,
+        approver_user_id: principalUser,
+        channel_type: 'gchat',
+        platform_id: 'spaces/dm-morgan',
+        platform_message_id: `msg-${viewId}`,
+      });
+    };
+
+    const futureExpiry = new Date(Date.now() + 3600_000).toISOString();
+    const pastExpiry = new Date(Date.now() - 60_000).toISOString();
+    await insertHeld('held-live-approve', 'Place lunch order', futureExpiry);
+    await insertHeld('held-live-decline', 'Place extra drink order', futureExpiry);
+    await insertHeld('held-already-expired', 'Stale expired order', pastExpiry);
+
+    try {
+      // Connections list surfaces pending unexpired approvals at top and omits expired ones.
+      const list = await request('/connections');
+      expect(list.status).toBe(200);
+      expect(list.body).toContain('Waiting for approval');
+      expect(list.body).toContain('/connections/held/held-live-approve');
+      expect(list.body).toContain('Place lunch order');
+      expect(list.body).toContain('/connections/held/held-live-decline');
+      expect(list.body).not.toContain('Stale expired order');
+
+      // Pending detail page renders direct Approve & Decline forms with no chat bounce-back notice.
+      const detail = await request('/connections/held/held-live-approve');
+      expect(detail.status).toBe(200);
+      expect(detail.body).toContain('action="/connections/held-decision"');
+      expect(detail.body).toContain('>Approve</button>');
+      expect(detail.body).toContain('>Decline</button>');
+      expect(detail.body).not.toContain('Reply 👍 or 👎 in chat');
+
+      // Expired detail page renders Expired state without Approve/Decline buttons.
+      const expiredDetail = await request('/connections/held/held-already-expired');
+      expect(expiredDetail.status).toBe(200);
+      expect(expiredDetail.body).toContain('Expired');
+      expect(expiredDetail.body).not.toContain('action="/connections/held-decision"');
+
+      // Non-principal reader and cross-site POST are refused with empty 404.
+      const readerPost = await request(
+        '/connections/held-decision',
+        'POST',
+        { ...postHeaders, 'cf-access-jwt-assertion': READER },
+        JSON.stringify({ viewId: 'held-live-approve', decision: 'approve' }),
+      );
+      expect(readerPost.status).toBe(404);
+      expect(readerPost.body).toBe('');
+      const crossSite = await request(
+        '/connections/held-decision',
+        'POST',
+        { ...postHeaders, 'sec-fetch-site': 'cross-site' },
+        JSON.stringify({ viewId: 'held-live-approve', decision: 'approve' }),
+      );
+      expect(crossSite.status).toBe(404);
+      expect(executedCalls).toEqual([]);
+
+      // Invalid decision is refused with empty 404 (kit InvalidSubmission).
+      const invalidDecision = await post('/connections/held-decision', {
+        viewId: 'held-live-approve',
+        decision: 'maybe',
+      });
+      expect(invalidDecision.status).toBe(404);
+      expect(invalidDecision.body).toBe('');
+      expect(executedCalls).toEqual([]);
+
+      // Approve from web executes once, edits chat card in place, and returns terminal Approved page.
+      const approved = await post('/connections/held-decision', {
+        viewId: 'held-live-approve',
+        decision: 'approve',
+      });
+      expect(approved.status).toBe(200);
+      expect(approved.headers['x-page-saved']).toBe('true');
+      expect(approved.body).toContain('Approved. Your assistant has the result in chat.');
+      expect(approved.body).not.toContain('action="/connections/held-decision"');
+      expect(executedCalls).toEqual(['confirm_checkout:{"checkout_id":"chk_held-live-approve"}']);
+      expect(editedCards.some((entry) => entry.includes('Approved'))).toBe(true);
+      expect(writtenNotes.some((note) => note.includes('Order placed #8841'))).toBe(true);
+
+      // Re-submitting the already-answered request does not re-execute and navigates cleanly to /connections.
+      const replay = await post('/connections/held-decision', {
+        viewId: 'held-live-approve',
+        decision: 'approve',
+      });
+      expect(replay.status).toBe(200);
+      expect(replay.headers['x-page-saved']).toBeUndefined();
+      expect(replay.headers['x-page-location']).toBe('/connections');
+      expect(replay.body).toContain('This request is no longer pending.');
+      expect(executedCalls).toHaveLength(1);
+
+      // Decline from web does not execute, edits chat card in place, and returns terminal Declined page.
+      const declined = await post('/connections/held-decision', {
+        viewId: 'held-live-decline',
+        decision: 'reject',
+      });
+      expect(declined.status).toBe(200);
+      expect(declined.headers['x-page-saved']).toBe('true');
+      expect(declined.body).toContain('Declined. Nothing was sent.');
+      expect(declined.body).not.toContain('action="/connections/held-decision"');
+      expect(executedCalls).toHaveLength(1);
+      expect(editedCards.some((entry) => entry.includes('Rejected'))).toBe(true);
+
+      // Pending approvals section disappears once all pending approvals are answered.
+      const listAfter = await request('/connections');
+      expect(listAfter.body).not.toContain('Waiting for approval');
+    } finally {
+      if (previousAdapter) setDeliveryAdapter(previousAdapter);
+      registerHeldAppCallHandlers();
+    }
+  });
+
+  it.skipIf(!chromePath).each([
+    { label: 'mobile', width: 375, height: 812 },
+    { label: 'desktop', width: 1280, height: 800 },
+  ])(
+    'live-polls unsorted tools to ready, toggles in place without re-sorting, and renders native $label layout in Chrome',
+    async ({ label, width, height }) => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          {
+            name: 'confirm_checkout',
+            description: 'Place the order and charge the card.',
+            inputSchema: { type: 'object', properties: {} },
+          },
+          {
+            name: 'create_cart',
+            description: 'Create a temporary draft cart.',
+            inputSchema: { type: 'object', properties: {} },
+            annotations: { readOnlyHint: false },
+          },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width, height } });
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+
+        // Initially unsorted: shows Checking shimmer and hides Confirm.
+        expect(await page.locator('[data-tools-app]').getAttribute('data-tools-polling')).toBe('true');
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+
+        // Backend sorter finishes asynchronously: UI updates live without a manual reload!
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'confirm_checkout',
+            definitionHash: hashes.get('confirm_checkout')!,
+            label: 'ask_first',
+            source: 'floor',
+            summary: 'Place order and charge card',
+            reason: 'Charges saved card',
+          },
+          {
+            name: 'create_cart',
+            definitionHash: hashes.get('create_cart')!,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Start a draft order cart',
+            reason: 'Reversible draft cart step',
+          },
+        ]);
+
+        await expect
+          .poll(() => page.locator('[data-tools-app]').getAttribute('data-tools-polling'), { timeout: 5000 })
+          .toBe('false');
+        await expect
+          .poll(() => page.locator('[data-tool-row="create_cart"] [data-tool-desc]').textContent(), { timeout: 5000 })
+          .toBe('Start a draft order cart');
+        await expect
+          .poll(() => page.locator('[data-tool-row="confirm_checkout"] [data-tool-desc]').textContent(), {
+            timeout: 5000,
+          })
+          .toBe('Place order and charge card');
+        expect(pageErrors).toEqual([]);
+
+        // Mobile vs Desktop native layout invariants.
+        const isMobile = label === 'mobile';
+        expect(await page.locator('.tools-card-head').isVisible()).toBe(!isMobile);
+        expect(await page.locator('.tools-mobile-strip').isVisible()).toBe(isMobile);
+        expect(await page.locator('.review-header-form button').isVisible()).toBe(!isMobile);
+        expect(await page.locator('.review-dock button').isVisible()).toBe(isMobile);
+        expect(await page.locator('[data-tool-row="create_cart"] .tool-slug').isVisible()).toBe(!isMobile);
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+
+        // Touch target check: all visible buttons/switches are >= 44px on mobile.
+        if (isMobile) {
+          const undersized = await page.evaluate<string[]>(
+            `[...document.querySelectorAll('button, a.app-link')].filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (r.width < 44 || r.height < 44); }).map(el => el.getAttribute('aria-label') || el.textContent)`,
+          );
+          expect(undersized).toEqual([]);
+        }
+
+        // Optimistic in-place switch toggle: flips without reordering rows or showing an #outcome jump banner.
+        const orderBefore = await page
+          .locator('[data-tool-row]')
+          .evaluateAll((els) => els.map((el) => el.getAttribute('data-tool-row')));
+        const cartSwitch = page.locator('button[data-switch-name="create_cart"]');
+        expect(await cartSwitch.getAttribute('aria-checked')).toBe('false');
+        await cartSwitch.click();
+        await expect.poll(() => cartSwitch.getAttribute('aria-checked')).toBe('true');
+        await expect.poll(async () => (await store.getTool(app.id, 'create_cart'))?.label).toBe('ask_first');
+        const orderAfter = await page
+          .locator('[data-tool-row]')
+          .evaluateAll((els) => els.map((el) => el.getAttribute('data-tool-row')));
+        expect(orderAfter).toEqual(orderBefore);
+        expect(await page.locator('#outcome').isVisible()).toBe(false);
+
+        // Confirm review works via the viewport-appropriate Confirm button.
+        const confirmBtn = isMobile ? page.locator('.review-dock button') : page.locator('.review-header-form button');
+        await confirmBtn.click();
+        await page.waitForURL(`https://${HOST}/connections`);
+        expect((await store.getPin(app.id))?.needsReview).toBe(false);
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+
+        // Held call approval surfaced on /connections and directly approvable in Chrome on both mobile & desktop.
+        const principalUser = 'gchat:users/morgan';
+        await upsertUser({
+          id: principalUser,
+          kind: 'human',
+          display_name: 'Morgan',
+          created_at: '2026-11-24T00:00:00.000Z',
+        });
+        await bindVerifiedPrincipalUser(principalUser, '2026-11-24T00:00:00.000Z');
+        await createMessagingGroup({
+          id: `mg-dm-${label}`,
+          channel_type: 'gchat',
+          platform_id: 'spaces/dm-morgan',
+          name: 'Morgan DM',
+          is_group: 0,
+          unknown_sender_policy: 'strict',
+          created_at: '2026-11-24T00:00:00.000Z',
+        });
+        await createSession({
+          id: `sess-chrome-${label}`,
+          agent_group_id: MAIN,
+          messaging_group_id: `mg-dm-${label}`,
+          thread_id: null,
+          agent_provider: null,
+          status: 'active',
+          container_status: 'stopped',
+          created_at: '2026-11-24T00:00:00.000Z',
+          last_active: '2026-11-24T00:00:00.000Z',
+        });
+        const chromeExecuted: string[] = [];
+        const chromeExecuteApproved: AppRelay['executeApprovedCall'] = async (input) => {
+          chromeExecuted.push(input.toolName);
+          return { status: 'completed', result: { content: [{ type: 'text', text: 'Done' }] } };
+        };
+        registerHeldAppCallHandlers({
+          relay: () => ({ executeApprovedCall: chromeExecuteApproved }) as AppRelay,
+          writeNote: async () => 'written',
+        });
+        const heldViewId = `held-chrome-${label}`;
+        const { canonical, hash } = canonicalArgsHash({ checkout_id: 'chk_chrome' });
+        const heldPayload: HeldAppCallPayload = {
+          viewId: heldViewId,
+          invocationId: `sess-chrome-${label}:req-1`,
+          appId: app.id,
+          appName: 'Bistro',
+          appHost: app.host,
+          grantGeneration: 1,
+          toolName: 'confirm_checkout',
+          definitionHash: hashes.get('confirm_checkout')!,
+          canonicalArgs: canonical,
+          argsHash: hash,
+          summary: 'Place lunch order from Corner Kitchen',
+          appContext: null,
+          expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        };
+        await createPendingApproval({
+          approval_id: `appr-${heldViewId}`,
+          session_id: `sess-chrome-${label}`,
+          request_id: 'req-1',
+          action: HELD_APP_CALL_ACTION,
+          payload: JSON.stringify(heldPayload),
+          title: 'Allow Bistro to run confirm_checkout?',
+          question: 'Order details',
+          options_json: JSON.stringify([{ label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' }]),
+          status: 'pending',
+          created_at: new Date().toISOString(),
+          expires_at: heldPayload.expiresAt,
+          approver_user_id: principalUser,
+          channel_type: 'gchat',
+          platform_id: 'spaces/dm-morgan',
+        });
+
+        try {
+          await page.goto(`https://${HOST}/connections`);
+          expect(await page.locator('#pending-approvals-heading').isVisible()).toBe(true);
+          expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+          await page.locator(`a.approval-link[href="/connections/held/${heldViewId}"]`).click();
+          await page.waitForURL(`https://${HOST}/connections/held/${heldViewId}`);
+          expect(await page.locator('.held-actions-header').isVisible()).toBe(!isMobile);
+          expect(await page.locator('.held-dock').isVisible()).toBe(isMobile);
+          expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+          if (isMobile) {
+            const undersizedHeld = await page.evaluate<string[]>(
+              `[...document.querySelectorAll('button, a.back-link')].filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (r.width < 44 || r.height < 44); }).map(el => el.getAttribute('aria-label') || el.textContent)`,
+            );
+            expect(undersizedHeld).toEqual([]);
+          }
+          const approveBtn = isMobile
+            ? page.locator('.held-dock button.button-primary')
+            : page.locator('.held-actions-header button.button-primary');
+          await approveBtn.click();
+          await expect
+            .poll(() => page.locator('#outcome').textContent(), { timeout: 5000 })
+            .toContain('Approved. Your assistant has the result in chat.');
+          expect(await page.locator('.held-dock').count()).toBe(0);
+          expect(await page.locator('.held-actions-header').count()).toBe(0);
+          expect(chromeExecuted).toEqual(['confirm_checkout']);
+          expect(pageErrors).toEqual([]);
+        } finally {
+          registerHeldAppCallHandlers();
+        }
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
 });

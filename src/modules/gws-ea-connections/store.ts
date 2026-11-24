@@ -58,6 +58,7 @@ export interface PinnedAppTool {
   readonly definition: ToolDefinition;
   readonly label: ToolLabel | null;
   readonly labelSource: ToolLabelSource | null;
+  readonly summary: string | null;
   readonly reason: string | null;
   readonly sorterVersion: string | null;
   readonly principalFloor: boolean;
@@ -78,6 +79,7 @@ export interface ToolLabelUpdate {
   readonly definitionHash: string;
   readonly label: ToolLabel;
   readonly source: ToolLabelSource;
+  readonly summary?: string | null;
   readonly reason: string;
 }
 
@@ -334,6 +336,7 @@ CREATE TABLE IF NOT EXISTS app_tools (
   definition_json TEXT NOT NULL,
   label TEXT CHECK(label IS NULL OR label IN ('ask_first','just_do')),
   label_source TEXT CHECK(label_source IS NULL OR label_source IN ('sorter','floor','principal','approved_request','fallback')),
+  summary TEXT,
   reason TEXT,
   sorter_version TEXT,
   principal_floor INTEGER NOT NULL DEFAULT 0 CHECK(principal_floor IN (0,1)),
@@ -465,6 +468,7 @@ interface AppToolRow {
   readonly definition_json: string;
   readonly label: ToolLabel | null;
   readonly label_source: ToolLabelSource | null;
+  readonly summary: string | null;
   readonly reason: string | null;
   readonly sorter_version: string | null;
   readonly principal_floor: number;
@@ -530,6 +534,7 @@ function toPinnedTool(row: AppToolRow): PinnedAppTool {
     definition: normalizeToolDefinition(JSON.parse(row.definition_json)),
     label: row.label,
     labelSource: row.label_source,
+    summary: row.summary ?? null,
     reason: row.reason,
     sorterVersion: row.sorter_version,
     principalFloor: row.principal_floor === 1,
@@ -674,9 +679,19 @@ export class ConnectionsStore {
     });
   }
 
+  private ensureSchema(db: Database.Database): void {
+    const columns = db.prepare<[], { name: string }>('PRAGMA table_info(app_tools)').all();
+    if (!columns.some((col) => col.name === 'summary')) {
+      db.exec('ALTER TABLE app_tools ADD COLUMN summary TEXT');
+    }
+  }
+
   private async use<T>(operation: (db: Database.Database) => T | Promise<T>): Promise<T> {
     try {
-      return await withPrivateDatabase(this.file, SCHEMA, operation);
+      return await withPrivateDatabase(this.file, SCHEMA, (db) => {
+        this.ensureSchema(db);
+        return operation(db);
+      });
     } catch (error) {
       if (error instanceof ConnectionsStoreError) throw error;
       throw new ConnectionsStoreError('store_unavailable');
@@ -1519,13 +1534,13 @@ export class ConnectionsStore {
 
           const insertTool = db.prepare(
             `INSERT INTO app_tools
-              (app_id, name, definition_hash, definition_json, label, label_source, reason, sorter_version,
+              (app_id, name, definition_hash, definition_json, label, label_source, summary, reason, sorter_version,
                principal_floor, unsettled, sort_attempts, updated_at)
-              VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 1, 0, ?)`,
+              VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, 1, 0, ?)`,
           );
           const updateChangedTool = db.prepare(
             `UPDATE app_tools SET definition_hash = ?, definition_json = ?, label = NULL, label_source = NULL,
-              reason = NULL, sorter_version = NULL, principal_floor = ?, unsettled = 1, sort_attempts = 0,
+              summary = NULL, reason = NULL, sorter_version = NULL, principal_floor = ?, unsettled = 1, sort_attempts = 0,
               updated_at = ?
               WHERE app_id = ? AND name = ?`,
           );
@@ -1602,8 +1617,12 @@ export class ConnectionsStore {
             'SELECT * FROM app_tools WHERE app_id = ? AND name = ?',
           );
           const updateTool = db.prepare(
-            `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, sorter_version = COALESCE(?, sorter_version),
-              principal_floor = ?, unsettled = 0, updated_at = ?
+            `UPDATE app_tools SET label = ?, label_source = ?, summary = ?, reason = ?, sorter_version = COALESCE(?, sorter_version),
+              principal_floor = ?, unsettled = 0, sort_attempts = 0, updated_at = ?
+              WHERE app_id = ? AND name = ? AND definition_hash = ?`,
+          );
+          const backfillSummary = db.prepare(
+            `UPDATE app_tools SET summary = COALESCE(summary, ?), updated_at = ?
               WHERE app_id = ? AND name = ? AND definition_hash = ?`,
           );
           const upsertFloor = db.prepare(
@@ -1615,12 +1634,16 @@ export class ConnectionsStore {
           for (const update of updates) {
             const row = selectTool.get(appId, update.name);
             if (!row || row.definition_hash !== update.definitionHash) continue;
+            const nextSummary = update.summary !== undefined ? update.summary : row.summary;
             const principalOverride = update.source === 'principal' || update.source === 'approved_request';
             if (
               !principalOverride &&
               row.label !== null &&
               (row.label_source === 'principal' || row.label_source === 'approved_request')
             ) {
+              if (row.summary === null && nextSummary) {
+                backfillSummary.run(nextSummary, at, appId, update.name, update.definitionHash);
+              }
               continue;
             }
             const floorLocked = !principalOverride && row.principal_floor === 1 && update.label === 'just_do';
@@ -1631,6 +1654,7 @@ export class ConnectionsStore {
             updateTool.run(
               label,
               labelSource,
+              nextSummary,
               reason,
               options.sorterVersion ?? null,
               principalFloor,
@@ -1736,9 +1760,12 @@ export class ConnectionsStore {
             const row = selectTool.get(appId, target.name);
             if (!row || row.definition_hash !== target.definitionHash) continue;
             if (row.label_source === 'principal' || row.label_source === 'approved_request') continue;
-            const attempts = row.sort_attempts + 1;
+            const attempts =
+              options.sorterVersion && row.sorter_version !== null && row.sorter_version !== options.sorterVersion
+                ? 1
+                : row.sort_attempts + 1;
             const unsettled = attempts < maxAttempts ? 1 : 0;
-            const reason = unsettled === 1 ? 'Being checked again' : "couldn't be checked";
+            const reason = unsettled === 1 ? 'Checking again' : "Couldn't be checked";
             updateTool.run(
               reason,
               options.sorterVersion ?? null,
@@ -1941,20 +1968,36 @@ export class ConnectionsStore {
     );
   }
 
-  /** Connected apps whose pinned tools still have unsorted or unsettled rows. */
-  async appsNeedingSort(): Promise<readonly { readonly appId: string; readonly listHash: string }[]> {
-    return this.use((db) =>
-      db
-        .prepare<[], { appId: string; listHash: string }>(
+  /** Connected apps whose pinned tools have unsorted, unsettled, or stale-sorter-version rows. */
+  async appsNeedingSort(
+    currentSorterVersion?: string,
+  ): Promise<readonly { readonly appId: string; readonly listHash: string }[]> {
+    return this.use((db) => {
+      if (currentSorterVersion === undefined) {
+        return db
+          .prepare<[], { appId: string; listHash: string }>(
+            `SELECT DISTINCT p.app_id AS appId, p.list_hash AS listHash
+              FROM app_pins p
+              JOIN grants g ON g.app_id = p.app_id AND g.state = 'live'
+              JOIN app_tools t ON t.app_id = p.app_id
+              WHERE t.label IS NULL OR t.unsettled = 1
+              ORDER BY p.app_id`,
+          )
+          .all();
+      }
+      return db
+        .prepare<[string], { appId: string; listHash: string }>(
           `SELECT DISTINCT p.app_id AS appId, p.list_hash AS listHash
             FROM app_pins p
             JOIN grants g ON g.app_id = p.app_id AND g.state = 'live'
             JOIN app_tools t ON t.app_id = p.app_id
-            WHERE t.label IS NULL OR t.unsettled = 1
+            WHERE t.label IS NULL
+               OR t.unsettled = 1
+               OR (t.sorter_version IS NOT NULL AND t.sorter_version <> ? AND t.label_source IN ('sorter', 'floor', 'fallback'))
             ORDER BY p.app_id`,
         )
-        .all(),
-    );
+        .all(currentSorterVersion);
+    });
   }
 
   /**
