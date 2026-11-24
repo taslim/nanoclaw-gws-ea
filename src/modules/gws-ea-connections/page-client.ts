@@ -239,6 +239,10 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     });
   }
 
+  function findToolRow(root, toolName) {
+    return [...root.querySelectorAll('[data-tool-row]')].find(row => row.dataset.toolRow === toolName) || null;
+  }
+
   function syncReviewLock(root) {
     const locked = inFlightToggles.size > 0 || uncertainTools.size > 0 || needsPostToggleSync;
     root.querySelectorAll('[data-review-form] button[type="submit"]').forEach(button => {
@@ -306,7 +310,10 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
           list = document.createElement('ul');
           list.className = 'list tools-list';
           list.dataset.toolsList = '';
-          for (const tool of tools) list.append(buildToolRowElement(appId, tool));
+          for (const tool of tools) {
+            const existing = inFlightToggles.has(tool.name) ? existingRows.get(tool.name) : undefined;
+            list.append(existing || buildToolRowElement(appId, tool));
+          }
           card.append(head, list);
           body.textContent = '';
           body.append(card);
@@ -337,7 +344,6 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     const fullyRenderedSnapshot = inFlightToggles.size === 0;
     if (fullyRenderedSnapshot) {
       needsPostToggleSync = false;
-      cancelReconciliation();
     }
 
     renderBadgeInto(root.querySelector('[data-tools-badge]'), payload.status, stillChecking, payload.needsReview === true);
@@ -486,6 +492,9 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       }
       const status = await fetchToolsStatusOnce(currentRoot);
       if (gen !== pollGeneration) return;
+      if ((status === 'checking' || status === 'settled' || status === 'missing') && !needsPostToggleSync && uncertainTools.size === 0) {
+        cancelReconciliation();
+      }
       if (status === 'checking' || status === 'stale') {
         consecutiveErrors = 0;
         schedule(1500);
@@ -530,13 +539,16 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     const titleText = row.querySelector('.tool-title')?.textContent?.trim() || toolName;
     const markUncertain = () => {
       uncertainTools.add(toolName);
-      row.dataset.toolState = 'checking';
-      row.classList.add('is-checking');
-      const button = row.querySelector('button[role="switch"]');
-      if (button instanceof HTMLButtonElement) {
-        button.disabled = true;
-        const stateNode = button.querySelector('.switch-state');
-        if (stateNode) stateNode.textContent = 'Checking…';
+      const liveRow = findToolRow(root, toolName);
+      if (liveRow) {
+        liveRow.dataset.toolState = 'checking';
+        liveRow.classList.add('is-checking');
+        const button = liveRow.querySelector('button[role="switch"]');
+        if (button instanceof HTMLButtonElement) {
+          button.disabled = true;
+          const stateNode = button.querySelector('.switch-state');
+          if (stateNode) stateNode.textContent = 'Checking…';
+        }
       }
       updateTallies(root);
       syncReviewLock(root);
@@ -549,10 +561,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         credentials: 'same-origin',
         cache: 'no-store',
       });
+      const liveRow = findToolRow(root, toolName);
       if (response.ok) {
         const result = await response.json().catch(() => null);
         const confirmed = result && (result.label === 'ask_first' || result.label === 'just_do') ? result.label : nextLabel;
-        applyRowVisual(row, confirmed);
+        if (liveRow) applyRowVisual(liveRow, confirmed);
         updateTallies(root);
         if (root.isConnected) {
           const outcome = document.getElementById('outcome');
@@ -567,9 +580,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (response.status >= 500) {
         markUncertain();
       } else {
-        applyRowVisual(row, prevState);
-        if (wasChecking) applyRowDescription(row, prevDescText, true);
-        else if (!prevDescHidden) applyRowDescription(row, prevDescText, false);
+        if (liveRow) {
+          applyRowVisual(liveRow, prevState);
+          if (wasChecking) applyRowDescription(liveRow, prevDescText, true);
+          else if (!prevDescHidden) applyRowDescription(liveRow, prevDescText, false);
+        }
         updateTallies(root);
       }
       const errBody = await response.json().catch(() => null);

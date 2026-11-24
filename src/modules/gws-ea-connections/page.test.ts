@@ -3102,4 +3102,213 @@ describe('tool approvals review and held-call details', () => {
     },
     30_000,
   );
+
+  it.skipIf(!chromePath)(
+    'restarts polling when reconciliation discovers a newly unsorted tool, and locks the live rebuilt switch after an in-flight list rebuild + 500',
+    async () => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+          { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'alpha_tool',
+          definitionHash: hashes.get('alpha_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read alpha state',
+          reason: 'Read-only',
+        },
+        {
+          name: 'beta_tool',
+          definitionHash: hashes.get('beta_tool')!,
+          label: 'ask_first',
+          source: 'sorter',
+          summary: 'Modify beta state',
+          reason: 'External write',
+        },
+      ]);
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        let scenario: 'reconcile_restarts_polling' | 'rebuild_during_toggle' = 'reconcile_restarts_polling';
+        let toggleStartedResolve: (() => void) | undefined;
+        let toggleStarted = new Promise<void>((resolve) => {
+          toggleStartedResolve = resolve;
+        });
+        let releaseToggle500: (() => void) | undefined;
+        let rebuildStatusCount = 0;
+        let postRebuildFailCount = 0;
+
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+
+          if (scenario === 'rebuild_during_toggle') {
+            if (sent.method() === 'POST' && url.pathname === '/connections/tool-label') {
+              toggleStartedResolve?.();
+              await new Promise<void>((resolve) => {
+                releaseToggle500 = resolve;
+              });
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Ambiguous failure after rebuild' }),
+              });
+              return;
+            }
+            if (sent.method() === 'GET' && url.pathname === `/connections/app/${app.id}/tools-status`) {
+              rebuildStatusCount += 1;
+              if (rebuildStatusCount === 1) {
+                // While alpha_tool toggle is in flight, return an expanded tool list (forcing needsRebuild).
+                const currentTools = await store.listTools(app.id);
+                const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+                const parsed = JSON.parse(reply.body) as { tools: Record<string, unknown>[] };
+                parsed.tools = [
+                  ...parsed.tools,
+                  {
+                    name: 'delta_tool',
+                    displayName: 'Delta tool',
+                    definitionHash: `delta-${currentTools.length}`,
+                    label: null,
+                    unsettled: true,
+                    description: '',
+                  },
+                ];
+                await route.fulfill({
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ ...parsed, hasUnsorted: true }),
+                });
+                return;
+              }
+              postRebuildFailCount += 1;
+              await route.fulfill({
+                status: 503,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ error: 'Unavailable' }),
+              });
+              return;
+            }
+          }
+
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+
+        // 1) Start settled (polling stopped). A catalog refresh adds unsorted gamma_tool.
+        //    Principal toggles alpha_tool -> reconciliation sees 'checking', restarts polling, and settles gamma_tool live!
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        expect(await page.locator('[data-tools-app]').getAttribute('data-tools-polling')).toBe('false');
+
+        const repinned = await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'gamma_tool', description: 'Third tool', inputSchema: { type: 'object', properties: {} } },
+          ],
+        });
+        const gammaHash = repinned.tools.find((t) => t.name === 'gamma_tool')!.definitionHash;
+
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        // Reconciliation must discover gamma_tool (Checking…) AND restart polling!
+        await expect
+          .poll(() => page.locator('[data-tools-app]').getAttribute('data-tools-polling'), { timeout: 5000 })
+          .toBe('true');
+        await expect.poll(() => page.locator('[data-tool-row="gamma_tool"]').count(), { timeout: 5000 }).toBe(1);
+
+        // Now backend sorts gamma_tool -> restarted polling settles it live without a reload!
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'gamma_tool',
+            definitionHash: gammaHash,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Inspect gamma status',
+            reason: 'Read-only',
+          },
+        ]);
+        await expect
+          .poll(() => page.locator('[data-tools-app]').getAttribute('data-tools-polling'), { timeout: 5000 })
+          .toBe('false');
+        await expect
+          .poll(() => page.locator('[data-tool-row="gamma_tool"] [data-tool-desc]').textContent(), { timeout: 5000 })
+          .toBe('Inspect gamma status');
+
+        // 2) While a toggle is in flight, a polling status rebuilds the list (adding delta_tool); then toggle returns 500
+        //    and subsequent status reads fail -> the VISIBLE rebuilt alpha_tool switch must lock in Checking… -> Unconfirmed!
+        scenario = 'rebuild_during_toggle';
+        rebuildStatusCount = 0;
+        postRebuildFailCount = 0;
+        toggleStarted = new Promise<void>((resolve) => {
+          toggleStartedResolve = resolve;
+        });
+        // Add an unsorted tool so the loaded page starts polling.
+        await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'gamma_tool', description: 'Third tool', inputSchema: { type: 'object', properties: {} } },
+            { name: 'pending_tool', description: 'Unsorted tool', inputSchema: { type: 'object', properties: {} } },
+          ],
+        });
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        await toggleStarted;
+        // Wait for the in-flight poll to rebuild the list with delta_tool while alpha_tool's POST is still pending!
+        await expect.poll(() => page.locator('[data-tool-row="delta_tool"]').count(), { timeout: 5000 }).toBe(1);
+
+        // Now alpha_tool's POST returns 500, and all subsequent status reads fail with 503.
+        releaseToggle500?.();
+        const visibleAlpha = page.locator('button[data-switch-name="alpha_tool"]');
+        await expect.poll(() => visibleAlpha.isDisabled(), { timeout: 4000 }).toBe(true);
+        await expect.poll(() => postRebuildFailCount, { timeout: 7000 }).toBeGreaterThanOrEqual(3);
+        await expect
+          .poll(() => page.locator('#outcome').textContent(), { timeout: 7000 })
+          .toContain('Couldn’t confirm the saved state. Reload the page before changing tools again.');
+        expect(await visibleAlpha.isDisabled()).toBe(true);
+        expect(await visibleAlpha.locator('.switch-state').textContent()).toBe('Unconfirmed');
+        expect(pageErrors).toEqual([]);
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
 });
