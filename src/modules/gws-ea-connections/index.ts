@@ -15,7 +15,7 @@ import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
 import { registerRelayAction } from './relay-actions.js';
-import { getAppRelay, startAppRelay, stopAppRelay } from './relay.js';
+import { startAppRelay, stopAppRelay } from './relay.js';
 import { registerSortToolsAction, startAppToolSorter, stopAppToolSorter } from './sorter.js';
 import {
   ConnectionsStoreError,
@@ -117,7 +117,7 @@ onHostStart(async ({ signal }) => {
       onToolsNeedSort: (appId, listHash) => {
         void sorter.enqueue(appId, listHash);
       },
-      onHoldCall: createHoldCallHandler({ store, relay: getAppRelay }),
+      onHoldCall: createHoldCallHandler({ store }),
     });
     await applyMainServers(store);
     void (async () => {

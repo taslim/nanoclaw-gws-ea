@@ -154,7 +154,6 @@ export function resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): Clau
   const everyKeyHeld = granted.size === named.size;
   if (grants.has('gws-ea-main-context')) for (const tool of MAIN_UNUSED_BUILTIN_TOOLS) granted.delete(tool);
   const withheldTools = [...named].filter((tool) => !granted.has(tool));
-  // An agent holding no keys, or an isolated app-tool sort session, gets zero built-in tools.
   const isolatedNoBuiltins = grants.size === 0 || (grants.size === 1 && grants.has('gws-ea-app-sort'));
   const base = isolatedNoBuiltins ? [] : BASE_BUILTIN_TOOLS;
   return {

@@ -1,20 +1,12 @@
-/**
- * Container-side stdio MCP relay for principal-connected apps.
- *
- * Exercises `initialize` (with host-pinned instructions and short-bound fallback),
- * `tools/list` (adding required `assistant_summary` only to ask-first tools), and
- * `tools/call` (stripping `assistant_summary` before forwarding, returning completed
- * results verbatim, and returning held/unsorted answers as plain tool text).
- */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import path from 'node:path';
 
 import type { ActionRequestOptions, ActionRequestResult } from '../action-request.js';
 import { closeSessionDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { getAgentMailbox } from '../mailbox/index.js';
-import '../modules/index.js';
 import {
   ASSISTANT_SUMMARY_FIELD,
   createAppRelayServer,
@@ -320,6 +312,20 @@ describe('app-relay stdio MCP server', () => {
         await client.close();
         await server.close();
       }
+    });
+
+    it('registers the session mailbox when imported in a standalone process', () => {
+      const relayPath = path.resolve(import.meta.dir, 'app-relay.ts');
+      const mailboxPath = path.resolve(import.meta.dir, '../mailbox/index.ts');
+      const proc = Bun.spawnSync(
+        [
+          process.execPath,
+          '-e',
+          `await import(${JSON.stringify(relayPath)}); const { getAgentMailbox } = await import(${JSON.stringify(mailboxPath)}); getAgentMailbox();`,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' },
+      );
+      expect(proc.exitCode, proc.stderr.toString()).toBe(0);
     });
   });
 });

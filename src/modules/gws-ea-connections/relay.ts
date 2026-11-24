@@ -1,11 +1,3 @@
-/**
- * Host-side MCP relay for principal-connected apps.
- *
- * Holds one `@modelcontextprotocol/sdk` `Client` per app over `StreamableHTTPClientTransport`, using the host's
- * public fetch with host-held credentials injected per request and no standalone GET SSE stream. Every `tools/list`
- * is pinned with RFC 8785 canonical definition hashes; every `tools/call` passes through the label gate; every
- * approved call claims an atomic in-flight record before touching the network.
- */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -14,21 +6,24 @@ import { log as hostLog } from '../../log.js';
 import type { Session } from '../../types.js';
 import { EgressError, publicFetch, type EgressDependencies } from '../gws-ea-egress/fetch.js';
 import { canonicalArgsHash, normalizeToolDefinition, type ToolDefinition } from './canonical.js';
-import { getConnectionsRefresher, type ConnectionsRefresher, type UsableToken } from './refresher.js';
+import {
+  getConnectionsRefresher,
+  readStoredUsableToken,
+  type ConnectionsRefresher,
+  type UsableToken,
+} from './refresher.js';
 import {
   ConnectionsStoreError,
   type ConnectionApp,
   type ConnectionsStore,
+  type LiveGrant,
   type PinnedAppTool,
   type PinToolsResult,
   type ToolLabel,
 } from './store.js';
 
-/** Re-read `tools/list` before a "just do it" call when the pin was last confirmed longer ago than this. */
 export const PIN_FRESHNESS_MS = 10 * 60_000;
-/** Timeout per upstream MCP request (longer than OAuth metadata fetches). */
 export const RELAY_TIMEOUT_MS = 60_000;
-/** Response cap for relayed MCP requests (4 MiB). */
 export const RELAY_MAX_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_LIST_PAGES = 50;
 
@@ -108,8 +103,6 @@ export interface AppRelay {
     readonly requestId: string;
   }): Promise<RelayCallOutcome>;
   executeApprovedCall(input: ExecuteApprovedCallInput): Promise<RelayCallOutcome>;
-  setHoldCallHandler(handler: HoldCallHandler): void;
-  setOnToolsNeedSort(callback: (appId: string, listHash: string) => void): void;
   closeApp(appId: string): Promise<void>;
   closeAll(): Promise<void>;
 }
@@ -135,11 +128,15 @@ interface ManagedClient {
   readonly url: string;
   readonly grantGeneration: number;
   readonly client: Client;
-  readonly transport: StreamableHTTPClientTransport;
   readonly trace: CallTrace;
-  /** Mutable auth header read on each HTTP request; refreshed transparently if token rotates. */
-  currentToken: string | undefined;
+  readonly auth: { token: string | undefined };
 }
+
+type UpstreamCallResult =
+  | { readonly status: 'completed'; readonly result: Record<string, unknown> }
+  | { readonly status: 'too_large' }
+  | { readonly status: 'unsent'; readonly reason: string }
+  | { readonly status: 'unknown' };
 
 function appendAskFirstSuffix(description: string | undefined): string {
   const trimmed = description?.trim();
@@ -178,8 +175,8 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
   const readRefresher = dependencies.refresher ?? getConnectionsRefresher;
   const rawFetch = publicFetch({ redirect: 'none', timeoutMs, maxBodyBytes }, dependencies.egress);
 
-  let holdHandler: HoldCallHandler = dependencies.onHoldCall ?? defaultHoldRefusal;
-  let onToolsNeedSort: ((appId: string, listHash: string) => void) | undefined = dependencies.onToolsNeedSort;
+  const holdHandler: HoldCallHandler = dependencies.onHoldCall ?? defaultHoldRefusal;
+  const onToolsNeedSort = dependencies.onToolsNeedSort;
 
   const clients = new Map<string, ManagedClient>();
   const connecting = new Map<string, Promise<ManagedClient>>();
@@ -187,22 +184,13 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
   async function resolveBearer(
     app: ConnectionApp,
-    generation: number,
+    grant: LiveGrant,
     forceRenew = false,
   ): Promise<UsableToken | undefined> {
     if (app.auth === 'none') return undefined;
     const refresher = readRefresher();
     if (refresher) return refresher.ensureToken(app.id, { forceRenew });
-    // Direct store read fallback when running standalone without a background refresher (e.g. unit tests).
-    if (app.auth === 'token') {
-      const creds = await store.readGrant(app.id, generation);
-      return creds?.kind === 'token' ? { generation: creds.generation, token: creds.token } : undefined;
-    }
-    const stored = await store.readAccessToken(app.id, generation);
-    if (stored && Date.parse(stored.expiresAt) > now()) {
-      return { generation: stored.generation, token: stored.token };
-    }
-    return undefined;
+    return readStoredUsableToken(store, app.id, grant, now);
   }
 
   async function closeClient(managed: ManagedClient): Promise<void> {
@@ -211,23 +199,23 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       await managed.client.close();
       /* eslint-disable-next-line no-catch-all/no-catch-all -- best-effort cleanup of an upstream transport */
     } catch {
-      // Transport may already be closed or disconnected.
+      return;
     }
   }
 
-  async function ensureClient(app: ConnectionApp, generation: number, forceRenew = false): Promise<ManagedClient> {
+  async function ensureClient(app: ConnectionApp, grant: LiveGrant, forceRenew = false): Promise<ManagedClient> {
     let token: string | undefined;
     if (app.auth !== 'none') {
-      const usable = await resolveBearer(app, generation, forceRenew);
-      if (!usable || usable.generation !== generation) {
+      const usable = await resolveBearer(app, grant, forceRenew);
+      if (!usable || usable.generation !== grant.generation) {
         throw new EgressError('refused', { sent: false });
       }
       token = usable.token;
     }
 
     const existing = clients.get(app.id);
-    if (existing && existing.url === app.url && existing.grantGeneration === generation) {
-      existing.currentToken = token;
+    if (existing && existing.url === app.url && existing.grantGeneration === grant.generation) {
+      existing.auth.token = token;
       return existing;
     }
     if (existing) await closeClient(existing);
@@ -235,8 +223,8 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     const inflight = connecting.get(app.id);
     if (inflight) {
       const ready = await inflight;
-      if (ready.url === app.url && ready.grantGeneration === generation) {
-        ready.currentToken = token;
+      if (ready.url === app.url && ready.grantGeneration === grant.generation) {
+        ready.auth.token = token;
         return ready;
       }
       await closeClient(ready);
@@ -244,21 +232,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
     const open = (async (): Promise<ManagedClient> => {
       const trace: CallTrace = { egressError: undefined, httpSent: false, httpStatus: undefined };
-      const managed: {
-        client: Client;
-        transport: StreamableHTTPClientTransport;
-        currentToken: string | undefined;
-      } = {
-        client: new Client({ name: 'nanoclaw-host-relay', version: '1.0.0' }, { capabilities: {} }),
-        transport: undefined as unknown as StreamableHTTPClientTransport,
-        currentToken: token,
-      };
+      const auth = { token };
+      const client = new Client({ name: 'nanoclaw-host-relay', version: '1.0.0' }, { capabilities: {} });
       const customFetch: FetchLike = async (input, init) => {
         const method = (init?.method ?? 'GET').toUpperCase();
         // Never open the standalone GET SSE stream: returning 405 tells StreamableHTTPClientTransport it is unsupported.
         if (method === 'GET') return new Response(null, { status: 405 });
         const headers = new Headers(init?.headers);
-        if (managed.currentToken !== undefined) headers.set('Authorization', `Bearer ${managed.currentToken}`);
+        if (auth.token !== undefined) headers.set('Authorization', `Bearer ${auth.token}`);
         else headers.delete('Authorization');
         try {
           const response = await rawFetch(input, { ...init, headers });
@@ -273,26 +254,19 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       const transport = new StreamableHTTPClientTransport(new URL(app.url), {
         fetch: customFetch,
       });
-      managed.transport = transport;
       const entry: ManagedClient = {
         appId: app.id,
         url: app.url,
-        grantGeneration: generation,
-        client: managed.client,
-        transport,
+        grantGeneration: grant.generation,
+        client,
         trace,
-        get currentToken() {
-          return managed.currentToken;
-        },
-        set currentToken(next: string | undefined) {
-          managed.currentToken = next;
-        },
+        auth,
       };
       transport.onclose = () => {
         if (clients.get(app.id) === entry) clients.delete(app.id);
       };
       try {
-        await managed.client.connect(transport);
+        await client.connect(transport);
       } catch (error) {
         await closeClient(entry);
         throw error;
@@ -321,26 +295,21 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     return collected;
   }
 
-  async function requireConnectedApp(serverKey: string): Promise<{ app: ConnectionApp; generation: number }> {
+  async function requireConnectedApp(serverKey: string): Promise<{ app: ConnectionApp; grant: LiveGrant }> {
     const app = await store.byServerKey(serverKey);
     if (!app || app.status !== 'connected') {
       throw new ConnectionsStoreError('app_not_found');
     }
     const grant = await store.currentGrant(app.id);
     if (!grant) throw new ConnectionsStoreError('app_not_found');
-    return { app, generation: grant.generation };
+    return { app, grant };
   }
 
-  async function pinApp(appId: string): Promise<PinToolsResult> {
-    const app = await store.get(appId);
-    const grant = await store.currentGrant(appId);
-    if (app.status !== 'connected' || !grant) {
-      throw new ConnectionsStoreError('app_not_found');
-    }
+  async function pinConnectedApp(app: ConnectionApp, grant: LiveGrant): Promise<PinToolsResult> {
     const run = async (
       forceRenew: boolean,
     ): Promise<{ instructions: string | null; tools: readonly ToolDefinition[] }> => {
-      const managed = await ensureClient(app, grant.generation, forceRenew);
+      const managed = await ensureClient(app, grant, forceRenew);
       resetTrace(managed.trace);
       const tools = await listAllUpstreamTools(managed);
       const instructions = managed.client.getInstructions() ?? null;
@@ -350,7 +319,6 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     try {
       listed = await run(false);
     } catch (error) {
-      // Retry once with a fresh token on 401 for renewable OAuth grants.
       const managed = clients.get(app.id);
       const unauthorized = managed?.trace.httpStatus === 401;
       await closeApp(app.id);
@@ -367,6 +335,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     });
     if (result.unsortedCount > 0) onToolsNeedSort?.(app.id, result.pin.listHash);
     return result;
+  }
+
+  async function pinApp(appId: string): Promise<PinToolsResult> {
+    const [app, grant] = await Promise.all([store.get(appId), store.currentGrant(appId)]);
+    if (app.status !== 'connected' || !grant) {
+      throw new ConnectionsStoreError('app_not_found');
+    }
+    return pinConnectedApp(app, grant);
   }
 
   function triggerBackgroundRefresh(appId: string): void {
@@ -392,20 +368,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
   async function invokeUpstreamTool(
     app: ConnectionApp,
-    generation: number,
+    grant: LiveGrant,
     toolName: string,
     args: Record<string, unknown>,
-    allowUnauthorizedRetry: boolean,
-  ): Promise<
-    | { readonly status: 'completed'; readonly result: Record<string, unknown> }
-    | { readonly status: 'too_large' }
-    | { readonly status: 'unsent'; readonly reason: string }
-    | { readonly status: 'unknown' }
-  > {
+  ): Promise<UpstreamCallResult> {
     const attempt = async (forceRenew: boolean) => {
       let managed: ManagedClient;
       try {
-        managed = await ensureClient(app, generation, forceRenew);
+        managed = await ensureClient(app, grant, forceRenew);
         /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any connect/handshake failure into unsent vs unknown */
       } catch (error) {
         if (error instanceof EgressError && error.detail?.sent === true) {
@@ -420,7 +390,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any upstream MCP call failure into too_large, unsent, or unknown */
       } catch (error) {
         const { egressError, httpSent, httpStatus } = snapshotTrace(managed.trace);
-        if (httpStatus === 401 && !forceRenew && allowUnauthorizedRetry && app.auth === 'oauth') {
+        if (httpStatus === 401 && !forceRenew && app.auth === 'oauth') {
           await closeClient(managed);
           return 'retry_401' as const;
         }
@@ -449,6 +419,38 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     return first;
   }
 
+  async function settleUpstreamOutcome(
+    callId: string,
+    upstream: UpstreamCallResult,
+    persistUnsentDetails: boolean,
+  ): Promise<RelayCallOutcome> {
+    const settledAt = new Date(now()).toISOString();
+    switch (upstream.status) {
+      case 'completed':
+        await store.settleRelayCall(callId, {
+          state: 'completed',
+          outcomeJson: JSON.stringify(upstream.result),
+          at: settledAt,
+        });
+        return { status: 'completed', result: upstream.result };
+      case 'too_large':
+        await store.settleRelayCall(callId, { state: 'too_large', at: settledAt });
+        return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE };
+      case 'unsent': {
+        const text = 'The app could not be reached, so nothing was sent.';
+        await store.settleRelayCall(callId, {
+          state: 'unsent',
+          ...(persistUnsentDetails ? { outcomeJson: JSON.stringify({ reason: upstream.reason, text }) } : {}),
+          at: settledAt,
+        });
+        return { status: 'unsent', reason: upstream.reason, text };
+      }
+      case 'unknown':
+        await store.settleRelayCall(callId, { state: 'unknown', at: settledAt });
+        return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
+    }
+  }
+
   async function closeApp(appId: string): Promise<void> {
     const existing = clients.get(appId);
     if (existing) await closeClient(existing);
@@ -464,32 +466,30 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     pinApp,
 
     async pinUnpinnedApps(): Promise<void> {
-      const apps = await store.apps();
-      for (const app of apps) {
-        if (app.status !== 'connected') continue;
-        const pin = await store.getPin(app.id);
-        if (pin) continue;
-        try {
-          await pinApp(app.id);
-          /* eslint-disable-next-line no-catch-all/no-catch-all -- startup pinning is best-effort per app so one down app never blocks others */
-        } catch (error) {
-          hostLog.warn('Could not pin connected app tools at startup', {
-            appId: app.id,
-            code: error instanceof EgressError ? error.code : 'failed',
-          });
-        }
-      }
+      const [apps, pins] = await Promise.all([store.apps(), store.listPins()]);
+      const pinnedIds = new Set(pins.map((pin) => pin.appId));
+      const unpinned = apps.filter((app) => app.status === 'connected' && !pinnedIds.has(app.id));
+      await Promise.all(
+        unpinned.map(async (app) => {
+          try {
+            await pinApp(app.id);
+            /* eslint-disable-next-line no-catch-all/no-catch-all -- startup pinning is best-effort per app so one down app never blocks others */
+          } catch (error) {
+            hostLog.warn('Could not pin connected app tools at startup', {
+              appId: app.id,
+              code: error instanceof EgressError ? error.code : 'failed',
+            });
+          }
+        }),
+      );
     },
 
     async initializeApp(serverKey: string): Promise<{ readonly instructions: string | null }> {
-      const { app } = await requireConnectedApp(serverKey);
+      const { app, grant } = await requireConnectedApp(serverKey);
       const pin = await store.getPin(app.id);
-      if (pin) {
-        triggerBackgroundRefresh(app.id);
-        return { instructions: pin.instructions };
-      }
+      if (pin) return { instructions: pin.instructions };
       try {
-        const pinned = await pinApp(app.id);
+        const pinned = await pinConnectedApp(app, grant);
         return { instructions: pinned.pin.instructions };
         /* eslint-disable-next-line no-catch-all/no-catch-all -- initialize succeeds even when the upstream app is temporarily unreachable */
       } catch {
@@ -498,33 +498,35 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     },
 
     async listToolsForSession(serverKey: string): Promise<RelayedToolList> {
-      const { app } = await requireConnectedApp(serverKey);
-      const pin = await store.getPin(app.id);
-      if (pin) {
-        const tools = await store.listTools(app.id);
+      const { app, grant } = await requireConnectedApp(serverKey);
+      const loaded = await store.readAppTools(app.id);
+      if (loaded?.pin) {
         triggerBackgroundRefresh(app.id);
-        return { instructions: pin.instructions, tools: tools.map(formatToolForMain) };
+        return { instructions: loaded.pin.instructions, tools: loaded.tools.map(formatToolForMain) };
       }
-      const pinned = await pinApp(app.id);
+      const pinned = await pinConnectedApp(app, grant);
       return { instructions: pinned.pin.instructions, tools: pinned.tools.map(formatToolForMain) };
     },
 
     async callTool(input): Promise<RelayCallOutcome> {
-      const { app, generation } = await requireConnectedApp(input.serverKey);
+      const { app, grant } = await requireConnectedApp(input.serverKey);
       let pin = await store.getPin(app.id);
+      let tool: PinnedAppTool | undefined;
       if (!pin) {
-        const pinned = await pinApp(app.id);
+        const pinned = await pinConnectedApp(app, grant);
         pin = pinned.pin;
+        tool = pinned.tools.find((entry) => entry.name === input.toolName);
+      } else {
+        tool = await store.getTool(app.id, input.toolName);
       }
-      let tool = await store.getTool(app.id, input.toolName);
       if (!tool) {
         return { status: 'unsent', reason: 'unknown_tool', text: `Unknown tool "${input.toolName}".` };
       }
 
-      // Before a "just do it" call, re-read tools/list when last confirmation is over 10 minutes old.
       if (tool.label === 'just_do' && now() - Date.parse(pin.confirmedAt) > PIN_FRESHNESS_MS) {
+        let refreshed: PinToolsResult;
         try {
-          await pinApp(app.id);
+          refreshed = await pinConnectedApp(app, grant);
           /* eslint-disable-next-line no-catch-all/no-catch-all -- if the freshness check cannot reach the app, refuse before running */
         } catch {
           return {
@@ -533,7 +535,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             text: 'Could not confirm the tool definition with the app right now; nothing was sent.',
           };
         }
-        tool = await store.getTool(app.id, input.toolName);
+        tool = refreshed.tools.find((entry) => entry.name === input.toolName);
         if (!tool) {
           return {
             status: 'unsent',
@@ -552,7 +554,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       if (tool.label === 'ask_first') {
         return holdHandler({
           app,
-          grantGeneration: generation,
+          grantGeneration: grant.generation,
           tool,
           args: input.args,
           canonicalArgs: canonical,
@@ -563,43 +565,20 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         });
       }
 
-      // Label is confirmed "just_do" for the current definition hash.
       const callId = `direct:${input.session.id}:${input.requestId}`;
       const at = new Date(now()).toISOString();
       await store.recordDirectCallStart({
         id: callId,
         appId: app.id,
-        grantGeneration: generation,
+        grantGeneration: grant.generation,
         toolName: tool.name,
         definitionHash: tool.definitionHash,
         argsHash,
         at,
       });
 
-      const upstream = await invokeUpstreamTool(app, generation, tool.name, input.args, true);
-      const settledAt = new Date(now()).toISOString();
-      switch (upstream.status) {
-        case 'completed':
-          await store.settleRelayCall(callId, {
-            state: 'completed',
-            outcomeJson: JSON.stringify(upstream.result),
-            at: settledAt,
-          });
-          return { status: 'completed', result: upstream.result };
-        case 'too_large':
-          await store.settleRelayCall(callId, { state: 'too_large', at: settledAt });
-          return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE };
-        case 'unsent':
-          await store.settleRelayCall(callId, { state: 'unsent', at: settledAt });
-          return {
-            status: 'unsent',
-            reason: upstream.reason,
-            text: 'The app could not be reached, so nothing was sent.',
-          };
-        case 'unknown':
-          await store.settleRelayCall(callId, { state: 'unknown', at: settledAt });
-          return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
-      }
+      const upstream = await invokeUpstreamTool(app, grant, tool.name, input.args);
+      return settleUpstreamOutcome(callId, upstream, false);
     },
 
     async executeApprovedCall(input: ExecuteApprovedCallInput): Promise<RelayCallOutcome> {
@@ -645,15 +624,15 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       };
 
       let app: ConnectionApp;
+      let grant: LiveGrant | undefined;
       try {
-        app = await store.get(input.appId);
+        [app, grant] = await Promise.all([store.get(input.appId), store.currentGrant(input.appId)]);
       } catch (error) {
         if (error instanceof ConnectionsStoreError) {
           return failUnsent('app_gone', 'The app is no longer connected, so nothing was sent.');
         }
         throw error;
       }
-      const grant = await store.currentGrant(app.id);
       if (app.status !== 'connected' || !grant || grant.generation !== input.grantGeneration) {
         return failUnsent(
           'grant_changed',
@@ -661,9 +640,9 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         );
       }
 
-      // Always re-read tools/list before executing an approved call to detect any definition change.
+      let refreshed: PinToolsResult;
       try {
-        await pinApp(app.id);
+        refreshed = await pinConnectedApp(app, grant);
         /* eslint-disable-next-line no-catch-all/no-catch-all -- pre-send re-read failure leaves nothing sent */
       } catch {
         return failUnsent(
@@ -672,7 +651,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         );
       }
 
-      const freshTool = await store.getTool(app.id, input.toolName);
+      const freshTool = refreshed.tools.find((entry) => entry.name === input.toolName);
       if (!freshTool || freshTool.definitionHash !== input.definitionHash) {
         return failUnsent(
           'definition_changed',
@@ -680,33 +659,8 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         );
       }
 
-      const upstream = await invokeUpstreamTool(app, grant.generation, input.toolName, input.args, true);
-      const settledAt = new Date(now()).toISOString();
-      switch (upstream.status) {
-        case 'completed':
-          await store.settleRelayCall(input.approvalId, {
-            state: 'completed',
-            outcomeJson: JSON.stringify(upstream.result),
-            at: settledAt,
-          });
-          return { status: 'completed', result: upstream.result };
-        case 'too_large':
-          await store.settleRelayCall(input.approvalId, { state: 'too_large', at: settledAt });
-          return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE };
-        case 'unsent':
-          return failUnsent(upstream.reason, 'The app could not be reached, so nothing was sent.');
-        case 'unknown':
-          await store.settleRelayCall(input.approvalId, { state: 'unknown', at: settledAt });
-          return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
-      }
-    },
-
-    setHoldCallHandler(handler: HoldCallHandler): void {
-      holdHandler = handler;
-    },
-
-    setOnToolsNeedSort(callback: (appId: string, listHash: string) => void): void {
-      onToolsNeedSort = callback;
+      const upstream = await invokeUpstreamTool(app, grant, input.toolName, input.args);
+      return settleUpstreamOutcome(input.approvalId, upstream, true);
     },
 
     closeApp,

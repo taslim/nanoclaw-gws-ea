@@ -58,7 +58,6 @@ interface Held {
   value: string;
 }
 
-/** The gateway's sweep surface: credentials listed and removed by exact host, never written by the refresher. */
 class FakeGateway implements AppGateway {
   readonly held = new Map<string, Held>();
   readonly failingRemovals = new Set<string>();
@@ -123,6 +122,7 @@ interface LogLine {
 let endpoints: FakeEndpoints;
 let directory: string;
 let store: ConnectionsStore;
+let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let gateway: FakeGateway;
 let clock: number;
 let lines: LogLine[];
@@ -167,7 +167,7 @@ afterAll(async () => {
 beforeEach(async () => {
   endpoints.reset();
   directory = await mkdtemp(path.join(os.tmpdir(), 'connections-refresher-'));
-  ({ store } = testConnectionsStore(path.join(directory, 'connections')));
+  ({ store, raw } = testConnectionsStore(path.join(directory, 'connections')));
   gateway = new FakeGateway();
   clock = START;
   lines = [];
@@ -246,15 +246,17 @@ async function oauthApp(
   const done = await store.completeSignIn(claim, {
     kind: 'oauth',
     ...(grant.refreshToken === undefined ? {} : { refreshToken: grant.refreshToken }),
-    ...(grant.accessToken === undefined ? {} : { accessToken: grant.accessToken }),
+    accessToken: grant.accessToken ?? 'sentinel-pre-release-placeholder',
     accessIssuedAt: new Date(grant.issuedAt).toISOString(),
     accessExpiresAt: new Date(grant.expiresAt).toISOString(),
   });
   if (done.status !== 'connected') throw new Error('The sign-in did not connect');
+  if (grant.accessToken === undefined) {
+    raw((db) => db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(done.app.id), { writable: true });
+  }
   return done.app;
 }
 
-/** As a connect leaves it: the grant and sealed access token stored in the host store, nothing in the gateway. */
 async function storedOAuthApp(
   name: string,
   appUrl: string,
@@ -495,7 +497,6 @@ describe('on-demand renewal', () => {
     expect(await refresher.ensureToken(app.id)).toEqual({ generation: 1, token: 'sentinel-access-at-sign-in' });
     expect(tokens.presented).toEqual([]);
 
-    // Once expired, ensureToken renews into the store immediately.
     clock = START + 31 * MINUTE;
     expect(await refresher.ensureToken(app.id)).toEqual({ generation: 1, token: 'sentinel-access-1' });
     expect(tokens.presented).toEqual(['sentinel-refresh-home']);

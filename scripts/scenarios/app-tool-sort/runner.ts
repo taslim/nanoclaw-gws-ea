@@ -9,7 +9,7 @@ import {
   resolveFinalToolUpdates,
   sorterVersion,
   type ParsedSortToolEntry,
-} from '../../../src/modules/gws-ea-connections/sorter.js';
+} from '../../../src/modules/gws-ea-connections/sort-rules.js';
 import { APP_TOOL_SORT_CORPUS, type SortEvalCase } from './corpus.js';
 import { scoreSortCase, scoreSortSuite, type SortCaseScore } from './score.js';
 

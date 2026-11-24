@@ -16,7 +16,7 @@ export interface TestKeychain {
 export function testConnectionsStore(connectionsRoot: string): {
   readonly store: ConnectionsStore;
   readonly keychain: TestKeychain;
-  readonly raw: <T>(read: (db: Database.Database) => T) => T;
+  readonly raw: <T>(read: (db: Database.Database) => T, options?: { readonly writable?: boolean }) => T;
 } {
   const keychain: TestKeychain = { key: undefined, unavailable: false, calls: [] };
   const runCommand: SanitizedCommandOutcomeRunner = async (command) => {
@@ -37,8 +37,8 @@ export function testConnectionsStore(connectionsRoot: string): {
   return {
     store: new ConnectionsStore({ connectionsRoot, instanceId: TEST_INSTANCE_ID, runCommand }),
     keychain,
-    raw: (read) => {
-      const db = new Database(path.join(connectionsRoot, 'apps.db'), { readonly: true });
+    raw: (read, options) => {
+      const db = new Database(path.join(connectionsRoot, 'apps.db'), { readonly: options?.writable !== true });
       try {
         return read(db);
       } finally {

@@ -303,7 +303,6 @@ describe('NanoClaw tool server capabilities', () => {
       expect(allowsBuiltinTool(policy, tool), tool).toBe(false);
     }
 
-    // Ordinary external-email sessions never receive sort_tools.
     const emailGrants = resolveSessionCapabilities(externalEmailGrants, 'mail-thread-1');
     expect(await served([...emailGrants])).not.toContain('sort_tools');
   });

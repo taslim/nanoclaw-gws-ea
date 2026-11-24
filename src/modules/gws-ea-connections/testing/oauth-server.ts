@@ -188,7 +188,6 @@ export interface FakeAppOptions {
   readonly serverName?: string;
   readonly instructions?: string;
   readonly tools?: readonly FakeToolDefinition[];
-  /** Allows unauthenticated MCP requests (for `auth: 'none'` apps). */
   readonly allowUnauthenticated?: boolean;
   readonly onToolCall?: (call: RecordedToolCall) => FakeToolResult | FakeReply | undefined;
   readonly fetchClientDocument?: (url: string) => Promise<FakeReply>;
@@ -223,7 +222,6 @@ export class FakeMcpApp {
   readonly toolCalls: RecordedToolCall[] = [];
   tools: FakeToolDefinition[];
   instructions: string | undefined;
-  /** Optional reply override for the MCP endpoint (e.g., to simulate downtime or oversized responses). */
   mcpOverride: ((request: FakeRequest) => FakeReply | undefined) | undefined;
   onToolCall: ((call: RecordedToolCall) => FakeToolResult | FakeReply | undefined) | undefined;
   private readonly refreshTokens = new Map<string, string>();

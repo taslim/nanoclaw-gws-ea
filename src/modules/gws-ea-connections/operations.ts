@@ -1,12 +1,3 @@
-/**
- * Adding, connecting, disconnecting, deleting and renaming the principal's apps. The Connections page and main's
- * chat tools both act through these, so an app is changed the same way whoever asked.
- *
- * Every grant change runs under the app's lock and in one order: the store first, then main's servers. Credentials
- * stay sealed in the host store and never reach the gateway; a grant is ended durably before revocation and
- * reconciling main's servers. Nothing a server says or a secret the principal entered reaches a result or a log line:
- * failures carry only a code.
- */
 import { log } from '../../log.js';
 import { admissionDependencies, admitAppUrl, type AdmissionDependencies, type AdmissionRefusal } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
@@ -143,24 +134,46 @@ export const defaultListingSources: ListingSources = {
 export async function readListing(
   store: ConnectionsStore | undefined,
   sources: ListingSources = defaultListingSources,
+  options: { readonly includeAvailability?: boolean } = {},
 ): Promise<ConnectionsListing> {
-  let operators: readonly OperatorServer[] = [];
-  let operatorsRead = true;
-  try {
-    operators = await sources.operatorServers();
-  } catch (error) {
-    if (!(error instanceof MainServersUnreadableError)) throw error;
-    operatorsRead = false;
-  }
-  if (!store) return { listed: false, canChange: false, apps: [], operators };
-  try {
-    const [apps, pinList, availability] = await Promise.all([store.apps(), store.listPins(), store.availability()]);
-    const pins = Object.fromEntries(pinList.map((pin) => [pin.appId, pin]));
-    return { listed: true, canChange: operatorsRead && availability.available, apps, operators, pins };
-  } catch (error) {
-    if (!(error instanceof ConnectionsStoreError)) throw error;
+  const operatorsPromise = (async () => {
+    try {
+      return { operators: await sources.operatorServers(), ok: true };
+    } catch (error) {
+      if (!(error instanceof MainServersUnreadableError)) throw error;
+      return { operators: [] as readonly OperatorServer[], ok: false };
+    }
+  })();
+
+  if (!store) {
+    const { operators } = await operatorsPromise;
     return { listed: false, canChange: false, apps: [], operators };
   }
+
+  const storePromise = (async () => {
+    try {
+      const [apps, pinList, availability] = await Promise.all([
+        store.apps(),
+        store.listPins(),
+        options.includeAvailability === false ? Promise.resolve({ available: false }) : store.availability(),
+      ]);
+      const pins = Object.fromEntries(pinList.map((pin) => [pin.appId, pin]));
+      return { listed: true as const, apps, pins, available: availability.available };
+    } catch (error) {
+      if (!(error instanceof ConnectionsStoreError)) throw error;
+      return { listed: false as const };
+    }
+  })();
+
+  const [opResult, storeResult] = await Promise.all([operatorsPromise, storePromise]);
+  if (!storeResult.listed) return { listed: false, canChange: false, apps: [], operators: opResult.operators };
+  return {
+    listed: true,
+    canChange: opResult.ok && storeResult.available,
+    apps: storeResult.apps,
+    operators: opResult.operators,
+    pins: storeResult.pins,
+  };
 }
 
 /** RFC 6749 client credentials are visible ASCII. */
@@ -493,12 +506,10 @@ export class ConnectionOperations {
     return withAppLock(id, () => this.store.rename(id, version, name));
   }
 
-  /** Principal flip on the Connections page: takes effect immediately without a card. */
   setToolLabel(id: string, toolName: string, label: ToolLabel): Promise<boolean> {
     return withAppLock(id, () => this.store.setToolLabel(id, toolName, label, 'principal'));
   }
 
-  /** Confirms the current pinned tool list as reviewed ("Looks right"). */
   markToolsReviewed(id: string, expectedListHash: string): Promise<boolean> {
     return withAppLock(id, () => this.store.markToolsReviewed(id, expectedListHash));
   }

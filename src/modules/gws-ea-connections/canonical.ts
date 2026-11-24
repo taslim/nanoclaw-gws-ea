@@ -1,8 +1,7 @@
-/**
- * RFC 8785 canonical JSON serialization and SHA-256 hashing for MCP tool definitions and arguments.
- */
 import { createHash } from 'node:crypto';
 import { isRecord } from '../../gws-ea/validation.js';
+
+export const ASSISTANT_SUMMARY_FIELD = 'assistant_summary';
 
 export interface ToolAnnotations {
   readonly title?: string;
@@ -75,7 +74,6 @@ function pickAnnotations(raw: unknown): ToolAnnotations | undefined {
   return Object.keys(annotations).length > 0 ? annotations : undefined;
 }
 
-/** Projects an upstream MCP tool onto the exact six fields pinned and hashed. */
 export function normalizeToolDefinition(raw: unknown): ToolDefinition {
   if (!isRecord(raw) || typeof raw.name !== 'string' || !raw.name) {
     throw new TypeError('MCP tool definition is missing a valid name');
@@ -93,13 +91,11 @@ export function normalizeToolDefinition(raw: unknown): ToolDefinition {
   };
 }
 
-/** SHA-256 over RFC 8785 canonical JSON of `{name, title, description, inputSchema, outputSchema, annotations}`. */
 export function toolDefinitionHash(definition: ToolDefinition): string {
   const projected = normalizeToolDefinition(definition);
   return sha256Hex(canonicalJson(projected));
 }
 
-/** Stable SHA-256 fingerprint of an app's full tool set by `{name, definitionHash}`. */
 export function toolListHash(tools: readonly { readonly name: string; readonly definitionHash: string }[]): string {
   const ordered = [...tools]
     .map(({ name, definitionHash }) => ({ definitionHash, name }))

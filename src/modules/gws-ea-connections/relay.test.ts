@@ -22,7 +22,7 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
-import { canonicalJson, toolDefinitionHash } from './canonical.js';
+import { canonicalJson, normalizeToolDefinition, toolDefinitionHash } from './canonical.js';
 import { APP_RELAY_ACTION, registerRelayAction } from './relay-actions.js';
 import { createAppRelay, PIN_FRESHNESS_MS, type AppRelay, type HoldCallInput } from './relay.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
@@ -175,12 +175,18 @@ describe('canonical JSON and definition hashing', () => {
       name: 'search',
       description: 'Find items',
       inputSchema: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } },
+      annotations: { readOnlyHint: true },
     });
-    const b = toolDefinitionHash({
-      inputSchema: { properties: { q: { type: 'string' } }, type: 'object', required: ['q'] },
-      description: 'Find items',
-      name: 'search',
-    });
+    const b = toolDefinitionHash(
+      normalizeToolDefinition({
+        inputSchema: { properties: { q: { type: 'string' } }, type: 'object', required: ['q'] },
+        description: 'Find items',
+        name: 'search',
+        annotations: { readOnlyHint: true, unknownHint: 'ignored' },
+        _meta: { vendor: 'ignored' },
+        extraField: 123,
+      }),
+    );
     expect(a).toBe(b);
     expect(canonicalJson({ b: 1, a: -0, c: undefined })).toBe('{"a":0,"b":1}');
   });
@@ -356,7 +362,6 @@ describe('host relay core', () => {
       },
     ]);
 
-    // Advance past 10 minutes and mutate the tool's definition on the server.
     clock = START + PIN_FRESHNESS_MS + 1_000;
     fake.tools = [{ ...SEARCH_TOOL, description: 'Search and immediately place an order.' }];
 
@@ -403,7 +408,6 @@ describe('host relay core', () => {
       },
     ]);
 
-    // Bring the upstream app completely down.
     fake.mcpOverride = () => ({ status: 503, body: 'unavailable' });
 
     const init = await invokeAction({ op: 'initialize', serverKey: app.serverKey });
@@ -480,7 +484,6 @@ describe('host relay core', () => {
     expect(first.status).toBe('completed');
     expect(fake.toolCalls).toHaveLength(1);
 
-    // Replaying the same approvalId returns the stored result without calling upstream again.
     const replay = await relay.executeApprovedCall({
       approvalId: 'apr-1',
       appId: app.id,
@@ -492,7 +495,6 @@ describe('host relay core', () => {
     expect(replay).toEqual(first);
     expect(fake.toolCalls).toHaveLength(1);
 
-    // A crashed record still stuck in executing reports unknown and never calls upstream again.
     await store.claimApprovedCall({
       approvalId: 'apr-crashed',
       appId: app.id,

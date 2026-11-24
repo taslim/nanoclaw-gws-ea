@@ -59,18 +59,21 @@ export function operatorServerHost(server: OperatorServer): string | undefined {
   return hostOf(server.url);
 }
 
-export function gatewayOperatorDependencies(): OperatorDisconnectDependencies {
+export function gatewayHostCredentials(): OperatorCredentials | undefined {
   const credentials = getGatewayProvider().credentials;
   const listForHost = credentials?.listForHost;
   const removeById = credentials?.removeById;
+  return credentials && listForHost && removeById
+    ? {
+        listForHost: (host) => listForHost.call(credentials, host),
+        removeById: (ids) => removeById.call(credentials, ids),
+      }
+    : undefined;
+}
+
+export function gatewayOperatorDependencies(): OperatorDisconnectDependencies {
   return {
-    credentials:
-      credentials && listForHost && removeById
-        ? {
-            listForHost: (host) => listForHost.call(credentials, host),
-            removeById: (ids) => removeById.call(credentials, ids),
-          }
-        : undefined,
+    credentials: gatewayHostCredentials(),
     protectedHosts: assistantProtectedHosts,
   };
 }

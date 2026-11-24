@@ -1,7 +1,3 @@
-/**
- * Main's MCP servers follow the connections store: each connected app is one stdio relay entry under its fixed
- * server key, and every entry the store does not own is left as the operator wrote it.
- */
 import { isDeepStrictEqual } from 'node:util';
 
 import { mcpServerPluginOwner } from '../../container-config.js';
@@ -58,7 +54,6 @@ function isAppEntry(key: string, entry: unknown): boolean {
   return key.startsWith(APP_SERVER_PREFIX) && mcpServerPluginOwner(entry) === undefined;
 }
 
-/** Each principal app runs through the container stdio relay; no URL or credential reaches the container. */
 function desiredAppEntries(apps: readonly ConnectionApp[]): Map<string, AppEntry> {
   return new Map(
     apps

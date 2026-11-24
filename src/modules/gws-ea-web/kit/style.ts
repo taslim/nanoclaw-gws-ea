@@ -169,7 +169,6 @@ h2 { font-size: 14px; font-weight: 600; line-height: 1.4; letter-spacing: -.005e
 .icon-button .icon { margin: 0; width: 20px; height: 20px; }
 .icon-button[aria-expanded="true"] { background: var(--fill-strong); color: var(--text); }
 
-/* Switches */
 .switch { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 4px 6px 10px; border: 0; border-radius: 12px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 500; white-space: nowrap; }
 .switch[aria-checked="true"] { color: var(--text); }
 .switch-track { position: relative; display: inline-flex; align-items: center; width: 42px; height: 24px; padding: 2px; border-radius: 999px; background: var(--fill-strong); box-shadow: inset 0 0 0 1px var(--line-strong); transition: background-color .16s var(--ease-out), box-shadow .16s var(--ease-out); flex-shrink: 0; }

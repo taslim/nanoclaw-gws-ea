@@ -139,7 +139,7 @@ const KIT_SCRIPT = String.raw`
     titleWatch.observe(heading);
   }
   watchTitle();
-  async function send(form) {
+  async function send(form, options = {}) {
     if (busy) return;
     busy = true;
     const data = Object.fromEntries(new FormData(form));
@@ -148,8 +148,9 @@ const KIT_SCRIPT = String.raw`
     });
     const controls = [...document.querySelectorAll('button, input')].filter(control => !control.disabled);
     const submit = form.querySelector('button[type="submit"]');
-    const label = submit.textContent;
-    submit.textContent = submit.dataset.pendingLabel || 'Saving…';
+    const updateLabel = options.pendingLabel !== false && Boolean(submit);
+    const label = updateLabel ? submit.textContent : '';
+    if (updateLabel) submit.textContent = submit.dataset.pendingLabel || 'Saving…';
     controls.forEach(control => { control.disabled = true; });
     const links = [...document.querySelectorAll('a[data-navigation]')];
     links.forEach(link => { link.setAttribute('aria-disabled', 'true'); });
@@ -177,20 +178,25 @@ const KIT_SCRIPT = String.raw`
       const swap = () => {
         document.querySelector('main').replaceWith(next);
         document.title = page.title;
-        history.replaceState(null, '', response.headers.get('${PAGE_LOCATION_HEADER}'));
+        const locationHeader = response.headers.get('${PAGE_LOCATION_HEADER}');
+        if (locationHeader) history.replaceState(null, '', locationHeader);
         watchTitle();
       };
-      if (document.startViewTransition && !calm.matches) await document.startViewTransition(swap).updateCallbackDone;
+      if (!options.keepScroll && document.startViewTransition && !calm.matches) await document.startViewTransition(swap).updateCallbackDone;
       else swap();
-      const outcome = document.getElementById('outcome');
-      (outcome.textContent ? outcome : next).focus();
-      window.scrollTo({ top: 0, behavior: 'instant' });
+      if (options.afterSwap) {
+        options.afterSwap(data);
+      } else {
+        const outcome = document.getElementById('outcome');
+        (outcome.textContent ? outcome : next).focus();
+        window.scrollTo({ top: 0, behavior: 'instant' });
+      }
     } catch {
       uncertain = true;
       message('That change couldn’t be confirmed. Reload the page to check it before trying again.', true);
     } finally {
       busy = false;
-      submit.textContent = label;
+      if (updateLabel) submit.textContent = label;
       document.querySelector('main').removeAttribute('aria-busy');
       links.forEach(link => { link.removeAttribute('aria-disabled'); });
       if (!uncertain) controls.forEach(control => { control.disabled = false; });

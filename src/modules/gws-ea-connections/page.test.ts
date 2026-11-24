@@ -64,7 +64,6 @@ interface HeldCredential {
   readonly value: string;
 }
 
-/** The gateway seam as admission and operator-disconnect see it: credentials listed and removed by exact host. */
 class FakeGateway implements OperatorCredentials {
   readonly held = new Map<string, HeldCredential>();
   readonly events: string[] = [];
@@ -95,8 +94,7 @@ let store: ConnectionsStore;
 let keychain: TestKeychain;
 let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let gateway: FakeGateway;
-/** Whether the gateway can list and remove operator credentials by host. */
-let hostSeam: boolean;
+let operatorCredentialsAvailable: boolean;
 let server: Server;
 let port: number;
 let replies: Reply[];
@@ -153,7 +151,7 @@ beforeEach(async () => {
   directory = await mkdtemp(path.join(os.tmpdir(), 'connections-page-'));
   ({ store, keychain, raw } = testConnectionsStore(path.join(directory, 'connections')));
   gateway = new FakeGateway();
-  hostSeam = true;
+  operatorCredentialsAvailable = true;
   documentsServed = true;
   replies = [];
   logged = [];
@@ -187,7 +185,7 @@ beforeEach(async () => {
     },
     operations: async () => operations(),
     operatorDependencies: () => ({
-      credentials: hostSeam ? gateway : undefined,
+      credentials: operatorCredentialsAvailable ? gateway : undefined,
       protectedHosts: async () => new Set([HOST, 'api.anthropic.com']),
     }),
   });
@@ -1526,7 +1524,7 @@ describe('operator servers', () => {
   it('shows Can’t disconnect on a gateway that cannot list and remove credentials by host', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
     gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
-    hostSeam = false;
+    operatorCredentialsAvailable = false;
 
     const page = await request('/connections');
     expect(page.body).toContain('Can’t disconnect');
@@ -1678,7 +1676,6 @@ describe('tool approvals review and held-call details', () => {
     expect(connectReply.headers['x-page-location']).toBe(`/connections/app/${app.id}/tools`);
     expect(connectReply.body).toContain('When I’ll check with you first');
 
-    // Pin 3 tools: one just_do, one ask_first, one still unsorted (being set up).
     app = await onlyApp();
     const pinned = await store.pinTools(app.id, {
       instructions: null,
@@ -1710,14 +1707,12 @@ describe('tool approvals review and held-call details', () => {
       },
     ]);
 
-    // List row shows Needs review marker and Review tools button; link facts report needsReview: true.
     const listBefore = await request('/connections');
     expect(listBefore.body).toContain('Needs review');
     expect(listBefore.body).toContain(`/connections/app/${app.id}/tools`);
     const factsBefore = await connectionsLinkFacts(() => operations().listing());
     expect(factsBefore.apps[0]?.needsReview).toBe(true);
 
-    // Review page shows labels, reasons, and "Being set up" for the unsorted tool.
     const review = await request(`/connections/app/${app.id}/tools?outcome=connected`);
     expect(review.status).toBe(200);
     expect(review.body).toContain('When I’ll check with you first');
@@ -1726,7 +1721,6 @@ describe('tool approvals review and held-call details', () => {
     expect(review.body).toContain('Being set up');
     expect(review.body).toContain('Looks right');
 
-    // Flipping a switch updates the label immediately without creating an approval card.
     const flipDown = await post('/connections/tool-label', {
       id: app.id,
       tool: 'order_groceries',
@@ -1750,18 +1744,15 @@ describe('tool approvals review and held-call details', () => {
       labelSource: 'principal',
     });
 
-    // Rejects stale listHash on Looks right.
     const staleReview = await post('/connections/review-tools', { id: app.id, listHash: 'stale-hash' });
     expect(staleReview.status).toBe(409);
 
-    // Confirming "Looks right" clears the review marker on list and link facts.
     const confirmed = await post('/connections/review-tools', { id: app.id, listHash: pinned.pin.listHash });
     expect(confirmed.status).toBe(200);
     expect(confirmed.headers['x-page-location']).toBe('/connections');
     expect(confirmed.body).not.toContain('Needs review');
     expect((await connectionsLinkFacts(() => operations().listing())).apps[0]?.needsReview).toBe(false);
 
-    // Definition change restores the Needs review marker.
     await store.pinTools(app.id, {
       instructions: null,
       tools: [
@@ -1819,7 +1810,6 @@ describe('tool approvals review and held-call details', () => {
       expires_at: payload.expiresAt,
     });
 
-    // Principal sees full arguments (with invisible character flagged), app context, and assistant description.
     const view = await request(`/connections/held/${approvalId}`);
     expect(view.status).toBe(200);
     expect(view.body).toContain('Chowdeck · confirm_checkout');
@@ -1828,7 +1818,6 @@ describe('tool approvals review and held-call details', () => {
     expect(view.body).toContain(longNotes);
     expect(view.body).toContain('Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.');
 
-    // Reader, unauthenticated, and unknown IDs get empty 404.
     const readerView = await request(`/connections/held/${approvalId}`, 'GET', {
       'cf-access-jwt-assertion': READER,
     });

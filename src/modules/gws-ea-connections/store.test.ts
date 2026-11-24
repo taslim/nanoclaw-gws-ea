@@ -36,10 +36,10 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-const oauthGrant = (refreshToken?: string, accessToken: string | undefined = SENTINELS.access) => ({
+const oauthGrant = (refreshToken?: string, accessToken = SENTINELS.access) => ({
   kind: 'oauth' as const,
   ...(refreshToken === undefined ? {} : { refreshToken }),
-  ...(accessToken === undefined ? {} : { accessToken }),
+  accessToken,
   accessIssuedAt: '2026-11-14T10:00:00.000Z',
   accessExpiresAt: '2026-11-14T11:00:00.000Z',
 });
@@ -284,22 +284,16 @@ describe('grants', () => {
     });
     expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
 
-    // A grant from before this release has no access_tokens row.
     const current = await store.get(app.id);
     const { state } = await store.startSignIn(app.id, current.version, signIn(current));
     const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
     if (!claim) throw new Error('Expected a claim');
-    await store.completeSignIn(claim, {
-      kind: 'oauth',
-      refreshToken: SENTINELS.refresh,
-      accessIssuedAt: '2026-11-14T10:00:00.000Z',
-      accessExpiresAt: '2026-11-14T11:00:00.000Z',
-    });
+    await store.completeSignIn(claim, oauthGrant(SENTINELS.refresh, SENTINELS.access));
+    raw((db) => db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id), { writable: true });
     expect(await store.currentGrant(app.id)).toMatchObject({ generation: 2, hasAccessToken: false });
     expect(await store.readAccessToken(app.id, 1)).toBeUndefined();
     expect(await store.readAccessToken(app.id, 2)).toBeUndefined();
 
-    // Reconnecting stores a generation-3 access token and leaves earlier generations unreadable.
     const again = await store.get(app.id);
     const { state: nextState } = await store.startSignIn(app.id, again.version, signIn(again));
     const nextClaim = await store.claimSignIn(nextState, { host: app.host, principalId: PRINCIPAL });

@@ -1,6 +1,3 @@
-/**
- * Held ask-first calls, 👍/👎 approval cards, once-only execution, expiry, withdrawal, and app_tool_ask label changes.
- */
 import fs from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -41,16 +38,14 @@ import { expireApproval } from '../approvals/lifecycle.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { MAIN, mainSession as getMainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
-import { toolDefinitionHash } from './canonical.js';
 import {
   createHoldCallHandler,
   HELD_APP_CALL_ACTION,
   HELD_CALL_ANSWER,
   registerHeldAppCallHandlers,
-  withdrawHeldAppCalls,
 } from './held-calls.js';
 import { ConnectionOperations } from './operations.js';
-import { createAppRelay, type AppRelay } from './relay.js';
+import { startAppRelay, stopAppRelay, type AppRelay } from './relay.js';
 import type { ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeToolDefinition } from './testing/oauth-server.js';
 import { testConnectionsStore } from './testing/store.js';
@@ -142,18 +137,16 @@ async function setupFoodApp(tools: readonly FakeToolDefinition[] = [PREPARE_TOOL
   const created = await store.create({ name: 'Chowdeck', url: FOOD_URL, auth: 'token' });
   const connected = await store.connect(created.id, created.version, { kind: 'token', token: 'food-secret-token' });
 
-  relay = createAppRelay({
-    store,
-    egress: endpoints.egress,
-  });
   const holdHandler = createHoldCallHandler({
     store,
-    relay: () => relay,
     webHostname: async () => HOSTNAME,
   });
-  relay.setHoldCallHandler(holdHandler);
-  registerHeldAppCallHandlers({
+  relay = startAppRelay({
     store,
+    egress: endpoints.egress,
+    onHoldCall: holdHandler,
+  });
+  registerHeldAppCallHandlers({
     relay: () => relay,
   });
 
@@ -226,10 +219,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (relay) {
-    await relay.closeAll();
-    relay = undefined;
-  }
+  await stopAppRelay();
+  relay = undefined;
   await closeDb();
   await rm(directory, { recursive: true, force: true });
   await rm(TEST_ROOT, { recursive: true, force: true });
@@ -239,7 +230,6 @@ describe('held ask-first calls', () => {
   it('holds an ask-first call with one card showing app, tool, args, expiry, earlier app words and assistant summary, then runs once on approve', async () => {
     const { app, fake } = await setupFoodApp();
 
-    // First run the reversible prepare step silently.
     const prepared = await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'prepare_checkout',
@@ -250,7 +240,6 @@ describe('held ask-first calls', () => {
     expect(prepared.status).toBe('completed');
     expect(deliveredCards).toHaveLength(0);
 
-    // Now invoke ask-first confirm_checkout referencing chk_order_7788.
     const held = await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -274,7 +263,6 @@ describe('held ask-first calls', () => {
     expect(card.question).toContain('Place Jollof Rice order for NGN 4,500');
     expect(card.question).toContain('Expires:');
 
-    // Approve -> fake app receives exact stored args once; main receives untrusted result note.
     await respondToCard(card.questionId, 'approve');
 
     expect(fake.toolCalls).toHaveLength(2);
@@ -314,7 +302,6 @@ describe('held ask-first calls', () => {
     expect(deliveredCards).toHaveLength(1);
     expect(deliveredCards[0]!.question).toContain('no summary given');
 
-    // Separate request with identical args produces a second card.
     const second = await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -325,7 +312,6 @@ describe('held ask-first calls', () => {
     expect(second.status).toBe('held');
     expect(deliveredCards).toHaveLength(2);
 
-    // Decline the first card -> main gets plain decline note; retrying gets a new card.
     await respondToCard(deliveredCards[0]!.questionId, 'reject', 'Too expensive');
     const rejectNote = readMainMessages().find((m) => m.id.startsWith('appr-reject-'));
     expect(String(rejectNote?.content.text)).toContain('declined');
@@ -367,7 +353,6 @@ describe('held ask-first calls', () => {
     expect(held.status).toBe('held');
     expect(deliveredCards).toHaveLength(1);
 
-    // Delete the originating task session BEFORE approval!
     await deleteSession(taskSession.id);
 
     await respondToCard(deliveredCards[0]!.questionId, 'approve');
@@ -380,7 +365,6 @@ describe('held ask-first calls', () => {
   it('writes a quiet note on 24h expiry, refuses on definition change or reconnect, and withdraws on remove', async () => {
     const { app, fake } = await setupFoodApp();
 
-    // 1. Expiry -> quiet note (wake: false)
     await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -396,7 +380,6 @@ describe('held ask-first calls', () => {
     expect(expiredNote!.trigger).toBe(0);
     expect(String(expiredNote!.content.text)).toContain('expired');
 
-    // 2. Definition change before approve -> refuses to run, nothing sent
     await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -417,7 +400,6 @@ describe('held ask-first calls', () => {
     const changedNote = readMainMessages().find((m) => m.id === `app-call-outcome:${changedId}`);
     expect(String(changedNote?.content.text)).toContain('nothing was sent');
 
-    // Re-pin & re-label to test withdrawal on remove
     const repinned = await relay!.pinApp(app.id);
     await store.applyToolLabels(app.id, [
       {
@@ -429,7 +411,6 @@ describe('held ask-first calls', () => {
       },
     ]);
 
-    // 3. Reconnect (grant generation bump) before approve -> refuses to run, nothing sent
     await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -446,7 +427,6 @@ describe('held ask-first calls', () => {
     expect(String(reconnNote?.content.text)).toContain('disconnected or reconnected');
     expect(String(reconnNote?.content.text)).toContain('nothing was sent');
 
-    // 4. Withdrawal on remove
     await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -462,16 +442,13 @@ describe('held ask-first calls', () => {
       webHostname: HOSTNAME,
       clientDocumentsServed: () => true,
       applyMain: async () => false,
-      onDisconnected: async (appId) => {
-        await relay?.closeApp(appId);
-        await withdrawHeldAppCalls(appId);
-      },
     });
+    const editsBeforeRemove = editedCards.length;
     const latest = await store.get(app.id);
     await ops.remove(latest.id, latest.version);
 
     expect(await getPendingApprovalsByAction(HELD_APP_CALL_ACTION)).toEqual([]);
-    expect(editedCards.length).toBeGreaterThan(0);
+    expect(editedCards.length).toBeGreaterThan(editsBeforeRemove);
   });
 
   it('produces an outcome-unknown note on host restart after executing was claimed without calling upstream again', async () => {
@@ -488,7 +465,6 @@ describe('held ask-first calls', () => {
     const pending: PendingApproval = (await getPendingApprovalsByAction(HELD_APP_CALL_ACTION))[0]!;
     const tool = (await store.getTool(app.id, 'confirm_checkout'))!;
 
-    // Simulate host crash right after claiming `executing` and marking approval `approved`.
     await transitionPendingApprovalStatus(approvalId, 'pending', 'approved');
     await store.claimApprovedCall({
       approvalId,
@@ -510,7 +486,6 @@ describe('held ask-first calls', () => {
   it('links to the held-call view when arguments exceed the 2,000-character card limit and flags invisible characters', async () => {
     const { app } = await setupFoodApp();
 
-    // Long args test (> 2,000 chars)
     const longNotes = 'delivery instructions '.repeat(120);
     await relay!.callTool({
       serverKey: app.serverKey,
@@ -526,7 +501,6 @@ describe('held ask-first calls', () => {
     expect(longCard.question).toContain('chk_long');
     expect(longCard.question).toContain('too long');
 
-    // Invisible character flagging test
     await relay!.callTool({
       serverKey: app.serverKey,
       toolName: 'confirm_checkout',
@@ -539,6 +513,5 @@ describe('held ask-first calls', () => {
     expect(invisCard.question).toContain('[U+200B]');
     expect(invisCard.question).toContain('[U+202E]');
     expect(invisCard.question.toLowerCase()).toContain('invisible');
-    expect(toolDefinitionHash(CONFIRM_TOOL)).toBeDefined();
   });
 });

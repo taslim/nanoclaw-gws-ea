@@ -14,7 +14,7 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
-import { getHeldCallApproval, resolvePrincipalZoneAt } from './held-calls.js';
+import { getPendingHeldCallApproval, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
   readListing,
@@ -183,6 +183,12 @@ function storeFailure(error: ConnectionsStoreError): { readonly status: number; 
   }
 }
 
+function singleOutcomeParam(search: string): SignInReturn | undefined {
+  const query = new URLSearchParams(search);
+  const code = query.get('outcome');
+  return [...query.keys()].length === 1 && isSignInReturn(code) ? code : undefined;
+}
+
 function readRoute(method: string | undefined, url: string | undefined): Route | undefined {
   if (!url) return undefined;
   const [pathname = '', search] = url.split(/\?(.*)/su, 2);
@@ -197,21 +203,15 @@ function readRoute(method: string | undefined, url: string | undefined): Route |
   if (method !== 'GET' && method !== 'HEAD') return undefined;
   if (pathname === '/connections') {
     if (search === undefined) return { kind: 'view', view: { kind: 'list' } };
-    const query = new URLSearchParams(search);
-    const code = query.get('outcome');
-    const outcome = isSignInReturn(code) ? code : undefined;
-    return outcome && [...query.keys()].length === 1 ? { kind: 'view', view: { kind: 'list' }, outcome } : undefined;
+    const outcome = singleOutcomeParam(search);
+    return outcome ? { kind: 'view', view: { kind: 'list' }, outcome } : undefined;
   }
   const appMatch = APP_VIEW.exec(pathname);
   if (appMatch) {
     const kind = appMatch[2] as 'connect' | 'rename' | 'tools';
     if (search === undefined) return { kind: 'view', view: { kind, id: appMatch[1] } };
-    if (kind === 'tools') {
-      const query = new URLSearchParams(search);
-      const code = query.get('outcome');
-      if (code === 'connected' && [...query.keys()].length === 1) {
-        return { kind: 'view', view: { kind: 'tools', id: appMatch[1] }, outcome: 'connected' };
-      }
+    if (kind === 'tools' && singleOutcomeParam(search) === 'connected') {
+      return { kind: 'view', view: { kind: 'tools', id: appMatch[1] }, outcome: 'connected' };
     }
     return undefined;
   }
@@ -430,22 +430,8 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       // Their address names a sign-in's owner.
       const principal = await principalEmail(request, options.hostname, options.identity);
       if (!principal) return refuse(response);
-      if (route.kind === 'write' && !sameOriginJson(request, options.hostname)) return refuse(response);
-      const data = route.kind === 'write' ? await readSubmission(request) : undefined;
-      const operations = await openOperations(factory, options.hostname);
-      if (route.kind === 'callback') {
-        if (!operations) return sendReturn(response, 'failed');
-        const outcome = await operations.finishSignIn(route.host, principal, route.query);
-        if (outcome === 'connected') {
-          const app = await operations.store.byHost(route.host).catch(() => undefined);
-          if (app) return sendReturn(response, 'connected', `/connections/app/${encodeURIComponent(app.id)}/tools`);
-        }
-        return sendReturn(response, outcome);
-      }
-      if (route.kind === 'write' && route.action === 'sign-in')
-        return startSignIn(response, data ?? {}, principal, operations);
       if (route.kind === 'view' && route.view.kind === 'held') {
-        const held = await getHeldCallApproval(route.view.approvalId);
+        const held = await getPendingHeldCallApproval(route.view.approvalId);
         if (!held) return refuse(response);
         const [shell, timezone] = await Promise.all([readShell(), resolvePrincipalZoneAt(held.payload.expiresAt)]);
         const nonce = pageNonce();
@@ -473,6 +459,20 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         });
         return;
       }
+      if (route.kind === 'write' && !sameOriginJson(request, options.hostname)) return refuse(response);
+      const data = route.kind === 'write' ? await readSubmission(request) : undefined;
+      const operations = await openOperations(factory, options.hostname);
+      if (route.kind === 'callback') {
+        if (!operations) return sendReturn(response, 'failed');
+        const outcome = await operations.finishSignIn(route.host, principal, route.query);
+        if (outcome === 'connected') {
+          const app = await operations.store.byHost(route.host).catch(() => undefined);
+          if (app) return sendReturn(response, 'connected', `/connections/app/${encodeURIComponent(app.id)}/tools`);
+        }
+        return sendReturn(response, outcome);
+      }
+      if (route.kind === 'write' && route.action === 'sign-in')
+        return startSignIn(response, data ?? {}, principal, operations);
       // Before any write, so a page that cannot be drawn changes nothing.
       const shell = await readShell();
       const operatorDependencies = readOperatorDependencies();
@@ -499,18 +499,37 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
           }
         }
       }
-      const listing: ConnectionsListing = operations ? await operations.listing() : await readListing(undefined);
       const { view } = result;
+      let listing: ConnectionsListing;
+      let toolReview: ConnectionsPageState['toolReview'];
+      if (view.kind === 'tools') {
+        if (!operations) {
+          listing = { listed: false, canChange: false, apps: [], operators: [] };
+        } else {
+          try {
+            const loaded = await operations.store.readAppTools(view.id);
+            listing = {
+              listed: true,
+              canChange: false,
+              apps: loaded ? [loaded.app] : [],
+              operators: [],
+            };
+            if (loaded) {
+              toolReview = { ...(loaded.pin === undefined ? {} : { pin: loaded.pin }), tools: loaded.tools };
+            }
+          } catch (error) {
+            if (!(error instanceof ConnectionsStoreError)) throw error;
+            listing = { listed: false, canChange: false, apps: [], operators: [] };
+          }
+        }
+      } else {
+        listing = operations ? await operations.listing() : await readListing(undefined);
+      }
       let status = result.status;
       if (route.kind === 'view' && (view.kind === 'connect' || view.kind === 'rename' || view.kind === 'tools')) {
         if (!listing.listed) status = 503;
         else if (!listing.apps.some((app) => app.id === view.id)) status = 404;
       }
-      const pin = view.kind === 'tools' ? listing.pins?.[view.id] : undefined;
-      const tools =
-        view.kind === 'tools' && operations && listing.apps.some((app) => app.id === view.id)
-          ? await operations.store.listTools(view.id).catch(() => [])
-          : undefined;
       const outcome = route.kind === 'view' && !listing.listed && !result.outcome ? STORE_UNAVAILABLE : result.outcome;
       const nonce = pageNonce();
       sendPage(response, {
@@ -532,8 +551,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                   // Main's restart after an operator disconnect is requested through the store.
                   operatorDisconnect: operations !== undefined && operatorDependencies.credentials !== undefined,
                   ...(result.retryServer === undefined ? {} : { retryServer: result.retryServer }),
-                  ...(pin === undefined ? {} : { pin }),
-                  ...(tools === undefined ? {} : { tools }),
+                  ...(toolReview === undefined ? {} : { toolReview }),
                 },
                 shell,
                 nonce,

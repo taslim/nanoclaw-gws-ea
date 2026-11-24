@@ -45,10 +45,7 @@ export interface ConnectionsPageState {
   readonly operatorDisconnect: boolean;
   /** The operator server whose disconnect just stopped part way, and the host the principal confirmed for it. */
   readonly retryServer?: { readonly key: string; readonly host: string };
-  /** Populated for the per-app tool review view. */
-  readonly pin?: AppPin;
-  readonly tools?: readonly PinnedAppTool[];
-  /** Populated for the principal-only held-call details view. */
+  readonly toolReview?: { readonly pin?: AppPin; readonly tools: readonly PinnedAppTool[] };
   readonly heldCall?: HeldCallViewData;
 }
 
@@ -323,7 +320,7 @@ function pageContent(state: ConnectionsPageState): string {
       if (!app) return appMissing();
       if (view.kind === 'connect') return connectView(app, state);
       if (view.kind === 'rename') return renameView(app);
-      return toolsView(app, state.pin, state.tools ?? []);
+      return toolsView(app, state.toolReview?.pin, state.toolReview?.tools ?? []);
     }
     case 'held':
       if (!state.heldCall) return appMissing();

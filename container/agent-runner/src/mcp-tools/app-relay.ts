@@ -1,11 +1,3 @@
-/**
- * Per-app stdio MCP relay inside main's container.
- *
- * Spawned by Claude Code for each principal-connected app (`bun run /app/src/mcp-tools/app-relay.ts <serverKey>`).
- * Answers `initialize` itself using host-pinned server instructions (or without them if the short bound elapses),
- * and forwards `tools/list` and `tools/call` to the host's guarded `app_relay` delivery action over the session
- * mailbox. No principal-app credentials exist inside the container.
- */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -17,7 +9,6 @@ import {
 
 import { requestAction, type ActionRequestOptions, type ActionRequestResult } from '../action-request.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
-// Registers the session mailbox before `getAgentMailbox()` runs in standalone entry mode.
 import '../modules/index.js';
 
 export const APP_RELAY_ACTION = 'app_relay';
@@ -60,10 +51,6 @@ function plainToolResult(text: string): CallToolResult {
   return { content: [{ type: 'text', text }] };
 }
 
-/**
- * Adds the reserved required `assistant_summary` string property to an ask-first tool's input schema without
- * mutating the host-returned schema object.
- */
 export function withAssistantSummarySchema(schema: Record<string, unknown>): Tool['inputSchema'] {
   const existingProperties = isRecord(schema.properties) ? schema.properties : {};
   const existingRequired = Array.isArray(schema.required)
@@ -86,10 +73,6 @@ export function withAssistantSummarySchema(schema: Record<string, unknown>): Too
   };
 }
 
-/**
- * Strips the reserved `assistant_summary` field from tool arguments before forwarding to the host so it is never
- * hashed, canonicalized or sent to the upstream app.
- */
 export function extractSummaryAndArgs(rawArgs: Record<string, unknown> | undefined): {
   readonly args: Record<string, unknown>;
   readonly summary?: string;
@@ -138,6 +121,27 @@ export async function fetchAppInstructions(serverKey: string, deps: AppRelayDeps
   return typeof instructions === 'string' && instructions.length > 0 ? instructions : undefined;
 }
 
+function mapAnsweredData(data: unknown): CallToolResult {
+  if (!isRecord(data) || typeof data.status !== 'string') {
+    return errorToolResult('The host returned an unreadable app relay response.');
+  }
+  switch (data.status) {
+    case 'completed':
+      return isRecord(data.result)
+        ? (data.result as CallToolResult)
+        : errorToolResult('The app returned an unreadable tool result.');
+    case 'held':
+    case 'unsorted':
+      return plainToolResult(typeof data.text === 'string' ? data.text : '');
+    case 'too_large':
+    case 'unsent':
+    case 'unknown':
+      return errorToolResult(typeof data.text === 'string' ? data.text : 'The app tool call did not complete.');
+    default:
+      return errorToolResult('The host returned an unexpected app relay status.');
+  }
+}
+
 function mapCallOutcome(result: ActionRequestResult): CallToolResult {
   switch (result.status) {
     case 'not-sent':
@@ -146,29 +150,8 @@ function mapCallOutcome(result: ActionRequestResult): CallToolResult {
       return errorToolResult('The app tool call was cancelled.');
     case 'timeout':
       return errorToolResult('The host did not answer this app tool call in time; check before retrying.');
-    case 'answered': {
-      if (!result.frame.ok) return errorToolResult(result.frame.error.message);
-      const data = result.frame.data;
-      if (!isRecord(data) || typeof data.status !== 'string') {
-        return errorToolResult('The host returned an unreadable app relay response.');
-      }
-      switch (data.status) {
-        case 'completed':
-          if (isRecord(data.result)) return data.result as CallToolResult;
-          return errorToolResult('The app returned an unreadable tool result.');
-        case 'held':
-        case 'unsorted':
-          return plainToolResult(typeof data.text === 'string' ? data.text : '');
-        case 'too_large':
-        case 'unsent':
-        case 'unknown':
-          return errorToolResult(
-            typeof data.text === 'string' ? data.text : 'The app tool call did not complete.',
-          );
-        default:
-          return errorToolResult('The host returned an unexpected app relay status.');
-      }
-    }
+    case 'answered':
+      return result.frame.ok ? mapAnsweredData(result.frame.data) : errorToolResult(result.frame.error.message);
     default: {
       const unreachable: never = result;
       throw new Error(`Unknown relay request result: ${JSON.stringify(unreachable)}`);

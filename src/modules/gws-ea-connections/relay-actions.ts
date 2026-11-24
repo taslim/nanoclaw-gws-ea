@@ -1,9 +1,3 @@
-/**
- * Guarded delivery action `app_relay`: main's sole mailbox path to principal-connected apps.
- *
- * Uses `ANSWER_LATER` so slow upstream MCP calls never block main's chat delivery loop. Only canonical main is
- * admitted by the guard; operator servers are never in the connections store and cannot pass through here.
- */
 import {
   ANSWER_LATER,
   ActionRefusal,
@@ -22,6 +16,7 @@ import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { APP_SERVER_PREFIX } from './apply.js';
+import { ASSISTANT_SUMMARY_FIELD } from './canonical.js';
 import { getAppRelay, type AppRelay } from './relay.js';
 import { ConnectionsStoreError } from './store.js';
 
@@ -76,7 +71,7 @@ function parseRelayRequest(content: Record<string, unknown>): ParsedRelayRequest
   const cleanArgs: Record<string, unknown> = {};
   if (rawArgs) {
     for (const [key, value] of Object.entries(rawArgs)) {
-      if (key === 'assistant_summary') continue;
+      if (key === ASSISTANT_SUMMARY_FIELD) continue;
       cleanArgs[key] = value;
     }
   }

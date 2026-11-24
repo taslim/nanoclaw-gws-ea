@@ -1,8 +1,3 @@
-/**
- * Held ask-first app tool calls: single 👍/👎 cards, exact once-only execution on 👍,
- * plain notes for every terminal outcome, 24-hour expiry notes, and withdrawal on
- * remove/disconnect/reconnect.
- */
 import { randomBytes } from 'node:crypto';
 
 import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
@@ -21,7 +16,7 @@ import {
   type ApprovalResolvedEvent,
 } from '../approvals/primitive.js';
 import { quoted } from '../approvals/request-text.js';
-import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import { cap, untrusted } from '../gws-ea-inbox/untrusted.js';
 import { principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
   resolveMainConversation,
@@ -49,12 +44,32 @@ const APP_CONTEXT_STORAGE_MAX = 64 * 1024;
 const RESULT_NOTE_MAX = 32_000;
 const SUMMARY_CARD_MAX = 280;
 
-/** Zero-width, bidi override/isolate, soft-hyphen and non-whitespace control characters. */
+const SOFT_HYPHEN = 0x00ad;
+const COMBINING_GRAPHEME_JOINER = 0x034f;
+const ARABIC_LETTER_MARK = 0x061c;
+const MONGOLIAN_VOWEL_SEPARATOR = 0x180e;
+const BYTE_ORDER_MARK = 0xfeff;
+
+function isNonWhitespaceControl(cp: number): boolean {
+  return cp <= 0x08 || cp === 0x0b || cp === 0x0c || (cp >= 0x0e && cp <= 0x1f) || cp === 0x7f;
+}
+
+function isInvisibleFormatChar(cp: number): boolean {
+  return (
+    cp === SOFT_HYPHEN ||
+    cp === COMBINING_GRAPHEME_JOINER ||
+    cp === ARABIC_LETTER_MARK ||
+    cp === MONGOLIAN_VOWEL_SEPARATOR ||
+    cp === BYTE_ORDER_MARK
+  );
+}
+
+function isZeroWidthOrBidi(cp: number): boolean {
+  return (cp >= 0x200b && cp <= 0x200f) || (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2060 && cp <= 0x2069);
+}
+
 function isInvisibleCodePoint(cp: number): boolean {
-  if (cp <= 0x08 || cp === 0x0b || cp === 0x0c || (cp >= 0x0e && cp <= 0x1f) || cp === 0x7f) return true;
-  if (cp === 0xad || cp === 0x034f || cp === 0x061c || cp === 0x180e || cp === 0xfeff) return true;
-  if ((cp >= 0x200b && cp <= 0x200f) || (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2060 && cp <= 0x2069)) return true;
-  return false;
+  return isNonWhitespaceControl(cp) || isInvisibleFormatChar(cp) || isZeroWidthOrBidi(cp);
 }
 
 export interface HeldAppCallContext {
@@ -78,9 +93,7 @@ export interface HeldAppCallPayload {
 }
 
 export interface HeldCallsDependencies {
-  readonly store?: ConnectionsStore;
   readonly relay: () => AppRelay | undefined;
-  readonly webHostname?: () => Promise<string | undefined>;
   readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
   readonly now?: () => number;
 }
@@ -151,12 +164,10 @@ export function extractResultText(result: Record<string, unknown>): string {
   return JSON.stringify(result);
 }
 
-export function findMatchingAppContext(
-  args: Record<string, unknown>,
+function matchNeedlesInRecent(
+  needles: ReadonlySet<string>,
   recent: readonly RecentRelayResult[],
 ): HeldAppCallContext | null {
-  const needles = new Set<string>();
-  collectArgStrings(args, needles);
   if (needles.size === 0) return null;
   for (const item of recent) {
     let parsed: unknown;
@@ -176,13 +187,13 @@ export function findMatchingAppContext(
   return null;
 }
 
-function clampExcerpt(text: string, maxChars: number): string {
-  const chars = Array.from(text);
-  if (chars.length <= maxChars) return text;
-  return `${chars
-    .slice(0, Math.max(1, maxChars - 1))
-    .join('')
-    .trimEnd()}…`;
+export function findMatchingAppContext(
+  args: Record<string, unknown>,
+  recent: readonly RecentRelayResult[],
+): HeldAppCallContext | null {
+  const needles = new Set<string>();
+  collectArgStrings(args, needles);
+  return matchNeedlesInRecent(needles, recent);
 }
 
 function defaultWebHostname(): Promise<string | undefined> {
@@ -201,7 +212,7 @@ export async function resolvePrincipalZoneAt(isoInstant: string): Promise<string
   }
 }
 
-export function formatHeldCallCard(input: {
+async function buildHeldCallCard(input: {
   readonly approvalId: string;
   readonly appName: string;
   readonly appHost: string;
@@ -211,8 +222,8 @@ export function formatHeldCallCard(input: {
   readonly appContext: HeldAppCallContext | null;
   readonly expiresAt: string;
   readonly timezone: string;
-  readonly webHostname: string | undefined;
-}): { readonly title: string; readonly question: string } {
+  readonly readHostname: () => Promise<string | undefined>;
+}): Promise<{ readonly title: string; readonly question: string }> {
   const title = `Allow ${input.appName} to run ${input.toolName}?`.slice(0, 120);
   const { text: renderedArgs, hasInvisible } = renderCompactArgs(input.args);
   const summaryLine =
@@ -242,10 +253,9 @@ export function formatHeldCallCard(input: {
     return { title, question: fullQuestion };
   }
 
-  // Details exceed the card budget: preserve host-rendered arg excerpt and an excerpt of the app's own words,
-  // explicitly state details are too long, and link to the principal-only held-call view.
-  const detailsUrl = input.webHostname
-    ? `https://${input.webHostname}/connections/held/${encodeURIComponent(input.approvalId)}`
+  const webHostname = await input.readHostname().catch(() => undefined);
+  const detailsUrl = webHostname
+    ? `https://${webHostname}/connections/held/${encodeURIComponent(input.approvalId)}`
     : `/connections/held/${encodeURIComponent(input.approvalId)}`;
   const linkLine = `Full details are too long for this message — review them in full: ${detailsUrl}`;
 
@@ -263,9 +273,9 @@ export function formatHeldCallCard(input: {
 
   const trimmedParts = [
     ...headerLines,
-    `Arguments:\n${clampExcerpt(renderedArgs, argsBudget)}`,
+    `Arguments:\n${cap(renderedArgs, argsBudget)}`,
     ...(input.appContext
-      ? [`From ${input.appName} (${input.appContext.toolName}):\n${clampExcerpt(input.appContext.text, contextBudget)}`]
+      ? [`From ${input.appName} (${input.appContext.toolName}):\n${cap(input.appContext.text, contextBudget)}`]
       : []),
     linkLine,
     expiryLine,
@@ -347,7 +357,6 @@ async function findPendingByInvocation(invocationId: string): Promise<PendingApp
 
 export function createHoldCallHandler(dependencies: {
   readonly store: ConnectionsStore;
-  readonly relay: () => AppRelay | undefined;
   readonly webHostname?: () => Promise<string | undefined>;
   readonly now?: () => number;
 }): HoldCallHandler {
@@ -361,7 +370,7 @@ export function createHoldCallHandler(dependencies: {
       return { status: 'held', text: HELD_CALL_ANSWER, approvalId: existing.approval_id };
     }
 
-    const conversation = await resolveMainConversation();
+    const [conversation, approverUserId] = await Promise.all([resolveMainConversation(), principalApproverUserId()]);
     if (typeof conversation === 'string') {
       return {
         status: 'unsent',
@@ -369,7 +378,6 @@ export function createHoldCallHandler(dependencies: {
         text: 'Could not reach the principal to ask for approval; nothing was sent.',
       };
     }
-    const approverUserId = await principalApproverUserId();
     if (!approverUserId) {
       return {
         status: 'unsent',
@@ -378,14 +386,19 @@ export function createHoldCallHandler(dependencies: {
       };
     }
 
-    const recent = await dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20);
-    const appContext = findMatchingAppContext(input.args, recent);
+    const needles = new Set<string>();
+    collectArgStrings(input.args, needles);
     const expiresAt = new Date(now() + HELD_CALL_TTL_MS).toISOString();
-    const timezone = await resolvePrincipalZoneAt(expiresAt);
-    const webHostname = await readHostname().catch(() => undefined);
+    const [recent, timezone] = await Promise.all([
+      needles.size > 0
+        ? dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20)
+        : Promise.resolve([]),
+      resolvePrincipalZoneAt(expiresAt),
+    ]);
+    const appContext = matchNeedlesInRecent(needles, recent);
     const approvalId = `appr-${now()}-${randomBytes(4).toString('hex')}`;
 
-    const card = formatHeldCallCard({
+    const card = await buildHeldCallCard({
       approvalId,
       appName: input.app.name,
       appHost: input.app.host,
@@ -395,7 +408,7 @@ export function createHoldCallHandler(dependencies: {
       appContext,
       expiresAt,
       timezone,
-      webHostname,
+      readHostname,
     });
 
     const payload: HeldAppCallPayload = {
@@ -454,7 +467,6 @@ async function handleApprovalResolved(event: ApprovalResolvedEvent): Promise<voi
   });
 }
 
-/** Registers the restart-safe approval handler, rejection wording, and expiry observer for held app calls. */
 export function registerHeldAppCallHandlers(dependencies: HeldCallsDependencies = { relay: getAppRelay }): void {
   activeDependencies = dependencies;
 
@@ -518,7 +530,6 @@ export function registerHeldAppCallHandlers(dependencies: HeldCallsDependencies 
   }
 }
 
-/** Withdraws every pending held-call approval card belonging to `appId`. */
 export async function withdrawHeldAppCalls(
   appId: string,
   resolution = 'Withdrawn — app changed or disconnected',
@@ -535,8 +546,7 @@ export async function withdrawHeldAppCalls(
   return count;
 }
 
-/** Reads a pending held-call approval and its decoded payload for the principal-only details view. */
-export async function getHeldCallApproval(
+export async function getPendingHeldCallApproval(
   approvalId: string,
 ): Promise<{ readonly approval: PendingApproval; readonly payload: HeldAppCallPayload } | undefined> {
   if (!(await getDb().hasTable('pending_approvals'))) return undefined;

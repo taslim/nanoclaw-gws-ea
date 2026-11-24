@@ -18,9 +18,9 @@ export const connectionsPageGuard = defineGuardedAction({
   },
 });
 
-async function currentListing(): Promise<ConnectionsListing> {
+async function currentListing(includeAvailability = true): Promise<ConnectionsListing> {
   try {
-    return await readListing(await getConnectionsStore());
+    return await readListing(await getConnectionsStore(), undefined, { includeAvailability });
   } catch (error) {
     if (!(error instanceof ConnectionsStoreError)) throw error;
     return readListing(undefined);
@@ -60,7 +60,7 @@ export function operatorAsApp(server: OperatorServer): ConnectionLinkFact | unde
 
 /** Main learns which apps exist and how they stand, never an address that could carry a credential. */
 export async function connectionsLinkFacts(
-  read: () => Promise<ConnectionsListing> = currentListing,
+  read: () => Promise<ConnectionsListing> = () => currentListing(false),
 ): Promise<{ readonly apps: readonly ConnectionLinkFact[] }> {
   const { apps, operators, pins } = await read();
   return {

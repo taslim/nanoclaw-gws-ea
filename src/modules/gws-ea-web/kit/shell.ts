@@ -96,7 +96,6 @@ export function renderCopyButton(sourceId: string, label: string): string {
   return `<button class="button button-secondary" type="button" data-copy-from="${escapeHtml(sourceId)}" aria-label="${escapeHtml(label)}"><span data-copy-label>Copy</span></button>`;
 }
 
-/** Accessible toggle switch with visible text state and 44px touch target. */
 export function renderSwitch(options: {
   readonly checked: boolean;
   readonly label: string;

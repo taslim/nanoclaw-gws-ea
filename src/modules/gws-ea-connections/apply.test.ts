@@ -7,8 +7,6 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import '../gws-ea-profile/index.js';
 import {
-  APP_RELAY_COMMAND,
-  APP_RELAY_SCRIPT,
   applyMainServers,
   appRelayServerEntry,
   MainServersUnreadableError,
@@ -75,7 +73,7 @@ describe('applyMainServers', () => {
       ledgerly: OPERATOR,
       calendar: STDIO,
       travel: PLUGIN,
-      [ledger.serverKey]: { command: APP_RELAY_COMMAND, args: ['run', APP_RELAY_SCRIPT, ledger.serverKey] },
+      [ledger.serverKey]: { command: 'bun', args: ['run', '/app/src/mcp-tools/app-relay.ts', ledger.serverKey] },
     });
     expect(JSON.stringify(await mainServers())).not.toContain(SENTINEL_TOKEN);
     const requested = await store.pendingRestart();

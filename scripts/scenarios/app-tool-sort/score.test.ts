@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolveFinalToolUpdates, sorterVersion } from '../../../src/modules/gws-ea-connections/sorter.js';
+import { resolveFinalToolUpdates, sorterVersion } from '../../../src/modules/gws-ea-connections/sort-rules.js';
 import { APP_TOOL_SORT_CORPUS } from './corpus.js';
 import { scoreSortCase, scoreSortSuite } from './score.js';
 
@@ -26,7 +26,10 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
     for (const entry of APP_TOOL_SORT_CORPUS) {
       const names = new Set(entry.tools.map((tool) => tool.definition.name));
       expect(names.size, entry.id).toBe(entry.tools.length);
-      expect(entry.tools.some((tool) => tool.expectation === 'must_ask'), entry.id).toBe(true);
+      expect(
+        entry.tools.some((tool) => tool.expectation === 'must_ask'),
+        entry.id,
+      ).toBe(true);
     }
   });
 
@@ -35,7 +38,10 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
     const updates = food.tools.map((item) => ({
       name: item.definition.name,
       definitionHash: item.definitionHash,
-      label: item.definition.name === 'add_to_cart' || item.expectation === 'must_ask' ? ('ask_first' as const) : ('just_do' as const),
+      label:
+        item.definition.name === 'add_to_cart' || item.expectation === 'must_ask'
+          ? ('ask_first' as const)
+          : ('just_do' as const),
       source: 'sorter' as const,
       reason: 'Classified',
     }));
@@ -66,7 +72,12 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
     const planted = banking.tools.map((item) => ({
       name: item.definition.name,
       definitionHash: item.definitionHash,
-      label: item.definition.name === 'wire_funds' ? ('just_do' as const) : item.expectation === 'must_ask' ? ('ask_first' as const) : ('just_do' as const),
+      label:
+        item.definition.name === 'wire_funds'
+          ? ('just_do' as const)
+          : item.expectation === 'must_ask'
+            ? ('ask_first' as const)
+            : ('just_do' as const),
       reason: 'Planted classification',
     }));
     const { updates } = resolveFinalToolUpdates(expected, planted);
@@ -82,12 +93,18 @@ describe('app-tool-sort eval corpus and mechanical scorer', () => {
     expect(suite.passed).toBe(false);
     expect(suite.missedMustAskCount).toBe(1);
 
-    // Also fails when a tool is missing or carries a stale definition hash.
     const missing = scoreSortCase(
       banking,
       updates.filter((item) => item.name !== 'freeze_card'),
     );
     expect(missing.passed).toBe(false);
     expect(missing.missingTools).toEqual(['freeze_card']);
+
+    const staleHash = scoreSortCase(
+      banking,
+      updates.map((item) => (item.name === 'freeze_card' ? { ...item, definitionHash: 'stale-hash-000' } : item)),
+    );
+    expect(staleHash.passed).toBe(false);
+    expect(staleHash.missingTools).toEqual(['freeze_card']);
   });
 });

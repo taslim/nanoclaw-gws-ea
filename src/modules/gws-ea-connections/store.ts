@@ -16,7 +16,7 @@ import {
   type SealedFile,
 } from '../gws-ea-vault/seal.js';
 import { connectionsRoot } from './config.js';
-import { normalizeToolDefinition, toolDefinitionHash, toolListHash, type ToolDefinition } from './canonical.js';
+import { canonicalJson, normalizeToolDefinition, sha256Hex, toolListHash, type ToolDefinition } from './canonical.js';
 import { ConnectionsKey } from './key.js';
 
 export type AppAuth = 'none' | 'oauth' | 'token';
@@ -163,25 +163,23 @@ export type LiveGrant = GrantFacts &
         readonly renewable: boolean;
         readonly accessIssuedAt: string;
         readonly accessExpiresAt: string;
-        /** Whether a sealed access token for this grant generation sits in the host store. */
         readonly hasAccessToken: boolean;
       }
-    | { readonly kind: 'token' | 'none' }
+    | { readonly kind: 'token' }
+    | { readonly kind: 'none' }
   );
 
 export type NewGrant =
   | {
       readonly kind: 'oauth';
       readonly refreshToken?: string;
-      /** Sealed into `access_tokens` atomically with the grant; omitted only for pre-upgrade tests. */
-      readonly accessToken?: string;
+      readonly accessToken: string;
       readonly accessIssuedAt: string;
       readonly accessExpiresAt: string;
     }
   | { readonly kind: 'token'; readonly token: string }
   | { readonly kind: 'none' };
 
-/** A sealed OAuth access token held by the host for a live grant generation. */
 export interface StoredAccessToken {
   readonly generation: number;
   readonly token: string;
@@ -246,6 +244,7 @@ export const SIGN_IN_TTL_MS = 10 * 60_000;
 export const NAME_MAX = 100;
 const SECRET_MAX = 64 * 1024;
 const STATE_MAX = 512;
+const MAX_RECENT_DIRECT_CALLS_PER_APP = 30;
 
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
@@ -321,6 +320,7 @@ CREATE TABLE IF NOT EXISTS app_tool_sorts (
   created_at TEXT NOT NULL,
   completed_at TEXT
 ) STRICT;
+CREATE INDEX IF NOT EXISTS idx_app_tool_sorts_app ON app_tool_sorts(app_id, created_at, id);
 CREATE TABLE IF NOT EXISTS relay_calls (
   id TEXT PRIMARY KEY,
   approval_id TEXT UNIQUE,
@@ -334,6 +334,7 @@ CREATE TABLE IF NOT EXISTS relay_calls (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
+CREATE INDEX IF NOT EXISTS idx_relay_calls_app_updated ON relay_calls(app_id, grant_generation, state, updated_at DESC);
 CREATE TABLE IF NOT EXISTS restart_request (
   id INTEGER PRIMARY KEY CHECK(id = 1), applied_at TEXT NOT NULL
 ) STRICT;
@@ -545,7 +546,7 @@ function grantValid(grant: NewGrant): void {
   switch (grant.kind) {
     case 'oauth':
       if (grant.refreshToken !== undefined) secretValid(grant.refreshToken);
-      if (grant.accessToken !== undefined) secretValid(grant.accessToken);
+      secretValid(grant.accessToken);
       isoValid(grant.accessIssuedAt);
       isoValid(grant.accessExpiresAt);
       return;
@@ -879,7 +880,7 @@ export class ConnectionsStore {
       secret = this.sealText(grant.kind === 'token' ? grant.token : (grant.refreshToken ?? ''), key);
     }
     let sealedAccess: Buffer | undefined;
-    if (grant.kind === 'oauth' && grant.accessToken !== undefined) {
+    if (grant.kind === 'oauth') {
       if (!key) throw new ConnectionsStoreError('store_unavailable');
       sealedAccess = this.sealText(grant.accessToken, key);
     }
@@ -1295,6 +1296,24 @@ export class ConnectionsStore {
     });
   }
 
+  async readAppTools(
+    appId: string,
+  ): Promise<
+    | { readonly app: ConnectionApp; readonly pin: AppPin | undefined; readonly tools: readonly PinnedAppTool[] }
+    | undefined
+  > {
+    return this.use((db) => {
+      const row = db.prepare<[string], AppRow>(`SELECT ${APP_COLUMNS} FROM ${APP_FROM} WHERE a.id = ?`).get(appId);
+      if (!row) return undefined;
+      const pinRow = db.prepare<[string], AppPinRow>('SELECT * FROM app_pins WHERE app_id = ?').get(appId);
+      const tools = db
+        .prepare<[string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? ORDER BY name')
+        .all(appId)
+        .map(toPinnedTool);
+      return { app: toApp(row), pin: pinRow && toAppPin(pinRow), tools };
+    });
+  }
+
   /**
    * Pins an app's current tool definitions and server instructions. Unchanged definitions keep their labels;
    * changed or new definitions become unsorted while preserving any principal-set Ask-first floor.
@@ -1307,7 +1326,7 @@ export class ConnectionsStore {
     isoValid(at);
     const normalized = input.tools.map((tool) => {
       const definition = normalizeToolDefinition(tool);
-      return { definition, hash: toolDefinitionHash(definition) };
+      return { definition, hash: sha256Hex(canonicalJson(definition)) };
     });
     const nextListHash = toolListHash(
       normalized.map(({ definition, hash }) => ({ name: definition.name, definitionHash: hash })),
@@ -1326,46 +1345,47 @@ export class ConnectionsStore {
           const incomingNames = new Set(normalized.map(({ definition }) => definition.name));
           let changed = existingPin?.list_hash !== nextListHash;
 
+          const deleteTool = db.prepare('DELETE FROM app_tools WHERE app_id = ? AND name = ?');
           for (const oldName of existingTools.keys()) {
             if (!incomingNames.has(oldName)) {
-              db.prepare('DELETE FROM app_tools WHERE app_id = ? AND name = ?').run(appId, oldName);
+              deleteTool.run(appId, oldName);
               changed = true;
             }
           }
+
+          const insertTool = db.prepare(
+            `INSERT INTO app_tools
+              (app_id, name, definition_hash, definition_json, label, label_source, reason, sorter_version,
+               principal_floor, unsettled, sort_attempts, updated_at)
+              VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 1, 0, ?)`,
+          );
+          const updateChangedTool = db.prepare(
+            `UPDATE app_tools SET definition_hash = ?, definition_json = ?, label = NULL, label_source = NULL,
+              reason = NULL, sorter_version = NULL, principal_floor = ?, unsettled = 1, sort_attempts = 0,
+              updated_at = ?
+              WHERE app_id = ? AND name = ?`,
+          );
+          const updateToolJson = db.prepare(
+            'UPDATE app_tools SET definition_json = ?, updated_at = ? WHERE app_id = ? AND name = ?',
+          );
 
           for (const { definition, hash } of normalized) {
             const json = JSON.stringify(definition);
             const prev = existingTools.get(definition.name);
             if (!prev) {
-              db.prepare(
-                `INSERT INTO app_tools
-                  (app_id, name, definition_hash, definition_json, label, label_source, reason, sorter_version,
-                   principal_floor, unsettled, sort_attempts, updated_at)
-                  VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 1, 0, ?)`,
-              ).run(appId, definition.name, hash, json, at);
+              insertTool.run(appId, definition.name, hash, json, at);
               changed = true;
             } else if (prev.definition_hash !== hash) {
-              // A definition change keeps a principal-set Ask-first as a floor and clears a principal-set Just-do.
               const keepFloor =
                 prev.principal_floor === 1 ||
                 (prev.label === 'ask_first' &&
                   (prev.label_source === 'principal' || prev.label_source === 'approved_request'))
                   ? 1
                   : 0;
-              db.prepare(
-                `UPDATE app_tools SET definition_hash = ?, definition_json = ?, label = NULL, label_source = NULL,
-                  reason = NULL, sorter_version = NULL, principal_floor = ?, unsettled = 1, sort_attempts = 0,
-                  updated_at = ?
-                  WHERE app_id = ? AND name = ?`,
-              ).run(hash, json, keepFloor, at, appId, definition.name);
+              updateChangedTool.run(hash, json, keepFloor, at, appId, definition.name);
               changed = true;
             } else if (prev.definition_json !== json) {
-              db.prepare('UPDATE app_tools SET definition_json = ?, updated_at = ? WHERE app_id = ? AND name = ?').run(
-                json,
-                at,
-                appId,
-                definition.name,
-              );
+              updateToolJson.run(json, at, appId, definition.name);
             }
           }
 
@@ -1404,11 +1424,17 @@ export class ConnectionsStore {
     return this.use((db) =>
       db
         .transaction(() => {
+          const selectTool = db.prepare<[string, string], AppToolRow>(
+            'SELECT * FROM app_tools WHERE app_id = ? AND name = ?',
+          );
+          const updateTool = db.prepare(
+            `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, sorter_version = COALESCE(?, sorter_version),
+              principal_floor = ?, unsettled = 0, updated_at = ?
+              WHERE app_id = ? AND name = ? AND definition_hash = ?`,
+          );
           let applied = 0;
           for (const update of updates) {
-            const row = db
-              .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
-              .get(appId, update.name);
+            const row = selectTool.get(appId, update.name);
             if (!row || row.definition_hash !== update.definitionHash) continue;
             const principalOverride = update.source === 'principal' || update.source === 'approved_request';
             const floorLocked = !principalOverride && row.principal_floor === 1 && update.label === 'just_do';
@@ -1416,11 +1442,7 @@ export class ConnectionsStore {
             const labelSource: ToolLabelSource = floorLocked ? 'principal' : update.source;
             const reason = floorLocked ? 'Kept as ask first per your earlier choice' : update.reason;
             const principalFloor = principalOverride ? (label === 'ask_first' ? 1 : 0) : row.principal_floor;
-            db.prepare(
-              `UPDATE app_tools SET label = ?, label_source = ?, reason = ?, sorter_version = COALESCE(?, sorter_version),
-                principal_floor = ?, unsettled = 0, updated_at = ?
-                WHERE app_id = ? AND name = ? AND definition_hash = ?`,
-            ).run(
+            updateTool.run(
               label,
               labelSource,
               reason,
@@ -1454,21 +1476,22 @@ export class ConnectionsStore {
     await this.use((db) =>
       db
         .transaction(() => {
+          const selectTool = db.prepare<[string, string], AppToolRow>(
+            'SELECT * FROM app_tools WHERE app_id = ? AND name = ?',
+          );
+          const updateTool = db.prepare(
+            `UPDATE app_tools SET label = 'ask_first', label_source = 'fallback', reason = ?,
+              sorter_version = COALESCE(?, sorter_version), unsettled = ?, sort_attempts = ?, updated_at = ?
+              WHERE app_id = ? AND name = ? AND definition_hash = ?`,
+          );
           for (const target of targets) {
-            const row = db
-              .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
-              .get(appId, target.name);
+            const row = selectTool.get(appId, target.name);
             if (!row || row.definition_hash !== target.definitionHash) continue;
-            // Never overwrite a settled principal choice.
             if (row.label_source === 'principal' || row.label_source === 'approved_request') continue;
             const attempts = row.sort_attempts + 1;
             const unsettled = attempts < maxAttempts ? 1 : 0;
             const reason = unsettled === 1 ? 'Being checked again' : "couldn't be checked";
-            db.prepare(
-              `UPDATE app_tools SET label = 'ask_first', label_source = 'fallback', reason = ?,
-                sorter_version = COALESCE(?, sorter_version), unsettled = ?, sort_attempts = ?, updated_at = ?
-                WHERE app_id = ? AND name = ? AND definition_hash = ?`,
-            ).run(
+            updateTool.run(
               reason,
               options.sorterVersion ?? null,
               unsettled,
@@ -1484,7 +1507,6 @@ export class ConnectionsStore {
     );
   }
 
-  /** Principal change on the Connections page or approved main request; bound to definitionHash when provided. */
   async setToolLabel(
     appId: string,
     name: string,
@@ -1514,7 +1536,6 @@ export class ConnectionsStore {
     });
   }
 
-  /** Marks the app's current pinned tool list as reviewed by the principal ("Looks right"). */
   async markToolsReviewed(appId: string, expectedListHash?: string, at = new Date().toISOString()): Promise<boolean> {
     isoValid(at);
     return this.use((db) => {
@@ -1696,19 +1717,17 @@ export class ConnectionsStore {
             id,
           );
           if (row && row.approval_id === null) {
-            // Keep the 30 most recent direct call outcomes per app for held-call context matching.
             db.prepare(
               `DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL AND id NOT IN (
-                SELECT id FROM relay_calls WHERE app_id = ? AND approval_id IS NULL ORDER BY updated_at DESC LIMIT 30
+                SELECT id FROM relay_calls WHERE app_id = ? AND approval_id IS NULL ORDER BY updated_at DESC LIMIT ?
               )`,
-            ).run(row.app_id, row.app_id);
+            ).run(row.app_id, row.app_id, MAX_RECENT_DIRECT_CALLS_PER_APP);
           }
         })
         .immediate(),
     );
   }
 
-  /** Most recent completed results returned for this app and grant, newest first. */
   async recentCompletedResults(
     appId: string,
     grantGeneration: number,

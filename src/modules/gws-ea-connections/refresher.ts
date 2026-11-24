@@ -1,23 +1,12 @@
-/**
- * Keeps every connected app's sealed OAuth access token current in the host store, sweeps legacy or rolled-back
- * `gws-ea-app-*` credentials out of the gateway, and reconciles main's servers to the store.
- *
- * Every step for one app runs under that app's lock, which connect, disconnect, delete and on-demand renewal also
- * take, and reads the app and its grant afresh under it. A renewal stores both the rotated refresh token and the
- * sealed access token atomically, only while the grant is still live at the generation it was renewed for. A refusal
- * the server will repeat ends the grant durably first; main's entry follows.
- *
- * Log lines name the app by ID and the outcome by code, nothing more: a server's words and every token stay out.
- */
 import { setTimeout as delay } from 'node:timers/promises';
 
-import type { GatewayCredentialRemoval, GatewayHostCredential } from '../../gateway-providers/credential-connection.js';
-import { getGatewayProvider } from '../../gateway-providers/index.js';
+import type { GatewayHostCredential } from '../../gateway-providers/credential-connection.js';
 import { log as hostLog } from '../../log.js';
 import { APP_CREDENTIAL_PREFIX, webHostname } from './admit.js';
 import { applyMainServers, MainServersUnreadableError } from './apply.js';
 import { withAppLock } from './locks.js';
 import { ConnectionOAuthError, refreshAccess, type ConnectionFetches, type ConnectionOAuthCode } from './oauth.js';
+import { gatewayHostCredentials, type OperatorCredentials } from './operator.js';
 import {
   ConnectionsStoreError,
   type ConnectionApp,
@@ -38,11 +27,7 @@ export const RENEW_WITHIN_MS = 15 * 60_000;
  */
 export const SHUTDOWN_WAIT_MS = 15_000;
 
-/** The gateway's read/remove surface, used solely to sweep legacy or rolled-back `gws-ea-app-*` credentials. */
-export interface AppGateway {
-  readonly listForHost: (host: string) => Promise<readonly GatewayHostCredential[]>;
-  readonly removeById: (ids: readonly string[]) => Promise<readonly GatewayCredentialRemoval[]>;
-}
+export type AppGateway = OperatorCredentials;
 
 export interface RefresherLog {
   info(message: string, fields?: Record<string, unknown>): void;
@@ -91,7 +76,6 @@ export interface ConnectionsRefresher {
 
 type OAuthGrant = Extract<LiveGrant, { kind: 'oauth' }>;
 
-/** A server's refusal it will repeat on every attempt, or a non-renewable grant whose token lapsed or is missing. */
 type TerminalCode = ConnectionOAuthCode | 'access_expired' | 'access_missing';
 
 /**
@@ -103,11 +87,6 @@ interface Unstored {
   readonly rotation: GrantRotation;
 }
 
-/**
- * A refused client stays refused until the principal reconnects with a new registration, so it ends the grant like a
- * refused refresh token. A missing or malformed sign-in description, or any other unexpected answer, may be a server
- * mid-deploy: the grant is kept and asked again, and the app stays Connected.
- */
 function refusedForGood(code: ConnectionOAuthCode): boolean {
   switch (code) {
     case 'grant_refused':
@@ -116,7 +95,6 @@ function refusedForGood(code: ConnectionOAuthCode): boolean {
     case 'client_refused':
     case 'needs_client':
       return true;
-    // A renewal never answers issuer_mismatch, cancelled or client_unavailable; only a sign-in does.
     case 'unreachable':
     case 'unsupported':
     case 'failed':
@@ -131,6 +109,25 @@ export function renewalDue(grant: Pick<OAuthGrant, 'accessIssuedAt' | 'accessExp
   const issued = Date.parse(grant.accessIssuedAt);
   const expires = Date.parse(grant.accessExpiresAt);
   return expires - (now + REFRESH_TICK_MS) < Math.min(RENEW_WITHIN_MS, (expires - issued) / 2);
+}
+
+/** Reads an already-stored bearer token without triggering renewal; skips Keychain when the OAuth token is absent or expired. */
+export async function readStoredUsableToken(
+  store: ConnectionsStore,
+  appId: string,
+  grant: LiveGrant,
+  now: () => number,
+): Promise<UsableToken | undefined> {
+  if (grant.kind === 'none') return undefined;
+  if (grant.kind === 'token') {
+    const creds = await store.readGrant(appId, grant.generation);
+    return creds?.kind === 'token' ? { generation: creds.generation, token: creds.token } : undefined;
+  }
+  if (!grant.hasAccessToken || Date.parse(grant.accessExpiresAt) <= now()) return undefined;
+  const stored = await store.readAccessToken(appId, grant.generation);
+  return stored && Date.parse(stored.expiresAt) > now()
+    ? { generation: stored.generation, token: stored.token }
+    : undefined;
 }
 
 /** Only a code crosses into a log line: an error's message may quote a server or name a URL. */
@@ -160,9 +157,6 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     }
   }
 
-  /**
-   * Runs one step of a background loop: any failure is logged by code and the next tick tries again.
-   */
   async function attempt(appId: string, message: string, fallback: string, step: () => Promise<void>): Promise<void> {
     try {
       await step();
@@ -183,7 +177,6 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     }
   }
 
-  /** Durably ended first, so nothing removed afterwards can come back if a later step fails or the host stops. */
   async function endRefused(app: ConnectionApp, generation: number, code: TerminalCode): Promise<void> {
     unstored.delete(app.id);
     if (!(await store.markRefused(app.id, generation))) return;
@@ -194,23 +187,28 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     });
   }
 
-  async function storeRenewal(app: ConnectionApp, renewal: Unstored): Promise<void> {
+  async function storeRenewal(app: ConnectionApp, renewal: Unstored): Promise<UsableToken | undefined> {
     unstored.set(app.id, renewal);
     const stored = await store.rotateGrant(app.id, renewal.generation, renewal.rotation);
     unstored.delete(app.id);
-    if (!stored) return;
+    if (!stored) return undefined;
     log.info('Renewed app access', { appId: app.id });
+    if (Date.parse(renewal.rotation.accessExpiresAt) <= now()) return undefined;
+    return { generation: renewal.generation, token: renewal.rotation.accessToken };
   }
 
-  async function renew(app: ConnectionApp, grant: OAuthGrant, host: string | undefined): Promise<void> {
+  async function renew(
+    app: ConnectionApp,
+    grant: OAuthGrant,
+    host: string | undefined,
+  ): Promise<UsableToken | undefined> {
     const held = unstored.get(app.id);
     if (held?.generation === grant.generation) return storeRenewal(app, held);
     unstored.delete(app.id);
     const credentials = await store.readGrant(app.id, grant.generation);
-    if (credentials?.kind !== 'oauth' || credentials.refreshToken === undefined) return;
+    if (credentials?.kind !== 'oauth' || credentials.refreshToken === undefined) return undefined;
     if (app.issuer === null) throw new ConnectionsStoreError('store_unavailable');
     let issued: Awaited<ReturnType<typeof refreshAccess>>;
-    // The server may fetch the document at any point during the request, so either reading can be the one it saw.
     const servedBefore = dependencies.clientDocumentsServed();
     try {
       issued = await refreshAccess(
@@ -224,14 +222,15 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         },
       );
     } catch (error) {
-      // A server that could not fetch the client document refuses the client only until it is served again.
       const documentUnserved =
         error instanceof ConnectionOAuthError &&
         error.code === 'client_refused' &&
         credentials.client?.kind === 'document' &&
         !(servedBefore && dependencies.clientDocumentsServed());
-      if (error instanceof ConnectionOAuthError && refusedForGood(error.code) && !documentUnserved)
-        return endRefused(app, grant.generation, error.code);
+      if (error instanceof ConnectionOAuthError && refusedForGood(error.code) && !documentUnserved) {
+        await endRefused(app, grant.generation, error.code);
+        return undefined;
+      }
       throw error;
     }
     const rotation: GrantRotation = {
@@ -251,15 +250,16 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
       return;
     }
     const hasPendingRotation = unstored.get(app.id)?.generation === grant.generation;
-    if (hasPendingRotation || !grant.hasAccessToken || renewalDue(grant, at)) return renew(app, grant, host);
+    if (hasPendingRotation || !grant.hasAccessToken || renewalDue(grant, at)) {
+      await renew(app, grant, host);
+    }
   }
 
-  /** Principal-app credentials belong in the host store, so every `gws-ea-app-*` entry in the gateway is removed. */
-  async function sweep(app: ConnectionApp, held: readonly GatewayHostCredential[]) {
+  async function sweepGatewayAppCredentials(app: ConnectionApp, held: readonly GatewayHostCredential[]) {
     if (!gateway) return;
-    const orphans = held.filter(({ name }) => name.startsWith(APP_CREDENTIAL_PREFIX));
-    if (orphans.length === 0) return;
-    const removals = await gateway.removeById(orphans.map(({ id }) => id));
+    const gatewayAppCredentials = held.filter(({ name }) => name.startsWith(APP_CREDENTIAL_PREFIX));
+    if (gatewayAppCredentials.length === 0) return;
+    const removals = await gateway.removeById(gatewayAppCredentials.map(({ id }) => id));
     if (removals.some(({ outcome }) => outcome === 'failed'))
       log.warn('Could not remove a gateway app credential; retrying', {
         appId: app.id,
@@ -270,7 +270,6 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
 
   async function reconcileApp(appId: string, host: string | undefined): Promise<void> {
     await withAppLock(appId, async () => {
-      // Read under the lock: a connect, sign-in or disconnect may have finished since the tick began.
       let app: ConnectionApp;
       let grant: LiveGrant | undefined;
       try {
@@ -281,7 +280,6 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         return;
       }
       const live = app.status === 'connected' ? grant : undefined;
-      // A held renewal belongs only to the live grant it was issued for.
       if (live?.kind !== 'oauth' || live.generation !== unstored.get(app.id)?.generation) unstored.delete(app.id);
       if (gateway) {
         let held: readonly GatewayHostCredential[] | undefined;
@@ -291,11 +289,10 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         if (held) {
           const listed = held;
           await attempt(app.id, 'Could not remove gateway app credentials; retrying', 'remove_failed', () =>
-            sweep(app, listed),
+            sweepGatewayAppCredentials(app, listed),
           );
         }
       }
-      // A grant replaced since by one of another kind is left to the next tick.
       if (!live || live.kind !== app.auth) return;
       if (live.kind === 'oauth') {
         await attempt(app.id, 'Could not renew app access; retrying', 'renew_failed', () => keepOAuth(app, live, host));
@@ -333,14 +330,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
       if (!forceRenew) {
         const grant = await store.currentGrant(appId);
         if (!grant || grant.kind === 'none') return undefined;
-        if (grant.kind === 'token') {
-          const creds = await store.readGrant(appId, grant.generation);
-          return creds?.kind === 'token' ? { generation: creds.generation, token: creds.token } : undefined;
-        }
-        const stored = await store.readAccessToken(appId, grant.generation);
-        if (stored && Date.parse(stored.expiresAt) > now()) {
-          return { generation: stored.generation, token: stored.token };
-        }
+        const usable = await readStoredUsableToken(store, appId, grant, now);
+        if (usable || grant.kind === 'token') return usable;
       }
       return withAppLock(appId, async () => {
         let app: ConnectionApp;
@@ -352,31 +343,23 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
           throw error;
         }
         if (app.status !== 'connected' || !grant || grant.kind !== app.auth || grant.kind === 'none') return undefined;
-        if (grant.kind === 'token') {
-          const creds = await store.readGrant(appId, grant.generation);
-          return creds?.kind === 'token' ? { generation: creds.generation, token: creds.token } : undefined;
+        if (grant.kind === 'token') return readStoredUsableToken(store, appId, grant, now);
+        if (!forceRenew) {
+          const usable = await readStoredUsableToken(store, appId, grant, now);
+          if (usable) return usable;
         }
-        if (grant.kind !== 'oauth') return undefined;
-        const oauthGrant: OAuthGrant = grant;
-        const stored = await store.readAccessToken(appId, oauthGrant.generation);
-        if (!forceRenew && stored && Date.parse(stored.expiresAt) > now()) {
-          return { generation: stored.generation, token: stored.token };
-        }
-        if (!oauthGrant.renewable) {
-          if (!stored) await endRefused(app, oauthGrant.generation, 'access_missing');
-          else if (Date.parse(stored.expiresAt) <= now())
-            await endRefused(app, oauthGrant.generation, 'access_expired');
+        if (!grant.renewable) {
+          if (!grant.hasAccessToken) await endRefused(app, grant.generation, 'access_missing');
+          else if (Date.parse(grant.accessExpiresAt) <= now())
+            await endRefused(app, grant.generation, 'access_expired');
           return undefined;
         }
         const host = await readHost();
-        await attempt(app.id, 'Could not renew app access; retrying', 'renew_failed', () =>
-          renew(app, oauthGrant, host),
-        );
-        const after = await store.readAccessToken(appId, oauthGrant.generation);
-        if (after && Date.parse(after.expiresAt) > now()) {
-          return { generation: after.generation, token: after.token };
-        }
-        return undefined;
+        let renewed: UsableToken | undefined;
+        await attempt(app.id, 'Could not renew app access; retrying', 'renew_failed', async () => {
+          renewed = await renew(app, grant, host);
+        });
+        return renewed;
       });
     },
   };
@@ -398,18 +381,7 @@ export function startConnectionsRefresher(
     Pick<ConnectionsRefresherDependencies, 'clientDocumentsServed'>,
 ): void {
   if (signal.aborted) return;
-  let gateway = overrides.gateway;
-  if (!gateway) {
-    const credentials = getGatewayProvider().credentials;
-    const listForHost = credentials?.listForHost;
-    const removeById = credentials?.removeById;
-    if (credentials && listForHost && removeById) {
-      gateway = {
-        listForHost: (host) => listForHost.call(credentials, host),
-        removeById: (ids) => removeById.call(credentials, ids),
-      };
-    }
-  }
+  const gateway = overrides.gateway ?? gatewayHostCredentials();
   const controller = new AbortController();
   stopController = controller;
   const stopped = AbortSignal.any([signal, controller.signal]);
@@ -420,7 +392,6 @@ export function startConnectionsRefresher(
     signal: stopped,
   });
   activeRefresher = refresher;
-  // Started, not awaited: host startup never waits on a server.
   void (async () => {
     while (!stopped.aborted) {
       const tick = refresher.tick().catch((err: unknown) => {

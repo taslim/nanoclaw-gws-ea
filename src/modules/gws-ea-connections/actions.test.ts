@@ -67,7 +67,6 @@ function ledgerly(): FakeMcpApp {
   });
 }
 
-/** The gateway seam as admission sees it: credentials listed by exact host. */
 class FakeGateway {
   readonly held = new Map<string, { readonly id: string; readonly host: string }>();
   async listForHost(host: string): Promise<{ id: string; name: string }[]> {
@@ -451,7 +450,6 @@ describe('app_tool_ask', () => {
       },
     ]);
 
-    // Direction 1: ask_first -> just_do (approved)
     const lower = await send(APP_TOOL_ASK_ACTION, {
       app: created.serverKey,
       tool: 'confirm_checkout',
@@ -463,7 +461,6 @@ describe('app_tool_ask', () => {
     await approve(APP_TOOL_ASK_ACTION);
     expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('just_do');
 
-    // Direction 2: just_do -> ask_first, but definition changes before approval -> refused!
     const raise = await send(APP_TOOL_ASK_ACTION, {
       app: created.serverKey,
       tool: 'confirm_checkout',
@@ -477,7 +474,6 @@ describe('app_tool_ask', () => {
     });
     await store.pinTools(created.id, { instructions: null, tools: [v2] });
     await approve(APP_TOOL_ASK_ACTION);
-    // Tool stayed unsorted (label null) because definition changed before 👍!
     expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBeNull();
     const changeNote = notes('connection-tool-ask:').at(-1);
     expect(JSON.parse(changeNote!.content)).toMatchObject({

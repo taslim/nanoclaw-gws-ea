@@ -25,7 +25,7 @@ import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../g
 import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { admissionDependencies, admitAppUrl, hostOf, type AdmissionDependencies } from './admit.js';
-import { APP_SERVER_PREFIX } from './apply.js';
+import { APP_SERVER_PREFIX, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import type { ConnectionOAuthOptions, SignInServer } from './oauth.js';
 import { ConnectionOperations, type AddRefusal, type ConnectRefusal } from './operations.js';
 import { probeApp, type SignInMethod } from './probe.js';
@@ -60,7 +60,7 @@ export interface AppActionDependencies {
 const ADD_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'url', 'name']);
 /** The approved request also carries the app's id, so it deletes exactly the app the principal saw. */
 const DELETE_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'app', 'id']);
-/** The approved request also binds the app's id and the tool's definitionHash at card time. */
+const TOOL_ASK_APPROVAL_BOUND_FIELDS = ['id', 'definitionHash'] as const;
 const TOOL_ASK_FIELDS: ReadonlySet<string> = new Set([
   'action',
   'requestId',
@@ -68,8 +68,7 @@ const TOOL_ASK_FIELDS: ReadonlySet<string> = new Set([
   'tool',
   'ask_first',
   'reason',
-  'id',
-  'definitionHash',
+  ...TOOL_ASK_APPROVAL_BOUND_FIELDS,
 ]);
 
 type AddAnswer = AddRefusal | AppsUnavailable;
@@ -519,6 +518,15 @@ export function createAppActions(dependencies: AppActionDependencies) {
     });
   };
 
+  async function hasOperatorServer(key: string): Promise<boolean | 'unavailable'> {
+    try {
+      return (await mainOperatorServers()).some((server) => server.key === key);
+    } catch (error) {
+      if (error instanceof MainServersUnreadableError) return 'unavailable';
+      throw error;
+    }
+  }
+
   async function requestDeleteHold(content: Record<string, unknown>, session: Session): Promise<void> {
     const request = deleteRequest(content, requestIdOf(content) ?? '');
     if (await alreadyAnswered(session, request.requestId)) return;
@@ -526,10 +534,10 @@ export function createAppActions(dependencies: AppActionDependencies) {
       answer(session, request.requestId, refusal(request.requestId, forbidden(DELETE_REFUSED[reason])));
     const context = await dependencies.context();
     if (typeof context === 'string') return refuse(context);
-    const app = (await context.store.apps()).find(({ serverKey }) => serverKey === request.app);
+    const app = await context.store.byServerKey(request.app);
     if (!app) {
-      const { operators } = await context.operations.listing();
-      return refuse(operators.some(({ key }) => key === request.app) ? 'operator_server' : 'not_found');
+      const isOperator = await hasOperatorServer(request.app);
+      return refuse(isOperator === 'unavailable' ? 'unavailable' : isOperator ? 'operator_server' : 'not_found');
     }
     const payload = { action: DELETE_APP_ACTION, requestId: request.requestId, app: app.serverKey, id: app.id };
     await hold(session, request, DELETE_APP_ACTION, payload, {
@@ -546,10 +554,9 @@ export function createAppActions(dependencies: AppActionDependencies) {
     const context = await dependencies.context();
     if (typeof context === 'string')
       return `The principal approved deleting the app ${request.app}, but it could not be deleted: ${DELETE_REFUSED[context]}`;
-    const app = (await context.store.apps()).find(
-      ({ id, serverKey }) => id === request.id && serverKey === request.app,
-    );
-    if (!app) return `The principal approved deleting the app ${request.app}; it was already gone.`;
+    const app = await context.store.byServerKey(request.app);
+    if (!app || app.id !== request.id)
+      return `The principal approved deleting the app ${request.app}; it was already gone.`;
     const approved = `The principal approved deleting ${JSON.stringify(app.name)} at ${app.host}`;
     await context.operations.remove(app.id, app.version);
     return `${approved}. It is deleted, and its tools leave you by their next message.`;
@@ -572,12 +579,10 @@ export function createAppActions(dependencies: AppActionDependencies) {
       answer(session, request.requestId, refusal(request.requestId, forbidden(TOOL_ASK_REFUSED[reason])));
     const context = await dependencies.context();
     if (typeof context === 'string') return refuse(context);
-    const app = (await context.store.apps()).find(
-      ({ serverKey, status }) => serverKey === request.app && status === 'connected',
-    );
-    if (!app) {
-      const { operators } = await context.operations.listing();
-      return refuse(operators.some(({ key }) => key === request.app) ? 'operator_server' : 'not_found');
+    const app = await context.store.byServerKey(request.app);
+    if (!app || app.status !== 'connected') {
+      const isOperator = await hasOperatorServer(request.app);
+      return refuse(isOperator === 'unavailable' ? 'unavailable' : isOperator ? 'operator_server' : 'not_found');
     }
     const tool = await context.store.getTool(app.id, request.tool);
     if (!tool) return refuse('tool_not_found');
@@ -614,10 +619,9 @@ export function createAppActions(dependencies: AppActionDependencies) {
     const context = await dependencies.context();
     if (typeof context === 'string')
       return `The principal approved changing ${request.app}.${request.tool}, but it could not be saved: ${TOOL_ASK_REFUSED[context]}`;
-    const app = (await context.store.apps()).find(
-      ({ id, serverKey }) => id === request.id && serverKey === request.app,
-    );
-    if (!app) return `The principal approved changing ${request.app}.${request.tool}, but that app is no longer there.`;
+    const app = await context.store.byServerKey(request.app);
+    if (!app || app.id !== request.id)
+      return `The principal approved changing ${request.app}.${request.tool}, but that app is no longer there.`;
     const nextLabel = request.askFirst ? 'ask_first' : 'just_do';
     const updated = await context.store.setToolLabel(app.id, request.tool, nextLabel, 'approved_request', {
       expectedHash: request.definitionHash,
@@ -665,7 +669,6 @@ export function createAppActions(dependencies: AppActionDependencies) {
   };
 }
 
-/** Main's app actions; their approvals resume through the registrations above. */
 export function registerAppActions(dependencies: AppActionDependencies = { context: defaultContext }): void {
   const actions = createAppActions(dependencies);
   registerDeliveryAction(ADD_APP_ACTION, actions.add.handler, actions.add.spec);

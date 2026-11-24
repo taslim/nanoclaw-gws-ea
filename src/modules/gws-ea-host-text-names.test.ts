@@ -139,7 +139,7 @@ const POLICY: Policy = {
     'gws-ea-chat-agents/docs.ts': 'job',
     // The answers and notes of main's app tools; their cards name no tool.
     'gws-ea-connections/actions.ts': 'main',
-    // Isolated app-tool sort session prompt and sort_tools action answers.
+    'gws-ea-connections/sort-rules.ts': 'app-sorter',
     'gws-ea-connections/sorter.ts': 'app-sorter',
     // `ncl people` and `ncl preferences` help, answers and guidance.
     'gws-ea-people/index.ts': 'main',
