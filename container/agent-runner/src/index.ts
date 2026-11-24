@@ -24,9 +24,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { trustGatewayCaForChromium } from './browser-trust.js';
-import { applySessionCapabilities, loadConfig } from './config.js';
+import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
-import { getSessionRouting, getTaskSeriesId } from './db/session-routing.js';
+import { getTaskSeriesId } from './db/session-routing.js';
 import { prepareSessionMemory, sessionsSealed } from './memory/sealed.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import './modules/index.js';
@@ -56,7 +56,6 @@ async function main(): Promise<void> {
   const providerName = requireProviderName(config.provider);
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
-  applySessionCapabilities(getSessionRouting().thread_id);
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 

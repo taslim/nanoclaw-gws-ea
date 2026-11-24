@@ -6,8 +6,7 @@
  * at module scope, and load it here under its capability key. No central list.
  * The server serves only the tools of the keys in the group's container.json.
  */
-import { loadConfig, resolveSessionCapabilities } from '../config.js';
-import { getSessionRouting } from '../db/session-routing.js';
+import { loadConfig } from '../config.js';
 // core.ts names its own capability keys.
 import './core.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
@@ -44,9 +43,8 @@ async function main(): Promise<void> {
   const { capabilities } = loadConfig();
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
-  const effectiveCapabilities = resolveSessionCapabilities(capabilities, getSessionRouting().thread_id);
   try {
-    await startMcpServer((action) => mailbox.run(action), effectiveCapabilities);
+    await startMcpServer((action) => mailbox.run(action), capabilities);
   } finally {
     await mailbox.stop();
   }

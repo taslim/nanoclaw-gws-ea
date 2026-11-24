@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
 import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
-import { getPendingApproval, getPendingApprovalsByAction } from '../../db/sessions.js';
+import { getPendingApprovalsByAction } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { formatLocalTime, resolveTimezone } from '../../timezone.js';
@@ -79,6 +79,7 @@ export interface HeldAppCallContext {
 }
 
 export interface HeldAppCallPayload {
+  readonly viewId?: string;
   readonly invocationId: string;
   readonly appId: string;
   readonly appName: string;
@@ -205,7 +206,7 @@ export async function resolvePrincipalZoneAt(isoInstant: string): Promise<string
 }
 
 async function buildHeldCallCard(input: {
-  readonly approvalId: string;
+  readonly viewId: string;
   readonly appName: string;
   readonly appHost: string;
   readonly toolName: string;
@@ -250,8 +251,8 @@ async function buildHeldCallCard(input: {
 
   const webHostname = await input.readHostname().catch(() => undefined);
   const detailsUrl = webHostname
-    ? `https://${webHostname}/connections/held/${encodeURIComponent(input.approvalId)}`
-    : `/connections/held/${encodeURIComponent(input.approvalId)}`;
+    ? `https://${webHostname}/connections/held/${encodeURIComponent(input.viewId)}`
+    : `/connections/held/${encodeURIComponent(input.viewId)}`;
   const linkLine = `Full details are too long for this message — review them in full: ${detailsUrl}`;
 
   const overhead =
@@ -307,6 +308,7 @@ export function parseHeldCallPayload(raw: string): HeldAppCallPayload | undefine
       ? { toolName: parsed.appContext.toolName, text: parsed.appContext.text }
       : null;
   return {
+    ...(typeof parsed.viewId === 'string' && parsed.viewId ? { viewId: parsed.viewId } : {}),
     invocationId: parsed.invocationId,
     appId: parsed.appId,
     appName: parsed.appName,
@@ -390,10 +392,10 @@ export function createHoldCallHandler(dependencies: {
       resolvePrincipalZoneAt(expiresAt),
     ]);
     const appContext = matchNeedlesInRecent(needles, recent);
-    const approvalId = `appr-${now()}-${randomBytes(4).toString('hex')}`;
+    const viewId = `held-${now()}-${randomBytes(4).toString('hex')}`;
 
     const card = await buildHeldCallCard({
-      approvalId,
+      viewId,
       appName: input.app.name,
       appHost: input.app.host,
       toolName: input.tool.name,
@@ -406,6 +408,7 @@ export function createHoldCallHandler(dependencies: {
     });
 
     const payload: HeldAppCallPayload = {
+      viewId,
       invocationId,
       appId: input.app.id,
       appName: input.app.name,
@@ -421,7 +424,6 @@ export function createHoldCallHandler(dependencies: {
     };
 
     const deliveredId = await requestApproval({
-      approvalId,
       session: conversation.session,
       agentName: 'Assistant',
       action: HELD_APP_CALL_ACTION,
@@ -560,12 +562,17 @@ export async function withdrawHeldAppCalls(
 }
 
 export async function getPendingHeldCallApproval(
-  approvalId: string,
+  viewOrApprovalId: string,
 ): Promise<{ readonly approval: PendingApproval; readonly payload: HeldAppCallPayload } | undefined> {
   if (!(await getDb().hasTable('pending_approvals'))) return undefined;
-  const approval = await getPendingApproval(approvalId);
-  if (!approval || approval.action !== HELD_APP_CALL_ACTION || approval.status !== 'pending') return undefined;
-  const payload = parseHeldCallPayload(approval.payload);
-  if (!payload) return undefined;
-  return { approval, payload };
+  const rows = await getPendingApprovalsByAction(HELD_APP_CALL_ACTION);
+  for (const approval of rows) {
+    if (approval.status !== 'pending') continue;
+    const payload = parseHeldCallPayload(approval.payload);
+    if (!payload) continue;
+    if (payload.viewId === viewOrApprovalId || approval.approval_id === viewOrApprovalId) {
+      return { approval, payload };
+    }
+  }
+  return undefined;
 }

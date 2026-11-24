@@ -1805,8 +1805,10 @@ describe('tool approvals review and held-call details', () => {
 
   it('shows full untruncated arguments and app words on /connections/held/<id> only to the principal', async () => {
     const approvalId = 'appr-held-detail-test';
+    const viewId = 'held-detail-view-1';
     const longNotes = 'Special delivery instructions '.repeat(120);
     const payload: HeldAppCallPayload = {
+      viewId,
       invocationId: 'sess-1:req-1',
       appId: randomUUID(),
       appName: 'Chowdeck',
@@ -1840,7 +1842,7 @@ describe('tool approvals review and held-call details', () => {
       expires_at: payload.expiresAt,
     });
 
-    const view = await request(`/connections/held/${approvalId}`);
+    const view = await request(`/connections/held/${viewId}`);
     expect(view.status).toBe(200);
     expect(view.body).toContain('Chowdeck · confirm_checkout');
     expect(view.body).toContain('Confirm Jollof Rice order for Morgan');
@@ -1848,7 +1850,7 @@ describe('tool approvals review and held-call details', () => {
     expect(view.body).toContain(longNotes);
     expect(view.body).toContain('Prepared checkout chk_999: 1x Jollof Rice, total NGN 4,500.');
 
-    const readerView = await request(`/connections/held/${approvalId}`, 'GET', {
+    const readerView = await request(`/connections/held/${viewId}`, 'GET', {
       'cf-access-jwt-assertion': READER,
     });
     expect(readerView.status).toBe(404);

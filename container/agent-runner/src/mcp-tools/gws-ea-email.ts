@@ -27,7 +27,6 @@ import { registerTools } from './server.js';
 
 const MAIN_CAPABILITY = 'gws-ea-email';
 const EXTERNAL_CAPABILITY = 'gws-ea-email-external';
-const APP_SORT_CAPABILITY = 'gws-ea-app-sort';
 
 /** How long a tool waits for the host; a request may still go through after that. */
 export const EMAIL_REQUEST_TIMEOUT_MS = 120_000;
@@ -321,5 +320,4 @@ export const sortTools = requestTool({
 });
 
 registerTools([emailHandoff, emailToPrincipal], MAIN_CAPABILITY);
-registerTools([signInReply, emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);
-registerTools([sortTools], APP_SORT_CAPABILITY);
+registerTools([signInReply, sortTools, emailSend, tellMain, freeTime, book, changeBooking, cancelBooking], EXTERNAL_CAPABILITY);

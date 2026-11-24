@@ -1,6 +1,6 @@
 ## Host sign-in task
 
-When the host sends a sign-in task, follow its inline instructions with `sign_in_reply` instead of the email workflow below.
+When the host sends a sign-in task, follow its inline instructions with `sign_in_reply` instead of the email workflow below; for a tool-sorting task, use `sort_tools`.
 
 ## Email in this thread
 

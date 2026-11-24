@@ -341,8 +341,6 @@ export interface RequestApprovalOptions {
    * which may hold secrets.
    */
   details?: RequestDetails;
-  /** Optional pre-generated approval id (e.g. when the card body links to a details view by id). */
-  approvalId?: string;
   /** Deliver the card to this specific user instead of all of the session group's admins. */
   approverUserId?: string;
   /** ISO-8601 UTC deadline for answering this request. */
@@ -410,7 +408,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<str
 
   const asking = await requestOrigin(session.agent_group_id, origin, target.messagingGroup, opts.originLine);
   const question = asking ? `${opts.question}\n\n${asking.line}` : opts.question;
-  const approvalId = opts.approvalId ?? `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
   const approver = target.userId;
   await createPendingApproval({

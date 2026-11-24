@@ -45,6 +45,7 @@ import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import {
   createHoldCallHandler,
+  getPendingHeldCallApproval,
   HELD_APP_CALL_ACTION,
   HELD_CALL_ANSWER,
   registerHeldAppCallHandlers,
@@ -502,7 +503,12 @@ describe('held ask-first calls', () => {
     });
     const longCard = deliveredCards[0]!;
     expect(longCard.title.length + longCard.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
-    expect(longCard.question).toContain(`https://${HOSTNAME}/connections/held/${longCard.questionId}`);
+    const linkMatch = new RegExp(
+      `https://${HOSTNAME.replace(/\./g, '\\.')}/connections/held/(held-[A-Za-z0-9-]+)`,
+    ).exec(longCard.question);
+    expect(linkMatch).not.toBeNull();
+    const resolvedHeld = await getPendingHeldCallApproval(linkMatch![1]!);
+    expect(resolvedHeld?.approval.approval_id).toBe(longCard.questionId);
     expect(longCard.question).toContain('chk_long');
     expect(longCard.question).toContain('too long');
 
