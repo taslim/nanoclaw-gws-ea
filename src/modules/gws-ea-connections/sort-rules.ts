@@ -150,8 +150,76 @@ function schemaHasActionEnum(schema: unknown, depth = 0): { readonly matched: bo
   return { matched: false, truncated };
 }
 
+function resolveLocalSchemaRef(root: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
+  if (!ref.startsWith('#/')) return undefined;
+  const parts = ref
+    .slice(2)
+    .split('/')
+    .map((part) => part.replace(/~1/gu, '/').replace(/~0/gu, '~'));
+  let current: unknown = root;
+  for (const part of parts) {
+    if (!isRecord(current) || !Object.hasOwn(current, part)) return undefined;
+    current = current[part];
+  }
+  return isRecord(current) ? current : undefined;
+}
+
+function walkRootObjectSubschemas(
+  root: Record<string, unknown>,
+  visitor: (node: Record<string, unknown>) => boolean,
+): boolean {
+  const seen = new Set<object>();
+  const visit = (node: unknown, depth: number): boolean => {
+    if (depth > MAX_SCHEMA_DEPTH || !isRecord(node) || seen.has(node)) return false;
+    seen.add(node);
+    if (visitor(node)) return true;
+    if (typeof node.$ref === 'string') {
+      const target = resolveLocalSchemaRef(root, node.$ref);
+      if (target && visit(target, depth + 1)) return true;
+    }
+    for (const branch of ['allOf', 'anyOf', 'oneOf'] as const) {
+      const list = node[branch];
+      if (Array.isArray(list)) {
+        for (const entry of list) {
+          if (visit(entry, depth + 1)) return true;
+        }
+      }
+    }
+    for (const key of ['if', 'then', 'else'] as const) {
+      if (isRecord(node[key]) && visit(node[key], depth + 1)) return true;
+    }
+    if (isRecord(node.dependentSchemas)) {
+      for (const dep of Object.values(node.dependentSchemas)) {
+        if (visit(dep, depth + 1)) return true;
+      }
+    }
+    return false;
+  };
+  return visit(root, 0);
+}
+
 export function schemaUsesReservedSummary(schema: Record<string, unknown>): boolean {
-  return isRecord(schema.properties) && Object.hasOwn(schema.properties, ASSISTANT_SUMMARY_FIELD);
+  return walkRootObjectSubschemas(
+    schema,
+    (node) =>
+      (isRecord(node.properties) && Object.hasOwn(node.properties, ASSISTANT_SUMMARY_FIELD)) ||
+      (Array.isArray(node.required) && node.required.includes(ASSISTANT_SUMMARY_FIELD)),
+  );
+}
+
+export function schemaAcceptsSummaryArg(schema: Record<string, unknown>): boolean {
+  if (schemaUsesReservedSummary(schema)) return true;
+  return walkRootObjectSubschemas(schema, (node) => {
+    if (!isRecord(node.patternProperties)) return false;
+    for (const pattern of Object.keys(node.patternProperties)) {
+      try {
+        if (new RegExp(pattern).test(ASSISTANT_SUMMARY_FIELD)) return true;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+    }
+    return false;
+  });
 }
 
 function collectTextFields(value: unknown, out: string[], state: { truncated: boolean }, depth = 0): void {

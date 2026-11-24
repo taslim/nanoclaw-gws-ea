@@ -542,6 +542,110 @@ describe('app-relay stdio MCP server', () => {
     }
   });
 
+  it('accounts for patternProperties, boolean property schemas, composed allOf summary declarations, stale listing migrations, and unlisted tools', async () => {
+    // 1) patternProperties matching assistant_summary picks a non-matching fallback summary field.
+    const patternTargeted = withAssistantSummarySchema({
+      type: 'object',
+      properties: { id: true, forbidden: false },
+      required: ['id'],
+      additionalProperties: false,
+      patternProperties: { '^assistant_summary$': { type: 'integer' } },
+    });
+    const targetedProps = patternTargeted.properties as Record<string, unknown>;
+    expect(targetedProps.id).toBe(true);
+    expect(targetedProps.forbidden).toBe(false);
+    expect(targetedProps[FALLBACK_ASSISTANT_SUMMARY_PREFIX]).toEqual({
+      type: 'string',
+      description: 'What this will do, in one line.',
+    });
+    expect(patternTargeted.required).toEqual(['id', FALLBACK_ASSISTANT_SUMMARY_PREFIX]);
+
+    // 2) Universal catch-all patternProperties excludes the chosen summary field so a string value remains valid.
+    const catchAll = withAssistantSummarySchema({
+      type: 'object',
+      patternProperties: { '.*': { type: 'integer' } },
+    });
+    const rewrittenPatterns = Object.keys(catchAll.patternProperties as Record<string, unknown>);
+    expect(rewrittenPatterns).toHaveLength(1);
+    const rewrittenRe = new RegExp(rewrittenPatterns[0]!);
+    expect(rewrittenRe.test(ASSISTANT_SUMMARY_FIELD)).toBe(false);
+    expect(rewrittenRe.test('count')).toBe(true);
+
+    // 3) Composed allOf declaration of assistant_summary selects a non-colliding summary field.
+    const composed = withAssistantSummarySchema({
+      type: 'object',
+      allOf: [
+        {
+          properties: { [ASSISTANT_SUMMARY_FIELD]: { type: 'string' } },
+          required: [ASSISTANT_SUMMARY_FIELD],
+        },
+      ],
+    });
+    expect(composed.required).toEqual([FALLBACK_ASSISTANT_SUMMARY_PREFIX]);
+
+    // 4) Stale call formed against an earlier listing is rejected when summary field shifts,
+    //    and unlisted tools after tools/list preserve assistant_summary untouched.
+    let listingRound = 0;
+    const forwarded: RecordedRequest[] = [];
+    const { client, close } = await connectRelay(async (action, fields, options) => {
+      if (fields.op === 'initialize') {
+        return { status: 'answered', frame: { id: 'i1', ok: true, data: { instructions: null } } };
+      }
+      if (fields.op === 'tools/list') {
+        listingRound += 1;
+        const inputSchema =
+          listingRound === 1
+            ? { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] }
+            : {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  [ASSISTANT_SUMMARY_FIELD]: { type: 'string' },
+                },
+                required: ['id', ASSISTANT_SUMMARY_FIELD],
+              };
+        return {
+          status: 'answered',
+          frame: {
+            id: `l-${listingRound}`,
+            ok: true,
+            data: {
+              toolsVersion: `v${listingRound}`,
+              tools: [{ name: 'shift_tool', inputSchema, label: 'ask_first' }],
+            },
+          },
+        };
+      }
+      forwarded.push({ action, fields, options });
+      return {
+        status: 'answered',
+        frame: { id: 'c1', ok: true, data: { status: 'held', text: 'Asked principal.' } },
+      };
+    });
+    try {
+      await client.listTools();
+      await client.listTools();
+      // Call formed against listing 1 (carries assistant_summary, omits nanoclaw_assistant_summary) is rejected.
+      const staleRes = await client.callTool({
+        name: 'shift_tool',
+        arguments: { id: '1', [ASSISTANT_SUMMARY_FIELD]: 'old summary' },
+      });
+      expect(staleRes.isError).toBe(true);
+      expect(forwarded).toHaveLength(0);
+
+      // Unlisted tool after tools/list preserves assistant_summary in forwarded arguments instead of stripping it.
+      await client.callTool({
+        name: 'removed_tool',
+        arguments: { id: '2', [ASSISTANT_SUMMARY_FIELD]: 'preserve me' },
+      });
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]!.fields.arguments).toEqual({ id: '2', [ASSISTANT_SUMMARY_FIELD]: 'preserve me' });
+      expect(forwarded[0]!.fields.summary).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
   describe('over the session mailbox', () => {
     beforeEach(() => {
       initTestSessionDb();

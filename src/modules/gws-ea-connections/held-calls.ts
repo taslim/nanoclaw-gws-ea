@@ -16,7 +16,7 @@ import {
   type ApprovalResolvedEvent,
 } from '../approvals/primitive.js';
 import { quoted } from '../approvals/request-text.js';
-import { cap, untrusted } from '../gws-ea-inbox/untrusted.js';
+import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
   resolveMainConversation,
@@ -29,14 +29,17 @@ import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { canonicalArgsHash } from './canonical.js';
 import {
   getAppRelay,
+  outcomeFromSettledRecord,
+  UNKNOWN_OUTCOME_MESSAGE,
   type AppRelay,
   type HoldCallHandler,
   type HoldCallInput,
   type RelayCallOutcome,
 } from './relay.js';
-import type { ConnectionsStore, RecentRelayResult } from './store.js';
+import type { ConnectionsStore, RecentRelayResult, RelayInvocationRecord } from './store.js';
 
 export const HELD_APP_CALL_ACTION = 'app_tool_call';
+const APP_TOOL_ASK_ACTION_NAME = 'app_tool_ask';
 export const HELD_CALL_ANSWER = "I've asked the principal; the result will arrive as a note.";
 export const HELD_CALL_TTL_MS = 24 * 60 * 60_000;
 
@@ -97,8 +100,22 @@ export interface HeldAppCallPayload {
 
 export interface HeldCallsDependencies {
   readonly relay: () => AppRelay | undefined | Promise<AppRelay | undefined>;
+  readonly store?: () => ConnectionsStore | undefined | Promise<ConnectionsStore | undefined>;
   readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
   readonly now?: () => number;
+}
+
+/** Truncates to at most `maxUnits` UTF-16 code units without splitting surrogate pairs; counts ellipsis in the budget. */
+function capUtf16(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  if (maxUnits <= 1) return maxUnits === 1 ? '…' : '';
+  const limit = maxUnits - 1;
+  let end = 0;
+  for (const ch of text) {
+    if (end + ch.length > limit) break;
+    end += ch.length;
+  }
+  return `${text.slice(0, end)}…`;
 }
 
 export function escapeInvisibleChars(text: string): { readonly rendered: string; readonly hasInvisible: boolean } {
@@ -234,8 +251,9 @@ async function buildHeldCallCard(input: {
   readonly timezone: string;
   readonly readHostname: () => Promise<string | undefined>;
 }): Promise<BuiltHeldCallCard> {
-  const displayToolName = cap(input.toolName, TOOL_CARD_MAX);
-  const title = `Allow ${input.appName} to run ${displayToolName}?`.slice(0, 120);
+  const displayToolName = capUtf16(input.toolName, TOOL_CARD_MAX);
+  const toolNameTruncated = displayToolName !== input.toolName;
+  const title = capUtf16(`Allow ${input.appName} to run ${displayToolName}?`, 120);
   const { text: renderedArgs, hasInvisible: argsHasInvisible } = renderCompactArgs(input.args);
   const summaryOut = input.summary && input.summary.trim() ? escapeInvisibleChars(input.summary.trim()) : undefined;
   const contextOut = input.appContext ? escapeInvisibleChars(input.appContext.text) : undefined;
@@ -256,7 +274,7 @@ async function buildHeldCallCard(input: {
   ];
 
   const contextHeader = input.appContext
-    ? `From ${input.appName} (${cap(input.appContext.toolName, TOOL_CARD_MAX)}):\n`
+    ? `From ${input.appName} (${capUtf16(input.appContext.toolName, TOOL_CARD_MAX)}):\n`
     : '';
   const fullParts = [
     ...headerLines,
@@ -265,7 +283,7 @@ async function buildHeldCallCard(input: {
     expiryLine,
   ];
   const fullQuestion = fullParts.join('\n');
-  if (title.length + fullQuestion.length <= CARD_SAFE_BUDGET) {
+  if (!toolNameTruncated && title.length + fullQuestion.length <= CARD_SAFE_BUDGET) {
     return { kind: 'card', title, question: fullQuestion };
   }
 
@@ -279,23 +297,25 @@ async function buildHeldCallCard(input: {
   const overhead =
     title.length +
     headerLines.join('\n').length +
-    expiryLine.length +
-    linkLine.length +
+    1 +
     'Arguments:\n'.length +
-    contextHeader.length +
-    16;
+    (contextOut ? 1 + contextHeader.length : 0) +
+    1 +
+    linkLine.length +
+    1 +
+    expiryLine.length;
   const available = MAX_CARD_QUESTION_LENGTH - overhead;
   if (available < 40) {
     return { kind: 'unreachable_details' };
   }
   const targetBody = Math.min(available, Math.max(40, CARD_SAFE_BUDGET - overhead));
-  const argsBudget = contextOut ? Math.max(20, Math.floor(targetBody * 0.6)) : targetBody;
-  const contextBudget = contextOut ? Math.max(20, targetBody - argsBudget) : 0;
+  const argsBudget = contextOut ? Math.floor(targetBody * 0.6) : targetBody;
+  const contextBudget = contextOut ? targetBody - argsBudget : 0;
 
   const trimmedParts = [
     ...headerLines,
-    `Arguments:\n${cap(renderedArgs, argsBudget)}`,
-    ...(contextOut ? [`${contextHeader}${cap(contextOut.rendered, contextBudget)}`] : []),
+    `Arguments:\n${capUtf16(renderedArgs, argsBudget)}`,
+    ...(contextOut ? [`${contextHeader}${capUtf16(contextOut.rendered, contextBudget)}`] : []),
     linkLine,
     expiryLine,
   ];
@@ -365,21 +385,141 @@ function formatOutcomeNote(payload: HeldAppCallPayload, outcome: RelayCallOutcom
   }
 }
 
-async function findPendingByInvocation(invocationId: string): Promise<PendingApproval | undefined> {
+const REQUEST_ID_CONFLICT_OUTCOME: RelayCallOutcome = {
+  status: 'unsent',
+  reason: 'request_id_conflict',
+  text: 'This request ID was already used for a different tool call; nothing was sent.',
+};
+
+async function findApprovalByInvocation(invocationId: string): Promise<PendingApproval | undefined> {
+  if (!(await getDb().hasTable('pending_approvals'))) return undefined;
   const rows = await getPendingApprovalsByAction(HELD_APP_CALL_ACTION);
   for (const row of rows) {
-    if (row.status !== 'pending') continue;
     const payload = parseHeldCallPayload(row.payload);
     if (payload?.invocationId === invocationId) return row;
   }
   return undefined;
 }
 
+async function resolveExistingHeldState(
+  store: ConnectionsStore,
+  input: HoldCallInput,
+  invocationId: string,
+  existingApproval: PendingApproval | undefined,
+  existingInvocation: RelayInvocationRecord | undefined,
+): Promise<RelayCallOutcome | undefined> {
+  if (existingInvocation) {
+    if (
+      existingInvocation.appId !== input.app.id ||
+      existingInvocation.toolName !== input.tool.name ||
+      existingInvocation.argsHash !== input.argsHash
+    ) {
+      return REQUEST_ID_CONFLICT_OUTCOME;
+    }
+    if (existingInvocation.mode === 'direct') {
+      const directCall = await store.getRelayCall(`direct:${invocationId}`);
+      if (!directCall || directCall.state === 'executing') {
+        return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
+      }
+      return outcomeFromSettledRecord(directCall);
+    }
+  }
+
+  if (existingApproval) {
+    const existingPayload = parseHeldCallPayload(existingApproval.payload);
+    if (
+      existingPayload &&
+      (existingPayload.appId !== input.app.id ||
+        existingPayload.toolName !== input.tool.name ||
+        existingPayload.argsHash !== input.argsHash)
+    ) {
+      return REQUEST_ID_CONFLICT_OUTCOME;
+    }
+    if (existingInvocation && existingInvocation.approvalId === null) {
+      await store.bindHeldApproval(invocationId, existingApproval.approval_id);
+    }
+    switch (existingApproval.status) {
+      case 'pending':
+        return { status: 'held', text: HELD_CALL_ANSWER, approvalId: existingApproval.approval_id };
+      case 'approved': {
+        const record = await store.getRelayCall(existingApproval.approval_id);
+        if (record && record.state !== 'executing') return outcomeFromSettledRecord(record);
+        return { status: 'held', text: HELD_CALL_ANSWER, approvalId: existingApproval.approval_id };
+      }
+      case 'awaiting_reason':
+      case 'rejected':
+        return {
+          status: 'unsent',
+          reason: 'rejected',
+          text: 'The principal declined this app tool call; nothing was sent.',
+        };
+      case 'expired':
+        return {
+          status: 'unsent',
+          reason: 'expired',
+          text: 'The approval request for this app tool call expired; nothing was sent.',
+        };
+      default: {
+        const unreachable: never = existingApproval.status;
+        throw new Error(`Unexpected approval status: ${String(unreachable)}`);
+      }
+    }
+  }
+
+  if (!existingInvocation) return undefined;
+  if (existingInvocation.state === 'active' && existingInvocation.approvalId === null) {
+    return undefined;
+  }
+  if (existingInvocation.approvalId) {
+    const record = await store.getRelayCall(existingInvocation.approvalId);
+    if (record) {
+      return record.state === 'executing'
+        ? { status: 'held', text: HELD_CALL_ANSWER, approvalId: existingInvocation.approvalId }
+        : outcomeFromSettledRecord(record);
+    }
+  }
+  switch (existingInvocation.state) {
+    case 'active':
+      return {
+        status: 'held',
+        text: HELD_CALL_ANSWER,
+        ...(existingInvocation.approvalId ? { approvalId: existingInvocation.approvalId } : {}),
+      };
+    case 'settled':
+      return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
+    case 'declined':
+      return {
+        status: 'unsent',
+        reason: 'rejected',
+        text: 'The principal declined this app tool call; nothing was sent.',
+      };
+    case 'expired':
+      return {
+        status: 'unsent',
+        reason: 'expired',
+        text: 'The approval request for this app tool call expired; nothing was sent.',
+      };
+    case 'withdrawn':
+      return {
+        status: 'unsent',
+        reason: 'withdrawn',
+        text: 'The approval request for this app tool call was withdrawn; nothing was sent.',
+      };
+    default: {
+      const unreachable: never = existingInvocation.state;
+      throw new Error(`Unexpected invocation state: ${String(unreachable)}`);
+    }
+  }
+}
+
+let lastHoldStore: ConnectionsStore | undefined;
+
 export function createHoldCallHandler(dependencies: {
   readonly store: ConnectionsStore;
   readonly webHostname?: () => Promise<string | undefined>;
   readonly now?: () => number;
 }): HoldCallHandler {
+  lastHoldStore = dependencies.store;
   const readHostname = dependencies.webHostname ?? defaultWebHostname;
   const now = dependencies.now ?? Date.now;
   const invocationQueues = new Map<string, Promise<unknown>>();
@@ -402,95 +542,142 @@ export function createHoldCallHandler(dependencies: {
   return async (input: HoldCallInput): Promise<RelayCallOutcome> => {
     const invocationId = `${input.session.id}:${input.requestId}`;
     return withInvocationLock(invocationId, async () => {
-      const existing = await findPendingByInvocation(invocationId);
-      if (existing) {
-        return { status: 'held', text: HELD_CALL_ANSWER, approvalId: existing.approval_id };
-      }
-
-      const [conversation, approverUserId] = await Promise.all([resolveMainConversation(), principalApproverUserId()]);
-      if (typeof conversation === 'string') {
-        return {
-          status: 'unsent',
-          reason: conversation,
-          text: 'Could not reach the principal to ask for approval; nothing was sent.',
-        };
-      }
-      if (!approverUserId) {
-        return {
-          status: 'unsent',
-          reason: 'no_principal',
-          text: 'No verified principal is configured to approve app actions; nothing was sent.',
-        };
-      }
-
-      const needles = new Set<string>();
-      collectArgStrings(input.args, needles);
-      const expiresAt = new Date(now() + HELD_CALL_TTL_MS).toISOString();
-      const [recent, timezone] = await Promise.all([
-        needles.size > 0
-          ? dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20)
-          : Promise.resolve([]),
-        resolvePrincipalZoneAt(expiresAt),
+      const [existingApproval, existingInvocation] = await Promise.all([
+        findApprovalByInvocation(invocationId),
+        dependencies.store.getRelayInvocation(invocationId),
       ]);
-      const appContext = matchNeedlesInRecent(needles, recent);
-      const viewId = `held-${now()}-${randomBytes(4).toString('hex')}`;
+      const existingOutcome = await resolveExistingHeldState(
+        dependencies.store,
+        input,
+        invocationId,
+        existingApproval,
+        existingInvocation,
+      );
+      if (existingOutcome) return existingOutcome;
 
-      const card = await buildHeldCallCard({
-        viewId,
-        appName: input.app.name,
-        appHost: input.app.host,
-        toolName: input.tool.name,
-        args: input.args,
-        summary: input.summary,
-        appContext,
-        expiresAt,
-        timezone,
-        readHostname,
-      });
-      if (card.kind === 'unreachable_details') {
-        return {
-          status: 'unsent',
-          reason: 'details_unavailable',
-          text: 'This action has too many details to show on an approval card, and the Connections page is unavailable to review them in full; nothing was sent.',
-        };
-      }
-
-      const payload: HeldAppCallPayload = {
-        viewId,
+      const reservation = await dependencies.store.reserveHeldInvocation({
         invocationId,
         appId: input.app.id,
-        appName: input.app.name,
-        appHost: input.app.host,
         grantGeneration: input.grantGeneration,
         toolName: input.tool.name,
-        definitionHash: input.tool.definitionHash,
-        canonicalArgs: input.canonicalArgs,
         argsHash: input.argsHash,
-        summary: input.summary ?? null,
-        appContext,
-        expiresAt,
-      };
-
-      const deliveredId = await requestApproval({
-        session: conversation.session,
-        agentName: 'Assistant',
-        action: HELD_APP_CALL_ACTION,
-        payload: payload as unknown as Record<string, unknown>,
-        title: card.title,
-        question: card.question,
-        details: { facts: { app: input.app.name, tool: input.tool.name } },
-        approverUserId,
-        expiresAt,
+        at: new Date(now()).toISOString(),
       });
-
-      if (!deliveredId) {
+      if (reservation.status === 'conflict') return REQUEST_ID_CONFLICT_OUTCOME;
+      if (reservation.status === 'app_not_found') {
         return {
           status: 'unsent',
-          reason: 'delivery_failed',
-          text: 'Could not send the approval request to the principal; nothing was sent.',
+          reason: 'app_gone',
+          text: 'The app is no longer connected, so nothing was sent.',
         };
       }
-      return { status: 'held', text: HELD_CALL_ANSWER, approvalId: deliveredId };
+      if (reservation.status === 'existing') {
+        const resolved = await resolveExistingHeldState(
+          dependencies.store,
+          input,
+          invocationId,
+          await findApprovalByInvocation(invocationId),
+          reservation.invocation,
+        );
+        if (resolved) return resolved;
+      }
+
+      let posted = false;
+      try {
+        const [conversation, approverUserId] = await Promise.all([
+          resolveMainConversation(),
+          principalApproverUserId(),
+        ]);
+        if (typeof conversation === 'string') {
+          return {
+            status: 'unsent',
+            reason: conversation,
+            text: 'Could not reach the principal to ask for approval; nothing was sent.',
+          };
+        }
+        if (!approverUserId) {
+          return {
+            status: 'unsent',
+            reason: 'no_principal',
+            text: 'No verified principal is configured to approve app actions; nothing was sent.',
+          };
+        }
+
+        const needles = new Set<string>();
+        collectArgStrings(input.args, needles);
+        const expiresAt = new Date(now() + HELD_CALL_TTL_MS).toISOString();
+        const [recent, timezone] = await Promise.all([
+          needles.size > 0
+            ? dependencies.store.recentCompletedResults(input.app.id, input.grantGeneration, 20)
+            : Promise.resolve([]),
+          resolvePrincipalZoneAt(expiresAt),
+        ]);
+        const appContext = matchNeedlesInRecent(needles, recent);
+        const viewId = `held-${now()}-${randomBytes(4).toString('hex')}`;
+
+        const card = await buildHeldCallCard({
+          viewId,
+          appName: input.app.name,
+          appHost: input.app.host,
+          toolName: input.tool.name,
+          args: input.args,
+          summary: input.summary,
+          appContext,
+          expiresAt,
+          timezone,
+          readHostname,
+        });
+        if (card.kind === 'unreachable_details') {
+          return {
+            status: 'unsent',
+            reason: 'details_unavailable',
+            text: 'This action has too many details to show on an approval card, and the Connections page is unavailable to review them in full; nothing was sent.',
+          };
+        }
+
+        const payload: HeldAppCallPayload = {
+          viewId,
+          invocationId,
+          appId: input.app.id,
+          appName: input.app.name,
+          appHost: input.app.host,
+          grantGeneration: input.grantGeneration,
+          toolName: input.tool.name,
+          definitionHash: input.tool.definitionHash,
+          canonicalArgs: input.canonicalArgs,
+          argsHash: input.argsHash,
+          summary: input.summary ?? null,
+          appContext,
+          expiresAt,
+        };
+
+        const deliveredId = await requestApproval({
+          session: conversation.session,
+          agentName: 'Assistant',
+          action: HELD_APP_CALL_ACTION,
+          payload: payload as unknown as Record<string, unknown>,
+          title: card.title,
+          question: card.question,
+          details: { facts: { app: input.app.name, tool: input.tool.name } },
+          approverUserId,
+          expiresAt,
+        });
+
+        if (!deliveredId) {
+          return {
+            status: 'unsent',
+            reason: 'delivery_failed',
+            text: 'Could not send the approval request to the principal; nothing was sent.',
+          };
+        }
+        posted = true;
+        await dependencies.store.bindHeldApproval(invocationId, deliveredId, new Date(now()).toISOString());
+        return { status: 'held', text: HELD_CALL_ANSWER, approvalId: deliveredId };
+      } finally {
+        if (!posted) {
+          await dependencies.store.releaseUnpostedHeldInvocation(invocationId).catch(() => undefined);
+        }
+      }
     });
   };
 }
@@ -499,11 +686,31 @@ let activeDependencies: HeldCallsDependencies = { relay: getAppRelay };
 let resolvedListenerRegistered = false;
 
 async function handleApprovalResolved(event: ApprovalResolvedEvent): Promise<void> {
-  if (event.approval.action !== HELD_APP_CALL_ACTION || event.outcome !== 'expired') return;
+  if (event.approval.action !== HELD_APP_CALL_ACTION) return;
   const payload = parseHeldCallPayload(event.approval.payload);
   if (!payload) return;
-  const writeNote = activeDependencies.writeNote ?? writeNoteForMain;
   const now = activeDependencies.now ?? Date.now;
+  const store = (await activeDependencies.store?.()) ?? lastHoldStore;
+  if (store) {
+    const resolvedState =
+      event.outcome === 'approve'
+        ? 'settled'
+        : event.outcome === 'reject'
+          ? 'declined'
+          : event.outcome === 'expired'
+            ? 'expired'
+            : 'withdrawn';
+    await store
+      .markHeldInvocationResolved(
+        payload.invocationId,
+        event.approval.approval_id,
+        resolvedState,
+        new Date(now()).toISOString(),
+      )
+      .catch(() => undefined);
+  }
+  if (event.outcome !== 'expired') return;
+  const writeNote = activeDependencies.writeNote ?? writeNoteForMain;
   await writeNote({
     id: `app-call-expired:${event.approval.approval_id}`,
     timestamp: new Date(now()).toISOString(),
@@ -559,6 +766,7 @@ export function registerHeldAppCallHandlers(dependencies: HeldCallsDependencies 
           } else {
             outcome = await relay.executeApprovedCall({
               approvalId: approval.approval_id,
+              invocationId: payload.invocationId,
               appId: payload.appId,
               grantGeneration: payload.grantGeneration,
               toolName: payload.toolName,
@@ -605,6 +813,28 @@ export async function withdrawHeldAppCalls(
     if (row.status !== 'pending') continue;
     const payload = parseHeldCallPayload(row.payload);
     if (payload?.appId !== appId) continue;
+    if (await withdrawApproval(row.approval_id, resolution)) count += 1;
+  }
+  return count;
+}
+
+export async function withdrawToolAskApprovals(
+  appId: string,
+  resolution = 'Withdrawn — app changed or disconnected',
+): Promise<number> {
+  if (!(await getDb().hasTable('pending_approvals'))) return 0;
+  const rows = await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION_NAME);
+  let count = 0;
+  for (const row of rows) {
+    if (row.status !== 'pending') continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.payload);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      continue;
+    }
+    if (!isRecord(parsed) || parsed.id !== appId) continue;
     if (await withdrawApproval(row.approval_id, resolution)) count += 1;
   }
   return count;

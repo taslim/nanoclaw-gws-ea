@@ -14,7 +14,7 @@ import {
   type OperatorServer,
 } from './apply.js';
 import { withAppLock } from './locks.js';
-import { withdrawHeldAppCalls } from './held-calls.js';
+import { withdrawHeldAppCalls, withdrawToolAskApprovals } from './held-calls.js';
 import { getAppRelay } from './relay.js';
 import {
   appClientDocumentUrl,
@@ -272,6 +272,7 @@ export class ConnectionOperations {
         const relay = getAppRelay();
         if (relay) await relay.closeApp(appId);
         await withdrawHeldAppCalls(appId);
+        await withdrawToolAskApprovals(appId);
       });
   }
 

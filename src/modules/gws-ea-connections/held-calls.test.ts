@@ -33,6 +33,7 @@ import {
   runMigrations,
   transitionPendingApprovalStatus,
 } from '../../db/index.js';
+import { markApprovalAwaitingReason } from '../../db/sessions.js';
 import { setDeliveryAdapter } from '../../delivery.js';
 import { sessionDir } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -50,6 +51,7 @@ import {
   HELD_CALL_ANSWER,
   registerHeldAppCallHandlers,
   renderCompactArgs,
+  withdrawHeldAppCalls,
 } from './held-calls.js';
 import { ConnectionOperations } from './operations.js';
 import { startAppRelay, stopAppRelay, type AppRelay } from './relay.js';
@@ -734,10 +736,11 @@ describe('held ask-first calls', () => {
     ]);
     expect(first.status).toBe('held');
     expect(second.status).toBe('held');
-    expect(first.status === 'held' ? first.approvalId : undefined).toBe(
-      second.status === 'held' ? second.approvalId : undefined,
-    );
     expect(deliveredCards).toHaveLength(1);
+    const deliveredId = deliveredCards[0]!.questionId;
+    expect(deliveredId).toBeTruthy();
+    expect(first.status === 'held' ? first.approvalId : undefined).toBe(deliveredId);
+    expect(second.status === 'held' ? second.approvalId : undefined).toBe(deliveredId);
 
     // 2) An over-long tool name is capped on the card so title + question never exceed MAX_CARD_QUESTION_LENGTH.
     const longOutcome = await relay!.callTool({
@@ -752,5 +755,216 @@ describe('held ask-first calls', () => {
     expect(deliveredCards).toHaveLength(2);
     const longCard = deliveredCards[1]!;
     expect(longCard.title.length + longCard.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
+
+    // 3) Truncated tool name with short arguments still forces a details link (and withholds when hostname is absent).
+    const shortArgsLongName = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: longToolName,
+      args: { id: 'tiny' },
+      summary: 'Run long tool with short args',
+      session: mainSession,
+      requestId: 'req-long-tool-short-args',
+    });
+    expect(shortArgsLongName.status).toBe('held');
+    expect(deliveredCards).toHaveLength(3);
+    expect(deliveredCards[2]!.question).toContain(`https://${HOSTNAME}/connections/held/`);
+
+    const noWebRelay = startAppRelay({
+      store,
+      egress: endpoints.egress,
+      onHoldCall: createHoldCallHandler({ store, webHostname: async () => undefined }),
+    });
+    try {
+      const withheld = await noWebRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: longToolName,
+        args: { id: 'tiny' },
+        summary: 'No details page available',
+        session: mainSession,
+        requestId: 'req-long-tool-no-web',
+      });
+      expect(withheld).toMatchObject({ status: 'unsent', reason: 'details_unavailable' });
+      expect(deliveredCards).toHaveLength(3);
+    } finally {
+      await noWebRelay.closeAll();
+    }
+
+    // 4) Emoji-heavy arguments respect the UTF-16 budget without exceeding MAX_CARD_QUESTION_LENGTH or splitting surrogates.
+    relay = startAppRelay({
+      store,
+      egress: endpoints.egress,
+      onHoldCall: createHoldCallHandler({ store, webHostname: async () => HOSTNAME }),
+    });
+    const emojiOutcome = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { note: '😀'.repeat(1800) },
+      summary: 'Emoji order',
+      session: mainSession,
+      requestId: 'req-emoji-budget',
+    });
+    expect(emojiOutcome.status).toBe('held');
+    const emojiCard = deliveredCards.at(-1)!;
+    expect(emojiCard.title.length + emojiCard.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
+    // Ensure no unpaired surrogate code unit was created by truncation.
+    const hasLoneSurrogate = (text: string): boolean => {
+      for (let i = 0; i < text.length; i += 1) {
+        const code = text.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          const next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+          if (next < 0xdc00 || next > 0xdfff) return true;
+          i += 1;
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+          return true;
+        }
+      }
+      return false;
+    };
+    expect(hasLoneSurrogate(emojiCard.title)).toBe(false);
+    expect(hasLoneSurrogate(emojiCard.question)).toBe(false);
+  });
+
+  it('never posts a second approval card or re-dispatches when retrying a held invocation after leaving pending', async () => {
+    const { fake, app } = await setupFoodApp();
+
+    // 1) After approval completes (and pending_approvals row is deleted), retry returns the settled outcome without posting a new card or dispatching again.
+    const heldApprove = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_once' },
+      summary: 'Approve once',
+      session: mainSession,
+      requestId: 'req-retry-after-approve',
+    });
+    expect(heldApprove.status).toBe('held');
+    const approveCardId = deliveredCards.at(-1)!.questionId;
+    await handleApprovalsResponse({
+      questionId: approveCardId,
+      value: 'approve',
+      userId: PRINCIPAL_USER,
+      channelType: 'gchat',
+      platformId: 'spaces/principal-dm',
+      threadId: null,
+    });
+    expect(fake.toolCalls).toHaveLength(1);
+    const cardsAfterApprove = deliveredCards.length;
+    const retryAfterApprove = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_once' },
+      summary: 'Approve once',
+      session: mainSession,
+      requestId: 'req-retry-after-approve',
+    });
+    expect(retryAfterApprove.status).toBe('completed');
+    expect(deliveredCards).toHaveLength(cardsAfterApprove);
+    expect(fake.toolCalls).toHaveLength(1);
+
+    // 2) While awaiting_reason, retry returns unsent/rejected without posting a second card.
+    const heldAwait = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_await' },
+      summary: 'Await reason',
+      session: mainSession,
+      requestId: 'req-retry-awaiting-reason',
+    });
+    expect(heldAwait.status).toBe('held');
+    const awaitCardId = deliveredCards.at(-1)!.questionId;
+    expect(await markApprovalAwaitingReason(awaitCardId, '2099-01-01T00:00:00.000Z')).toBe(true);
+    const cardsAfterAwait = deliveredCards.length;
+    expect(
+      await relay!.callTool({
+        serverKey: app.serverKey,
+        toolName: 'confirm_checkout',
+        args: { checkout_id: 'chk_await' },
+        summary: 'Await reason',
+        session: mainSession,
+        requestId: 'req-retry-awaiting-reason',
+      }),
+    ).toMatchObject({ status: 'unsent', reason: 'rejected' });
+    expect(deliveredCards).toHaveLength(cardsAfterAwait);
+
+    // 3) After rejection completes (and row is deleted), retry returns unsent/rejected without posting a second card.
+    const heldReject = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_rej' },
+      summary: 'Reject once',
+      session: mainSession,
+      requestId: 'req-retry-after-reject',
+    });
+    expect(heldReject.status).toBe('held');
+    const rejectCardId = deliveredCards.at(-1)!.questionId;
+    await handleApprovalsResponse({
+      questionId: rejectCardId,
+      value: 'reject',
+      userId: PRINCIPAL_USER,
+      channelType: 'gchat',
+      platformId: 'spaces/principal-dm',
+      threadId: null,
+    });
+    const cardsAfterReject = deliveredCards.length;
+    expect(
+      await relay!.callTool({
+        serverKey: app.serverKey,
+        toolName: 'confirm_checkout',
+        args: { checkout_id: 'chk_rej' },
+        summary: 'Reject once',
+        session: mainSession,
+        requestId: 'req-retry-after-reject',
+      }),
+    ).toMatchObject({ status: 'unsent', reason: 'rejected' });
+    expect(deliveredCards).toHaveLength(cardsAfterReject);
+
+    // 4) After expiry (and row deletion), retry returns unsent/expired without posting a second card.
+    const heldExpire = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_exp' },
+      summary: 'Expire once',
+      session: mainSession,
+      requestId: 'req-retry-after-expire',
+    });
+    expect(heldExpire.status).toBe('held');
+    const expireCardId = deliveredCards.at(-1)!.questionId;
+    expect(await expireApproval(expireCardId, '2099-01-01T00:00:00.000Z')).toBe(true);
+    const cardsAfterExpire = deliveredCards.length;
+    expect(
+      await relay!.callTool({
+        serverKey: app.serverKey,
+        toolName: 'confirm_checkout',
+        args: { checkout_id: 'chk_exp' },
+        summary: 'Expire once',
+        session: mainSession,
+        requestId: 'req-retry-after-expire',
+      }),
+    ).toMatchObject({ status: 'unsent', reason: 'expired' });
+    expect(deliveredCards).toHaveLength(cardsAfterExpire);
+
+    // 5) After withdrawal (and row deletion), retry returns unsent/withdrawn without posting a second card.
+    const heldWithdraw = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_wd' },
+      summary: 'Withdraw once',
+      session: mainSession,
+      requestId: 'req-retry-after-withdraw',
+    });
+    expect(heldWithdraw.status).toBe('held');
+    expect(await withdrawHeldAppCalls(app.id)).toBe(1);
+    const cardsAfterWithdraw = deliveredCards.length;
+    expect(
+      await relay!.callTool({
+        serverKey: app.serverKey,
+        toolName: 'confirm_checkout',
+        args: { checkout_id: 'chk_wd' },
+        summary: 'Withdraw once',
+        session: mainSession,
+        requestId: 'req-retry-after-withdraw',
+      }),
+    ).toMatchObject({ status: 'unsent', reason: 'withdrawn' });
+    expect(deliveredCards).toHaveLength(cardsAfterWithdraw);
+    expect(fake.toolCalls).toHaveLength(1);
   });
 });

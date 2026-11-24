@@ -1210,6 +1210,7 @@ describe('host relay core', () => {
       requestId: 'req-flip-replay',
     });
     expect(settledDirect.status).toBe('completed');
+    const callsAfterFirst = fake.toolCalls.length;
     await store.setToolLabel(app.id, 'search_menu', 'ask_first', 'principal', {
       expectedHash: toolDefinitionHash(SEARCH_TOOL),
     });
@@ -1220,7 +1221,25 @@ describe('host relay core', () => {
       session,
       requestId: 'req-flip-replay',
     });
-    expect(replayedAfterFlip).toEqual(expect.objectContaining({ status: 'completed' }));
+    expect(replayedAfterFlip).toEqual(
+      expect.objectContaining({
+        status: 'completed',
+        result: settledDirect.status === 'completed' ? settledDirect.result : undefined,
+      }),
+    );
+    expect(fake.toolCalls).toHaveLength(callsAfterFirst);
+    expect(heldCalls).toHaveLength(0);
+
+    // 2b) Reusing a settled requestId with different arguments is refused instead of returning the earlier outcome.
+    const mismatchedReplay = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_menu',
+      args: { query: 'different-args' },
+      session,
+      requestId: 'req-flip-replay',
+    });
+    expect(mismatchedReplay).toMatchObject({ status: 'unsent', reason: 'request_id_conflict' });
+    expect(fake.toolCalls).toHaveLength(callsAfterFirst);
     expect(heldCalls).toHaveLength(0);
 
     // 3) Colliding tool whose pinned schema declares assistant_summary preserves that upstream argument.
@@ -1391,6 +1410,224 @@ describe('host relay core', () => {
       }
     } finally {
       await defChangeRelay.closeAll();
+    }
+  });
+
+  it('preserves composed allOf assistant_summary and own __proto__, rechecks live grant after egress resolve, and prevents double dispatch across reroute and approval paths', async () => {
+    const composedSummaryTool = {
+      name: 'allof_summary_tool',
+      description: 'Declares assistant_summary via allOf',
+      inputSchema: {
+        type: 'object' as const,
+        allOf: [
+          {
+            properties: { assistant_summary: { type: 'string' }, id: { type: 'string' } },
+            required: ['assistant_summary', 'id'],
+          },
+        ],
+      },
+    };
+    const fake = new FakeMcpApp({
+      appUrl: OPEN_URL,
+      issuer: 'https://recipes.example.test',
+      allowUnauthenticated: true,
+      tools: [SEARCH_TOOL, composedSummaryTool],
+    });
+    endpoints.use(fake.handle);
+    const app = await connectOpenApp();
+    await relay.pinApp(app.id);
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'search_menu',
+        definitionHash: toolDefinitionHash(SEARCH_TOOL),
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Lookup',
+      },
+      {
+        name: 'allof_summary_tool',
+        definitionHash: toolDefinitionHash(composedSummaryTool),
+        label: 'just_do',
+        source: 'principal',
+        reason: 'Allowed by principal',
+      },
+    ]);
+
+    // 1) Composed allOf assistant_summary is preserved upstream.
+    const composedRes = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'allof_summary_tool',
+      args: { id: 'a-1', assistant_summary: 'real allOf arg' },
+      summary: 'Relay note',
+      session,
+      requestId: 'req-allof-summary',
+    });
+    expect(composedRes.status).toBe('completed');
+    expect(fake.toolCalls.find((c) => c.name === 'allof_summary_tool')?.arguments).toEqual({
+      id: 'a-1',
+      assistant_summary: 'real allOf arg',
+    });
+
+    // 2) Stripping synthetic assistant_summary preserves an own __proto__ property.
+    const argsWithOwnProto = JSON.parse(
+      '{"query":"proto-test","__proto__":{"keep":true},"assistant_summary":"strip me"}',
+    ) as Record<string, unknown>;
+    const protoRes = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_menu',
+      args: argsWithOwnProto,
+      session,
+      requestId: 'req-own-proto',
+    });
+    expect(protoRes.status).toBe('completed');
+    const protoCall = fake.toolCalls.find((c) => c.arguments.query === 'proto-test')!;
+    expect(Object.hasOwn(protoCall.arguments, '__proto__')).toBe(true);
+    expect(Object.hasOwn(protoCall.arguments, 'assistant_summary')).toBe(false);
+
+    // 3) Reroute to approval records a held invocation atomically: replaying after flipping back to just_do
+    //    never dispatches directly, and executing the approval runs at most once.
+    let blockQueue = true;
+    let releaseQueue = (): void => undefined;
+    let enteredQueue = (): void => undefined;
+    const queueEntered = new Promise<void>((resolve) => {
+      enteredQueue = resolve;
+    });
+    let holdEnteredResolve = (): void => undefined;
+    const holdEntered = new Promise<void>((resolve) => {
+      holdEnteredResolve = resolve;
+    });
+    let releaseHold = (): void => undefined;
+    let holdInvocations = 0;
+    const raceRelay = createAppRelay({
+      store,
+      egress: {
+        ...endpoints.egress,
+        resolve: async (target) => {
+          if (blockQueue) {
+            blockQueue = false;
+            enteredQueue();
+            await new Promise<void>((resolve) => {
+              releaseQueue = resolve;
+            });
+          }
+          return endpoints.egress.resolve!(target);
+        },
+      },
+      now: () => clock,
+      onHoldCall: async (input) => {
+        holdInvocations += 1;
+        if (holdInvocations === 1) {
+          holdEnteredResolve();
+          await new Promise<void>((resolve) => {
+            releaseHold = resolve;
+          });
+        }
+        return { status: 'held', text: `held:${input.tool.name}`, approvalId: 'apr-reroute-once' };
+      },
+    });
+    try {
+      const blocker = raceRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'allof_summary_tool',
+        args: { id: 'blk-1', assistant_summary: 'blocker' },
+        session,
+        requestId: 'req-reroute-blocker',
+      });
+      await queueEntered;
+      const rerouting = raceRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'reroute-once' },
+        session,
+        requestId: 'req-reroute-race',
+      });
+      await vi.waitFor(async () => {
+        expect(await store.getRelayCall(`direct:${session.id}:req-reroute-race`)).toMatchObject({ state: 'executing' });
+      });
+      // Flip search_menu to ask_first so queued call reroutes to hold while blocker finishes cleanly.
+      await store.setToolLabel(app.id, 'search_menu', 'ask_first', 'principal', {
+        expectedHash: toolDefinitionHash(SEARCH_TOOL),
+      });
+      releaseQueue();
+      await blocker;
+      await holdEntered;
+      // While holdHandler is still pending, flip back to just_do and replay the exact same requestId.
+      await store.setToolLabel(app.id, 'search_menu', 'just_do', 'principal', {
+        expectedHash: toolDefinitionHash(SEARCH_TOOL),
+      });
+      const replayDuringHold = await raceRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'reroute-once' },
+        session,
+        requestId: 'req-reroute-race',
+      });
+      releaseHold();
+      const firstReroute = await rerouting;
+      expect(firstReroute.status).toBe('held');
+      expect(replayDuringHold.status).toBe('held');
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'reroute-once')).toHaveLength(0);
+
+      // Approved execution dispatches exactly once.
+      const exec1 = await raceRelay.executeApprovedCall({
+        approvalId: 'apr-reroute-once',
+        invocationId: `${session.id}:req-reroute-race`,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'search_menu',
+        definitionHash: toolDefinitionHash(SEARCH_TOOL),
+        args: { query: 'reroute-once' },
+      });
+      expect(exec1.status).toBe('completed');
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'reroute-once')).toHaveLength(1);
+
+      // 4) Disconnect committed while tools/call egress resolve is pending aborts before dialing the socket.
+      let armDisconnectOnResolve = false;
+      const dialGuardRelay = createAppRelay({
+        store,
+        egress: {
+          ...endpoints.egress,
+          resolve: async (target) => {
+            const dest = await endpoints.egress.resolve!(target);
+            if (armDisconnectOnResolve) {
+              armDisconnectOnResolve = false;
+              const cur = await store.get(app.id);
+              await store.disconnect(cur.id, cur.version);
+            }
+            return dest;
+          },
+        },
+        now: () => clock,
+      });
+      try {
+        // Warm the MCP session first so the next call's resolve happens strictly after verifyBeforeCall on tools/call.
+        expect(
+          (
+            await dialGuardRelay.callTool({
+              serverKey: app.serverKey,
+              toolName: 'search_menu',
+              args: { query: 'warm-dial-guard' },
+              session,
+              requestId: 'req-dial-guard-warm',
+            })
+          ).status,
+        ).toBe('completed');
+        const beforeCount = fake.toolCalls.length;
+        armDisconnectOnResolve = true;
+        const postDisc = await dialGuardRelay.callTool({
+          serverKey: app.serverKey,
+          toolName: 'search_menu',
+          args: { query: 'must-not-dial-after-disconnect' },
+          session,
+          requestId: 'req-dial-guard',
+        });
+        expect(postDisc).toMatchObject({ status: 'unsent', reason: 'grant_changed' });
+        expect(fake.toolCalls).toHaveLength(beforeCount);
+      } finally {
+        await dialGuardRelay.closeAll();
+      }
+    } finally {
+      await raceRelay.closeAll();
     }
   });
 });

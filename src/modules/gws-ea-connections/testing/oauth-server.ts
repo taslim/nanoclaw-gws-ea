@@ -97,7 +97,7 @@ export async function startFakeEndpoints(hosts: readonly string[]): Promise<Fake
         };
         requests.push(request);
         let reply: FakeReply = { status: 404, body: { error: 'not_found' } };
-        for (const handler of handlers) {
+        for (const handler of [...handlers]) {
           const answer = await handler(request);
           if (answer) {
             reply = answer;

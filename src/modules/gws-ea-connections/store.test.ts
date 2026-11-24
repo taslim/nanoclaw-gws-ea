@@ -798,4 +798,83 @@ describe('tool pinning, principal floors, and call claims', () => {
     expect(() => canonicalJson({ ['key-\uDC00']: 1 })).toThrow(TypeError);
     expect(canonicalJson({ emoji: '😀' })).toBe('{"emoji":"😀"}');
   });
+
+  it('guards applyApprovedToolAsk against newer approved_request decisions, grant replacements, and records restart atomically while allowing sorter-only writes', async () => {
+    const app = await store.create(LEDGERLY);
+    const firstGrant = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+    const toolDef = {
+      name: 'place_order',
+      description: 'Place order',
+      inputSchema: { type: 'object', properties: {} },
+    };
+    const pinned = await store.pinTools(app.id, { instructions: null, tools: [toolDef] });
+    const hash = pinned.tools[0]!.definitionHash;
+    await store.applyToolLabels(app.id, [
+      { name: 'place_order', definitionHash: hash, label: 'ask_first', source: 'floor', reason: 'Places order' },
+    ]);
+
+    const rev0 = await store.getToolDecisionRevision(app.id, 'place_order');
+    expect(rev0).toBe(0);
+
+    // Sorter-only and fallback writes must NOT advance the principal decision revision.
+    await store.applyToolLabels(app.id, [
+      { name: 'place_order', definitionHash: hash, label: 'ask_first', source: 'sorter', reason: 'Still ask' },
+    ]);
+    expect(await store.getToolDecisionRevision(app.id, 'place_order')).toBe(0);
+
+    // Principal turns Ask-first off on the page (rev 1), then approves request B turning Ask-first back on (rev 2, source=approved_request).
+    await store.setToolLabel(app.id, 'place_order', 'just_do', 'principal', { expectedHash: hash });
+    const rev1 = await store.getToolDecisionRevision(app.id, 'place_order');
+    expect(rev1).toBe(1);
+    expect(await store.pendingRestart()).toBeUndefined();
+    expect(
+      await store.applyApprovedToolAsk({
+        requestId: 'req-b-raise',
+        appId: app.id,
+        name: 'place_order',
+        label: 'ask_first',
+        expectedGrantGeneration: firstGrant.generation,
+        expectedHash: hash,
+        expectedDecisionRevision: rev1,
+      }),
+    ).toBe('applied');
+    // Restart request was recorded atomically inside the applyApprovedToolAsk transaction.
+    expect(await store.pendingRestart()).toBeDefined();
+    expect(await store.getToolDecisionRevision(app.id, 'place_order')).toBe(2);
+
+    // Older request A (captured at rev 0) must NOT override newer approved_request B or clear the Ask-first floor.
+    expect(
+      await store.applyApprovedToolAsk({
+        requestId: 'req-a-stale-lower',
+        appId: app.id,
+        name: 'place_order',
+        label: 'just_do',
+        expectedGrantGeneration: firstGrant.generation,
+        expectedHash: hash,
+        expectedDecisionRevision: rev0,
+      }),
+    ).toBe('principal_changed');
+    expect(await store.getTool(app.id, 'place_order')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'approved_request',
+      principalFloor: true,
+    });
+
+    // Grant replacement followed by identical re-pin must STILL reject an approval captured under generation 1.
+    const current = await store.get(app.id);
+    await store.connect(current.id, current.version, { kind: 'token', token: 'tok-gen-2' });
+    await store.pinTools(app.id, { instructions: null, tools: [toolDef] });
+    expect(
+      await store.applyApprovedToolAsk({
+        requestId: 'req-gen1-stale',
+        appId: app.id,
+        name: 'place_order',
+        label: 'just_do',
+        expectedGrantGeneration: firstGrant.generation,
+        expectedHash: hash,
+        expectedDecisionRevision: 2,
+      }),
+    ).toBe('grant_changed');
+    expect((await store.getTool(app.id, 'place_order'))?.principalFloor).toBe(true);
+  });
 });

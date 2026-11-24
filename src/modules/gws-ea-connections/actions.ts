@@ -60,7 +60,7 @@ export interface AppActionDependencies {
 const ADD_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'url', 'name']);
 /** The approved request also carries the app's id, so it deletes exactly the app the principal saw. */
 const DELETE_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'app', 'id']);
-const TOOL_ASK_APPROVAL_BOUND_FIELDS = ['id', 'definitionHash', 'priorUpdatedAt'] as const;
+const TOOL_ASK_APPROVAL_BOUND_FIELDS = ['id', 'grantGeneration', 'definitionHash', 'priorDecisionRevision'] as const;
 const TOOL_ASK_FIELDS: ReadonlySet<string> = new Set([
   'action',
   'requestId',
@@ -188,8 +188,9 @@ interface ToolAskRequest {
   readonly askFirst: boolean;
   readonly reason?: string;
   readonly id?: string;
+  readonly grantGeneration?: number;
   readonly definitionHash?: string;
-  readonly priorUpdatedAt?: string;
+  readonly priorDecisionRevision?: number;
 }
 
 function fieldsOnly(content: Record<string, unknown>, allowed: ReadonlySet<string>, takes: string): void {
@@ -232,21 +233,38 @@ function toolAskRequest(content: Record<string, unknown>, requestId: string): To
   if (content.reason !== undefined && (typeof content.reason !== 'string' || hasControlCharacters(content.reason)))
     throw invalidArgs('reason must be plain text with no control characters.');
   if (content.id !== undefined && typeof content.id !== 'string') throw invalidArgs('Invalid app id.');
+  if (
+    content.grantGeneration !== undefined &&
+    (typeof content.grantGeneration !== 'number' ||
+      !Number.isSafeInteger(content.grantGeneration) ||
+      content.grantGeneration < 1)
+  ) {
+    throw invalidArgs('Invalid grant generation.');
+  }
   if (content.definitionHash !== undefined && typeof content.definitionHash !== 'string')
     throw invalidArgs('Invalid definition hash.');
-  if (content.priorUpdatedAt !== undefined && typeof content.priorUpdatedAt !== 'string')
-    throw invalidArgs('Invalid tool version.');
+  if (
+    content.priorDecisionRevision !== undefined &&
+    (typeof content.priorDecisionRevision !== 'number' ||
+      !Number.isSafeInteger(content.priorDecisionRevision) ||
+      content.priorDecisionRevision < 0)
+  ) {
+    throw invalidArgs('Invalid tool decision revision.');
+  }
   const reason =
     typeof content.reason === 'string' && content.reason.trim() ? content.reason.trim().slice(0, 200) : undefined;
   return {
     requestId,
     app: content.app.trim(),
-    tool: content.tool.trim(),
+    tool: content.tool,
     askFirst: content.ask_first,
     ...(reason === undefined ? {} : { reason }),
     ...(typeof content.id === 'string' ? { id: content.id } : {}),
+    ...(typeof content.grantGeneration === 'number' ? { grantGeneration: content.grantGeneration } : {}),
     ...(typeof content.definitionHash === 'string' ? { definitionHash: content.definitionHash } : {}),
-    ...(typeof content.priorUpdatedAt === 'string' ? { priorUpdatedAt: content.priorUpdatedAt } : {}),
+    ...(typeof content.priorDecisionRevision === 'number'
+      ? { priorDecisionRevision: content.priorDecisionRevision }
+      : {}),
   };
 }
 
@@ -588,18 +606,22 @@ export function createAppActions(dependencies: AppActionDependencies) {
       const isOperator = await hasOperatorServer(request.app);
       return refuse(isOperator === 'unavailable' ? 'unavailable' : isOperator ? 'operator_server' : 'not_found');
     }
+    const grant = await context.store.currentGrant(app.id);
+    if (!grant) return refuse('not_found');
     const tool = await context.store.getTool(app.id, request.tool);
     if (!tool) return refuse('tool_not_found');
     if (tool.label === null) return refuse('unsorted');
     if ((tool.label === 'ask_first') === request.askFirst) return refuse('unchanged');
+    const priorDecisionRevision = await context.store.getToolDecisionRevision(app.id, tool.name);
     const payload: Record<string, unknown> = {
       action: APP_TOOL_ASK_ACTION,
       requestId: request.requestId,
       app: app.serverKey,
       id: app.id,
+      grantGeneration: grant.generation,
       tool: tool.name,
       definitionHash: tool.definitionHash,
-      priorUpdatedAt: tool.updatedAt,
+      priorDecisionRevision,
       ask_first: request.askFirst,
       ...(request.reason === undefined ? {} : { reason: request.reason }),
     };
@@ -633,14 +655,20 @@ export function createAppActions(dependencies: AppActionDependencies) {
       appId: app.id,
       name: request.tool,
       label: nextLabel,
+      ...(request.grantGeneration === undefined ? {} : { expectedGrantGeneration: request.grantGeneration }),
       ...(request.definitionHash === undefined ? {} : { expectedHash: request.definitionHash }),
-      ...(request.priorUpdatedAt === undefined ? {} : { expectedPriorUpdatedAt: request.priorUpdatedAt }),
+      ...(request.priorDecisionRevision === undefined
+        ? {}
+        : { expectedDecisionRevision: request.priorDecisionRevision }),
     });
+    if (outcome === 'grant_changed') {
+      return `The principal approved changing ${app.name}.${request.tool}, but the app was disconnected or reconnected since approval was requested, so nothing changed.`;
+    }
     if (outcome === 'definition_changed') {
       return `The principal approved changing ${app.name}.${request.tool}, but the tool definition changed since approval was requested, so nothing changed.`;
     }
     if (outcome === 'principal_changed') {
-      return `The principal already updated ${app.name}.${request.tool} on their Connections page, so nothing changed.`;
+      return `The principal already updated ${app.name}.${request.tool}, so nothing changed.`;
     }
     if (outcome === 'applied') {
       await notifyMainToolsChanged(context.store);

@@ -626,6 +626,100 @@ describe('app_tool_ask', () => {
     expect((await store.getTool(created.id, 'confirm_checkout'))?.label).toBe('ask_first');
     expect((await store.getTool(created.id, 'confirm_checkout'))?.labelSource).toBe('principal');
   });
+
+  it('preserves exact whitespace tool names, prevents older tool-ask approvals from overriding newer decisions or surviving grant replacement, and withdraws tool-ask cards on disconnect', async () => {
+    const created = await store.create({ name: 'Scanner', url: RECIPES, auth: 'token' });
+    await store.connect(created.id, created.version, { kind: 'token', token: 'tok-scan-1' });
+    const plain = normalizeToolDefinition({
+      name: 'scan',
+      description: 'Plain scan',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const trailing = normalizeToolDefinition({
+      name: 'scan ',
+      description: 'Trailing space scan',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [plain, trailing] });
+    const plainHash = pinned.tools.find((t) => t.name === 'scan')!.definitionHash;
+    const trailingHash = pinned.tools.find((t) => t.name === 'scan ')!.definitionHash;
+    await store.applyToolLabels(created.id, [
+      { name: 'scan', definitionHash: plainHash, label: 'ask_first', source: 'floor', reason: 'Ask plain' },
+      { name: 'scan ', definitionHash: trailingHash, label: 'ask_first', source: 'floor', reason: 'Ask trailing' },
+    ]);
+
+    // Exact tool name with trailing space targets "scan ", not "scan".
+    const spaceReq = await send(APP_TOOL_ASK_ACTION, {
+      app: created.serverKey,
+      tool: 'scan ',
+      ask_first: false,
+    });
+    expect(spaceReq.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, 'scan '))?.label).toBe('just_do');
+    expect((await store.getTool(created.id, 'scan'))?.label).toBe('ask_first');
+
+    // Request A (lower scan -> just_do) is held, then principal flips scan to just_do on page and approves Request B (scan -> ask_first).
+    await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: false });
+    const reqARow = (await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).at(-1)!;
+    await store.setToolLabel(created.id, 'scan', 'just_do', 'principal', { expectedHash: plainHash });
+    await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: true });
+    const reqBRow = (await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).find(
+      (r) => r.approval_id !== reqARow.approval_id,
+    )!;
+    const handler = getApprovalHandler(APP_TOOL_ASK_ACTION)!;
+    // Approve B first -> sets label_source = 'approved_request' and principal_floor = true.
+    await handler({
+      session,
+      payload: JSON.parse(reqBRow.payload) as Record<string, unknown>,
+      approval: { ...reqBRow, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect(await store.getTool(created.id, 'scan')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'approved_request',
+      principalFloor: true,
+    });
+    // Now approve older A -> must NOT clear B's Ask-first floor.
+    await handler({
+      session,
+      payload: JSON.parse(reqARow.payload) as Record<string, unknown>,
+      approval: { ...reqARow, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect(await store.getTool(created.id, 'scan')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'approved_request',
+      principalFloor: true,
+    });
+
+    // Disconnecting withdraws pending app_tool_ask cards, and replaying a gen-1 approval after grant replacement is refused.
+    const latestApp = await store.get(created.id);
+    const ops = new ConnectionOperations({
+      store,
+      webHostname: HOST,
+      fetches: endpoints.fetches,
+      clientDocumentsServed: () => true,
+      applyMain: applyMainServers,
+    });
+    await ops.disconnect(latestApp.id, latestApp.version);
+    expect((await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).filter((r) => r.status === 'pending')).toHaveLength(
+      0,
+    );
+    const afterDisc = await store.get(created.id);
+    await store.connect(afterDisc.id, afterDisc.version, { kind: 'token', token: 'tok-scan-2' });
+    await store.pinTools(created.id, { instructions: null, tools: [plain] });
+    await handler({
+      session,
+      payload: JSON.parse(reqARow.payload) as Record<string, unknown>,
+      approval: { ...reqARow, status: 'approved' },
+      userId: PRINCIPAL,
+      notify: async () => undefined,
+    });
+    expect((await store.getTool(created.id, 'scan'))?.principalFloor).toBe(true);
+  });
 });
 
 describe("main's self-modification path", () => {

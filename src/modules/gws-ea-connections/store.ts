@@ -24,6 +24,8 @@ export type AppStatus = 'connected' | 'needs_reconnecting' | 'not_connected';
 export type ToolLabel = 'ask_first' | 'just_do';
 export type ToolLabelSource = 'sorter' | 'floor' | 'principal' | 'approved_request' | 'fallback';
 export type RelayCallState = 'executing' | 'completed' | 'unsent' | 'too_large' | 'unknown';
+export type RelayInvocationMode = 'direct' | 'held';
+export type RelayInvocationState = 'active' | 'settled' | 'declined' | 'expired' | 'withdrawn';
 export type ToolSortStatus = 'pending' | 'completed' | 'failed' | 'timed_out';
 export type ConnectionsStoreAvailability = SealAvailability;
 
@@ -93,11 +95,39 @@ export interface RelayCallRecord {
   readonly updatedAt: string;
 }
 
+export interface RelayInvocationRecord {
+  readonly invocationId: string;
+  readonly appId: string;
+  readonly grantGeneration: number;
+  readonly toolName: string;
+  readonly argsHash: string;
+  readonly mode: RelayInvocationMode;
+  readonly approvalId: string | null;
+  readonly state: RelayInvocationState;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export type ClaimApprovedCallResult =
   | { readonly status: 'claimed' }
   | { readonly status: 'app_not_found' }
   | { readonly status: 'already_executing'; readonly record: RelayCallRecord }
-  | { readonly status: 'already_settled'; readonly record: RelayCallRecord };
+  | { readonly status: 'already_settled'; readonly record: RelayCallRecord }
+  | { readonly status: 'already_dispatched' };
+
+export type ClaimDirectCallResult =
+  | { readonly status: 'claimed' }
+  | { readonly status: 'app_not_found' }
+  | { readonly status: 'already_executing'; readonly record: RelayCallRecord }
+  | { readonly status: 'already_settled'; readonly record: RelayCallRecord }
+  | { readonly status: 'already_held'; readonly invocation: RelayInvocationRecord }
+  | { readonly status: 'conflict' };
+
+export type ReserveHeldInvocationResult =
+  | { readonly status: 'reserved' }
+  | { readonly status: 'app_not_found' }
+  | { readonly status: 'existing'; readonly invocation: RelayInvocationRecord }
+  | { readonly status: 'conflict' };
 
 export interface RecentRelayResult {
   readonly id: string;
@@ -317,6 +347,12 @@ CREATE TABLE IF NOT EXISTS app_tool_floors (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (app_id, name)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS app_tool_revisions (
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+  PRIMARY KEY (app_id, name)
+) STRICT;
 CREATE TABLE IF NOT EXISTS app_tool_sorts (
   id TEXT PRIMARY KEY,
   app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
@@ -342,6 +378,18 @@ CREATE TABLE IF NOT EXISTS relay_calls (
   updated_at TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_relay_calls_app_updated ON relay_calls(app_id, grant_generation, state, updated_at DESC);
+CREATE TABLE IF NOT EXISTS relay_invocations (
+  invocation_id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  grant_generation INTEGER NOT NULL CHECK(grant_generation > 0),
+  tool_name TEXT NOT NULL,
+  args_hash TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN ('direct','held')),
+  approval_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('active','settled','declined','expired','withdrawn')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS restart_request (
   id INTEGER PRIMARY KEY CHECK(id = 1), applied_at TEXT NOT NULL
 ) STRICT;
@@ -445,6 +493,18 @@ interface RelayCallRow {
   readonly created_at: string;
   readonly updated_at: string;
 }
+interface RelayInvocationRow {
+  readonly invocation_id: string;
+  readonly app_id: string;
+  readonly grant_generation: number;
+  readonly tool_name: string;
+  readonly args_hash: string;
+  readonly mode: RelayInvocationMode;
+  readonly approval_id: string | null;
+  readonly state: RelayInvocationState;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
 
 function toAppPin(row: AppPinRow): AppPin {
   return {
@@ -503,6 +563,25 @@ function toRelayCall(row: RelayCallRow): RelayCallRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function toRelayInvocation(row: RelayInvocationRow): RelayInvocationRecord {
+  return {
+    invocationId: row.invocation_id,
+    appId: row.app_id,
+    grantGeneration: row.grant_generation,
+    toolName: row.tool_name,
+    argsHash: row.args_hash,
+    mode: row.mode,
+    approvalId: row.approval_id,
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function invocationIdFromDirectCallId(id: string): string {
+  return id.startsWith('direct:') ? id.slice('direct:'.length) : id;
 }
 
 function toApp(row: AppRow): ConnectionApp {
@@ -919,7 +998,7 @@ export class ConnectionsStore {
     db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(app.id);
     db.prepare('DELETE FROM app_pins WHERE app_id = ?').run(app.id);
     db.prepare('DELETE FROM app_tools WHERE app_id = ?').run(app.id);
-    db.prepare('DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL').run(app.id);
+    db.prepare('UPDATE relay_calls SET outcome_json = NULL WHERE app_id = ? AND approval_id IS NULL').run(app.id);
     if (grant.kind === 'oauth' && sealedAccess) {
       db.prepare(
         `INSERT INTO access_tokens (app_id, generation, token, issued_at, expires_at)
@@ -1089,7 +1168,7 @@ export class ConnectionsStore {
 
   private endGrant(db: Database.Database, appId: string, state: 'disconnected' | 'refused'): void {
     db.prepare('DELETE FROM access_tokens WHERE app_id = ?').run(appId);
-    db.prepare('DELETE FROM relay_calls WHERE app_id = ? AND approval_id IS NULL').run(appId);
+    db.prepare('UPDATE relay_calls SET outcome_json = NULL WHERE app_id = ? AND approval_id IS NULL').run(appId);
     db.prepare(
       `UPDATE grants SET state = ?, secret = NULL, access_issued_at = NULL, access_expires_at = NULL,
           access_published = 0, updated_at = ?
@@ -1559,6 +1638,7 @@ export class ConnectionsStore {
             if (principalOverride) {
               if (principalFloor === 1) upsertFloor.run(appId, update.name, at);
               else deleteFloor.run(appId, update.name);
+              this.bumpToolDecisionRevision(db, appId, update.name);
             }
             applied += 1;
           }
@@ -1566,6 +1646,28 @@ export class ConnectionsStore {
         })
         .immediate(),
     );
+  }
+
+  private bumpToolDecisionRevision(db: Database.Database, appId: string, name: string): void {
+    db.prepare(
+      `INSERT INTO app_tool_revisions (app_id, name, revision) VALUES (?, ?, 1)
+        ON CONFLICT(app_id, name) DO UPDATE SET revision = revision + 1`,
+    ).run(appId, name);
+  }
+
+  private readToolDecisionRevision(db: Database.Database, appId: string, name: string): number {
+    return (
+      db
+        .prepare<
+          [string, string],
+          { revision: number }
+        >('SELECT revision FROM app_tool_revisions WHERE app_id = ? AND name = ?')
+        .get(appId, name)?.revision ?? 0
+    );
+  }
+
+  async getToolDecisionRevision(appId: string, name: string): Promise<number> {
+    return this.use((db) => this.readToolDecisionRevision(db, appId, name));
   }
 
   /**
@@ -1627,65 +1729,79 @@ export class ConnectionsStore {
 
   /**
    * Atomically settles an approved `app_tool_ask` label change once per `requestId`, refusing to overwrite a newer
-   * principal edit on the Connections page or a changed tool definition.
+   * principal decision (from the Connections page or an approved request), a changed tool definition, or a replaced
+   * grant, and recording a main restart atomically in the same transaction.
    */
   async applyApprovedToolAsk(input: {
     readonly requestId: string;
     readonly appId: string;
     readonly name: string;
     readonly label: ToolLabel;
+    readonly expectedGrantGeneration?: number;
     readonly expectedHash?: string;
-    readonly expectedPriorUpdatedAt?: string;
+    readonly expectedDecisionRevision?: number;
     readonly reason?: string;
     readonly at?: string;
-  }): Promise<'applied' | 'already_settled' | 'definition_changed' | 'principal_changed'> {
+  }): Promise<'applied' | 'already_settled' | 'grant_changed' | 'definition_changed' | 'principal_changed'> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
     const reason = input.reason ?? (input.label === 'ask_first' ? 'Set to ask first' : 'Set to run without asking');
     const principalFloor = input.label === 'ask_first' ? 1 : 0;
     return this.use((db) =>
       db
-        .transaction((): 'applied' | 'already_settled' | 'definition_changed' | 'principal_changed' => {
-          const settled = db
-            .prepare<
-              [string],
-              { request_id: string }
-            >('SELECT request_id FROM settled_tool_ask_requests WHERE request_id = ?')
-            .get(input.requestId);
-          if (settled) return 'already_settled';
-          const row = db
-            .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
-            .get(input.appId, input.name);
-          if (!row || (input.expectedHash !== undefined && row.definition_hash !== input.expectedHash)) {
-            return 'definition_changed';
-          }
-          if (
-            input.expectedPriorUpdatedAt !== undefined &&
-            row.label_source === 'principal' &&
-            row.updated_at !== input.expectedPriorUpdatedAt
-          ) {
-            return 'principal_changed';
-          }
-          db.prepare(
-            `UPDATE app_tools SET label = ?, label_source = 'approved_request', reason = ?, principal_floor = ?,
-              unsettled = 0, updated_at = ?
-              WHERE app_id = ? AND name = ?`,
-          ).run(input.label, reason, principalFloor, at, input.appId, input.name);
-          if (principalFloor === 1) {
+        .transaction(
+          (): 'applied' | 'already_settled' | 'grant_changed' | 'definition_changed' | 'principal_changed' => {
+            const settled = db
+              .prepare<
+                [string],
+                { request_id: string }
+              >('SELECT request_id FROM settled_tool_ask_requests WHERE request_id = ?')
+              .get(input.requestId);
+            if (settled) return 'already_settled';
+            if (input.expectedGrantGeneration !== undefined) {
+              const grant = this.grantRow(db, input.appId);
+              if (!grant || grant.state !== 'live' || grant.generation !== input.expectedGrantGeneration) {
+                return 'grant_changed';
+              }
+            }
+            const row = db
+              .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+              .get(input.appId, input.name);
+            if (!row || (input.expectedHash !== undefined && row.definition_hash !== input.expectedHash)) {
+              return 'definition_changed';
+            }
+            if (
+              input.expectedDecisionRevision !== undefined &&
+              this.readToolDecisionRevision(db, input.appId, input.name) !== input.expectedDecisionRevision
+            ) {
+              return 'principal_changed';
+            }
             db.prepare(
-              `INSERT INTO app_tool_floors (app_id, name, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(app_id, name) DO UPDATE SET updated_at = excluded.updated_at`,
-            ).run(input.appId, input.name, at);
-          } else {
-            db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?').run(input.appId, input.name);
-          }
-          db.prepare('INSERT INTO settled_tool_ask_requests (request_id, app_id, settled_at) VALUES (?, ?, ?)').run(
-            input.requestId,
-            input.appId,
-            at,
-          );
-          return 'applied';
-        })
+              `UPDATE app_tools SET label = ?, label_source = 'approved_request', reason = ?, principal_floor = ?,
+                unsettled = 0, updated_at = ?
+                WHERE app_id = ? AND name = ?`,
+            ).run(input.label, reason, principalFloor, at, input.appId, input.name);
+            if (principalFloor === 1) {
+              db.prepare(
+                `INSERT INTO app_tool_floors (app_id, name, updated_at) VALUES (?, ?, ?)
+                  ON CONFLICT(app_id, name) DO UPDATE SET updated_at = excluded.updated_at`,
+              ).run(input.appId, input.name, at);
+            } else {
+              db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?').run(input.appId, input.name);
+            }
+            this.bumpToolDecisionRevision(db, input.appId, input.name);
+            db.prepare('INSERT INTO settled_tool_ask_requests (request_id, app_id, settled_at) VALUES (?, ?, ?)').run(
+              input.requestId,
+              input.appId,
+              at,
+            );
+            db.prepare(
+              `INSERT INTO restart_request (id, applied_at) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET applied_at = max(applied_at, excluded.applied_at)`,
+            ).run(at);
+            return 'applied';
+          },
+        )
         .immediate(),
     );
   }
@@ -1726,6 +1842,7 @@ export class ConnectionsStore {
             } else {
               db.prepare('DELETE FROM app_tool_floors WHERE app_id = ? AND name = ?').run(appId, name);
             }
+            this.bumpToolDecisionRevision(db, appId, name);
           }
           return updated;
         })
@@ -1814,10 +1931,11 @@ export class ConnectionsStore {
 
   /**
    * Atomically claims an approved call before sending anything upstream. Replays find the existing row and never
-   * dispatch a second upstream call.
+   * dispatch a second upstream call, even if the same invocation already ran directly or under another approval.
    */
   async claimApprovedCall(input: {
     readonly approvalId: string;
+    readonly invocationId?: string;
     readonly appId: string;
     readonly grantGeneration: number;
     readonly toolName: string;
@@ -1839,8 +1957,47 @@ export class ConnectionsStore {
               ? { status: 'already_executing', record }
               : { status: 'already_settled', record };
           }
+          if (input.invocationId) {
+            const inv = db
+              .prepare<[string], RelayInvocationRow>('SELECT * FROM relay_invocations WHERE invocation_id = ?')
+              .get(input.invocationId);
+            if (inv) {
+              if (inv.mode === 'direct') {
+                const directRow = db
+                  .prepare<[string], RelayCallRow>('SELECT * FROM relay_calls WHERE id = ?')
+                  .get(`direct:${input.invocationId}`);
+                if (directRow) {
+                  const record = toRelayCall(directRow);
+                  return record.state === 'executing'
+                    ? { status: 'already_executing', record }
+                    : { status: 'already_settled', record };
+                }
+                return { status: 'already_dispatched' };
+              }
+              if (inv.approval_id !== null && inv.approval_id !== input.approvalId) {
+                return { status: 'already_dispatched' };
+              }
+            }
+          }
           const appExists = db.prepare<[string], { id: string }>('SELECT id FROM apps WHERE id = ?').get(input.appId);
           if (!appExists) return { status: 'app_not_found' };
+          if (input.invocationId) {
+            db.prepare(
+              `INSERT INTO relay_invocations
+                (invocation_id, app_id, grant_generation, tool_name, args_hash, mode, approval_id, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'held', ?, 'settled', ?, ?)
+                ON CONFLICT(invocation_id) DO UPDATE SET approval_id = excluded.approval_id, state = 'settled', updated_at = excluded.updated_at`,
+            ).run(
+              input.invocationId,
+              input.appId,
+              input.grantGeneration,
+              input.toolName,
+              input.argsHash,
+              input.approvalId,
+              at,
+              at,
+            );
+          }
           db.prepare(
             `INSERT INTO relay_calls
               (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,
@@ -1865,24 +2022,54 @@ export class ConnectionsStore {
 
   /**
    * Atomically claims a direct ("just do it") call before sending anything upstream. Replays find the existing row
-   * so settled outcomes are returned without re-invoking upstream or overwriting stored history.
+   * so settled outcomes are returned without re-invoking upstream, held invocations never dispatch directly, and
+   * mismatched arguments for the same invocation ID are refused.
    */
   async claimDirectCall(input: {
     readonly id: string;
+    readonly invocationId?: string;
     readonly appId: string;
     readonly grantGeneration: number;
     readonly toolName: string;
     readonly definitionHash: string;
     readonly argsHash: string;
     readonly at?: string;
-  }): Promise<ClaimApprovedCallResult> {
+  }): Promise<ClaimDirectCallResult> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
+    const invocationId = input.invocationId ?? invocationIdFromDirectCallId(input.id);
     return this.use((db) =>
       db
-        .transaction((): ClaimApprovedCallResult => {
+        .transaction((): ClaimDirectCallResult => {
+          const inv = db
+            .prepare<[string], RelayInvocationRow>('SELECT * FROM relay_invocations WHERE invocation_id = ?')
+            .get(invocationId);
+          if (inv) {
+            if (inv.app_id !== input.appId || inv.tool_name !== input.toolName || inv.args_hash !== input.argsHash) {
+              return { status: 'conflict' };
+            }
+            if (inv.mode === 'held') {
+              return { status: 'already_held', invocation: toRelayInvocation(inv) };
+            }
+            const directRow = db
+              .prepare<[string], RelayCallRow>('SELECT * FROM relay_calls WHERE id = ?')
+              .get(input.id);
+            if (directRow) {
+              const record = toRelayCall(directRow);
+              return record.state === 'executing'
+                ? { status: 'already_executing', record }
+                : { status: 'already_settled', record };
+            }
+          }
           const existing = db.prepare<[string], RelayCallRow>('SELECT * FROM relay_calls WHERE id = ?').get(input.id);
           if (existing) {
+            if (
+              existing.app_id !== input.appId ||
+              existing.tool_name !== input.toolName ||
+              existing.args_hash !== input.argsHash
+            ) {
+              return { status: 'conflict' };
+            }
             const record = toRelayCall(existing);
             return record.state === 'executing'
               ? { status: 'already_executing', record }
@@ -1890,6 +2077,11 @@ export class ConnectionsStore {
           }
           const appExists = db.prepare<[string], { id: string }>('SELECT id FROM apps WHERE id = ?').get(input.appId);
           if (!appExists) return { status: 'app_not_found' };
+          db.prepare(
+            `INSERT INTO relay_invocations
+              (invocation_id, app_id, grant_generation, tool_name, args_hash, mode, approval_id, state, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, 'direct', NULL, 'active', ?, ?)`,
+          ).run(invocationId, input.appId, input.grantGeneration, input.toolName, input.argsHash, at, at);
           db.prepare(
             `INSERT INTO relay_calls
               (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,
@@ -1918,12 +2110,124 @@ export class ConnectionsStore {
     });
   }
 
-  /** Removes a direct relay_calls record when pre-send verification reroutes the call before any upstream send. */
+  async getRelayInvocation(invocationId: string): Promise<RelayInvocationRecord | undefined> {
+    return this.use((db) => {
+      const row = db
+        .prepare<[string], RelayInvocationRow>('SELECT * FROM relay_invocations WHERE invocation_id = ?')
+        .get(invocationId);
+      return row ? toRelayInvocation(row) : undefined;
+    });
+  }
+
+  /** Atomically converts an unsent direct claim into a held invocation so no replay can dispatch directly in between. */
+  async rerouteDirectCallToHold(input: {
+    readonly id: string;
+    readonly invocationId: string;
+    readonly argsHash: string;
+    readonly at?: string;
+  }): Promise<void> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    await this.use((db) =>
+      db
+        .transaction(() => {
+          db.prepare("DELETE FROM relay_calls WHERE id = ? AND approval_id IS NULL AND state = 'executing'").run(
+            input.id,
+          );
+          db.prepare(
+            "UPDATE relay_invocations SET mode = 'held', state = 'active', args_hash = ?, updated_at = ? WHERE invocation_id = ?",
+          ).run(input.argsHash, at, input.invocationId);
+        })
+        .immediate(),
+    );
+  }
+
+  /** Atomically reserves an invocation for a held approval card, preventing duplicate cards or direct dispatch races. */
+  async reserveHeldInvocation(input: {
+    readonly invocationId: string;
+    readonly appId: string;
+    readonly grantGeneration: number;
+    readonly toolName: string;
+    readonly argsHash: string;
+    readonly at?: string;
+  }): Promise<ReserveHeldInvocationResult> {
+    const at = input.at ?? new Date().toISOString();
+    isoValid(at);
+    return this.use((db) =>
+      db
+        .transaction((): ReserveHeldInvocationResult => {
+          const existing = db
+            .prepare<[string], RelayInvocationRow>('SELECT * FROM relay_invocations WHERE invocation_id = ?')
+            .get(input.invocationId);
+          if (existing) {
+            if (
+              existing.app_id !== input.appId ||
+              existing.tool_name !== input.toolName ||
+              existing.args_hash !== input.argsHash
+            ) {
+              return { status: 'conflict' };
+            }
+            if (existing.mode === 'held' && existing.state === 'active' && existing.approval_id === null) {
+              return { status: 'reserved' };
+            }
+            return { status: 'existing', invocation: toRelayInvocation(existing) };
+          }
+          const appExists = db.prepare<[string], { id: string }>('SELECT id FROM apps WHERE id = ?').get(input.appId);
+          if (!appExists) return { status: 'app_not_found' };
+          db.prepare(
+            `INSERT INTO relay_invocations
+              (invocation_id, app_id, grant_generation, tool_name, args_hash, mode, approval_id, state, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, 'held', NULL, 'active', ?, ?)`,
+          ).run(input.invocationId, input.appId, input.grantGeneration, input.toolName, input.argsHash, at, at);
+          return { status: 'reserved' };
+        })
+        .immediate(),
+    );
+  }
+
+  async bindHeldApproval(invocationId: string, approvalId: string, at = new Date().toISOString()): Promise<void> {
+    isoValid(at);
+    await this.use((db) => {
+      db.prepare(
+        "UPDATE relay_invocations SET approval_id = ?, updated_at = ? WHERE invocation_id = ? AND mode = 'held'",
+      ).run(approvalId, at, invocationId);
+    });
+  }
+
+  async releaseUnpostedHeldInvocation(invocationId: string): Promise<void> {
+    await this.use((db) => {
+      db.prepare(
+        "DELETE FROM relay_invocations WHERE invocation_id = ? AND mode = 'held' AND approval_id IS NULL AND state = 'active'",
+      ).run(invocationId);
+    });
+  }
+
+  async markHeldInvocationResolved(
+    invocationId: string,
+    approvalId: string,
+    state: Exclude<RelayInvocationState, 'active'>,
+    at = new Date().toISOString(),
+  ): Promise<void> {
+    isoValid(at);
+    await this.use((db) => {
+      db.prepare(
+        `UPDATE relay_invocations
+          SET approval_id = COALESCE(approval_id, ?),
+              state = CASE WHEN state = 'settled' THEN 'settled' ELSE ? END,
+              updated_at = ?
+          WHERE invocation_id = ?`,
+      ).run(approvalId, state, at, invocationId);
+    });
+  }
+
+  /** Removes a direct relay_calls record and its invocation claim when pre-send verification aborts before sending. */
   async deleteRelayCall(id: string): Promise<void> {
+    const invocationId = invocationIdFromDirectCallId(id);
     await this.use((db) =>
       db
         .transaction(() => {
           db.prepare('DELETE FROM relay_calls WHERE id = ? AND approval_id IS NULL').run(id);
+          db.prepare("DELETE FROM relay_invocations WHERE invocation_id = ? AND mode = 'direct'").run(invocationId);
         })
         .immediate(),
     );
@@ -1955,6 +2259,9 @@ export class ConnectionsStore {
             id,
           );
           if (row && row.approval_id === null) {
+            db.prepare(
+              "UPDATE relay_invocations SET state = 'settled', updated_at = ? WHERE invocation_id = ? AND mode = 'direct'",
+            ).run(at, invocationIdFromDirectCallId(id));
             db.prepare(
               `UPDATE relay_calls SET outcome_json = NULL
                 WHERE app_id = ? AND approval_id IS NULL AND state != 'executing' AND outcome_json IS NOT NULL

@@ -204,7 +204,7 @@ async function evaluateCase(
 
 async function main(): Promise<void> {
   const flags = parseFlags(process.argv.slice(2));
-  const claudePath = flags.get('--claude') ?? path.join(os.homedir(), '.local', 'bin', 'claude');
+  const claudePath = path.resolve(flags.get('--claude') ?? path.join(os.homedir(), '.local', 'bin', 'claude'));
   if (!fs.existsSync(claudePath)) {
     throw new Error(`Authenticated claude CLI not found at ${claudePath}. Pass --claude <path>.`);
   }

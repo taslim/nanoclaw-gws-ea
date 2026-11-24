@@ -8,6 +8,7 @@ import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { log as hostLog } from '../../log.js';
 import type { Session } from '../../types.js';
 import { EgressError, publicFetch, type EgressDependencies } from '../gws-ea-egress/fetch.js';
+import { resolveDestination } from '../gws-ea-egress/resolve.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { notifyMainToolsChanged } from './apply.js';
 import {
@@ -25,7 +26,7 @@ import {
   type ConnectionsRefresher,
   type UsableToken,
 } from './refresher.js';
-import { schemaUsesReservedSummary } from './sort-rules.js';
+import { schemaAcceptsSummaryArg } from './sort-rules.js';
 import {
   ConnectionsStoreError,
   type ConnectionApp,
@@ -89,6 +90,7 @@ export type HoldCallHandler = (input: HoldCallInput) => Promise<RelayCallOutcome
 
 export interface ExecuteApprovedCallInput {
   readonly approvalId: string;
+  readonly invocationId?: string;
   readonly appId: string;
   readonly grantGeneration: number;
   readonly toolName: string;
@@ -131,10 +133,72 @@ interface CallTrace {
   fetchStarted: boolean;
   httpSent: boolean;
   httpStatus: number | undefined;
+  verifyGrantBeforeDial: (() => Promise<boolean>) | undefined;
+  grantChangedBeforeDial: boolean;
 }
 
 function newTrace(): CallTrace {
-  return { egressError: undefined, fetchStarted: false, httpSent: false, httpStatus: undefined };
+  return {
+    egressError: undefined,
+    fetchStarted: false,
+    httpSent: false,
+    httpStatus: undefined,
+    verifyGrantBeforeDial: undefined,
+    grantChangedBeforeDial: false,
+  };
+}
+
+export function outcomeFromSettledRecord(
+  record: { readonly state: string; readonly outcomeJson: string | null },
+  toolsVersion?: string,
+): RelayCallOutcome {
+  const versionField = toolsVersion === undefined ? {} : { toolsVersion };
+  if (record.state === 'completed') {
+    if (record.outcomeJson) {
+      return {
+        status: 'completed',
+        result: JSON.parse(record.outcomeJson) as Record<string, unknown>,
+        ...versionField,
+      };
+    }
+    return {
+      status: 'unknown',
+      text: 'This app tool call already completed, but its result is no longer available.',
+      ...versionField,
+    };
+  }
+  if (record.state === 'too_large') {
+    return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE, ...versionField };
+  }
+  if (record.state === 'unsent') {
+    const parsed = record.outcomeJson ? (JSON.parse(record.outcomeJson) as { reason?: string; text?: string }) : {};
+    return {
+      status: 'unsent',
+      reason: parsed.reason,
+      text: parsed.text ?? 'Nothing was sent to the app.',
+      ...versionField,
+    };
+  }
+  return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE, ...versionField };
+}
+
+function stripSyntheticSummary(args: Record<string, unknown>): Record<string, unknown> {
+  if (!Object.hasOwn(args, ASSISTANT_SUMMARY_FIELD)) return args;
+  const { [ASSISTANT_SUMMARY_FIELD]: _omitted, ...rest } = args;
+  return rest;
+}
+
+function prepareCallArgs(
+  rawArgs: Record<string, unknown>,
+  tool: PinnedAppTool,
+): {
+  readonly callArgs: Record<string, unknown>;
+  readonly canonical: string;
+  readonly argsHash: string;
+} {
+  const callArgs = schemaAcceptsSummaryArg(tool.definition.inputSchema) ? rawArgs : stripSyntheticSummary(rawArgs);
+  const { canonical, hash: argsHash } = canonicalArgsHash(callArgs);
+  return { callArgs, canonical, argsHash };
 }
 
 class UpstreamUnauthorizedError extends Error {
@@ -217,7 +281,23 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
   const timeoutMs = dependencies.timeoutMs ?? RELAY_TIMEOUT_MS;
   const maxBodyBytes = dependencies.maxBodyBytes ?? RELAY_MAX_BODY_BYTES;
   const readRefresher = dependencies.refresher ?? getConnectionsRefresher;
-  const rawFetch = publicFetch({ redirect: 'none', timeoutMs, maxBodyBytes }, dependencies.egress);
+  const baseResolve = dependencies.egress?.resolve ?? resolveDestination;
+  const traceStore = new AsyncLocalStorage<CallTrace>();
+  const rawFetch = publicFetch(
+    { redirect: 'none', timeoutMs, maxBodyBytes },
+    {
+      ...dependencies.egress,
+      resolve: async (target) => {
+        const destination = await baseResolve(target);
+        const activeTrace = traceStore.getStore();
+        if (activeTrace?.verifyGrantBeforeDial && !(await activeTrace.verifyGrantBeforeDial())) {
+          activeTrace.grantChangedBeforeDial = true;
+          throw new EgressError('refused', { sent: false });
+        }
+        return destination;
+      },
+    },
+  );
 
   const holdHandler: HoldCallHandler = dependencies.onHoldCall ?? defaultHoldRefusal;
   const onToolsNeedSort = dependencies.onToolsNeedSort;
@@ -226,7 +306,6 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
   const relayQueues = new Map<string, Promise<unknown>>();
   const refreshing = new Map<string, Promise<void>>();
   const activeOps = new Set<Promise<unknown>>();
-  const traceStore = new AsyncLocalStorage<CallTrace>();
   let stopping = false;
   let closed = false;
 
@@ -570,6 +649,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'unsent' as const, reason: 'relay_stopping' };
         }
         const callTrace = newTrace();
+        callTrace.verifyGrantBeforeDial = () => verifyLiveGrant(app.id, grant.generation);
         try {
           const result = await traceStore.run(callTrace, () =>
             managed.client.callTool({ name: toolName, arguments: args }),
@@ -577,7 +657,11 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'completed' as const, result: result as Record<string, unknown> };
           /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any upstream MCP call failure into too_large, unsent, or unknown */
         } catch (error) {
-          const { egressError, fetchStarted, httpSent, httpStatus } = callTrace;
+          const { egressError, fetchStarted, httpSent, httpStatus, grantChangedBeforeDial } = callTrace;
+          if (grantChangedBeforeDial) {
+            await closeClient(managed);
+            return { status: 'unsent' as const, reason: 'grant_changed' };
+          }
           if ((httpStatus === 401 || isHttp401Error(error)) && !forceRenew && app.auth === 'oauth') {
             await closeClient(managed);
             return 'retry_401' as const;
@@ -606,40 +690,6 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       }
       return first;
     });
-  }
-
-  function outcomeFromSettledRecord(
-    record: { readonly state: string; readonly outcomeJson: string | null },
-    toolsVersion?: string,
-  ): RelayCallOutcome {
-    const versionField = toolsVersion === undefined ? {} : { toolsVersion };
-    if (record.state === 'completed') {
-      if (record.outcomeJson) {
-        return {
-          status: 'completed',
-          result: JSON.parse(record.outcomeJson) as Record<string, unknown>,
-          ...versionField,
-        };
-      }
-      return {
-        status: 'unknown',
-        text: 'This app tool call already completed, but its result is no longer available.',
-        ...versionField,
-      };
-    }
-    if (record.state === 'too_large') {
-      return { status: 'too_large', text: TOO_LARGE_RESPONSE_MESSAGE, ...versionField };
-    }
-    if (record.state === 'unsent') {
-      const parsed = record.outcomeJson ? (JSON.parse(record.outcomeJson) as { reason?: string; text?: string }) : {};
-      return {
-        status: 'unsent',
-        reason: parsed.reason,
-        text: parsed.text ?? 'Nothing was sent to the app.',
-        ...versionField,
-      };
-    }
-    return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE, ...versionField };
   }
 
   async function settleUpstreamOutcome(
@@ -786,18 +836,115 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         const loaded = await store.readAppTools(app.id);
         let pin = loaded?.pin;
         let tools: readonly PinnedAppTool[] = loaded?.tools ?? [];
-        const callId = `direct:${input.session.id}:${input.requestId}`;
-        const existingCall = await store.getRelayCall(callId);
-        if (existingCall && existingCall.appId === app.id && existingCall.toolName === input.toolName) {
-          const existingVersion = pin ? computeToolsVersion(pin.listHash, tools) : undefined;
-          if (existingCall.state === 'executing') {
-            return {
-              status: 'unknown',
-              text: UNKNOWN_OUTCOME_MESSAGE,
-              ...(existingVersion === undefined ? {} : { toolsVersion: existingVersion }),
-            };
+        const invocationId = `${input.session.id}:${input.requestId}`;
+        const callId = `direct:${invocationId}`;
+        const [existingInvocation, existingCall] = await Promise.all([
+          store.getRelayInvocation(invocationId),
+          store.getRelayCall(callId),
+        ]);
+        const existingVersion = pin ? computeToolsVersion(pin.listHash, tools) : undefined;
+        const requestConflict = (version?: string): RelayCallOutcome => ({
+          status: 'unsent',
+          reason: 'request_id_conflict',
+          text: 'This request ID was already used for a different tool call; nothing was sent.',
+          ...(version === undefined ? {} : { toolsVersion: version }),
+        });
+
+        if (existingInvocation || existingCall) {
+          const pinnedTool = tools.find((entry) => entry.name === input.toolName);
+          const expectedAppId = existingInvocation?.appId ?? existingCall!.appId;
+          const expectedToolName = existingInvocation?.toolName ?? existingCall!.toolName;
+          const expectedArgsHash = existingInvocation?.argsHash ?? existingCall!.argsHash;
+          let argsMatch = false;
+          if (pinnedTool) {
+            argsMatch = prepareCallArgs(input.args, pinnedTool).argsHash === expectedArgsHash;
+          } else {
+            argsMatch =
+              canonicalArgsHash(input.args).hash === expectedArgsHash ||
+              (Object.hasOwn(input.args, ASSISTANT_SUMMARY_FIELD) &&
+                canonicalArgsHash(stripSyntheticSummary(input.args)).hash === expectedArgsHash);
           }
-          return outcomeFromSettledRecord(existingCall, existingVersion);
+          if (expectedAppId !== app.id || expectedToolName !== input.toolName || !argsMatch) {
+            return requestConflict(existingVersion);
+          }
+          if (existingInvocation?.mode === 'held') {
+            if (pinnedTool) {
+              const prepared = prepareCallArgs(input.args, pinnedTool);
+              const held = await holdHandler({
+                app,
+                grantGeneration: grant.generation,
+                tool: pinnedTool,
+                args: prepared.callArgs,
+                canonicalArgs: prepared.canonical,
+                argsHash: prepared.argsHash,
+                summary: input.summary,
+                session: input.session,
+                requestId: input.requestId,
+              });
+              return existingVersion === undefined ? held : { ...held, toolsVersion: existingVersion };
+            }
+            if (existingInvocation.approvalId) {
+              const approvedRecord = await store.getRelayCall(existingInvocation.approvalId);
+              if (approvedRecord) {
+                return approvedRecord.state === 'executing'
+                  ? {
+                      status: 'unknown',
+                      text: UNKNOWN_OUTCOME_MESSAGE,
+                      ...(existingVersion === undefined ? {} : { toolsVersion: existingVersion }),
+                    }
+                  : outcomeFromSettledRecord(approvedRecord, existingVersion);
+              }
+            }
+            const versionField = existingVersion === undefined ? {} : { toolsVersion: existingVersion };
+            if (existingInvocation.state === 'declined') {
+              return {
+                status: 'unsent',
+                reason: 'rejected',
+                text: 'The principal declined this app tool call; nothing was sent.',
+                ...versionField,
+              };
+            }
+            if (existingInvocation.state === 'expired') {
+              return {
+                status: 'unsent',
+                reason: 'expired',
+                text: 'The approval request for this app tool call expired; nothing was sent.',
+                ...versionField,
+              };
+            }
+            if (existingInvocation.state === 'withdrawn') {
+              return {
+                status: 'unsent',
+                reason: 'withdrawn',
+                text: 'The approval request for this app tool call was withdrawn; nothing was sent.',
+                ...versionField,
+              };
+            }
+            if (existingInvocation.state === 'active') {
+              return {
+                status: 'held',
+                text: "I've asked the principal; the result will arrive as a note.",
+                ...(existingInvocation.approvalId ? { approvalId: existingInvocation.approvalId } : {}),
+                ...versionField,
+              };
+            }
+            return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE, ...versionField };
+          }
+          if (existingCall) {
+            if (existingCall.state === 'executing') {
+              return {
+                status: 'unknown',
+                text: UNKNOWN_OUTCOME_MESSAGE,
+                ...(existingVersion === undefined ? {} : { toolsVersion: existingVersion }),
+              };
+            }
+            return outcomeFromSettledRecord(existingCall, existingVersion);
+          }
+          return {
+            status: 'unknown',
+            text: UNKNOWN_OUTCOME_MESSAGE,
+            ...(existingVersion === undefined ? {} : { toolsVersion: existingVersion }),
+          };
         }
 
         let tool: PinnedAppTool | undefined;
@@ -845,19 +992,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'unsorted', text: UNSORTED_TOOL_MESSAGE, toolsVersion };
         }
 
-        // Strip the synthetic relay summary field unless the tool's own pinned schema declares it.
-        let callArgs = input.args;
-        if (
-          !schemaUsesReservedSummary(tool.definition.inputSchema) &&
-          Object.hasOwn(input.args, ASSISTANT_SUMMARY_FIELD)
-        ) {
-          const stripped: Record<string, unknown> = {};
-          for (const [key, value] of Object.entries(input.args)) {
-            if (key !== ASSISTANT_SUMMARY_FIELD) stripped[key] = value;
-          }
-          callArgs = stripped;
-        }
-        const { canonical, hash: argsHash } = canonicalArgsHash(callArgs);
+        const { callArgs, canonical, argsHash } = prepareCallArgs(input.args, tool);
 
         if (tool.label === 'ask_first') {
           const held = await holdHandler({
@@ -877,6 +1012,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         const at = new Date(now()).toISOString();
         const directClaim = await store.claimDirectCall({
           id: callId,
+          invocationId,
           appId: app.id,
           grantGeneration: grant.generation,
           toolName: tool.name,
@@ -884,6 +1020,23 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           argsHash,
           at,
         });
+        if (directClaim.status === 'conflict') {
+          return requestConflict(toolsVersion);
+        }
+        if (directClaim.status === 'already_held') {
+          const held = await holdHandler({
+            app,
+            grantGeneration: grant.generation,
+            tool,
+            args: callArgs,
+            canonicalArgs: canonical,
+            argsHash,
+            summary: input.summary,
+            session: input.session,
+            requestId: input.requestId,
+          });
+          return { ...held, toolsVersion };
+        }
         if (directClaim.status === 'app_not_found') {
           return {
             status: 'unsent',
@@ -932,14 +1085,32 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             return { status: 'unsorted', text: UNSORTED_TOOL_MESSAGE, toolsVersion: latestVersion };
           }
           if (latestTool.label === 'ask_first') {
-            await store.deleteRelayCall(callId);
+            if (
+              latestTool.definitionHash !== tool.definitionHash &&
+              schemaAcceptsSummaryArg(latestTool.definition.inputSchema) !==
+                schemaAcceptsSummaryArg(tool.definition.inputSchema)
+            ) {
+              return settleUpstreamOutcome(
+                callId,
+                { status: 'unsent', reason: 'definition_changed' },
+                true,
+                latestVersion,
+              );
+            }
+            const rerouted = prepareCallArgs(input.args, latestTool);
+            await store.rerouteDirectCallToHold({
+              id: callId,
+              invocationId,
+              argsHash: rerouted.argsHash,
+              at: new Date(now()).toISOString(),
+            });
             const held = await holdHandler({
               app,
               grantGeneration: grant.generation,
               tool: latestTool,
-              args: callArgs,
-              canonicalArgs: canonical,
-              argsHash,
+              args: rerouted.callArgs,
+              canonicalArgs: rerouted.canonical,
+              argsHash: rerouted.argsHash,
               summary: input.summary,
               session: input.session,
               requestId: input.requestId,
@@ -965,6 +1136,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         const at = new Date(now()).toISOString();
         const claim = await store.claimApprovedCall({
           approvalId: input.approvalId,
+          ...(input.invocationId === undefined ? {} : { invocationId: input.invocationId }),
           appId: input.appId,
           grantGeneration: input.grantGeneration,
           toolName: input.toolName,
@@ -972,6 +1144,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           argsHash,
           at,
         });
+
+        if (claim.status === 'already_dispatched') {
+          return {
+            status: 'unsent',
+            reason: 'already_dispatched',
+            text: 'This app tool call already ran, so nothing was sent again.',
+          };
+        }
 
         if (claim.status === 'app_not_found') {
           return {
