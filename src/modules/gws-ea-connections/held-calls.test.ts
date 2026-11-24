@@ -1281,4 +1281,148 @@ describe('held ask-first calls', () => {
     ).toBe(true);
     expect(editedCards.some((card) => card.text.includes('Timed out'))).toBe(true);
   });
+
+  it('distills opaque tokens and verbose checkout JSON on the card while keeping full raw payload for web review and execution', async () => {
+    const jwt =
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+      'eyJzdWIiOiJ1c2VyXzQ5MjEiLCJjYXJ0X2lkIjo5OTM4MiwidmVuZG9yX2lkIjoyMzc4NywiaWF0IjoxNzMyNDU5MjAwLCJleHAiOjE3MzI0NjI4MDB9.' +
+      'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    const fingerprint = '58dc5a4fb1840d8c7b6a9123ef450987654321abcdef0123456789abcdef6275';
+    const rawPreviewJson = JSON.stringify({
+      ok: true,
+      data: {
+        checkout_id: jwt,
+        fingerprint,
+        vendor_id: 23787,
+        vendor_name: 'Corner Kitchen',
+        address_id: 2847953,
+        destination: { address_id: 2847953, label: 'Office', address: '21 Park Ave, Midtown' },
+        items: [
+          {
+            item_id: 412,
+            pack_id: 9,
+            menu_group_id: null,
+            name: 'Grain Bowl',
+            quantity: 1,
+            unit_price: 1850,
+            containers: '[]',
+          },
+        ],
+        currency: 'USD',
+        amounts: {
+          items: 1850,
+          delivery: 350,
+          service: 120,
+          small_order: 0,
+          containers: 0,
+          bags: 0,
+          safety: 0,
+          tip: 0,
+          promo_discount: 0,
+          voucher: 0,
+          total: 2320,
+        },
+        payment: { method: 'wallet', label: 'Wallet balance' },
+        summary: '1x Grain Bowl from Corner Kitchen to Office — $23.20 via Wallet',
+        expires_at: '2026-11-24T12:30:00Z',
+      },
+    });
+
+    const { app, fake } = await setupFoodApp();
+    fake.onToolCall = (call) => {
+      if (call.name === 'prepare_checkout') {
+        return { content: [{ type: 'text', text: rawPreviewJson }] };
+      }
+      return { content: [{ type: 'text', text: 'Order confirmed: ORD-9910' }] };
+    };
+
+    const prep = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'prepare_checkout',
+      args: { item: 'Grain Bowl' },
+      session: mainSession,
+      requestId: 'req-distill-prep',
+    });
+    expect(prep.status).toBe('completed');
+
+    const held = await relay!.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: jwt, confirmed: true, fingerprint },
+      summary: 'Place Grain Bowl lunch order from Corner Kitchen to Office',
+      session: mainSession,
+      requestId: 'req-distill-confirm',
+    });
+    expect(held.status).toBe('held');
+    expect(deliveredCards).toHaveLength(1);
+    const card = deliveredCards[0]!;
+    expect(card.title.length + card.question.length).toBeLessThanOrEqual(MAX_CARD_QUESTION_LENGTH);
+
+    // Chat card is compact, scannable, and links to full untruncated details on web.
+    expect(card.question).toContain('checkout_id: "eyJhbG…sw5c"');
+    expect(card.question).toContain('fingerprint: "58dc5a…6275"');
+    expect(card.question).not.toContain(jwt);
+    expect(card.question).not.toContain(fingerprint);
+    expect(card.question).toContain('Summary: 1x Grain Bowl from Corner Kitchen to Office — $23.20 via Wallet');
+    expect(card.question).toContain('Vendor name: Corner Kitchen');
+    expect(card.question).toContain('Items: 1x Grain Bowl (unit price: 1850)');
+    expect(card.question).toContain('Destination: address: 21 Park Ave, Midtown, label: Office');
+    expect(card.question).toContain('Amounts: items: 1850, total: 2320, delivery: 350, service: 120');
+    expect(card.question).toContain('Payment: method: wallet, label: Wallet balance');
+    expect(card.question).not.toContain('small order');
+    expect(card.question).not.toContain('voucher');
+    expect(card.question).toContain(`Full details: https://${HOSTNAME}/connections/held/`);
+
+    // Stored payload preserves the complete raw arguments and raw app context for web review and execution.
+    const [pending] = await listPendingHeldCallApprovals();
+    expect(pending?.payload.canonicalArgs).toContain(jwt);
+    expect(pending?.payload.canonicalArgs).toContain(fingerprint);
+    expect(pending?.payload.appContext?.text).toBe(rawPreviewJson);
+
+    // Approving executes upstream with the complete unmodified arguments.
+    await respondToCard(card.questionId, 'approve');
+    const confirmCall = fake.toolCalls.find((call) => call.name === 'confirm_checkout');
+    expect(confirmCall?.arguments).toEqual({ checkout_id: jwt, confirmed: true, fingerprint });
+
+    // Without web hostname, a small JSON call falls back to raw verbatim text while an oversized one still withholds.
+    await stopAppRelay();
+    relay = startAppRelay({
+      store,
+      egress: endpoints.egress,
+      onHoldCall: createHoldCallHandler({ store, webHostname: async () => undefined }),
+    });
+    const smallNoWeb = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: jwt, confirmed: true },
+      summary: 'Small token call without web',
+      session: mainSession,
+      requestId: 'req-distill-noweb-small',
+    });
+    expect(smallNoWeb.status).toBe('held');
+    expect(deliveredCards[1]!.question).toContain(jwt);
+    expect(deliveredCards[1]!.question).not.toContain('/connections/held/');
+
+    const oversizedRawJson = JSON.stringify({
+      ok: true,
+      data: { checkout_id: 'chk_big_noweb', summary: 'Order', padding: 'note '.repeat(400) },
+    });
+    fake.onToolCall = () => ({ content: [{ type: 'text', text: oversizedRawJson }] });
+    await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'prepare_checkout',
+      args: { item: 'Big order' },
+      session: mainSession,
+      requestId: 'req-distill-noweb-big-prep',
+    });
+    const bigNoWeb = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_big_noweb' },
+      summary: 'Oversized JSON without web',
+      session: mainSession,
+      requestId: 'req-distill-noweb-big',
+    });
+    expect(bigNoWeb).toMatchObject({ status: 'unsent', reason: 'details_unavailable' });
+  });
 });
