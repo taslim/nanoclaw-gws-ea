@@ -14,9 +14,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   const inFlightToggles = new Set();
   const uncertainTools = new Set();
   let needsPostToggleSync = false;
+  let mutationEpoch = 0;
   let pollTimer;
   let reconcileTimer;
   let pollGeneration = 0;
+  let reconcileGeneration = 0;
 
   async function signIn(form) {
     if (signingIn || kit.busy()) return;
@@ -237,8 +239,8 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     });
   }
 
-  function syncUncertainReviewLock(root) {
-    const locked = uncertainTools.size > 0;
+  function syncReviewLock(root) {
+    const locked = inFlightToggles.size > 0 || uncertainTools.size > 0 || needsPostToggleSync;
     root.querySelectorAll('[data-review-form] button[type="submit"]').forEach(button => {
       if (button instanceof HTMLButtonElement) button.disabled = locked;
     });
@@ -332,15 +334,23 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       }
     }
 
+    const fullyRenderedSnapshot = inFlightToggles.size === 0;
+    if (fullyRenderedSnapshot) {
+      needsPostToggleSync = false;
+      cancelReconciliation();
+    }
+
     renderBadgeInto(root.querySelector('[data-tools-badge]'), payload.status, stillChecking, payload.needsReview === true);
     updateTallies(root);
 
     const showReview = Boolean(isConnected && payload.pinned && !stillChecking && payload.needsReview === true && payload.listHash);
-    syncReviewHashes(root, payload.listHash, payload.labelsHash);
+    if (fullyRenderedSnapshot) {
+      syncReviewHashes(root, payload.listHash, payload.labelsHash);
+    }
     root.querySelectorAll('[data-review-form]').forEach(form => {
       form.hidden = !showReview;
     });
-    syncUncertainReviewLock(root);
+    syncReviewLock(root);
 
     if (wasPolling && !stillChecking) {
       kit.announce(showReview ? 'Tools ready to review.' : isConnected ? 'Tools checked.' : 'App is not connected.');
@@ -351,6 +361,8 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   function showUnavailableTools(root) {
     root.dataset.toolsPolling = 'false';
     uncertainTools.clear();
+    needsPostToggleSync = false;
+    cancelReconciliation();
     const badge = root.querySelector('[data-tools-badge]');
     if (badge) badge.textContent = '';
     const desktopTally = root.querySelector('[data-tools-tally]');
@@ -375,6 +387,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   async function fetchToolsStatusOnce(root) {
     const appId = root.dataset.toolsApp;
     if (!appId || !root.isConnected) return null;
+    const startedEpoch = mutationEpoch;
     try {
       const response = await fetch('/connections/app/' + encodeURIComponent(appId) + '/tools-status', {
         method: 'GET',
@@ -383,6 +396,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         cache: 'no-store',
       });
       if (!root.isConnected) return null;
+      if (startedEpoch !== mutationEpoch) return 'stale';
       if (response.status === 404) {
         stopToolsPolling();
         showUnavailableTools(root);
@@ -391,9 +405,10 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (!response.ok) return 'error';
       const payload = await response.json();
       if (!root.isConnected) return null;
+      if (startedEpoch !== mutationEpoch) return 'stale';
       return applyToolsStatus(root, payload) ? 'checking' : 'settled';
     } catch {
-      return 'error';
+      return startedEpoch !== mutationEpoch ? 'stale' : 'error';
     }
   }
 
@@ -404,12 +419,19 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     }
   }
 
-  function reconcileToolsStatus(root, attempt = 0) {
+  function cancelReconciliation() {
+    reconcileGeneration += 1;
     clearReconcileTimer();
-    const gen = pollGeneration;
+  }
+
+  function reconcileToolsStatus(root, attempt = 0) {
+    reconcileGeneration += 1;
+    clearReconcileTimer();
+    const gen = reconcileGeneration;
     void (async () => {
       const status = await fetchToolsStatusOnce(root);
-      if (gen !== pollGeneration || !root.isConnected) return;
+      if (gen !== reconcileGeneration || !root.isConnected) return;
+      if (status === 'stale') return;
       if (status === 'checking') {
         startToolsPolling();
         return;
@@ -436,7 +458,6 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       clearTimeout(pollTimer);
       pollTimer = undefined;
     }
-    clearReconcileTimer();
   }
 
   function startToolsPolling() {
@@ -465,7 +486,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       }
       const status = await fetchToolsStatusOnce(currentRoot);
       if (gen !== pollGeneration) return;
-      if (status === 'checking') {
+      if (status === 'checking' || status === 'stale') {
         consecutiveErrors = 0;
         schedule(1500);
       } else if (status === 'settled' || status === 'missing' || status === null) {
@@ -497,10 +518,14 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     const prevDescText = row.querySelector('[data-tool-desc]')?.textContent ?? '';
     const wasChecking = prevState === 'checking';
 
+    mutationEpoch += 1;
     inFlightToggles.add(toolName);
+    needsPostToggleSync = true;
+    cancelReconciliation();
     applyRowVisual(row, nextLabel);
     if (wasChecking) applyRowDescription(row, '', false);
     updateTallies(root);
+    syncReviewLock(root);
 
     const titleText = row.querySelector('.tool-title')?.textContent?.trim() || toolName;
     const markUncertain = () => {
@@ -514,8 +539,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         if (stateNode) stateNode.textContent = 'Checking…';
       }
       updateTallies(root);
-      syncUncertainReviewLock(root);
-      needsPostToggleSync = true;
+      syncReviewLock(root);
     };
     try {
       const response = await fetch(form.action, {
@@ -529,9 +553,6 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         const result = await response.json().catch(() => null);
         const confirmed = result && (result.label === 'ask_first' || result.label === 'just_do') ? result.label : nextLabel;
         applyRowVisual(row, confirmed);
-        if (result && typeof result.labelsHash === 'string') {
-          syncReviewHashes(root, undefined, result.labelsHash);
-        }
         updateTallies(root);
         if (root.isConnected) {
           const outcome = document.getElementById('outcome');
@@ -559,8 +580,9 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (root.isConnected) kit.message('Couldn’t save that change. Reload and try again.', true);
     } finally {
       inFlightToggles.delete(toolName);
+      mutationEpoch += 1;
+      syncReviewLock(root);
       if (needsPostToggleSync && inFlightToggles.size === 0 && root.isConnected) {
-        needsPostToggleSync = false;
         reconcileToolsStatus(root);
       }
     }
@@ -584,6 +606,8 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     inFlightToggles.clear();
     uncertainTools.clear();
     needsPostToggleSync = false;
+    mutationEpoch += 1;
+    cancelReconciliation();
     startToolsPolling();
   });
   document.addEventListener('visibilitychange', () => {

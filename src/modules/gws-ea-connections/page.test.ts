@@ -1870,7 +1870,7 @@ describe('tool approvals review and held-call details', () => {
     });
     expect(staleToggle.status).toBe(409);
 
-    // JSON toggle returns a lightweight JSON payload (with fresh labelsHash) and preserves the sharp tool summary.
+    // JSON toggle returns a lightweight JSON payload (never a full-table labelsHash) and preserves the sharp tool summary.
     const flipDownJson = await post(
       '/connections/tool-label',
       {
@@ -1887,7 +1887,6 @@ describe('tool approvals review and held-call details', () => {
       tool: 'order_groceries',
       label: 'just_do',
       definitionHash: hashes.get('order_groceries')!,
-      labelsHash: toolLabelsHash(await store.listTools(app.id)),
     });
     expect(await store.getTool(app.id, 'order_groceries')).toMatchObject({
       label: 'just_do',
@@ -2784,6 +2783,315 @@ describe('tool approvals review and held-call details', () => {
           .toContain('No tools listed by this app.');
         expect(await page.evaluate<boolean>('document.activeElement?.classList.contains("back-link") ?? false')).toBe(
           true,
+        );
+        expect(pageErrors).toEqual([]);
+
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!chromePath)(
+    'keeps Confirm locked until a full snapshot renders unseen label changes, discards stale pre-toggle polls, and isolates reconciliation from poll shutdown',
+    async () => {
+      serve(recipesServer);
+      await post('/connections/add', { url: RECIPES, name: 'Bistro' });
+      let app = await onlyApp();
+      await post('/connections/connect', { id: app.id, version: String(app.version) });
+      app = await onlyApp();
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          { name: 'alpha_tool', description: 'First tool', inputSchema: { type: 'object', properties: {} } },
+          { name: 'beta_tool', description: 'Second tool', inputSchema: { type: 'object', properties: {} } },
+        ],
+      });
+      const hashes = new Map(pinned.tools.map((t) => [t.name, t.definitionHash]));
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'alpha_tool',
+          definitionHash: hashes.get('alpha_tool')!,
+          label: 'just_do',
+          source: 'sorter',
+          summary: 'Read alpha state',
+          reason: 'Read-only',
+        },
+        {
+          name: 'beta_tool',
+          definitionHash: hashes.get('beta_tool')!,
+          label: 'ask_first',
+          source: 'sorter',
+          summary: 'Modify beta state',
+          reason: 'External write',
+        },
+      ]);
+
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+        let scenario: 'unseen_label' | 'delayed_pre_toggle_poll' | 'poll_shutdown_vs_reconcile' = 'unseen_label';
+        let holdStatus = false;
+        let markStatusHeld: (() => void) | undefined;
+        let statusHeld = new Promise<void>((resolve) => {
+          markStatusHeld = resolve;
+        });
+        let releaseStatus: (() => void) | undefined;
+        let stalePollStartedResolve: (() => void) | undefined;
+        let stalePollStarted = new Promise<void>((resolve) => {
+          stalePollStartedResolve = resolve;
+        });
+        let releaseStalePoll: (() => void) | undefined;
+        let statusRequestCount = 0;
+        let reconcileFailCount = 0;
+
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['accept', 'content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+
+          if (sent.method() === 'POST' && url.pathname === '/connections/tool-label') {
+            if (scenario === 'delayed_pre_toggle_poll') {
+              // Simulate a toggle that commits in the store, then fails with 500 on the wire.
+              await operations().setToolLabel(app.id, 'alpha_tool', 'ask_first', {
+                expectedHash: hashes.get('alpha_tool')!,
+              });
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Ambiguous failure after save' }),
+              });
+              return;
+            }
+            if (scenario === 'poll_shutdown_vs_reconcile') {
+              await route.fulfill({
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ ok: false, error: 'Ambiguous failure' }),
+              });
+              return;
+            }
+          }
+
+          if (sent.method() === 'GET' && url.pathname === `/connections/app/${app.id}/tools-status`) {
+            statusRequestCount += 1;
+            if (scenario === 'unseen_label' && holdStatus) {
+              markStatusHeld?.();
+              await new Promise<void>((resolve) => {
+                releaseStatus = resolve;
+              });
+            } else if (scenario === 'delayed_pre_toggle_poll') {
+              if (statusRequestCount === 1) {
+                // Capture the pre-toggle snapshot (alpha_tool = just_do) and hold it until after the 500 toggle!
+                const staleBody = JSON.stringify({
+                  appId: app.id,
+                  status: 'connected',
+                  pinned: true,
+                  listHash: pinned.pin.listHash,
+                  labelsHash: toolLabelsHash(await store.listTools(app.id)),
+                  needsReview: true,
+                  hasUnsorted: false,
+                  tools: [
+                    {
+                      name: 'alpha_tool',
+                      displayName: 'Alpha tool',
+                      definitionHash: hashes.get('alpha_tool')!,
+                      label: 'just_do',
+                      unsettled: false,
+                      description: 'Read alpha state',
+                    },
+                    {
+                      name: 'beta_tool',
+                      displayName: 'Beta tool',
+                      definitionHash: hashes.get('beta_tool')!,
+                      label: 'ask_first',
+                      unsettled: false,
+                      description: 'Modify beta state',
+                    },
+                  ],
+                });
+                stalePollStartedResolve?.();
+                await new Promise<void>((resolve) => {
+                  releaseStalePoll = resolve;
+                });
+                await route.fulfill({
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                  body: staleBody,
+                });
+                return;
+              }
+              if (statusRequestCount === 2) {
+                // Hold the post-toggle reconciliation until the delayed stale poll has been delivered first!
+                markStatusHeld?.();
+                await new Promise<void>((resolve) => {
+                  releaseStatus = resolve;
+                });
+              }
+            } else if (scenario === 'poll_shutdown_vs_reconcile') {
+              if (statusRequestCount === 1) {
+                // First in-flight poll will finish as 'settled' (calling stopToolsPolling) AFTER reconcile starts.
+                stalePollStartedResolve?.();
+                await new Promise<void>((resolve) => {
+                  releaseStalePoll = resolve;
+                });
+              } else {
+                // Reconciliation attempts fail with 503 — must NOT be cancelled by poll #1 completing!
+                reconcileFailCount += 1;
+                await route.fulfill({
+                  status: 503,
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ error: 'Unavailable' }),
+                });
+                return;
+              }
+            }
+          }
+
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => pageErrors.push(error.message));
+
+        // 1) Unseen background label change on beta_tool while principal toggles alpha_tool:
+        //    Confirm stays disabled (and retains the old labelsHash) until full tools-status renders beta_tool's new label.
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        const initialLabelsHash = await page.locator('[data-review-labels-hash]').first().inputValue();
+        expect(await page.locator('button[data-switch-name="beta_tool"]').getAttribute('aria-checked')).toBe('true');
+
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'beta_tool',
+            definitionHash: hashes.get('beta_tool')!,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Modify beta state',
+            reason: 'Background reclassification',
+          },
+        ]);
+        holdStatus = true;
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        await statusHeld;
+        // Alpha flipped optimistically, but Confirm MUST remain disabled and NOT carry the unseen hash yet!
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').getAttribute('aria-checked')).toBe('true');
+        expect(await page.locator('.review-header-form button').isDisabled()).toBe(true);
+        expect(await page.locator('[data-review-labels-hash]').first().inputValue()).toBe(initialLabelsHash);
+
+        // Release full status snapshot -> beta_tool visibly updates to Auto, hash refreshes, Confirm unlocks & succeeds!
+        holdStatus = false;
+        releaseStatus?.();
+        await expect.poll(() => page.locator('.review-header-form button').isDisabled(), { timeout: 5000 }).toBe(false);
+        expect(await page.locator('button[data-switch-name="beta_tool"]').getAttribute('aria-checked')).toBe('false');
+        expect(await page.locator('[data-review-labels-hash]').first().inputValue()).not.toBe(initialLabelsHash);
+        await page.locator('.review-header-form button').click();
+        await page.waitForURL(`https://${HOST}/connections`);
+        expect((await store.getPin(app.id))?.needsReview).toBe(false);
+
+        // 2) Delayed pre-toggle tools-status arriving after an ambiguous 500 save is discarded (never clears uncertain lock with stale label).
+        scenario = 'delayed_pre_toggle_poll';
+        statusRequestCount = 0;
+        statusHeld = new Promise<void>((resolve) => {
+          markStatusHeld = resolve;
+        });
+        // Reset alpha_tool to just_do and leave beta_tool checking so initial page polls.
+        await store.pinTools(app.id, {
+          instructions: null,
+          tools: [
+            { name: 'alpha_tool', description: 'First tool (v2)', inputSchema: { type: 'object', properties: {} } },
+            { name: 'beta_tool', description: 'Second tool (v2)', inputSchema: { type: 'object', properties: {} } },
+          ],
+        });
+        const repinned = await store.listTools(app.id);
+        hashes.clear();
+        for (const t of repinned) hashes.set(t.name, t.definitionHash);
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'alpha_tool',
+            definitionHash: hashes.get('alpha_tool')!,
+            label: 'just_do',
+            source: 'sorter',
+            summary: 'Read alpha state',
+            reason: 'Read-only',
+          },
+        ]);
+
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        await stalePollStarted; // Poll #1 is in flight with alpha_tool = just_do!
+        await page.locator('button[data-switch-name="alpha_tool"]').click(); // Commits ask_first then returns 500!
+        await statusHeld; // Reconcile #2 is now in flight; alpha_tool is uncertain & disabled.
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').isDisabled()).toBe(true);
+
+        // Deliver the stale pre-toggle poll #1 first — it MUST be discarded, NOT clear the lock or paint 'Auto'!
+        releaseStalePoll?.();
+        await page.waitForTimeout(150);
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').isDisabled()).toBe(true);
+        expect(await page.locator('button[data-switch-name="alpha_tool"] .switch-state').textContent()).toBe(
+          'Checking…',
+        );
+
+        // Now deliver post-toggle reconcile #2 -> alpha_tool resolves to its true committed label ('Ask first').
+        releaseStatus?.();
+        await expect
+          .poll(() => page.locator('button[data-switch-name="alpha_tool"]').isDisabled(), { timeout: 5000 })
+          .toBe(false);
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').getAttribute('aria-checked')).toBe('true');
+        expect(await page.locator('button[data-switch-name="alpha_tool"] .switch-state').textContent()).toBe(
+          'Ask first',
+        );
+
+        // 3) Settled poll shutdown does not cancel reconciliation retries when reconciliation fails.
+        scenario = 'poll_shutdown_vs_reconcile';
+        statusRequestCount = 0;
+        reconcileFailCount = 0;
+        stalePollStarted = new Promise<void>((resolve) => {
+          stalePollStartedResolve = resolve;
+        });
+        await page.goto(`https://${HOST}/connections/app/${app.id}/tools`);
+        await stalePollStarted; // In-flight poll #1 started.
+        // Settle beta_tool in store so poll #1 would return 'settled', then trigger ambiguous toggle on alpha_tool.
+        await store.applyToolLabels(app.id, [
+          {
+            name: 'beta_tool',
+            definitionHash: hashes.get('beta_tool')!,
+            label: 'ask_first',
+            source: 'sorter',
+            summary: 'Modify beta state',
+            reason: 'External write',
+          },
+        ]);
+        await page.locator('button[data-switch-name="alpha_tool"]').click();
+        await expect.poll(() => reconcileFailCount, { timeout: 4000 }).toBeGreaterThanOrEqual(1);
+        // Release poll #1 while reconcile retry timer is pending — must NOT cancel reconciliation!
+        releaseStalePoll?.();
+        await expect.poll(() => reconcileFailCount, { timeout: 7000 }).toBeGreaterThanOrEqual(3);
+        await expect
+          .poll(() => page.locator('#outcome').textContent(), { timeout: 7000 })
+          .toContain('Couldn’t confirm the saved state. Reload the page before changing tools again.');
+        expect(await page.locator('button[data-switch-name="alpha_tool"]').isDisabled()).toBe(true);
+        expect(await page.locator('button[data-switch-name="alpha_tool"] .switch-state').textContent()).toBe(
+          'Unconfirmed',
         );
         expect(pageErrors).toEqual([]);
 

@@ -612,14 +612,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         try {
           const updated = await operations.setToolLabel(id, tool, label, { expectedHash: definitionHash });
           if (!updated) return sendJson(response, 409, { ok: false, error: CHANGED });
-          const refreshed = await operations.store.readAppTools(id).catch(() => undefined);
-          return sendJson(response, 200, {
-            ok: true,
-            tool,
-            label,
-            definitionHash,
-            ...(refreshed ? { labelsHash: toolLabelsHash(refreshed.tools) } : {}),
-          });
+          return sendJson(response, 200, { ok: true, tool, label, definitionHash });
         } catch (error) {
           if (!(error instanceof ConnectionsStoreError)) throw error;
           const failure = storeFailure(error);
