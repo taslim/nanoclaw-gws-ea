@@ -15,7 +15,8 @@ import {
 } from '../gws-ea-web/kit/index.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
-import { escapeInvisibleChars, type HeldAppCallPayload, type PendingHeldCallItem } from './held-calls.js';
+import { escapeInvisibleChars, hasAnyInvisible } from './held-card.js';
+import { type HeldAppCallPayload, type PendingHeldCallItem } from './held-calls.js';
 import type { ConnectionsListing } from './operations.js';
 import { operatorServerHost } from './operator.js';
 import { CONNECTIONS_PAGE_SCRIPT } from './page-client.js';
@@ -439,19 +440,78 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
   return `<div class="tools-view" data-tools-app="${escapeHtml(app.id)}" data-tools-polling="${hasUnsorted ? 'true' : 'false'}" data-tools-list-hash="${escapeHtml(pin?.listHash ?? '')}">${heading}${mobileStrip}<section class="section tools-section" aria-label="App tools" data-tools-body>${bodyMarkup}</section>${mobileDock}</div>`;
 }
 
-function prettyJsonStructure(raw: string): string {
+/**
+ * Losslessly indents a valid JSON object/array without parsing numbers through IEEE-754 (preserving 64-bit IDs
+ * and exact decimal notation) and returns whether the decoded JSON tree contains any invisible characters.
+ */
+function formatLosslessJson(raw: string): { readonly text: string; readonly decodedHasInvisible: boolean } {
   const trimmed = raw.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return raw;
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    return { text: raw, decodedHasInvisible: false };
+  }
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(trimmed);
-    if (parsed !== null && typeof parsed === 'object') {
-      return JSON.stringify(parsed, null, 2);
-    }
-    return raw;
+    parsed = JSON.parse(trimmed);
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
-    return raw;
+    return { text: raw, decodedHasInvisible: false };
   }
+  if (parsed === null || typeof parsed !== 'object') {
+    return { text: raw, decodedHasInvisible: false };
+  }
+  const decodedHasInvisible = hasAnyInvisible(parsed);
+  let out = '';
+  let indent = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const ch = trimmed[i]!;
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '{' || ch === '[') {
+      let look = i + 1;
+      while (look < trimmed.length && /\s/u.test(trimmed[look]!)) look += 1;
+      const closing = ch === '{' ? '}' : ']';
+      if (trimmed[look] === closing) {
+        out += `${ch}${closing}`;
+        i = look;
+      } else {
+        indent += 1;
+        out += `${ch}\n${'  '.repeat(indent)}`;
+      }
+      continue;
+    }
+    if (ch === '}' || ch === ']') {
+      indent = Math.max(0, indent - 1);
+      out += `\n${'  '.repeat(indent)}${ch}`;
+      continue;
+    }
+    if (ch === ',') {
+      out += `,\n${'  '.repeat(indent)}`;
+      continue;
+    }
+    if (ch === ':') {
+      out += ': ';
+      continue;
+    }
+    out += ch;
+  }
+  return { text: out, decodedHasInvisible };
 }
 
 function heldDecisionForm(
@@ -490,18 +550,21 @@ function heldCallView(held: HeldCallViewData): string {
     : `<div class="held-actions-header">${heldDecisionForm(held.approvalId, 'reject', 'Decline', 'Declining…', 'button-secondary')}${heldDecisionForm(held.approvalId, 'approve', 'Approve', 'Approving…', 'button-primary')}</div>`;
   const heading = `${BACK}${renderPageHeading(displayName, metadata, desktopActions)}`;
   const rawArgsOut = escapeInvisibleChars(payload.canonicalArgs);
-  const argsOut = rawArgsOut.hasInvisible
-    ? rawArgsOut
-    : escapeInvisibleChars(prettyJsonStructure(payload.canonicalArgs));
+  const formattedArgs = rawArgsOut.hasInvisible ? undefined : formatLosslessJson(payload.canonicalArgs);
+  const argsOut = formattedArgs ? escapeInvisibleChars(formattedArgs.text) : rawArgsOut;
   const rawContextOut = payload.appContext ? escapeInvisibleChars(payload.appContext.text) : undefined;
-  const contextOut =
-    payload.appContext && rawContextOut
-      ? rawContextOut.hasInvisible
-        ? rawContextOut
-        : escapeInvisibleChars(prettyJsonStructure(payload.appContext.text))
+  const formattedContext =
+    payload.appContext && rawContextOut && !rawContextOut.hasInvisible
+      ? formatLosslessJson(payload.appContext.text)
       : undefined;
+  const contextOut = formattedContext ? escapeInvisibleChars(formattedContext.text) : rawContextOut;
   const invisibleWarning =
-    rawArgsOut.hasInvisible || argsOut.hasInvisible || rawContextOut?.hasInvisible || contextOut?.hasInvisible
+    rawArgsOut.hasInvisible ||
+    argsOut.hasInvisible ||
+    formattedArgs?.decodedHasInvisible === true ||
+    rawContextOut?.hasInvisible === true ||
+    contextOut?.hasInvisible === true ||
+    formattedContext?.decodedHasInvisible === true
       ? notice('<strong>Hidden characters detected.</strong> Shown as [U+...] below.')
       : '';
   const summarySection = `<section class="section"><h2 class="section-title">Summary</h2><p class="detail-box">${escapeHtml(payload.summary ?? 'No summary provided')}</p></section>`;

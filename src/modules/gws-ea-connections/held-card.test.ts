@@ -156,6 +156,7 @@ describe('held-card distiller', () => {
       data: {
         vendor_name: 'Corner Kitchen',
         note: 'Leave at desk\nExpires: never',
+        ['forged\u200B\nExpires']: 'never',
         hidden_empty: '\u200B',
         amounts: { total: 100, ['tip\u202E']: 0 },
       },
@@ -165,7 +166,37 @@ describe('held-card distiller', () => {
     expect(out.text).toContain('[U+200B]');
     expect(out.text).toContain('[U+202E]');
     expect(out.text).toContain('Leave at desk\\nExpires: never');
+    expect(out.text).toContain('forged[U+200B]\\nExpires: never');
     expect(out.text).not.toContain('\nExpires: never');
+  });
+
+  it('detects JSON-escaped invisible characters at arbitrary depth and preserves zero totals under camelCase or snake_case names', () => {
+    // Escaped \\u200B inside raw JSON at depth 4 and depth 10 — raw ASCII scan alone cannot see it.
+    const deepEscaped = '{"summary":"Ready","details":{"a":{"b":{"c":{"note":"hidden\\u200B"}}}}}';
+    const deepOut = renderDistilledContext(deepEscaped, new Set());
+    expect(deepOut.hasInvisible).toBe(true);
+    expect(deepOut.text).toContain('[U+200B]');
+
+    const veryDeepEscaped =
+      '{"summary":"Ready","d1":{"d2":{"d3":{"d4":{"d5":{"d6":{"d7":{"d8":{"d9":{"d10":"spoof\\u202E"}}}}}}}}}}';
+    const veryDeepOut = renderDistilledContext(veryDeepEscaped, new Set());
+    expect(veryDeepOut.hasInvisible).toBe(true);
+    expect(veryDeepOut.text).toContain('[U+202E]');
+
+    const zeroTotals = JSON.stringify({
+      subtotal: 100,
+      discount: 100,
+      totalAmount: 0,
+      total_amount: 0,
+      amountDue: 0,
+      tip_amount: 0,
+      small_order: 0,
+    });
+    const zeroOut = renderDistilledContext(zeroTotals, new Set());
+    expect(zeroOut.text).toContain('Total amount: 0');
+    expect(zeroOut.text).toContain('Amount due: 0');
+    expect(zeroOut.text).not.toContain('Tip amount');
+    expect(zeroOut.text).not.toContain('Small order');
   });
 
   it('handles mixed prose plus JSON lines, caps oversized item lists, collapses inline JWTs in prose, and preserves deep invisible characters', () => {

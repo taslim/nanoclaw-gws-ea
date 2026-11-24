@@ -290,11 +290,12 @@ describe("GWS-EA's guidance for main", () => {
 
   it('tracks placed orders and deliveries to completion across apps, browser and email', () => {
     expect(GUIDANCE).toContain('**Orders & deliveries:**');
-    expect(GUIDANCE).toContain('Orders finish on delivery, not checkout.');
+    expect(GUIDANCE).toContain('Orders with a delivery or pickup finish on delivery or collection');
+    expect(GUIDANCE).toContain('`ncl matters place`');
     expect(GUIDANCE).toContain('`ncl matters open` with `--due`');
     expect(GUIDANCE).toContain('adaptive one-off `--look` times');
     expect(GUIDANCE).toContain('Stay silent in `<internal>` when unchanged');
-    expect(GUIDANCE).toContain('close once delivered');
+    expect(GUIDANCE).toContain('close once delivered or collected');
   });
 
   it('renders the protected doctrine and one account-failure response, without separate store pointers', async () => {

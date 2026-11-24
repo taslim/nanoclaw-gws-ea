@@ -2067,7 +2067,7 @@ describe('tool approvals review and held-call details', () => {
     expect(view.body).toContain(longNotes);
     expect(view.body).toContain('Prepared checkout chk_999: 1x Grain Bowl, total $18.50.');
 
-    // Minified JSON app context is pretty-printed losslessly on the web details page.
+    // Minified JSON app context is pretty-printed losslessly on the web details page, preserving 64-bit IDs.
     const jsonViewId = 'held-test-json-1';
     const jsonPayload: HeldAppCallPayload = {
       ...payload,
@@ -2076,7 +2076,7 @@ describe('tool approvals review and held-call details', () => {
       canonicalArgs: JSON.stringify({ checkout_id: 'chk_json_1', confirmed: true }),
       appContext: {
         toolName: 'prepare_checkout',
-        text: JSON.stringify({ ok: true, data: { vendor_id: 23787, tip: 0, total: 1850 } }),
+        text: '{"ok":true,"data":{"order_id":9007199254740993,"price":18.50,"vendor_id":23787,"tip":0}}',
       },
     };
     await createPendingApproval({
@@ -2094,6 +2094,9 @@ describe('tool approvals review and held-call details', () => {
     });
     const jsonView = await request(`/connections/held/${jsonViewId}`);
     expect(jsonView.status).toBe(200);
+    expect(jsonView.body).toContain('&quot;order_id&quot;: 9007199254740993');
+    expect(jsonView.body).not.toContain('9007199254740992');
+    expect(jsonView.body).toContain('&quot;price&quot;: 18.50');
     expect(jsonView.body).toContain('&quot;vendor_id&quot;: 23787');
     expect(jsonView.body).toContain('&quot;tip&quot;: 0');
     expect(jsonView.body).toContain('\n  &quot;data&quot;: {');

@@ -32,7 +32,9 @@ const TRIVIAL_STATUS_KEYS = new Set(['ok', 'success', 'status', 'code', 'statusC
 const TRIVIAL_STATUS_STRINGS = /^(?:ok|success|succeeded)$/iu;
 
 const KEEP_ZERO_KEY =
-  /^(?:total|grand_total|net_total|subtotal|amount|price|cost|payable|due|balance|charge|quantity|qty|count|guests|seats|adults|children|rooms|nights|days|hours|minutes|score|rating|status|code)$/iu;
+  /(?:^|[_-])(?:total|subtotal|amount|price|cost|payable|due|balance|charge|quantity|qty|count|guests|seats|adults|children|rooms|nights|days|hours|minutes|score|rating|status|code)(?:$|[_-])|(?:Total|Subtotal|Amount|Price|Cost|Payable|Due|Balance|Charge|Quantity|Qty|Count)$/u;
+
+const OPTIONAL_ZERO_SLOT = /(?:tip|voucher|promo|discount|fee|tax|bag|container|safety|small[_-]?order|surcharge)/iu;
 
 const USER_FACING_ID_KEY =
   /^(?:order|booking|confirmation|reference|ref|invoice|receipt|transaction|ticket|tracking|flight|reservation|case|issue|pr|pull_request)(?:_id|_number|_no|_code|Id|Number|Code)?$/iu;
@@ -227,16 +229,59 @@ export function renderDistilledArgs(args: Record<string, unknown>): DistilledArg
   };
 }
 
-function hasAnyInvisible(value: unknown, depth = 0): boolean {
-  if (depth > 8) return false;
-  if (typeof value === 'string') return escapeInvisibleChars(value).hasInvisible;
-  if (Array.isArray(value)) return value.some((item) => hasAnyInvisible(item, depth + 1));
-  if (isRecord(value)) {
-    return Object.entries(value).some(
-      ([k, v]) => escapeInvisibleChars(k).hasInvisible || hasAnyInvisible(v, depth + 1),
-    );
+/** Iteratively scans an entire decoded value at any depth for invisible characters in keys or string values. */
+export function hasAnyInvisible(root: unknown): boolean {
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value === 'string') {
+      if (escapeInvisibleChars(value).hasInvisible) return true;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (let i = value.length - 1; i >= 0; i -= 1) stack.push(value[i]);
+      continue;
+    }
+    if (isRecord(value)) {
+      for (const [k, v] of Object.entries(value)) {
+        if (escapeInvisibleChars(k).hasInvisible) return true;
+        stack.push(v);
+      }
+    }
   }
   return false;
+}
+
+/** Collects a bounded sample of invisible-bearing escaped snippets from a deep subtree so markers stay visible on cards. */
+function collectDeepInvisibleSnippets(root: unknown, limit = 3): string[] {
+  const found: string[] = [];
+  const stack: unknown[] = [root];
+  while (stack.length > 0 && found.length < limit) {
+    const value = stack.pop();
+    if (typeof value === 'string') {
+      const escaped = escapeInvisibleChars(value);
+      if (escaped.hasInvisible) {
+        found.push(capUtf16(escaped.rendered.replace(/\r\n|\r|\n/gu, '\\n'), MAX_JSON_FIELD_STRING));
+      }
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (let i = value.length - 1; i >= 0; i -= 1) stack.push(value[i]);
+      continue;
+    }
+    if (isRecord(value)) {
+      const entries = Object.entries(value);
+      for (let i = entries.length - 1; i >= 0; i -= 1) {
+        const [k, v] = entries[i]!;
+        const keyEscaped = escapeInvisibleChars(k);
+        if (keyEscaped.hasInvisible && found.length < limit) {
+          found.push(capUtf16(keyEscaped.rendered.replace(/\r\n|\r|\n/gu, '\\n'), MAX_JSON_FIELD_STRING));
+        }
+        stack.push(v);
+      }
+    }
+  }
+  return found;
 }
 
 function isTrivialWrapperEntry(key: string, value: unknown): boolean {
@@ -320,12 +365,12 @@ function sortKeysByRelevance<T>(entries: readonly (readonly [string, T])[]): Arr
 
 function humanizeKey(key: string, capitalizeFirst = true): string {
   const escaped = escapeInvisibleChars(key);
-  if (escaped.hasInvisible) return escaped.rendered;
+  if (escaped.hasInvisible) return escaped.rendered.replace(/\r\n|\r|\n/gu, '\\n');
   const spaced = escaped.rendered
     .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
     .replace(/[_-]+/gu, ' ')
     .trim();
-  if (!spaced) return escaped.rendered;
+  if (!spaced) return escaped.rendered.replace(/\r\n|\r|\n/gu, '\\n');
   const words = spaced.split(/\s+/u).map((word, index) => {
     if (/^[A-Z]{2,5}$/u.test(word)) return word;
     const lower = word.toLowerCase();
@@ -347,6 +392,11 @@ function cleanRecord(
 ): Record<string, unknown> {
   if (depth >= MAX_DISTILL_DEPTH) {
     state.compacted = true;
+    if (hasAnyInvisible(obj)) {
+      state.hasInvisible = true;
+      const snippets = collectDeepInvisibleSnippets(obj);
+      if (snippets.length > 0) return { hidden: snippets.join(', ') };
+    }
     return {};
   }
   const humanSibling = hasHumanSibling(obj);
@@ -395,7 +445,12 @@ function cleanRecord(
       continue;
     }
 
-    if (typeof value === 'number' && value === 0 && hasNonZeroNumber && !KEEP_ZERO_KEY.test(key)) {
+    if (
+      typeof value === 'number' &&
+      value === 0 &&
+      hasNonZeroNumber &&
+      (!KEEP_ZERO_KEY.test(key) || OPTIONAL_ZERO_SLOT.test(key))
+    ) {
       state.compacted = true;
       continue;
     }
@@ -419,7 +474,11 @@ function cleanArray(
 ): unknown[] {
   if (depth >= MAX_DISTILL_DEPTH) {
     state.compacted = true;
-    return hasAnyInvisible(arr) ? [...arr] : [];
+    if (hasAnyInvisible(arr)) {
+      state.hasInvisible = true;
+      return collectDeepInvisibleSnippets(arr);
+    }
+    return [];
   }
   const cleaned: unknown[] = [];
   for (const item of arr) {
@@ -594,7 +653,7 @@ function distillStructuredJson(
   parsed: Record<string, unknown> | readonly unknown[],
   argOpaqueTokens: ReadonlySet<string>,
 ): { readonly text: string; readonly hasInvisible: boolean; readonly compacted: boolean } {
-  const state: DistillState = { compacted: true, hasInvisible: false };
+  const state: DistillState = { compacted: true, hasInvisible: hasAnyInvisible(parsed) };
   if (Array.isArray(parsed)) {
     const cleaned = cleanArray(parsed, argOpaqueTokens, state, 0);
     if (cleaned.length === 0) {

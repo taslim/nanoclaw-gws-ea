@@ -50,9 +50,9 @@ type Agent = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser';
 /** A raise needs its reason here; each reason records the size its budget was set from. */
 const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason: string }>> = {
   main: {
-    tokens: 8_850,
+    tokens: 8_900,
     reason:
-      "8,815 tokens (35,259 characters): main's whole document with web connector enabled after trimming resident tool-schema repetition (interactive, artifacts, whatsapp-formatting) to deferred MCP descriptions and on-demand SKILL.md, plus automatic adaptive order and delivery tracking craft across connected apps, browser and email; rounded up.",
+      "8,882 tokens (35,526 characters): main's whole document with web connector enabled after trimming resident tool-schema repetition (interactive, artifacts, whatsapp-formatting) to deferred MCP descriptions and on-demand SKILL.md, plus automatic adaptive order/pickup tracking craft (with matter deduplication) across connected apps, browser and email; rounded up.",
   },
   'external-email': {
     tokens: 4_100,
