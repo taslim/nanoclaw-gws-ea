@@ -5,6 +5,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 
+import { getDb } from '../../db/connection.js';
+import { getPendingApproval } from '../../db/sessions.js';
 import { log as hostLog } from '../../log.js';
 import type { Session } from '../../types.js';
 import { EgressError, publicFetch, type EgressDependencies } from '../gws-ea-egress/fetch.js';
@@ -73,6 +75,7 @@ export interface HoldCallInput {
   readonly args: Record<string, unknown>;
   readonly canonicalArgs: string;
   readonly argsHash: string;
+  readonly stripSummary?: boolean;
   readonly summary: string | undefined;
   readonly session: Session;
   readonly requestId: string;
@@ -128,13 +131,15 @@ export interface AppRelay {
   drain(waitMs?: number): Promise<void>;
 }
 
+type PreflightResult = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
 interface CallTrace {
   egressError: EgressError | undefined;
   fetchStarted: boolean;
   httpSent: boolean;
   httpStatus: number | undefined;
-  verifyGrantBeforeDial: (() => Promise<boolean>) | undefined;
-  grantChangedBeforeDial: boolean;
+  verifyBeforeDial: (() => Promise<PreflightResult>) | undefined;
+  dialPreflightFailure: string | undefined;
 }
 
 function newTrace(): CallTrace {
@@ -143,8 +148,8 @@ function newTrace(): CallTrace {
     fetchStarted: false,
     httpSent: false,
     httpStatus: undefined,
-    verifyGrantBeforeDial: undefined,
-    grantChangedBeforeDial: false,
+    verifyBeforeDial: undefined,
+    dialPreflightFailure: undefined,
   };
 }
 
@@ -195,10 +200,12 @@ function prepareCallArgs(
   readonly callArgs: Record<string, unknown>;
   readonly canonical: string;
   readonly argsHash: string;
+  readonly stripSummary: boolean;
 } {
-  const callArgs = schemaAcceptsSummaryArg(tool.definition.inputSchema) ? rawArgs : stripSyntheticSummary(rawArgs);
+  const stripSummary = !schemaAcceptsSummaryArg(tool.definition.inputSchema);
+  const callArgs = stripSummary ? stripSyntheticSummary(rawArgs) : rawArgs;
   const { canonical, hash: argsHash } = canonicalArgsHash(callArgs);
-  return { callArgs, canonical, argsHash };
+  return { callArgs, canonical, argsHash, stripSummary };
 }
 
 class UpstreamUnauthorizedError extends Error {
@@ -290,9 +297,12 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       resolve: async (target) => {
         const destination = await baseResolve(target);
         const activeTrace = traceStore.getStore();
-        if (activeTrace?.verifyGrantBeforeDial && !(await activeTrace.verifyGrantBeforeDial())) {
-          activeTrace.grantChangedBeforeDial = true;
-          throw new EgressError('refused', { sent: false });
+        if (activeTrace?.verifyBeforeDial) {
+          const check = await activeTrace.verifyBeforeDial();
+          if (!check.ok) {
+            activeTrace.dialPreflightFailure = check.reason;
+            throw new EgressError('refused', { sent: false });
+          }
         }
         return destination;
       },
@@ -338,8 +348,6 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     promise.then(cleanup, cleanup);
     return promise;
   }
-
-  type PreflightResult = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
   async function verifyLiveGrant(appId: string, expectedGeneration: number): Promise<boolean> {
     return withAppLock(appId, async () => {
@@ -649,7 +657,10 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'unsent' as const, reason: 'relay_stopping' };
         }
         const callTrace = newTrace();
-        callTrace.verifyGrantBeforeDial = () => verifyLiveGrant(app.id, grant.generation);
+        callTrace.verifyBeforeDial =
+          options.verifyBeforeCall ??
+          (async () =>
+            (await verifyLiveGrant(app.id, grant.generation)) ? { ok: true } : { ok: false, reason: 'grant_changed' });
         try {
           const result = await traceStore.run(callTrace, () =>
             managed.client.callTool({ name: toolName, arguments: args }),
@@ -657,10 +668,10 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'completed' as const, result: result as Record<string, unknown> };
           /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any upstream MCP call failure into too_large, unsent, or unknown */
         } catch (error) {
-          const { egressError, fetchStarted, httpSent, httpStatus, grantChangedBeforeDial } = callTrace;
-          if (grantChangedBeforeDial) {
-            await closeClient(managed);
-            return { status: 'unsent' as const, reason: 'grant_changed' };
+          const { egressError, fetchStarted, httpSent, httpStatus, dialPreflightFailure } = callTrace;
+          if (dialPreflightFailure) {
+            if (dialPreflightFailure === 'grant_changed') await closeClient(managed);
+            return { status: 'unsent' as const, reason: dialPreflightFailure };
           }
           if ((httpStatus === 401 || isHttp401Error(error)) && !forceRenew && app.auth === 'oauth') {
             await closeClient(managed);
@@ -855,28 +866,39 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           const expectedAppId = existingInvocation?.appId ?? existingCall!.appId;
           const expectedToolName = existingInvocation?.toolName ?? existingCall!.toolName;
           const expectedArgsHash = existingInvocation?.argsHash ?? existingCall!.argsHash;
-          let argsMatch = false;
-          if (pinnedTool) {
-            argsMatch = prepareCallArgs(input.args, pinnedTool).argsHash === expectedArgsHash;
+          let replayArgs: {
+            readonly callArgs: Record<string, unknown>;
+            readonly canonical: string;
+            readonly argsHash: string;
+            readonly stripSummary: boolean;
+          };
+          if (existingInvocation) {
+            const callArgs = existingInvocation.stripSummary ? stripSyntheticSummary(input.args) : input.args;
+            const { canonical, hash } = canonicalArgsHash(callArgs);
+            replayArgs = { callArgs, canonical, argsHash: hash, stripSummary: existingInvocation.stripSummary };
+          } else if (pinnedTool) {
+            replayArgs = prepareCallArgs(input.args, pinnedTool);
           } else {
-            argsMatch =
-              canonicalArgsHash(input.args).hash === expectedArgsHash ||
-              (Object.hasOwn(input.args, ASSISTANT_SUMMARY_FIELD) &&
-                canonicalArgsHash(stripSyntheticSummary(input.args)).hash === expectedArgsHash);
+            const { canonical, hash } = canonicalArgsHash(input.args);
+            replayArgs = { callArgs: input.args, canonical, argsHash: hash, stripSummary: false };
           }
-          if (expectedAppId !== app.id || expectedToolName !== input.toolName || !argsMatch) {
+          if (
+            expectedAppId !== app.id ||
+            expectedToolName !== input.toolName ||
+            replayArgs.argsHash !== expectedArgsHash
+          ) {
             return requestConflict(existingVersion);
           }
           if (existingInvocation?.mode === 'held') {
             if (pinnedTool) {
-              const prepared = prepareCallArgs(input.args, pinnedTool);
               const held = await holdHandler({
                 app,
                 grantGeneration: grant.generation,
                 tool: pinnedTool,
-                args: prepared.callArgs,
-                canonicalArgs: prepared.canonical,
-                argsHash: prepared.argsHash,
+                args: replayArgs.callArgs,
+                canonicalArgs: replayArgs.canonical,
+                argsHash: replayArgs.argsHash,
+                stripSummary: replayArgs.stripSummary,
                 summary: input.summary,
                 session: input.session,
                 requestId: input.requestId,
@@ -921,10 +943,55 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
               };
             }
             if (existingInvocation.state === 'active') {
+              if (!existingInvocation.approvalId) {
+                return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE, ...versionField };
+              }
+              if (await getDb().hasTable('pending_approvals')) {
+                const pendingRow = await getPendingApproval(existingInvocation.approvalId);
+                if (!pendingRow) {
+                  try {
+                    await store.markHeldInvocationResolved(
+                      invocationId,
+                      existingInvocation.approvalId,
+                      'withdrawn',
+                      new Date(now()).toISOString(),
+                    );
+                    /* eslint-disable-next-line no-catch-all/no-catch-all -- best-effort reconciliation of an orphaned held invocation */
+                  } catch (error) {
+                    hostLog.warn('Could not reconcile orphaned held app call state', {
+                      invocationId,
+                      approvalId: existingInvocation.approvalId,
+                      error: error instanceof Error ? error.message : String(error),
+                    });
+                  }
+                  return {
+                    status: 'unsent',
+                    reason: 'withdrawn',
+                    text: 'The approval request for this app tool call is no longer pending; nothing was sent.',
+                    ...versionField,
+                  };
+                }
+                if (pendingRow.status === 'awaiting_reason' || pendingRow.status === 'rejected') {
+                  return {
+                    status: 'unsent',
+                    reason: 'rejected',
+                    text: 'The principal declined this app tool call; nothing was sent.',
+                    ...versionField,
+                  };
+                }
+                if (pendingRow.status === 'expired') {
+                  return {
+                    status: 'unsent',
+                    reason: 'expired',
+                    text: 'The approval request for this app tool call expired; nothing was sent.',
+                    ...versionField,
+                  };
+                }
+              }
               return {
                 status: 'held',
                 text: "I've asked the principal; the result will arrive as a note.",
-                ...(existingInvocation.approvalId ? { approvalId: existingInvocation.approvalId } : {}),
+                approvalId: existingInvocation.approvalId,
                 ...versionField,
               };
             }
@@ -992,7 +1059,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return { status: 'unsorted', text: UNSORTED_TOOL_MESSAGE, toolsVersion };
         }
 
-        const { callArgs, canonical, argsHash } = prepareCallArgs(input.args, tool);
+        const { callArgs, canonical, argsHash, stripSummary } = prepareCallArgs(input.args, tool);
 
         if (tool.label === 'ask_first') {
           const held = await holdHandler({
@@ -1002,6 +1069,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             args: callArgs,
             canonicalArgs: canonical,
             argsHash,
+            stripSummary,
             summary: input.summary,
             session: input.session,
             requestId: input.requestId,
@@ -1018,6 +1086,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           toolName: tool.name,
           definitionHash: tool.definitionHash,
           argsHash,
+          stripSummary,
           at,
         });
         if (directClaim.status === 'conflict') {
@@ -1031,6 +1100,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             args: callArgs,
             canonicalArgs: canonical,
             argsHash,
+            stripSummary,
             summary: input.summary,
             session: input.session,
             requestId: input.requestId,
@@ -1102,6 +1172,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
               id: callId,
               invocationId,
               argsHash: rerouted.argsHash,
+              stripSummary: rerouted.stripSummary,
               at: new Date(now()).toISOString(),
             });
             const held = await holdHandler({
@@ -1111,6 +1182,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
               args: rerouted.callArgs,
               canonicalArgs: rerouted.canonical,
               argsHash: rerouted.argsHash,
+              stripSummary: rerouted.stripSummary,
               summary: input.summary,
               session: input.session,
               requestId: input.requestId,

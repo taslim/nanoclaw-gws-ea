@@ -182,9 +182,18 @@ function ensureConnectionsRuntime(
       startConnectionsRefresher(store, signal, {
         onRefused: oweReconnectNote,
         onDisconnected: async (appId) => {
-          await getAppRelay()?.closeApp(appId);
-          await withdrawHeldAppCalls(appId);
-          await withdrawToolAskApprovals(appId);
+          const settled = await Promise.allSettled([
+            getAppRelay()?.closeApp(appId),
+            withdrawHeldAppCalls(appId),
+            withdrawToolAskApprovals(appId),
+          ]);
+          const rejected = settled.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+          if (rejected.length > 0) {
+            throw new AggregateError(
+              rejected.map((entry) => entry.reason),
+              'One or more post-disconnect cleanup steps failed',
+            );
+          }
         },
         onTick: () => sorter.enqueuePending(),
         clientDocumentsServed,

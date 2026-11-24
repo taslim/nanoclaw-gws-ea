@@ -270,9 +270,18 @@ export class ConnectionOperations {
       options.onDisconnected ??
       (async (appId) => {
         const relay = getAppRelay();
-        if (relay) await relay.closeApp(appId);
-        await withdrawHeldAppCalls(appId);
-        await withdrawToolAskApprovals(appId);
+        const settled = await Promise.allSettled([
+          relay ? relay.closeApp(appId) : Promise.resolve(),
+          withdrawHeldAppCalls(appId),
+          withdrawToolAskApprovals(appId),
+        ]);
+        const rejected = settled.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+        if (rejected.length > 0) {
+          throw new AggregateError(
+            rejected.map((entry) => entry.reason),
+            'One or more post-disconnect cleanup steps failed',
+          );
+        }
       });
   }
 

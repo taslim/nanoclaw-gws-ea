@@ -226,7 +226,7 @@ function toolAskRequest(content: Record<string, unknown>, requestId: string): To
   fieldsOnly(content, TOOL_ASK_FIELDS, 'app, tool, ask_first, and optional reason');
   if (typeof content.app !== 'string' || !content.app.trim())
     throw invalidArgs('app is the key principal_page connections lists for the app.');
-  if (typeof content.tool !== 'string' || !content.tool.trim())
+  if (typeof content.tool !== 'string' || content.tool.length === 0)
     throw invalidArgs('tool is the exact name of the app tool.');
   if (typeof content.ask_first !== 'boolean')
     throw invalidArgs('ask_first must be true (ask before running) or false (run without asking).');
@@ -606,19 +606,21 @@ export function createAppActions(dependencies: AppActionDependencies) {
       const isOperator = await hasOperatorServer(request.app);
       return refuse(isOperator === 'unavailable' ? 'unavailable' : isOperator ? 'operator_server' : 'not_found');
     }
-    const grant = await context.store.currentGrant(app.id);
-    if (!grant) return refuse('not_found');
-    const tool = await context.store.getTool(app.id, request.tool);
+    const {
+      grantGeneration,
+      tool,
+      decisionRevision: priorDecisionRevision,
+    } = await context.store.readToolForAsk(app.id, request.tool);
+    if (grantGeneration === undefined) return refuse('not_found');
     if (!tool) return refuse('tool_not_found');
     if (tool.label === null) return refuse('unsorted');
     if ((tool.label === 'ask_first') === request.askFirst) return refuse('unchanged');
-    const priorDecisionRevision = await context.store.getToolDecisionRevision(app.id, tool.name);
     const payload: Record<string, unknown> = {
       action: APP_TOOL_ASK_ACTION,
       requestId: request.requestId,
       app: app.serverKey,
       id: app.id,
-      grantGeneration: grant.generation,
+      grantGeneration,
       tool: tool.name,
       definitionHash: tool.definitionHash,
       priorDecisionRevision,

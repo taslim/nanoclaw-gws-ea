@@ -1,6 +1,7 @@
 import { isRecord } from '../../gws-ea/validation.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { ASSISTANT_SUMMARY_FIELD, sha256Hex, type ToolDefinition } from './canonical.js';
+import { testSafeRegex } from './safe-regex.js';
 import type { PinnedAppTool, ToolLabel, ToolLabelUpdate } from './store.js';
 
 export const FLOOR_VERBS: ReadonlySet<string> = new Set([
@@ -152,10 +153,14 @@ function schemaHasActionEnum(schema: unknown, depth = 0): { readonly matched: bo
 
 function resolveLocalSchemaRef(root: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
   if (!ref.startsWith('#/')) return undefined;
-  const parts = ref
-    .slice(2)
-    .split('/')
-    .map((part) => part.replace(/~1/gu, '/').replace(/~0/gu, '~'));
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(ref.slice(2));
+  } catch (error) {
+    if (!(error instanceof URIError)) throw error;
+    return undefined;
+  }
+  const parts = decoded.split('/').map((part) => part.replace(/~1/gu, '/').replace(/~0/gu, '~'));
   let current: unknown = root;
   for (const part of parts) {
     if (!isRecord(current) || !Object.hasOwn(current, part)) return undefined;
@@ -168,10 +173,12 @@ function walkRootObjectSubschemas(
   root: Record<string, unknown>,
   visitor: (node: Record<string, unknown>) => boolean,
 ): boolean {
-  const seen = new Set<object>();
+  const seenDepth = new Map<object, number>();
   const visit = (node: unknown, depth: number): boolean => {
-    if (depth > MAX_SCHEMA_DEPTH || !isRecord(node) || seen.has(node)) return false;
-    seen.add(node);
+    if (depth > MAX_SCHEMA_DEPTH || !isRecord(node)) return false;
+    const prevDepth = seenDepth.get(node);
+    if (prevDepth !== undefined && prevDepth <= depth) return false;
+    seenDepth.set(node, depth);
     if (visitor(node)) return true;
     if (typeof node.$ref === 'string') {
       const target = resolveLocalSchemaRef(root, node.$ref);
@@ -212,11 +219,8 @@ export function schemaAcceptsSummaryArg(schema: Record<string, unknown>): boolea
   return walkRootObjectSubschemas(schema, (node) => {
     if (!isRecord(node.patternProperties)) return false;
     for (const pattern of Object.keys(node.patternProperties)) {
-      try {
-        if (new RegExp(pattern).test(ASSISTANT_SUMMARY_FIELD)) return true;
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-      }
+      const matched = testSafeRegex(pattern, ASSISTANT_SUMMARY_FIELD);
+      if (matched === 'match' || matched === 'unsupported') return true;
     }
     return false;
   });

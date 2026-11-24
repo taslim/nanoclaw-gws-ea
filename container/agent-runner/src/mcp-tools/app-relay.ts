@@ -10,6 +10,7 @@ import {
 import { requestAction, type ActionRequestOptions, type ActionRequestResult } from '../action-request.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import '../modules/index.js';
+import { testSafeRegex } from './safe-regex.js';
 
 export const APP_RELAY_ACTION = 'app_relay';
 export const ASSISTANT_SUMMARY_FIELD = 'assistant_summary';
@@ -59,16 +60,29 @@ const ASSISTANT_SUMMARY_PROPERTY = {
 
 const MAX_SCHEMA_WALK_DEPTH = 8;
 
+function setOwnProperty<T>(target: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
 function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 function resolveLocalRef(root: Record<string, unknown>, ref: string): Record<string, unknown> | undefined {
   if (!ref.startsWith('#/')) return undefined;
-  const parts = ref
-    .slice(2)
-    .split('/')
-    .map((part) => part.replace(/~1/gu, '/').replace(/~0/gu, '~'));
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(ref.slice(2));
+  } catch (error) {
+    if (!(error instanceof URIError)) throw error;
+    return undefined;
+  }
+  const parts = decoded.split('/').map((part) => part.replace(/~1/gu, '/').replace(/~0/gu, '~'));
   let current: unknown = root;
   for (const part of parts) {
     if (!isRecord(current) || !Object.prototype.hasOwnProperty.call(current, part)) return undefined;
@@ -78,11 +92,8 @@ function resolveLocalRef(root: Record<string, unknown>, ref: string): Record<str
 }
 
 function patternMatchesField(pattern: string, field: string): boolean {
-  try {
-    return new RegExp(pattern).test(field);
-  } catch {
-    return true;
-  }
+  const result = testSafeRegex(pattern, field);
+  return result === 'match' || result === 'unsupported';
 }
 
 function collectRootObjectConstraints(root: Record<string, unknown>): {
@@ -91,11 +102,13 @@ function collectRootObjectConstraints(root: Record<string, unknown>): {
 } {
   const declaredNames = new Set<string>();
   const patterns: string[] = [];
-  const seen = new Set<object>();
+  const seenDepth = new Map<object, number>();
 
   const visit = (node: unknown, depth: number): void => {
-    if (depth > MAX_SCHEMA_WALK_DEPTH || !isRecord(node) || seen.has(node)) return;
-    seen.add(node);
+    if (depth > MAX_SCHEMA_WALK_DEPTH || !isRecord(node)) return;
+    const prevDepth = seenDepth.get(node);
+    if (prevDepth !== undefined && prevDepth <= depth) return;
+    seenDepth.set(node, depth);
     if (isRecord(node.properties)) {
       for (const key of Object.keys(node.properties)) declaredNames.add(key);
     }
@@ -179,18 +192,12 @@ function excludeSummaryFromPatternProperties(
   const updated: Record<string, unknown> = {};
   const escaped = escapeRegExp(summaryField);
   for (const [pattern, subschema] of Object.entries(patternProperties)) {
-    let matches = false;
-    let compilable = true;
-    try {
-      matches = new RegExp(pattern).test(summaryField);
-    } catch {
-      compilable = false;
-    }
-    if (compilable && matches) {
-      updated[`^(?!${escaped}$)(?:[\\s\\S]*?(?:${pattern}))`] = subschema;
+    const matched = testSafeRegex(pattern, summaryField);
+    if (matched === 'match' || matched === 'unsupported') {
+      setOwnProperty(updated, `^(?!${escaped}$)(?:[\\s\\S]*?(?:${pattern}))`, subschema);
       changed = true;
     } else {
-      updated[pattern] = subschema;
+      setOwnProperty(updated, pattern, subschema);
     }
   }
   return { updated, changed };
@@ -205,13 +212,79 @@ function allowSummaryInPropertyNames(propertyNames: unknown, summaryField: strin
   return propertyNames;
 }
 
-function branchHasBlockingConstraint(node: Record<string, unknown>, summaryField: string): boolean {
-  if (node.additionalProperties === false || node.unevaluatedProperties === false) return true;
+function constrainsAdditionalProps(node: Record<string, unknown>): boolean {
+  return (
+    node.additionalProperties === false ||
+    isRecord(node.additionalProperties) ||
+    node.unevaluatedProperties === false ||
+    isRecord(node.unevaluatedProperties)
+  );
+}
+
+function inlineRef(resolved: Record<string, unknown>, siblings: Record<string, unknown>): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...resolved, ...siblings };
+  if (isRecord(resolved.properties) && isRecord(siblings.properties)) {
+    const props: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(resolved.properties)) setOwnProperty(props, k, v);
+    for (const [k, v] of Object.entries(siblings.properties)) setOwnProperty(props, k, v);
+    merged.properties = props;
+  }
+  if (Array.isArray(resolved.required) || Array.isArray(siblings.required)) {
+    const req = new Set<string>();
+    if (Array.isArray(resolved.required)) {
+      for (const entry of resolved.required) {
+        if (typeof entry === 'string') req.add(entry);
+      }
+    }
+    if (Array.isArray(siblings.required)) {
+      for (const entry of siblings.required) {
+        if (typeof entry === 'string') req.add(entry);
+      }
+    }
+    merged.required = [...req];
+  }
+  return merged;
+}
+
+function branchHasBlockingConstraint(
+  node: Record<string, unknown>,
+  summaryField: string,
+  root: Record<string, unknown>,
+  depth = 0,
+  seen: ReadonlySet<object> = new Set(),
+): boolean {
+  if (depth > MAX_SCHEMA_WALK_DEPTH || seen.has(node)) return false;
+  const nextSeen = new Set(seen);
+  nextSeen.add(node);
+  if (constrainsAdditionalProps(node)) return true;
   if (Object.prototype.hasOwnProperty.call(node, 'propertyNames')) return true;
   if (typeof node.maxProperties === 'number' || typeof node.minProperties === 'number') return true;
   if (isRecord(node.patternProperties)) {
     for (const pattern of Object.keys(node.patternProperties)) {
       if (patternMatchesField(pattern, summaryField)) return true;
+    }
+  }
+  if (typeof node.$ref === 'string') {
+    const target = resolveLocalRef(root, node.$ref);
+    if (target && branchHasBlockingConstraint(target, summaryField, root, depth + 1, nextSeen)) return true;
+  }
+  for (const combiner of ['allOf', 'anyOf', 'oneOf'] as const) {
+    const branches = node[combiner];
+    if (Array.isArray(branches)) {
+      for (const branch of branches) {
+        if (isRecord(branch) && branchHasBlockingConstraint(branch, summaryField, root, depth + 1, nextSeen)) {
+          return true;
+        }
+      }
+    }
+  }
+  for (const key of ['if', 'then', 'else'] as const) {
+    const sub = node[key];
+    if (isRecord(sub) && branchHasBlockingConstraint(sub, summaryField, root, depth + 1, nextSeen)) return true;
+  }
+  if (isRecord(node.dependentSchemas)) {
+    for (const dep of Object.values(node.dependentSchemas)) {
+      if (isRecord(dep) && branchHasBlockingConstraint(dep, summaryField, root, depth + 1, nextSeen)) return true;
     }
   }
   return false;
@@ -225,16 +298,16 @@ function allowAssistantSummaryInBranch(
   seenRefs: ReadonlySet<string> = new Set(),
 ): unknown {
   if (depth > MAX_SCHEMA_WALK_DEPTH || !isRecord(subschema)) return subschema;
-  let working: Record<string, unknown> = subschema;
+  const working: Record<string, unknown> = subschema;
   let changed = false;
 
   if (typeof subschema.$ref === 'string' && !seenRefs.has(subschema.$ref)) {
     const resolved = resolveLocalRef(root, subschema.$ref);
-    if (resolved && branchHasBlockingConstraint(resolved, summaryField)) {
+    if (resolved && branchHasBlockingConstraint(resolved, summaryField, root)) {
       const nextSeen = new Set(seenRefs);
       nextSeen.add(subschema.$ref);
       const { $ref: _removedRef, ...siblings } = subschema;
-      const inlined = { ...resolved, ...siblings };
+      const inlined = inlineRef(resolved, siblings);
       return allowAssistantSummaryInBranch(inlined, summaryField, root, depth + 1, nextSeen);
     }
   }
@@ -243,11 +316,13 @@ function allowAssistantSummaryInBranch(
   const subProps = isRecord(working.properties) ? working.properties : undefined;
   const hasSummary = subProps !== undefined && Object.prototype.hasOwnProperty.call(subProps, summaryField);
 
-  if (!hasSummary && (working.additionalProperties === false || working.unevaluatedProperties === false)) {
-    next.properties = {
-      ...(subProps ?? {}),
-      [summaryField]: ASSISTANT_SUMMARY_PROPERTY,
-    };
+  if (!hasSummary && constrainsAdditionalProps(working)) {
+    const mergedProps: Record<string, unknown> = {};
+    if (subProps) {
+      for (const [key, value] of Object.entries(subProps)) setOwnProperty(mergedProps, key, value);
+    }
+    setOwnProperty(mergedProps, summaryField, ASSISTANT_SUMMARY_PROPERTY);
+    next.properties = mergedProps;
     changed = true;
   }
   if (!hasSummary && Object.prototype.hasOwnProperty.call(working, 'propertyNames')) {
@@ -299,7 +374,7 @@ function allowAssistantSummaryInBranch(
     for (const [depKey, depSchema] of Object.entries(working.dependentSchemas)) {
       const updated = allowAssistantSummaryInBranch(depSchema, summaryField, root, depth + 1, seenRefs);
       if (updated !== depSchema) depChanged = true;
-      nextDeps[depKey] = updated;
+      setOwnProperty(nextDeps, depKey, updated);
     }
     if (depChanged) {
       next.dependentSchemas = nextDeps;
@@ -316,19 +391,17 @@ export function withAssistantSummarySchema(
   const existingProperties = isRecord(schema.properties) ? schema.properties : {};
   const field = summaryField ?? pickAssistantSummaryField(schema);
   const alreadyPresent = Object.prototype.hasOwnProperty.call(existingProperties, field);
-  const existingRequired = Array.isArray(schema.required)
-    ? schema.required.filter((entry): entry is string => typeof entry === 'string')
-    : [];
-  const required = existingRequired.includes(field) ? [...existingRequired] : [...existingRequired, field];
 
   let base: Record<string, unknown> = { ...schema };
   if (!alreadyPresent) {
-    if (typeof base.$ref === 'string') {
+    const seenRootRefs = new Set<string>();
+    for (let depth = 0; depth <= MAX_SCHEMA_WALK_DEPTH; depth += 1) {
+      if (typeof base.$ref !== 'string' || seenRootRefs.has(base.$ref)) break;
       const resolved = resolveLocalRef(schema, base.$ref);
-      if (resolved && branchHasBlockingConstraint(resolved, field)) {
-        const { $ref: _removedRef, ...siblings } = base;
-        base = { ...resolved, ...siblings };
-      }
+      if (!resolved || !branchHasBlockingConstraint(resolved, field, schema)) break;
+      seenRootRefs.add(base.$ref);
+      const { $ref: _removedRef, ...siblings } = base;
+      base = inlineRef(resolved, siblings);
     }
     if (Object.prototype.hasOwnProperty.call(base, 'propertyNames')) {
       base.propertyNames = allowSummaryInPropertyNames(base.propertyNames, field);
@@ -357,18 +430,23 @@ export function withAssistantSummarySchema(
     if (isRecord(base.dependentSchemas)) {
       const nextDeps: Record<string, unknown> = {};
       for (const [depKey, depSchema] of Object.entries(base.dependentSchemas)) {
-        nextDeps[depKey] = allowAssistantSummaryInBranch(depSchema, field, schema, 0);
+        setOwnProperty(nextDeps, depKey, allowAssistantSummaryInBranch(depSchema, field, schema, 0));
       }
       base.dependentSchemas = nextDeps;
     }
   }
 
+  const baseRequired = Array.isArray(base.required)
+    ? base.required.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+  const required = baseRequired.includes(field) ? [...baseRequired] : [...baseRequired, field];
+
   const baseProperties = isRecord(base.properties) ? base.properties : existingProperties;
   const properties: Record<string, object | boolean> = {};
   for (const [key, value] of Object.entries(baseProperties)) {
-    if (isRecord(value) || typeof value === 'boolean') properties[key] = value;
+    if (isRecord(value) || typeof value === 'boolean') setOwnProperty(properties, key, value);
   }
-  properties[field] = ASSISTANT_SUMMARY_PROPERTY;
+  setOwnProperty(properties, field, ASSISTANT_SUMMARY_PROPERTY);
 
   return {
     ...base,
@@ -394,9 +472,14 @@ export function extractSummaryAndArgs(
   return summary === undefined ? { args } : { args, summary };
 }
 
-function formatRelayedTool(raw: unknown): { readonly tool: Tool; readonly summaryField: string | null } | undefined {
+function formatRelayedTool(
+  raw: unknown,
+):
+  | { readonly tool: Tool; readonly summaryField: string | null; readonly declaredArgs: ReadonlySet<string> }
+  | undefined {
   if (!isRecord(raw) || typeof raw.name !== 'string' || !isRecord(raw.inputSchema)) return undefined;
   const label = raw.label === 'ask_first' || raw.label === 'just_do' ? raw.label : null;
+  const declaredArgs = collectRootObjectConstraints(raw.inputSchema).declaredNames;
   const summaryField = label === 'ask_first' ? pickAssistantSummaryField(raw.inputSchema) : null;
   const inputSchema =
     summaryField !== null
@@ -409,7 +492,7 @@ function formatRelayedTool(raw: unknown): { readonly tool: Tool; readonly summar
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
     ...(isRecord(raw.annotations) ? { annotations: raw.annotations as Tool['annotations'] } : {}),
   };
-  return { tool, summaryField };
+  return { tool, summaryField, declaredArgs };
 }
 
 export async function fetchAppInstructions(serverKey: string, deps: AppRelayDeps): Promise<string | undefined> {
@@ -486,6 +569,7 @@ export async function createAppRelayServer(serverKey: string, overrides: Partial
   let lastToolsVersion: string | undefined;
   let hasListed = false;
   const toolSummaryFields = new Map<string, string | null>();
+  const toolDeclaredArgs = new Map<string, ReadonlySet<string>>();
   const previousSummaryFields = new Map<string, string | null>();
 
   server.setRequestHandler(ListToolsRequestSchema, async (_request, context) => {
@@ -508,11 +592,13 @@ export async function createAppRelayServer(serverKey: string, overrides: Partial
     const rawTools =
       isRecord(result.frame.data) && Array.isArray(result.frame.data.tools) ? result.frame.data.tools : [];
     const nextSummaryFields = new Map<string, string | null>();
+    const nextDeclaredArgs = new Map<string, ReadonlySet<string>>();
     const tools: Tool[] = [];
     for (const entry of rawTools) {
       const formatted = formatRelayedTool(entry);
       if (!formatted) continue;
       nextSummaryFields.set(formatted.tool.name, formatted.summaryField);
+      nextDeclaredArgs.set(formatted.tool.name, formatted.declaredArgs);
       tools.push(formatted.tool);
     }
     for (const [name, prevField] of toolSummaryFields) {
@@ -524,6 +610,8 @@ export async function createAppRelayServer(serverKey: string, overrides: Partial
     }
     toolSummaryFields.clear();
     for (const [name, field] of nextSummaryFields) toolSummaryFields.set(name, field);
+    toolDeclaredArgs.clear();
+    for (const [name, args] of nextDeclaredArgs) toolDeclaredArgs.set(name, args);
     hasListed = true;
     return { tools };
   });
@@ -543,7 +631,8 @@ export async function createAppRelayServer(serverKey: string, overrides: Partial
         Object.prototype.hasOwnProperty.call(rawArgs, prevField)
       ) {
         const missingCurrent = currentField !== null && !Object.prototype.hasOwnProperty.call(rawArgs, currentField);
-        const carriesPriorFallback = prevField !== ASSISTANT_SUMMARY_FIELD;
+        const declaredInCurrent = toolDeclaredArgs.get(toolName)?.has(prevField) === true;
+        const carriesPriorFallback = prevField !== ASSISTANT_SUMMARY_FIELD && !declaredInCurrent;
         if (missingCurrent || carriesPriorFallback) {
           return errorToolResult('This tool schema changed since it was listed; refresh the tool list and retry.');
         }

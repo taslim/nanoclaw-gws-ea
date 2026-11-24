@@ -646,6 +646,159 @@ describe('app-relay stdio MCP server', () => {
     }
   });
 
+  it('handles schema-valued additionalProperties in branches, root $ref required preservation, __proto__ keys, declared prior fallback args, percent-encoded $ref, and ReDoS patterns', async () => {
+    // 1) Schema-valued additionalProperties in an allOf branch and referenced $defs branch exempts summary while preserving the branch constraint.
+    const branchAdditional = withAssistantSummarySchema({
+      type: 'object',
+      $defs: {
+        refIntMap: {
+          properties: { count: { type: 'integer' } },
+          additionalProperties: { type: 'integer' },
+        },
+      },
+      properties: { id: { type: 'string' } },
+      allOf: [
+        { properties: { id: { type: 'string' } }, additionalProperties: { type: 'integer' } },
+        { $ref: '#/$defs/refIntMap' },
+      ],
+    });
+    const branches = branchAdditional.allOf as Array<Record<string, unknown>>;
+    expect((branches[0]!.properties as Record<string, unknown>)[ASSISTANT_SUMMARY_FIELD]).toEqual({
+      type: 'string',
+      description: 'What this will do, in one line.',
+    });
+    expect(branches[0]!.additionalProperties).toEqual({ type: 'integer' });
+    expect((branches[1]!.properties as Record<string, unknown>)[ASSISTANT_SUMMARY_FIELD]).toEqual({
+      type: 'string',
+      description: 'What this will do, in one line.',
+    });
+    expect((branches[1]!.properties as Record<string, unknown>).count).toEqual({ type: 'integer' });
+    expect(branches[1]!.additionalProperties).toEqual({ type: 'integer' });
+
+    // 2) Root $ref preserves required fields from both referenced schema and root siblings when inlined.
+    const rootRefSchema = withAssistantSummarySchema({
+      $ref: '#/$defs/order',
+      required: ['extra'],
+      properties: { extra: { type: 'string' } },
+      $defs: {
+        order: {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          required: ['id'],
+          additionalProperties: false,
+        },
+      },
+    });
+    expect(rootRefSchema.required).toEqual(['id', 'extra', ASSISTANT_SUMMARY_FIELD]);
+    expect((rootRefSchema.properties as Record<string, unknown>).id).toEqual({ type: 'string' });
+    expect((rootRefSchema.properties as Record<string, unknown>).extra).toEqual({ type: 'string' });
+
+    // 3) Own __proto__ keys survive in properties, patternProperties, and dependentSchemas without mutating prototypes.
+    const protoInput = JSON.parse(
+      '{"type":"object","properties":{"__proto__":{"type":"string"},"id":{"type":"string"}},"patternProperties":{"__proto__":{"type":"string"}},"dependentSchemas":{"__proto__":{"additionalProperties":false}}}',
+    ) as Record<string, unknown>;
+    const protoAdapted = withAssistantSummarySchema(protoInput);
+    const protoProps = protoAdapted.properties as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(protoProps, '__proto__')).toBe(true);
+    expect(Object.getPrototypeOf(protoProps)).toBe(Object.prototype);
+    const protoPatterns = protoAdapted.patternProperties as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(protoPatterns, '__proto__')).toBe(true);
+    expect(Object.getPrototypeOf(protoPatterns)).toBe(Object.prototype);
+    const protoDeps = protoAdapted.dependentSchemas as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(protoDeps, '__proto__')).toBe(true);
+    expect(Object.getPrototypeOf(protoDeps)).toBe(Object.prototype);
+
+    // 4) Percent-encoded $ref and catastrophic ReDoS patternProperties keys resolve safely in bounded time.
+    const encodedRef = withAssistantSummarySchema({
+      type: 'object',
+      $defs: {
+        'summary args': { properties: { [ASSISTANT_SUMMARY_FIELD]: { type: 'string' } } },
+      },
+      allOf: [{ $ref: '#/$defs/summary%20args' }],
+    });
+    expect(encodedRef.required).toEqual([FALLBACK_ASSISTANT_SUMMARY_PREFIX]);
+
+    const started = performance.now();
+    const redosSchema = withAssistantSummarySchema({
+      type: 'object',
+      patternProperties: { '^(.*){100}Z$': { type: 'integer' }, '^(a+)+$': { type: 'integer' } },
+    });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(redosSchema.required).toContain(ASSISTANT_SUMMARY_FIELD);
+
+    // 5) When a prior fallback field becomes a declared app arg in the new listing, a fresh call carrying both
+    //    the current summary field and the declared arg succeeds, while a stale call missing the current field fails.
+    let listNum = 0;
+    const forwarded: RecordedRequest[] = [];
+    const { client, close } = await connectRelay(async (action, fields, options) => {
+      if (fields.op === 'initialize') {
+        return { status: 'answered', frame: { id: 'i-fb', ok: true, data: { instructions: null } } };
+      }
+      if (fields.op === 'tools/list') {
+        listNum += 1;
+        const inputSchema =
+          listNum === 1
+            ? {
+                type: 'object',
+                properties: { id: { type: 'string' }, [ASSISTANT_SUMMARY_FIELD]: { type: 'string' } },
+                required: ['id', ASSISTANT_SUMMARY_FIELD],
+              }
+            : {
+                type: 'object',
+                properties: { id: { type: 'string' }, [FALLBACK_ASSISTANT_SUMMARY_PREFIX]: { type: 'string' } },
+                required: ['id', FALLBACK_ASSISTANT_SUMMARY_PREFIX],
+              };
+        return {
+          status: 'answered',
+          frame: {
+            id: `l-fb-${listNum}`,
+            ok: true,
+            data: {
+              toolsVersion: `vfb-${listNum}`,
+              tools: [{ name: 'swap_tool', inputSchema, label: 'ask_first' }],
+            },
+          },
+        };
+      }
+      forwarded.push({ action, fields, options });
+      return {
+        status: 'answered',
+        frame: { id: 'c-fb', ok: true, data: { status: 'held', text: 'Asked principal.' } },
+      };
+    });
+    try {
+      await client.listTools();
+      await client.listTools();
+
+      // Stale call (carries prior fallback, omits new current assistant_summary) is still rejected.
+      const stale = await client.callTool({
+        name: 'swap_tool',
+        arguments: { id: '1', [FALLBACK_ASSISTANT_SUMMARY_PREFIX]: 'stale summary' },
+      });
+      expect(stale.isError).toBe(true);
+      expect(forwarded).toHaveLength(0);
+
+      // Fresh call (carries current assistant_summary AND declared nanoclaw_assistant_summary arg) succeeds.
+      const fresh = await client.callTool({
+        name: 'swap_tool',
+        arguments: {
+          id: '1',
+          [ASSISTANT_SUMMARY_FIELD]: 'Run swap tool',
+          [FALLBACK_ASSISTANT_SUMMARY_PREFIX]: 'real upstream param',
+        },
+      });
+      expect(fresh.isError).not.toBe(true);
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]!.fields.summary).toBe('Run swap tool');
+      expect(forwarded[0]!.fields.arguments).toEqual({
+        id: '1',
+        [FALLBACK_ASSISTANT_SUMMARY_PREFIX]: 'real upstream param',
+      });
+    } finally {
+      await close();
+    }
+  });
+
   describe('over the session mailbox', () => {
     beforeEach(() => {
       initTestSessionDb();

@@ -38,12 +38,14 @@ import { setDeliveryAdapter } from '../../delivery.js';
 import { sessionDir } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { expireApproval } from '../approvals/lifecycle.js';
+import { requestApproval } from '../approvals/primitive.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { MAIN, mainSession as getMainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
+import { APP_TOOL_ASK_ACTION } from './actions.js';
 import {
   createHoldCallHandler,
   getPendingHeldCallApproval,
@@ -51,6 +53,7 @@ import {
   HELD_CALL_ANSWER,
   registerHeldAppCallHandlers,
   renderCompactArgs,
+  resolveDetailsHostname,
   withdrawHeldAppCalls,
 } from './held-calls.js';
 import { ConnectionOperations } from './operations.js';
@@ -966,5 +969,115 @@ describe('held ask-first calls', () => {
     ).toMatchObject({ status: 'unsent', reason: 'withdrawn' });
     expect(deliveredCards).toHaveLength(cardsAfterWithdraw);
     expect(fake.toolCalls).toHaveLength(1);
+  });
+
+  it('checks web publication readiness for oversized details links, reconciles orphaned bound invocations, and withdraws tool-ask cards even when closeApp throws', async () => {
+    const enabledPolicy = async () => ({
+      status: 'enabled' as const,
+      enabled: true as const,
+      config: {
+        schemaVersion: 1 as const,
+        enabled: true,
+        hostname: HOSTNAME,
+        listenPort: 4100,
+        accessIssuer: 'https://team.cloudflareaccess.com',
+        accessAud: 'aud-test',
+        cloudflare: {
+          accountId: 'acct-1',
+          applicationId: 'app-1',
+          operatorConfigFile: '/tmp/web-operator.json',
+        },
+      },
+    });
+    expect(await resolveDetailsHostname(enabledPolicy, { publicationReady: async () => false })).toBeUndefined();
+    expect(await resolveDetailsHostname(enabledPolicy, { publicationReady: async () => true })).toBe(HOSTNAME);
+
+    const { app } = await setupFoodApp();
+    await stopAppRelay();
+    relay = startAppRelay({
+      store,
+      egress: endpoints.egress,
+      onHoldCall: createHoldCallHandler({
+        store,
+        webHostname: () => resolveDetailsHostname(enabledPolicy, { publicationReady: async () => false }),
+      }),
+    });
+
+    // 1) Oversized card is withheld when web policy is enabled but publication is not ready.
+    const withheld = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_not_ready', note: 'long details '.repeat(200) },
+      summary: 'Oversized call when web runtime is not serving',
+      session: mainSession,
+      requestId: 'req-web-not-ready',
+    });
+    expect(withheld).toMatchObject({ status: 'unsent', reason: 'details_unavailable' });
+    expect(deliveredCards).toHaveLength(0);
+
+    // 2) Orphaned bound active invocation (pending_approvals row gone without markHeldInvocationResolved)
+    //    reconciles to withdrawn on retry instead of returning held forever.
+    const held = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_orphan' },
+      summary: 'Will become orphaned',
+      session: mainSession,
+      requestId: 'req-orphaned-bound',
+    });
+    expect(held.status).toBe('held');
+    const orphanCardId = deliveredCards.at(-1)!.questionId;
+    await getDb().run('DELETE FROM pending_approvals WHERE approval_id = ?', orphanCardId);
+    const cardsBeforeOrphanRetry = deliveredCards.length;
+    const orphanRetry = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_orphan' },
+      summary: 'Will become orphaned',
+      session: mainSession,
+      requestId: 'req-orphaned-bound',
+    });
+    expect(orphanRetry).toMatchObject({ status: 'unsent', reason: 'withdrawn' });
+    expect(deliveredCards).toHaveLength(cardsBeforeOrphanRetry);
+    expect((await store.getRelayInvocation(`${mainSession.id}:req-orphaned-bound`))?.state).toBe('withdrawn');
+
+    // 3) Even if relay.closeApp fails during disconnect, pending held-call AND app_tool_ask approvals are withdrawn.
+    const heldBeforeDisc = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'confirm_checkout',
+      args: { checkout_id: 'chk_disc_cleanup' },
+      summary: 'Pending during failing closeApp',
+      session: mainSession,
+      requestId: 'req-disc-cleanup',
+    });
+    expect(heldBeforeDisc.status).toBe('held');
+    const toolAskApprovalId = await requestApproval({
+      session: mainSession,
+      agentName: 'Assistant',
+      action: APP_TOOL_ASK_ACTION,
+      payload: { id: app.id, app: app.serverKey, tool: 'confirm_checkout', ask_first: false },
+      title: 'Stop asking before Chow runs confirm_checkout?',
+      question: 'Allow confirm_checkout without asking?',
+      details: { facts: { app: app.name, tool: 'confirm_checkout' } },
+      approverUserId: PRINCIPAL_USER,
+    });
+    expect(toolAskApprovalId).toBeTruthy();
+    const closeSpy = vi.spyOn(relay, 'closeApp').mockRejectedValueOnce(new Error('close failure'));
+    const ops = new ConnectionOperations({
+      store,
+      webHostname: HOSTNAME,
+      fetches: endpoints.fetches,
+      clientDocumentsServed: () => true,
+      applyMain: async () => true,
+    });
+    const current = await store.get(app.id);
+    await ops.disconnect(current.id, current.version);
+    expect(closeSpy).toHaveBeenCalledWith(app.id);
+    expect(
+      (await getPendingApprovalsByAction(HELD_APP_CALL_ACTION)).filter((r) => r.status === 'pending'),
+    ).toHaveLength(0);
+    expect((await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).filter((r) => r.status === 'pending')).toHaveLength(
+      0,
+    );
   });
 });

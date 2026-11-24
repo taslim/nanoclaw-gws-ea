@@ -1060,9 +1060,11 @@ describe('host relay core', () => {
         expectedHash: toolDefinitionHash(SEARCH_TOOL),
       });
       releaseBlocked();
-      await blockingCall;
+      // Both the in-flight call (caught at dial time) and the queued call reroute to hold without dialing upstream.
+      expect(await blockingCall).toMatchObject({ status: 'held', text: 'held:search_menu' });
       expect(await queuedFlipped).toMatchObject({ status: 'held', text: 'held:search_menu' });
-      expect(localHeldCalls).toBe(1);
+      expect(localHeldCalls).toBe(2);
+      expect(fake.toolCalls.filter((c) => c.arguments.query === 'hold-queue')).toHaveLength(0);
       expect(fake.toolCalls.filter((c) => c.arguments.query === 'flipped-while-queued')).toHaveLength(0);
 
       // 4) Queued direct call to a no-auth app whose grant disconnects before dispatch is refused.
@@ -1568,7 +1570,7 @@ describe('host relay core', () => {
       expect(replayDuringHold.status).toBe('held');
       expect(fake.toolCalls.filter((c) => c.arguments.query === 'reroute-once')).toHaveLength(0);
 
-      // Approved execution dispatches exactly once.
+      // Approved execution dispatches exactly once — even under a second approvalId for the same invocationId.
       const exec1 = await raceRelay.executeApprovedCall({
         approvalId: 'apr-reroute-once',
         invocationId: `${session.id}:req-reroute-race`,
@@ -1579,6 +1581,16 @@ describe('host relay core', () => {
         args: { query: 'reroute-once' },
       });
       expect(exec1.status).toBe('completed');
+      const exec2 = await raceRelay.executeApprovedCall({
+        approvalId: 'apr-reroute-second',
+        invocationId: `${session.id}:req-reroute-race`,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'search_menu',
+        definitionHash: toolDefinitionHash(SEARCH_TOOL),
+        args: { query: 'reroute-once' },
+      });
+      expect(exec2).toMatchObject({ status: 'unsent', reason: 'already_dispatched' });
       expect(fake.toolCalls.filter((c) => c.arguments.query === 'reroute-once')).toHaveLength(1);
 
       // 4) Disconnect committed while tools/call egress resolve is pending aborts before dialing the socket.
@@ -1628,6 +1640,146 @@ describe('host relay core', () => {
       }
     } finally {
       await raceRelay.closeAll();
+    }
+  });
+
+  it('rechecks ask_first label at dial time, replays with recorded stripSummary rule, and reports unbound held reservations as unknown when tool is removed', async () => {
+    const fake = new FakeMcpApp({
+      appUrl: OPEN_URL,
+      issuer: 'https://recipes.example.test',
+      allowUnauthenticated: true,
+      tools: [SEARCH_TOOL],
+    });
+    endpoints.use(fake.handle);
+    const app = await connectOpenApp();
+    await relay.pinApp(app.id);
+    const searchHash = toolDefinitionHash(SEARCH_TOOL);
+    await store.applyToolLabels(app.id, [
+      { name: 'search_menu', definitionHash: searchHash, label: 'just_do', source: 'sorter', reason: 'Lookup' },
+    ]);
+
+    // 1) Flipping search_menu from just_do to ask_first while tools/call egress resolve is pending
+    //    aborts before dialing and reroutes to hold (never dispatching upstream).
+    let flipOnResolve = false;
+    const dialHeld: HoldCallInput[] = [];
+    const dialFlipRelay = createAppRelay({
+      store,
+      egress: {
+        ...endpoints.egress,
+        resolve: async (target) => {
+          const dest = await endpoints.egress.resolve!(target);
+          if (flipOnResolve) {
+            flipOnResolve = false;
+            await store.setToolLabel(app.id, 'search_menu', 'ask_first', 'principal', { expectedHash: searchHash });
+          }
+          return dest;
+        },
+      },
+      now: () => clock,
+      onHoldCall: async (input) => {
+        dialHeld.push(input);
+        return { status: 'held', text: 'Held after dial-time flip.', approvalId: 'apr-dial-flip' };
+      },
+    });
+    try {
+      // Warm session so next call hits resolve strictly during tools/call.
+      const warm = await dialFlipRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'warm-dial-flip', assistant_summary: 'synthetic summary stripped on first call' },
+        session,
+        requestId: 'req-strip-rule-replay',
+      });
+      expect(warm.status).toBe('completed');
+      const callsAfterWarm = fake.toolCalls.length;
+
+      flipOnResolve = true;
+      const flipped = await dialFlipRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'must-reroute-at-dial' },
+        session,
+        requestId: 'req-dial-flip-ask',
+      });
+      expect(flipped).toMatchObject({ status: 'held', approvalId: 'apr-dial-flip' });
+      expect(dialHeld).toHaveLength(1);
+      expect(fake.toolCalls).toHaveLength(callsAfterWarm);
+
+      // 2) After tool schema changes to declare assistant_summary, exact replay of the earlier invocation
+      //    still hashes using its recorded stripSummary=true rule and returns the settled result.
+      const searchWithSummary: FakeToolDefinition = {
+        name: 'search_menu',
+        description: 'Search menu with real assistant_summary arg',
+        inputSchema: {
+          type: 'object',
+          properties: { query: { type: 'string' }, assistant_summary: { type: 'string' } },
+          required: ['query'],
+        },
+      };
+      await store.pinTools(app.id, { instructions: null, tools: [searchWithSummary] });
+      const replayed = await dialFlipRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'warm-dial-flip', assistant_summary: 'synthetic summary stripped on first call' },
+        session,
+        requestId: 'req-strip-rule-replay',
+      });
+      expect(replayed.status).toBe('completed');
+      expect(fake.toolCalls).toHaveLength(callsAfterWarm);
+
+      // And for an invocation dispatched with stripSummary=false (declared assistant_summary), changing
+      // assistant_summary on replay is rejected as request_id_conflict (never accepted via stripped hash).
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'search_menu',
+          definitionHash: toolDefinitionHash(searchWithSummary),
+          label: 'just_do',
+          source: 'principal',
+          reason: 'Allowed',
+        },
+      ]);
+      const realSummaryCall = await dialFlipRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'real-summary', assistant_summary: 'v1' },
+        session,
+        requestId: 'req-real-summary-strict',
+      });
+      expect(realSummaryCall.status).toBe('completed');
+      const changedSummaryReplay = await dialFlipRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'search_menu',
+        args: { query: 'real-summary', assistant_summary: 'v2' },
+        session,
+        requestId: 'req-real-summary-strict',
+      });
+      expect(changedSummaryReplay).toMatchObject({ status: 'unsent', reason: 'request_id_conflict' });
+
+      // 3) Unbound active held reservation whose tool is removed from the pin returns unknown (not held)
+      //    and preserves the existing reservation without initiating a second delivery.
+      await store.reserveHeldInvocation({
+        invocationId: `${session.id}:req-unbound-removed`,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'removed_tool',
+        argsHash: (await import('./canonical.js')).canonicalArgsHash({ id: 'u-1' }).hash,
+        stripSummary: true,
+      });
+      const unboundOutcome = await dialFlipRelay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'removed_tool',
+        args: { id: 'u-1' },
+        session,
+        requestId: 'req-unbound-removed',
+      });
+      expect(unboundOutcome.status).toBe('unknown');
+      expect(await store.getRelayInvocation(`${session.id}:req-unbound-removed`)).toMatchObject({
+        mode: 'held',
+        state: 'active',
+        approvalId: null,
+      });
+    } finally {
+      await dialFlipRelay.closeAll();
     }
   });
 });

@@ -640,13 +640,28 @@ describe('app_tool_ask', () => {
       description: 'Trailing space scan',
       inputSchema: { type: 'object', properties: {} },
     });
-    const pinned = await store.pinTools(created.id, { instructions: null, tools: [plain, trailing] });
+    const whitespaceOnly = normalizeToolDefinition({
+      name: ' ',
+      description: 'Whitespace-only catalog name',
+      inputSchema: { type: 'object', properties: {} },
+    });
+    const pinned = await store.pinTools(created.id, { instructions: null, tools: [plain, trailing, whitespaceOnly] });
     const plainHash = pinned.tools.find((t) => t.name === 'scan')!.definitionHash;
     const trailingHash = pinned.tools.find((t) => t.name === 'scan ')!.definitionHash;
+    const wsHash = pinned.tools.find((t) => t.name === ' ')!.definitionHash;
     await store.applyToolLabels(created.id, [
       { name: 'scan', definitionHash: plainHash, label: 'ask_first', source: 'floor', reason: 'Ask plain' },
       { name: 'scan ', definitionHash: trailingHash, label: 'ask_first', source: 'floor', reason: 'Ask trailing' },
+      { name: ' ', definitionHash: wsHash, label: 'ask_first', source: 'floor', reason: 'Ask whitespace' },
     ]);
+
+    // Empty tool name is rejected, while whitespace-only catalog names remain addressable consistently.
+    const emptyReq = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: '', ask_first: false });
+    expect(emptyReq.answer).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+    const wsReq = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: ' ', ask_first: false });
+    expect(wsReq.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    await approve(APP_TOOL_ASK_ACTION);
+    expect((await store.getTool(created.id, ' '))?.label).toBe('just_do');
 
     // Exact tool name with trailing space targets "scan ", not "scan".
     const spaceReq = await send(APP_TOOL_ASK_ACTION, {
@@ -695,7 +710,32 @@ describe('app_tool_ask', () => {
       principalFloor: true,
     });
 
-    // Disconnecting withdraws pending app_tool_ask cards, and replaying a gen-1 approval after grant replacement is refused.
+    // Create two fresh lowering requests after Request B (matching the post-B decision revision):
+    // - Request C is approved right before disconnect (simulating a replay surviving across grant replacement),
+    // - Request D stays pending so we verify disconnect withdraws pending app_tool_ask cards.
+    const postBRevision = await store.getToolDecisionRevision(created.id, 'scan');
+    const reqCSend = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: false });
+    expect(reqCSend.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    const reqDSend = await send(APP_TOOL_ASK_ACTION, { app: created.serverKey, tool: 'scan', ask_first: false });
+    expect(reqDSend.answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    const pendingBeforeDisc = (await getPendingApprovalsByAction(APP_TOOL_ASK_ACTION)).filter(
+      (r) => r.status === 'pending',
+    );
+    const reqCRow = pendingBeforeDisc.find((r) => {
+      const parsed = JSON.parse(r.payload) as { requestId?: string; priorDecisionRevision?: number };
+      return parsed.requestId === reqCSend.requestId && parsed.priorDecisionRevision === postBRevision;
+    });
+    const reqDRow = pendingBeforeDisc.find((r) => {
+      const parsed = JSON.parse(r.payload) as { requestId?: string; priorDecisionRevision?: number };
+      return parsed.requestId === reqDSend.requestId && parsed.priorDecisionRevision === postBRevision;
+    });
+    expect(reqCRow).toBeDefined();
+    expect(reqDRow).toBeDefined();
+    expect(await transitionPendingApprovalStatus(reqCRow!.approval_id, 'pending', 'approved')).toBe(true);
+
+    // Disconnecting withdraws pending Request D while leaving already-approved Request C to replay after reconnect;
+    // replaying Request C after reconnect + re-pin fails specifically on grant replacement even though its decision
+    // revision still matches.
     const latestApp = await store.get(created.id);
     const ops = new ConnectionOperations({
       store,
@@ -711,12 +751,12 @@ describe('app_tool_ask', () => {
     const afterDisc = await store.get(created.id);
     await store.connect(afterDisc.id, afterDisc.version, { kind: 'token', token: 'tok-scan-2' });
     await store.pinTools(created.id, { instructions: null, tools: [plain] });
-    await handler({
-      session,
-      payload: JSON.parse(reqARow.payload) as Record<string, unknown>,
-      approval: { ...reqARow, status: 'approved' },
-      userId: PRINCIPAL,
-      notify: async () => undefined,
+    expect(await store.getToolDecisionRevision(created.id, 'scan')).toBe(postBRevision);
+    await resumeApprovedApprovals();
+    const reqCNote = notes(`connection-tool-ask:${session.id}:${reqCSend.requestId}`)[0];
+    expect(reqCNote).toBeDefined();
+    expect(JSON.parse(reqCNote!.content)).toMatchObject({
+      text: expect.stringContaining('disconnected or reconnected'),
     });
     expect((await store.getTool(created.id, 'scan'))?.principalFloor).toBe(true);
   });

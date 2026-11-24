@@ -101,6 +101,7 @@ export interface RelayInvocationRecord {
   readonly grantGeneration: number;
   readonly toolName: string;
   readonly argsHash: string;
+  readonly stripSummary: boolean;
   readonly mode: RelayInvocationMode;
   readonly approvalId: string | null;
   readonly state: RelayInvocationState;
@@ -384,6 +385,7 @@ CREATE TABLE IF NOT EXISTS relay_invocations (
   grant_generation INTEGER NOT NULL CHECK(grant_generation > 0),
   tool_name TEXT NOT NULL,
   args_hash TEXT NOT NULL,
+  strip_summary INTEGER NOT NULL DEFAULT 1 CHECK(strip_summary IN (0,1)),
   mode TEXT NOT NULL CHECK(mode IN ('direct','held')),
   approval_id TEXT,
   state TEXT NOT NULL CHECK(state IN ('active','settled','declined','expired','withdrawn')),
@@ -499,6 +501,7 @@ interface RelayInvocationRow {
   readonly grant_generation: number;
   readonly tool_name: string;
   readonly args_hash: string;
+  readonly strip_summary: number;
   readonly mode: RelayInvocationMode;
   readonly approval_id: string | null;
   readonly state: RelayInvocationState;
@@ -572,6 +575,7 @@ function toRelayInvocation(row: RelayInvocationRow): RelayInvocationRecord {
     grantGeneration: row.grant_generation,
     toolName: row.tool_name,
     argsHash: row.args_hash,
+    stripSummary: row.strip_summary === 1,
     mode: row.mode,
     approvalId: row.approval_id,
     state: row.state,
@@ -1670,6 +1674,30 @@ export class ConnectionsStore {
     return this.use((db) => this.readToolDecisionRevision(db, appId, name));
   }
 
+  /** Reads live grant generation, pinned tool, and principal decision revision from one consistent store snapshot. */
+  async readToolForAsk(
+    appId: string,
+    name: string,
+  ): Promise<{
+    readonly grantGeneration: number | undefined;
+    readonly tool: PinnedAppTool | undefined;
+    readonly decisionRevision: number;
+  }> {
+    return this.use((db) =>
+      db.transaction(() => {
+        const grant = this.grantRow(db, appId);
+        const row = db
+          .prepare<[string, string], AppToolRow>('SELECT * FROM app_tools WHERE app_id = ? AND name = ?')
+          .get(appId, name);
+        return {
+          grantGeneration: grant?.state === 'live' ? grant.generation : undefined,
+          tool: row ? toPinnedTool(row) : undefined,
+          decisionRevision: this.readToolDecisionRevision(db, appId, name),
+        };
+      })(),
+    );
+  }
+
   /**
    * Records a failed/timed-out/malformed sort attempt for the given tools. Each affected tool defaults to Ask-first
    * and remains unsettled until `maxAttempts` failures, after which it stays Ask-first with "couldn't be checked".
@@ -2033,11 +2061,13 @@ export class ConnectionsStore {
     readonly toolName: string;
     readonly definitionHash: string;
     readonly argsHash: string;
+    readonly stripSummary?: boolean;
     readonly at?: string;
   }): Promise<ClaimDirectCallResult> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
     const invocationId = input.invocationId ?? invocationIdFromDirectCallId(input.id);
+    const stripSummary = input.stripSummary === false ? 0 : 1;
     return this.use((db) =>
       db
         .transaction((): ClaimDirectCallResult => {
@@ -2079,9 +2109,9 @@ export class ConnectionsStore {
           if (!appExists) return { status: 'app_not_found' };
           db.prepare(
             `INSERT INTO relay_invocations
-              (invocation_id, app_id, grant_generation, tool_name, args_hash, mode, approval_id, state, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, 'direct', NULL, 'active', ?, ?)`,
-          ).run(invocationId, input.appId, input.grantGeneration, input.toolName, input.argsHash, at, at);
+              (invocation_id, app_id, grant_generation, tool_name, args_hash, strip_summary, mode, approval_id, state, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, 'direct', NULL, 'active', ?, ?)`,
+          ).run(invocationId, input.appId, input.grantGeneration, input.toolName, input.argsHash, stripSummary, at, at);
           db.prepare(
             `INSERT INTO relay_calls
               (id, approval_id, app_id, grant_generation, tool_name, definition_hash, args_hash, state, outcome_json,
@@ -2124,10 +2154,12 @@ export class ConnectionsStore {
     readonly id: string;
     readonly invocationId: string;
     readonly argsHash: string;
+    readonly stripSummary?: boolean;
     readonly at?: string;
   }): Promise<void> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
+    const stripSummary = input.stripSummary === undefined ? null : input.stripSummary ? 1 : 0;
     await this.use((db) =>
       db
         .transaction(() => {
@@ -2135,8 +2167,11 @@ export class ConnectionsStore {
             input.id,
           );
           db.prepare(
-            "UPDATE relay_invocations SET mode = 'held', state = 'active', args_hash = ?, updated_at = ? WHERE invocation_id = ?",
-          ).run(input.argsHash, at, input.invocationId);
+            `UPDATE relay_invocations
+              SET mode = 'held', state = 'active', args_hash = ?,
+                  strip_summary = COALESCE(?, strip_summary), updated_at = ?
+              WHERE invocation_id = ?`,
+          ).run(input.argsHash, stripSummary, at, input.invocationId);
         })
         .immediate(),
     );
@@ -2149,10 +2184,12 @@ export class ConnectionsStore {
     readonly grantGeneration: number;
     readonly toolName: string;
     readonly argsHash: string;
+    readonly stripSummary?: boolean;
     readonly at?: string;
   }): Promise<ReserveHeldInvocationResult> {
     const at = input.at ?? new Date().toISOString();
     isoValid(at);
+    const stripSummary = input.stripSummary === false ? 0 : 1;
     return this.use((db) =>
       db
         .transaction((): ReserveHeldInvocationResult => {
@@ -2176,9 +2213,18 @@ export class ConnectionsStore {
           if (!appExists) return { status: 'app_not_found' };
           db.prepare(
             `INSERT INTO relay_invocations
-              (invocation_id, app_id, grant_generation, tool_name, args_hash, mode, approval_id, state, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, 'held', NULL, 'active', ?, ?)`,
-          ).run(input.invocationId, input.appId, input.grantGeneration, input.toolName, input.argsHash, at, at);
+              (invocation_id, app_id, grant_generation, tool_name, args_hash, strip_summary, mode, approval_id, state, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, 'held', NULL, 'active', ?, ?)`,
+          ).run(
+            input.invocationId,
+            input.appId,
+            input.grantGeneration,
+            input.toolName,
+            input.argsHash,
+            stripSummary,
+            at,
+            at,
+          );
           return { status: 'reserved' };
         })
         .immediate(),
@@ -2249,12 +2295,19 @@ export class ConnectionsStore {
           const row = db
             .prepare<
               [string],
-              { app_id: string; approval_id: string | null }
-            >('SELECT app_id, approval_id FROM relay_calls WHERE id = ?')
+              { app_id: string; approval_id: string | null; grant_generation: number }
+            >('SELECT app_id, approval_id, grant_generation FROM relay_calls WHERE id = ?')
             .get(id);
+          let persistedOutcome = outcome.outcomeJson ?? null;
+          if (row && row.approval_id === null && persistedOutcome !== null) {
+            const grant = this.grantRow(db, row.app_id);
+            if (!grant || grant.state !== 'live' || grant.generation !== row.grant_generation) {
+              persistedOutcome = null;
+            }
+          }
           db.prepare('UPDATE relay_calls SET state = ?, outcome_json = ?, updated_at = ? WHERE id = ?').run(
             outcome.state,
-            outcome.outcomeJson ?? null,
+            persistedOutcome,
             at,
             id,
           );

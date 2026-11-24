@@ -877,4 +877,91 @@ describe('tool pinning, principal floors, and call claims', () => {
     ).toBe('grant_changed');
     expect((await store.getTool(app.id, 'place_order'))?.principalFloor).toBe(true);
   });
+
+  it('reads tool ask snapshot atomically, stores stripSummary on invocations, and never caches direct results after grant ends', async () => {
+    const app = await store.create(LEDGERLY);
+    const gen1 = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+    const toolDef = {
+      name: 'lookup_balance',
+      description: 'Lookup account balance',
+      inputSchema: { type: 'object', properties: {} },
+    };
+    const pinned = await store.pinTools(app.id, { instructions: null, tools: [toolDef] });
+    const hash = pinned.tools[0]!.definitionHash;
+    await store.applyToolLabels(app.id, [
+      { name: 'lookup_balance', definitionHash: hash, label: 'just_do', source: 'sorter', reason: 'Read-only' },
+    ]);
+
+    // 1) Atomic ask snapshot returns live generation, tool, and revision together.
+    const snap = await store.readToolForAsk(app.id, 'lookup_balance');
+    expect(snap.grantGeneration).toBe(gen1.generation);
+    expect(snap.tool?.label).toBe('just_do');
+    expect(snap.decisionRevision).toBe(0);
+
+    // 2) stripSummary flag persists accurately on direct and held invocations.
+    await store.claimDirectCall({
+      id: 'direct:s-1:r-strip-false',
+      invocationId: 's-1:r-strip-false',
+      appId: app.id,
+      grantGeneration: gen1.generation,
+      toolName: 'lookup_balance',
+      definitionHash: hash,
+      argsHash: 'hash-a',
+      stripSummary: false,
+    });
+    expect((await store.getRelayInvocation('s-1:r-strip-false'))?.stripSummary).toBe(false);
+
+    // Direct call settling under its original live grant caches its outcomeJson.
+    await store.settleRelayCall('direct:s-1:r-strip-false', {
+      state: 'completed',
+      outcomeJson: JSON.stringify({ content: [{ type: 'text', text: 'live-gen-1-balance' }] }),
+    });
+    expect((await store.getRelayCall('direct:s-1:r-strip-false'))?.outcomeJson).toContain('live-gen-1-balance');
+
+    // 3) Direct call in flight when disconnect commits must NOT write outcomeJson back after disconnect.
+    await store.claimDirectCall({
+      id: 'direct:s-1:r-inflight-disc',
+      invocationId: 's-1:r-inflight-disc',
+      appId: app.id,
+      grantGeneration: gen1.generation,
+      toolName: 'lookup_balance',
+      definitionHash: hash,
+      argsHash: 'hash-b',
+      stripSummary: true,
+    });
+    expect((await store.getRelayInvocation('s-1:r-inflight-disc'))?.stripSummary).toBe(true);
+
+    const beforeDisc = await store.get(app.id);
+    await store.disconnect(beforeDisc.id, beforeDisc.version);
+    expect((await store.readToolForAsk(app.id, 'lookup_balance')).grantGeneration).toBeUndefined();
+
+    await store.settleRelayCall('direct:s-1:r-inflight-disc', {
+      state: 'completed',
+      outcomeJson: JSON.stringify({ content: [{ type: 'text', text: 'stale-gen-1-secret' }] }),
+    });
+    const settledAfterDisc = await store.getRelayCall('direct:s-1:r-inflight-disc');
+    expect(settledAfterDisc).toMatchObject({ state: 'completed', outcomeJson: null });
+    expect((await store.getRelayInvocation('s-1:r-inflight-disc'))?.state).toBe('settled');
+
+    // Even after reconnecting (gen 2), late settlement of another gen-1 direct call stays uncached.
+    const afterDisc = await store.get(app.id);
+    await store.connect(afterDisc.id, afterDisc.version, { kind: 'token', token: 'tok-gen-2' });
+    await store.claimDirectCall({
+      id: 'direct:s-1:r-stale-gen',
+      invocationId: 's-1:r-stale-gen',
+      appId: app.id,
+      grantGeneration: gen1.generation,
+      toolName: 'lookup_balance',
+      definitionHash: hash,
+      argsHash: 'hash-c',
+    });
+    await store.settleRelayCall('direct:s-1:r-stale-gen', {
+      state: 'completed',
+      outcomeJson: JSON.stringify({ content: [{ type: 'text', text: 'must-not-cache' }] }),
+    });
+    expect(await store.getRelayCall('direct:s-1:r-stale-gen')).toMatchObject({
+      state: 'completed',
+      outcomeJson: null,
+    });
+  });
 });

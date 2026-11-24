@@ -32,6 +32,8 @@ import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js
 import { ensureExternalEmailGroup } from '../gws-ea-external-email/group.js';
 import '../gws-ea-profile/index.js';
 import { normalizeToolDefinition, toolDefinitionHash, type ToolDefinition } from './canonical.js';
+import { testSafeRegex } from './safe-regex.js';
+import { schemaAcceptsSummaryArg, schemaUsesReservedSummary } from './sort-rules.js';
 import {
   APP_SORT_THREAD_PREFIX,
   createAppToolSorter,
@@ -999,5 +1001,59 @@ describe('exhaustive deterministic floor coverage', () => {
     );
     await genJob;
     expect((await store.getTool(genApp.app.id, 'read_v1'))?.label).toBeNull();
+  });
+
+  it('percent-decodes $ref fragments, revisits shared DAG nodes at shallower depth, and evaluates patternProperties in bounded time', () => {
+    // 1) Percent-encoded local $ref resolves space-containing $defs keys; malformed percent encoding fails closed without throwing.
+    expect(
+      schemaUsesReservedSummary({
+        type: 'object',
+        $defs: { 'summary args': { properties: { assistant_summary: { type: 'string' } } } },
+        allOf: [{ $ref: '#/$defs/summary%20args' }],
+      }),
+    ).toBe(true);
+    expect(
+      schemaUsesReservedSummary({
+        type: 'object',
+        $defs: { a: { properties: { assistant_summary: { type: 'string' } } } },
+        allOf: [{ $ref: '#/$defs/%E0%A4%A' }],
+      }),
+    ).toBe(false);
+
+    // 2) Shared node reached first at depth 8 (pruning its child at depth 9) is still revisited when reached at depth 2.
+    const leaf = { properties: { assistant_summary: { type: 'string' } } };
+    const shared = { allOf: [leaf] };
+    // Build a chain of depth 7 leading into `shared` (so `shared` is visited at depth 8 first).
+    let deepBranch: Record<string, unknown> = shared;
+    for (let i = 0; i < 7; i += 1) {
+      deepBranch = { allOf: [deepBranch] };
+    }
+    const diamondSchema = {
+      type: 'object',
+      allOf: [deepBranch, { allOf: [shared] }],
+    };
+    expect(schemaUsesReservedSummary(diamondSchema)).toBe(true);
+
+    // 3) Bounded-time NFA regex evaluation handles common patterns and rejects ReDoS stalls.
+    expect(testSafeRegex('^assistant_summary$', 'assistant_summary')).toBe('match');
+    expect(testSafeRegex('^x_[a-z]+$', 'assistant_summary')).toBe('no_match');
+    expect(testSafeRegex('[unclosed', 'assistant_summary')).toBe('invalid');
+    expect(testSafeRegex('^(.*){100}Z$', 'assistant_summary')).toBe('unsupported');
+    expect(testSafeRegex('^(a+)+$', 'aaaaaaaaaaaaaaaaaaaaaaaaa!')).toBe('no_match');
+
+    const started = performance.now();
+    expect(
+      schemaAcceptsSummaryArg({
+        type: 'object',
+        patternProperties: { '^(.*){100}Z$': { type: 'integer' } },
+      }),
+    ).toBe(true);
+    expect(
+      schemaAcceptsSummaryArg({
+        type: 'object',
+        patternProperties: { '^(a+)+$': { type: 'integer' }, '^x_': { type: 'string' } },
+      }),
+    ).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 });

@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
 import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
-import { getPendingApprovalsByAction } from '../../db/sessions.js';
+import { getPendingApproval, getPendingApprovalsByAction } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { formatLocalTime, resolveTimezone } from '../../timezone.js';
@@ -25,7 +25,9 @@ import {
   type NoteForMainResult,
 } from '../gws-ea-profile/main-note.js';
 import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
+import { webReadiness } from '../gws-ea-web/index.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
+import type { WebReadiness } from '../gws-ea-web/runtime.js';
 import { canonicalArgsHash } from './canonical.js';
 import {
   getAppRelay,
@@ -219,8 +221,17 @@ function matchNeedlesInRecent(
   return null;
 }
 
+export async function resolveDetailsHostname(
+  readPolicy: typeof readWebPolicy = readWebPolicy,
+  readiness: Pick<WebReadiness, 'publicationReady'> = webReadiness,
+): Promise<string | undefined> {
+  const policy = await readPolicy();
+  if (policy.status !== 'enabled') return undefined;
+  return (await readiness.publicationReady(policy.config)) ? policy.config.hostname : undefined;
+}
+
 function defaultWebHostname(): Promise<string | undefined> {
-  return readWebPolicy().then((policy) => (policy.status === 'enabled' ? policy.config.hostname : undefined));
+  return resolveDetailsHostname();
 }
 
 /** Resolves the principal's local clock for `isoInstant` via whereabouts, falling back to install timezone. */
@@ -407,6 +418,7 @@ async function resolveExistingHeldState(
   invocationId: string,
   existingApproval: PendingApproval | undefined,
   existingInvocation: RelayInvocationRecord | undefined,
+  now: () => number,
 ): Promise<RelayCallOutcome | undefined> {
   if (existingInvocation) {
     if (
@@ -479,12 +491,38 @@ async function resolveExistingHeldState(
     }
   }
   switch (existingInvocation.state) {
-    case 'active':
+    case 'active': {
+      if (existingInvocation.approvalId && (await getDb().hasTable('pending_approvals'))) {
+        const pendingRow = await getPendingApproval(existingInvocation.approvalId);
+        if (!pendingRow) {
+          try {
+            await store.markHeldInvocationResolved(
+              invocationId,
+              existingInvocation.approvalId,
+              'withdrawn',
+              new Date(now()).toISOString(),
+            );
+            /* eslint-disable-next-line no-catch-all/no-catch-all -- best-effort reconciliation of an orphaned held invocation */
+          } catch (error) {
+            log.warn('Could not reconcile orphaned held app call state', {
+              invocationId,
+              approvalId: existingInvocation.approvalId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return {
+            status: 'unsent',
+            reason: 'withdrawn',
+            text: 'The approval request for this app tool call is no longer pending; nothing was sent.',
+          };
+        }
+      }
       return {
         status: 'held',
         text: HELD_CALL_ANSWER,
         ...(existingInvocation.approvalId ? { approvalId: existingInvocation.approvalId } : {}),
       };
+    }
     case 'settled':
       return { status: 'unknown', text: UNKNOWN_OUTCOME_MESSAGE };
     case 'declined':
@@ -552,6 +590,7 @@ export function createHoldCallHandler(dependencies: {
         invocationId,
         existingApproval,
         existingInvocation,
+        now,
       );
       if (existingOutcome) return existingOutcome;
 
@@ -561,6 +600,7 @@ export function createHoldCallHandler(dependencies: {
         grantGeneration: input.grantGeneration,
         toolName: input.tool.name,
         argsHash: input.argsHash,
+        ...(input.stripSummary === undefined ? {} : { stripSummary: input.stripSummary }),
         at: new Date(now()).toISOString(),
       });
       if (reservation.status === 'conflict') return REQUEST_ID_CONFLICT_OUTCOME;
@@ -578,6 +618,7 @@ export function createHoldCallHandler(dependencies: {
           invocationId,
           await findApprovalByInvocation(invocationId),
           reservation.invocation,
+          now,
         );
         if (resolved) return resolved;
       }
@@ -700,14 +741,22 @@ async function handleApprovalResolved(event: ApprovalResolvedEvent): Promise<voi
           : event.outcome === 'expired'
             ? 'expired'
             : 'withdrawn';
-    await store
-      .markHeldInvocationResolved(
+    try {
+      await store.markHeldInvocationResolved(
         payload.invocationId,
         event.approval.approval_id,
         resolvedState,
         new Date(now()).toISOString(),
-      )
-      .catch(() => undefined);
+      );
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- log failed invocation state update without blocking expiry note delivery */
+    } catch (error) {
+      log.warn('Could not record resolved held app call state', {
+        invocationId: payload.invocationId,
+        approvalId: event.approval.approval_id,
+        outcome: event.outcome,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   if (event.outcome !== 'expired') return;
   const writeNote = activeDependencies.writeNote ?? writeNoteForMain;
