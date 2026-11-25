@@ -21,6 +21,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # The static checks, the host suite and the container suite are independent,
 # so each gets its own runner and the gate waits for the slowest one, not the
 # sum. The host suite is cut into shards; vitest assigns files to a shard by a
@@ -62,7 +66,8 @@ jobs:
     runs-on: ubuntu-26.04
     strategy:
       matrix:
-        node-version: [22, 24]
+        # PRs validate on Node 24 for faster feedback; pushes to main/dogfood run the full Node 22 + 24 matrix.
+        node-version: ${{ github.event_name == 'pull_request' && fromJSON('[24]') || fromJSON('[22, 24]') }}
         shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -195,13 +200,13 @@ jobs:
           test "${{ needs.skill-pins.result }}" = success
 
   # The single check the main ruleset will require, in every repo under the same
-  # name. It needs `ci` as well as `test` so the older required context and the
-  # new one cannot disagree. if: always() because a skipped required check is
-  # not a failed one.
+  # name. Evaluates the exact same upstream jobs as `ci` in parallel so neither
+  # context waits on the other and they cannot disagree. if: always() because a
+  # skipped required check is not a failed one.
   gate:
     name: gate
     if: always()
-    needs: [checks, test, container-test, iron-front, skill-pins, ci]
+    needs: [checks, test, container-test, iron-front, skill-pins]
     permissions: {}
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -211,6 +216,5 @@ jobs:
           test "${{ needs.checks.result }}" = success
           test "${{ needs.test.result }}" = success
           test "${{ needs.container-test.result }}" = success
-          test "${{ needs.ci.result }}" = success
           test "${{ needs.iron-front.result }}" = success
           test "${{ needs.skill-pins.result }}" = success
