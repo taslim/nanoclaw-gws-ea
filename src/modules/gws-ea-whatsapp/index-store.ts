@@ -203,6 +203,21 @@ export class WhatsAppIndex {
       .prepare('UPDATE messages SET text=? WHERE account=? AND chat=? AND id=?')
       .run(text, this.account(), chat, id);
   }
+  /** Atomically commit an edit receipt, target text update, optional request cleanup, and row acceptance. */
+  recordEdit(
+    rowId: string,
+    message: Omit<IndexedMessage, 'routed'>,
+    targetId: string,
+    forgetRequest: boolean,
+    wire?: proto.IMessage | null,
+  ): void {
+    this.db.transaction(() => {
+      this.sent(message, wire);
+      this.edit(message.chat, targetId, message.text);
+      if (forgetRequest) this.forgetRequest(targetId);
+      this.accepted(rowId);
+    })();
+  }
   sent(message: Omit<IndexedMessage, 'routed'>, wire?: proto.IMessage | null): void {
     this.db
       .prepare(

@@ -188,21 +188,19 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         const sent = await socket.sendMessage(platformId, part, { messageId: id });
         if (sent?.key.id !== id)
           throw new Error('WhatsApp returned a different message id from the caller-provided id');
-        options.index.sent(
-          {
-            chat: platformId,
-            id,
-            sender: options.sender(),
-            fromMe: true,
-            forwarded: false,
-            text: formatted.text,
-            at: options.now(),
-          },
-          sent.message,
-        );
+        const sentRecord = {
+          chat: platformId,
+          id,
+          sender: options.sender(),
+          fromMe: true,
+          forwarded: false,
+          text: formatted.text,
+          at: options.now(),
+        };
         if ('edit' in part && part.edit?.id) {
-          options.index.edit(platformId, part.edit.id, formatted.text);
-          if (typeof content.questionId === 'string') options.index.forgetRequest(part.edit.id);
+          options.index.recordEdit(key, sentRecord, part.edit.id, typeof content.questionId === 'string', sent.message);
+        } else {
+          options.index.sent(sentRecord, sent.message);
         }
       } catch (error) {
         const status = whatsappStatusCode(error);
@@ -230,7 +228,7 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
         await options.state.set(recorded, true);
       }
     }
-    options.index.accepted(key);
+    if (content.operation !== 'edit') options.index.accepted(key);
     if (rowId === undefined) options.index.complete(key);
     return firstId;
   }

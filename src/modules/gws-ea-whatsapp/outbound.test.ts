@@ -341,7 +341,8 @@ describe('WhatsApp questions use native text answers', () => {
     expect(stillOpen.request(id!)).toMatchObject({ questionId, platformId: 'team@g.us' });
     stillOpen.close();
 
-    // Once the retry lands, the request is forgotten and a duplicate retry of the accepted deliveryId stays idempotent.
+    // Once the retry lands, receipt + target update + request cleanup + acceptance commit atomically,
+    // so a restart before completeDelivery still returns the accepted edit id without resending.
     h.socket().sendError = undefined;
     const outcomeMessage = {
       kind: 'chat-sdk',
@@ -355,10 +356,59 @@ describe('WhatsApp questions use native text answers', () => {
       deliveryId: 'outcome-edit-1',
     };
     const editId = await adapter.deliver('team@g.us', null, outcomeMessage);
-    expect(await adapter.deliver('team@g.us', null, outcomeMessage)).toBe(editId);
-    expect(h.socket().sends).toHaveLength(3); // original post + failed send attempt + succeeded retry
+    await adapter.teardown();
+    const restarted = await h.start();
+    expect(await restarted.deliver('team@g.us', null, outcomeMessage)).toBe(editId);
+    expect(h.socket().sends).toEqual([]);
     const forgotten = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    expect(forgotten.pending('outcome-edit-1')?.accepted).toBe(true);
+    expect(forgotten.message('team@g.us', id!)?.text).toBe('Allowed');
     expect(forgotten.request(id!)).toBeUndefined();
     forgotten.close();
+  });
+
+  it('rolls back receipt, text update, and request cleanup together if acceptance fails inside recordEdit', async () => {
+    const index = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    try {
+      index.sent({
+        chat: 'team@g.us',
+        id: 'orig-1',
+        sender: '15550000000@s.whatsapp.net',
+        fromMe: true,
+        forwarded: false,
+        text: 'Allow?',
+        at: h.now.value,
+      });
+      index.rememberRequest('orig-1', 'team@g.us', questionId, new Date(h.now.value).toISOString());
+      index.prepare('edit-row', 'team@g.us', 'receipt-1', h.now.value);
+
+      vi.spyOn(index, 'accepted').mockImplementationOnce(() => {
+        throw new Error('simulated failure before commit');
+      });
+      expect(() =>
+        index.recordEdit(
+          'edit-row',
+          {
+            chat: 'team@g.us',
+            id: 'receipt-1',
+            sender: '15550000000@s.whatsapp.net',
+            fromMe: true,
+            forwarded: false,
+            text: 'Allowed',
+            at: h.now.value,
+          },
+          'orig-1',
+          true,
+        ),
+      ).toThrow('simulated failure before commit');
+
+      // None of the four mutations committed: request stays resolvable and row stays unaccepted.
+      expect(index.message('team@g.us', 'receipt-1')).toBeUndefined();
+      expect(index.message('team@g.us', 'orig-1')?.text).toBe('Allow?');
+      expect(index.request('orig-1')).toMatchObject({ questionId, platformId: 'team@g.us' });
+      expect(index.pending('edit-row')?.accepted).toBe(false);
+    } finally {
+      index.close();
+    }
   });
 });
