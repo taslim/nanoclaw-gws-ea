@@ -56,10 +56,6 @@ interface SwitchableService {
   readonly name: string;
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-}
-
 /** NanoClaw's `ServiceMode`. */
 export type NanoclawServiceMode = 'launchd' | 'systemd-user' | 'systemd-system' | 'nohup' | 'unmanaged' | 'none';
 
@@ -320,7 +316,6 @@ export function createServiceControl(
     startHandle(handle);
   };
 
-  /** The installed service an operator can turn off and on: a launchd job or a systemd unit. */
   const switchable = (): SwitchableService => {
     const handle = installed(managed(detect()));
     const { mode, name } = handle;
@@ -346,9 +341,14 @@ export function createServiceControl(
       } catch (cause) {
         throw new GwsEaError('service_unobservable', reasonOf(cause), { cause });
       }
+      const label = `"${service.name}"`;
+      const row = listed
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => line.startsWith(`${label} `) || line.startsWith(`${label}=`));
+      const state = row?.slice(label.length).replace('=>', '').trim();
       // Older macOS prints true/false where current releases print disabled/enabled.
-      const row = new RegExp(`^\\s*"${escapeRegExp(service.name)}"\\s*=>\\s*(\\w+)`, 'mu').exec(listed);
-      return row?.[1] === 'disabled' || row?.[1] === 'true' ? 'disabled' : 'enabled';
+      return state === 'disabled' || state === 'true' ? 'disabled' : 'enabled';
     }
     const answer = env.runner.tryRun(
       'systemctl',

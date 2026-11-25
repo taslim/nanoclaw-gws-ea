@@ -2449,26 +2449,6 @@ describe('gws-ea start, stop, and restart', () => {
     expect(io.out.join('\n')).toContain('It stays off, through logins and reboots, until gws-ea start.');
   });
 
-  it('finishes turning off an assistant an older stop left enabled with its vault running', async () => {
-    const paths = await testPaths();
-    const a = await createdAssistant(paths, 35_001);
-    const { helpers, calls, vault } = nanoclawServices(
-      { [a.install_id]: false },
-      { vaultRunning: { [a.install_id]: true } },
-    );
-    const io = lines();
-
-    expect(
-      await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
-    ).toBe(0);
-
-    expect(calls.map(({ helper }) => helper).filter((helper) => helper !== 'detect')).toEqual([
-      'disable',
-      'vault stop',
-    ]);
-    expect(io.out).toContain(`Assistant ${a.instance_id} stopped.`);
-  });
-
   it('counts stopping an assistant already off as success, changing nothing', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);

@@ -12,7 +12,7 @@ import {
 } from './onecli.js';
 import type { ControlPlanePaths } from './paths.js';
 import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
-import type { InstanceServiceControl, StopOutcome } from './service-control.js';
+import type { InstanceServiceControl, NanoclawServiceHandle, StopOutcome } from './service-control.js';
 import { GwsEaError, type InstanceReservation } from './types.js';
 
 /**
@@ -20,8 +20,10 @@ import { GwsEaError, type InstanceReservation } from './types.js';
  * manager is never off, and a manager that cannot be asked leaves what
  * detection saw to decide.
  */
-export function isTurnedOff(service: InstanceServiceControl): boolean {
-  const { mode } = service.detect();
+export function isTurnedOff(
+  service: InstanceServiceControl,
+  { mode }: NanoclawServiceHandle = service.detect(),
+): boolean {
   if (mode !== 'launchd' && mode !== 'systemd-user' && mode !== 'systemd-system') return false;
   try {
     return service.enablement() === 'disabled';
@@ -32,12 +34,10 @@ export function isTurnedOff(service: InstanceServiceControl): boolean {
 }
 
 export interface AssistantVault {
-  /** Starts the vault and proves it serves, unless it serves already. */
   readonly bringUp: () => Promise<void>;
   readonly stop: () => Promise<'stopped' | 'already-stopped'>;
 }
 
-/** The assistant's own OneCLI compose stack, at the version its live release's receipt records. */
 export function onecliVault(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -71,7 +71,6 @@ export async function turnOff(service: InstanceServiceControl, vault: AssistantV
 }
 
 export interface TurnedOn<T> {
-  /** Whether the service had been turned off. */
   readonly turnedOn: boolean;
   readonly started: T;
 }
@@ -94,7 +93,7 @@ export async function turnOn<T>(
     if (wasOff) await stopAfterFailedStart(vault, error);
     throw error;
   }
-  const turnedOn = service.enable();
+  const turnedOn = wasOff && service.enable();
   return { turnedOn, started: await start() };
 }
 

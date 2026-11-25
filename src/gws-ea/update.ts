@@ -281,7 +281,7 @@ export function assertHostRunning(
       `A NanoClaw host runs from ${runtime.checkout_root} outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
     );
   }
-  if (isTurnedOff(service)) throw refused('host_not_running', 'off');
+  if (isTurnedOff(service, handle)) throw refused('host_not_running', 'off');
   if (!handle.active) throw refused('host_not_running', 'stopped');
 }
 

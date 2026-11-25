@@ -74,12 +74,12 @@ import {
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
 } from './service.js';
+import { isTurnedOff } from './assistant-power.js';
 import {
   createServiceControl,
   runtimeServiceTarget,
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
-  type ServiceEnablement,
 } from './service-control.js';
 import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { hasControlCharacters, isRecord, optionalString, unwrapData } from './validation.js';
@@ -685,17 +685,7 @@ function observeService(
         uid: context.uid,
       });
       const handle = control.detect();
-      if (handle.mode !== 'launchd' && handle.mode !== 'systemd-user' && handle.mode !== 'systemd-system')
-        return serviceObservation(handle);
-      let enablement: ServiceEnablement;
-      try {
-        enablement = control.enablement();
-      } catch (error) {
-        // Whether it is off is a refinement of what detection saw; failing to read it never hides that.
-        if (error instanceof GwsEaError && error.code === 'service_unobservable') return serviceObservation(handle);
-        throw error;
-      }
-      if (enablement === 'enabled') return serviceObservation(handle);
+      if (!isTurnedOff(control, handle)) return serviceObservation(handle);
       const id = runtime.instance_id;
       return {
         status: 'degraded',
