@@ -4,11 +4,15 @@
  * drift from NanoClaw's. `src/` cannot import `scripts/`, so the driver
  * supplies the helpers and this module binds them to one instance: its
  * checkout, install, home, and Docker endpoint. What gws-ea adds is naming the
- * install exactly (`installSlug`), and on systemd a reset of a unit's failed
- * state before each start.
+ * install exactly (`installSlug`), on systemd a reset of a unit's failed state
+ * before each start, and turning the service off and on in its manager.
  *
- * Stop follows NanoClaw: agent containers are left for the next start to
- * adopt, and the stop lasts until the next start, login, or reboot.
+ * `start` and `stop` follow NanoClaw and are transient: updates, rollbacks,
+ * removal, and stray cleanup share them, so they never change whether the
+ * service starts at login or boot. Only the operator's own stop and start turn
+ * it off and on, through `disable` and `enable`. NanoClaw has no such helper,
+ * and launchd refuses to load a disabled job with the same error it gives a
+ * job still being removed, so the manager's own record is read, never inferred.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -21,6 +25,31 @@ export { hostLogFiles, type HostLogFiles } from './service.js';
 
 /** Bounds a `systemctl` call a hung user bus would otherwise hold forever, leaving the assistant down. */
 const SYSTEMCTL_TIMEOUT_MS = 30_000;
+
+/** `systemctl is-enabled` states other than `disabled`, which it reports with a non-zero exit. */
+const SYSTEMD_UNIT_FILE_STATES: ReadonlySet<string> = new Set([
+  'enabled-runtime',
+  'linked',
+  'linked-runtime',
+  'alias',
+  'masked',
+  'masked-runtime',
+  'static',
+  'indirect',
+  'generated',
+  'transient',
+  'bad',
+  'not-found',
+]);
+
+interface SwitchableService {
+  readonly mode: 'launchd' | 'systemd-user' | 'systemd-system';
+  readonly name: string;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
 
 /** NanoClaw's `ServiceMode`. */
 export type NanoclawServiceMode = 'launchd' | 'systemd-user' | 'systemd-system' | 'nohup' | 'unmanaged' | 'none';
@@ -107,6 +136,9 @@ export interface ServiceControlOptions {
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
+/** Whether the service manager starts the service at login or boot: the record an operator's stop leaves. */
+export type ServiceEnablement = 'enabled' | 'disabled';
+
 export type StartOutcome = 'started' | 'already-running';
 export type StopOutcome = 'stopped' | 'already-stopped';
 export type RestartOutcome = 'restarted' | 'started';
@@ -127,6 +159,11 @@ export interface InstanceServiceControl {
   start(options?: StartOptions): Promise<StartOutcome>;
   /** Leaves agent containers for the next start, and returns once the host has exited. */
   stop(): Promise<StopOutcome>;
+  enablement(): ServiceEnablement;
+  /** Keeps the service from starting at login or boot; true when it changed. Leaves a running host running. */
+  disable(): boolean;
+  /** Lets the service start again; true when it changed. Starts nothing. */
+  enable(): boolean;
   /**
    * Stops a launchd job by its label, and returns once it has gone. NanoClaw
    * finds a job by its plist, so a job still loaded after its plist was deleted
@@ -272,8 +309,76 @@ export function createServiceControl(
     startHandle(handle);
   };
 
+  /** The installed service an operator can turn off and on: a launchd job or a systemd unit. */
+  const switchable = (): SwitchableService => {
+    const handle = installed(managed(detect()));
+    const { mode, name } = handle;
+    if (name !== undefined && (mode === 'launchd' || mode === 'systemd-user' || mode === 'systemd-system')) {
+      return { mode, name };
+    }
+    throw new GwsEaError(
+      'unsupported_platform',
+      `NanoClaw's service for ${root} runs under ${mode}, which gws-ea cannot keep off across reboots.`,
+    );
+  };
+  const systemctl = (mode: 'systemd-user' | 'systemd-system', ...args: string[]): string[] => [
+    ...(mode === 'systemd-user' ? ['--user'] : []),
+    ...args,
+  ];
+  const managerOptions = { timeoutMs: SYSTEMCTL_TIMEOUT_MS };
+
+  const observeEnablement = (service: SwitchableService): ServiceEnablement => {
+    if (service.mode === 'launchd') {
+      let listed: string;
+      try {
+        listed = env.runner.run('launchctl', ['print-disabled', `gui/${uid}`], undefined, managerOptions);
+      } catch (cause) {
+        throw new GwsEaError('service_unobservable', reasonOf(cause), { cause });
+      }
+      // Older macOS prints true/false where current releases print disabled/enabled.
+      const row = new RegExp(`^\\s*"${escapeRegExp(service.name)}"\\s*=>\\s*(\\w+)`, 'mu').exec(listed);
+      return row?.[1] === 'disabled' || row?.[1] === 'true' ? 'disabled' : 'enabled';
+    }
+    const answer = env.runner.tryRun(
+      'systemctl',
+      systemctl(service.mode, 'is-enabled', service.name),
+      undefined,
+      managerOptions,
+    );
+    const state = answer.stdout.trim().split('\n')[0]?.trim() ?? '';
+    if (state === 'disabled') return 'disabled';
+    // is-enabled exits non-zero for masked, static, and other states that are not an operator's disable.
+    if (answer.ok || SYSTEMD_UNIT_FILE_STATES.has(state)) return 'enabled';
+    throw new GwsEaError('service_unobservable', `systemctl is-enabled ${service.name} failed: ${answer.stdout}`);
+  };
+
+  const setEnablement = (to: ServiceEnablement): boolean => {
+    const service = switchable();
+    if (observeEnablement(service) === to) return false;
+    const verb = to === 'enabled' ? 'enable' : 'disable';
+    try {
+      options.recordEffect?.(null);
+      if (service.mode === 'launchd') {
+        env.runner.run('launchctl', [verb, `gui/${uid}/${service.name}`], undefined, managerOptions);
+      } else {
+        env.runner.run('systemctl', systemctl(service.mode, verb, service.name), undefined, managerOptions);
+      }
+      options.recordEffect?.(true);
+    } catch (cause) {
+      throw new GwsEaError(
+        'service_enablement_failed',
+        `Could not ${verb} NanoClaw's service ${service.name}: ${reasonOf(cause)}`,
+        { cause },
+      );
+    }
+    return true;
+  };
+
   return {
     detect,
+    enablement: () => observeEnablement(switchable()),
+    disable: () => setEnablement('disabled'),
+    enable: () => setEnablement('enabled'),
     async start({ definitionChanged = false } = {}) {
       const handle = managed(detect());
       if (handle.active && !definitionChanged) return 'already-running';
