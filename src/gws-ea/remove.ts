@@ -615,9 +615,15 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
 
   if (platform === 'macos') {
     const service = coordinates(false);
-    // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is stopped
-    // by its label, before the stray-host kill below: launchd would only start that host again.
-    if (detected.mode !== 'launchd') await control.stopByLabel(service.serviceIdentity, service.serviceDefinitionPath);
+    if (detected.mode === 'launchd') {
+      // An assistant turned off has its launchd override set to disabled; launchd clears it only with enable,
+      // which finds the job by its plist, so it runs before the plist goes.
+      control.enable();
+    } else {
+      // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is stopped
+      // by its label, before the stray-host kill below: launchd would only start that host again.
+      await control.stopByLabel(service.serviceIdentity, service.serviceDefinitionPath);
+    }
     await rm(service.serviceDefinitionPath, { force: true });
   }
   for (const service of units) {
