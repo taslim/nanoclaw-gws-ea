@@ -133,8 +133,8 @@ Uninstall stops new recognition everywhere before taking instance locks or
 checking drainage. It then proves managed consumers drained, covering the
 whole preparation window and actual processes holding any installed model or
 program open. An unreachable host or missing runtime is not proof of idle work.
-Let running hosts finish their notes, or stop the affected assistant and wait
-for its processes and containers to become quiet, then retry uninstall. No live
+Let running hosts finish their notes, or turn the affected assistant off with
+`gws-ea stop`, which stops its host and agent containers, then retry uninstall. No live
 text host is stopped by this command.
 
 Host policy, instance operation locks and the registry reservation lock prevent
