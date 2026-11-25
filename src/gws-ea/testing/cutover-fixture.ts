@@ -385,7 +385,7 @@ export async function assistant(host: Machine, options: AssistantOptions = {}): 
     dockerEndpoint: DOCKER,
   });
   const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
-    nodePath: options.nodePath ?? (await realpath(process.execPath)),
+    nodePath: options.nodePath ?? path.resolve(process.execPath),
     homeDirectory: host.root,
     selectedProvider: 'claude',
     dockerEndpoint: DOCKER,
@@ -1059,12 +1059,12 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
     freeBytes: async () => state.freeBytes,
     service: SERVICE,
     ambientEnv: {},
-    ...(state.nodePath
-      ? {
-          node: { version: process.version, execPath: state.nodePath, execve: process.execve },
-          resolvePersisted: async (command: string) => path.resolve(command),
-        }
-      : {}),
+    node: {
+      version: process.version,
+      execPath: state.nodePath ?? path.resolve(process.execPath),
+      execve: process.execve,
+    },
+    resolvePersisted: async (command: string) => path.resolve(command),
     onecli: {
       reverify: async (layout: OnecliRuntimeLayout) => {
         state.reverified.push(layout.project);
