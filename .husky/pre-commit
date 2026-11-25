@@ -1,5 +1,56 @@
-staged=$(git diff --cached --name-only --diff-filter=ACM -- 'src/**/*.ts')
-pnpm run format:fix
-if [ -n "$staged" ]; then
-  echo "$staged" | xargs git add
+staged=$(git diff --cached --name-only --diff-filter=ACMR -- ':(glob)src/**/*.ts')
+if [ -z "$staged" ]; then
+  exit 0
 fi
+
+node -e '
+const { execFileSync, spawnSync } = require("node:child_process");
+
+const files = execFileSync(
+  "git",
+  ["diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", "--", ":(glob)src/**/*.ts"],
+  { encoding: "utf8" },
+)
+  .split("\0")
+  .filter(Boolean);
+
+if (files.length === 0) process.exit(0);
+
+const fullyStaged = [];
+const partiallyStaged = [];
+for (const file of files) {
+  const diff = spawnSync("git", ["--literal-pathspecs", "diff", "--quiet", "--", file]);
+  if (diff.status === 0) {
+    fullyStaged.push(file);
+  } else if (diff.status === 1) {
+    partiallyStaged.push(file);
+  } else {
+    process.exit(diff.status ?? 1);
+  }
+}
+
+if (fullyStaged.length > 0) {
+  execFileSync("pnpm", ["exec", "prettier", "--write", "--", ...fullyStaged], { stdio: "inherit" });
+  execFileSync("git", ["--literal-pathspecs", "add", "--", ...fullyStaged], { stdio: "inherit" });
+}
+
+for (const file of partiallyStaged) {
+  const ls = execFileSync("git", ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", file], {
+    encoding: "utf8",
+  }).split("\0")[0];
+  const mode = ls?.split(" ")[0];
+  if (!mode) continue;
+  const stagedContent = execFileSync("git", ["show", `:${file}`]);
+  const formatted = execFileSync("pnpm", ["exec", "prettier", "--stdin-filepath", file], {
+    input: stagedContent,
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  if (!formatted.equals(stagedContent)) {
+    const hash = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      input: formatted,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["update-index", "--cacheinfo", `${mode},${hash},${file}`]);
+  }
+}
+'
