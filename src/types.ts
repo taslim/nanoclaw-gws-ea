@@ -180,40 +180,6 @@ export interface Session {
   created_at: string;
 }
 
-// ── Session DB entities ──
-
-export type MessageInKind = 'chat' | 'chat-sdk' | 'task' | 'webhook' | 'system';
-export type MessageInStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
-
-export interface MessageIn {
-  id: string;
-  kind: MessageInKind;
-  timestamp: string;
-  status: MessageInStatus;
-  status_changed: string | null;
-  process_after: string | null;
-  recurrence: string | null;
-  tries: number;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  content: string; // JSON blob
-}
-
-export interface MessageOut {
-  id: string;
-  in_reply_to: string | null;
-  timestamp: string;
-  delivered: number; // 0 | 1
-  deliver_after: string | null;
-  recurrence: string | null;
-  kind: string;
-  platform_id: string | null;
-  channel_type: string | null;
-  thread_id: string | null;
-  content: string; // JSON blob
-}
-
 // ── Pending questions (central DB) ──
 
 export interface PendingQuestion {
@@ -224,11 +190,11 @@ export interface PendingQuestion {
   channel_type: string | null;
   thread_id: string | null;
   title: string;
-  /** Empty on a row from before the question text was kept. */
-  question: string;
+  /** Card body, kept so the answered card still shows it. Empty on older rows. */
+  question?: string;
   options: import('./channels/ask-question.js').NormalizedOption[];
   /** When the asking agent stops waiting (ISO-8601 UTC); null on a row from before deadlines were kept. */
-  deadline: string | null;
+  deadline?: string | null;
   created_at: string;
 }
 

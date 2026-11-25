@@ -389,8 +389,7 @@ function signInRow(appId: string): { claimed_at: string | null } | undefined {
   return raw(
     (db) =>
       db.prepare('SELECT claimed_at FROM sign_ins WHERE app_id = ?').get(appId) as
-        | { claimed_at: string | null }
-        | undefined,
+        { claimed_at: string | null } | undefined,
   );
 }
 

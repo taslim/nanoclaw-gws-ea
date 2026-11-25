@@ -23,10 +23,10 @@
  * Only a group holding `conversation-context` is backfilled.
  */
 import { CONVERSATION_CONTEXT_CAPABILITY, getGroupCapabilities } from '../../capabilities.js';
-import { parseInboundContent } from '../../channels/inbound-content.js';
+import { extractInboundContent } from '../../channels/inbound-content.js';
 import { isTaskThread } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import { withExistingMailboxSession } from '../../session-manager.js';
+import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 import {
   ECHO_CHANNEL_TIMELINE_SURFACE,
@@ -47,6 +47,30 @@ interface BackfillRow {
   text: string;
   /** Row authored by the agent itself — rendered as "you" in the prelude. */
   self: boolean;
+  /** The platform's id for it, kept on the seeded row so a platform read can skip it. */
+  platformMessageId?: string;
+}
+
+function parseTimelineContent(raw: string): {
+  id?: string;
+  text: string;
+  sender: string | null;
+  senderId: string | null;
+} {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    const id =
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as Record<string, unknown>).id === 'string'
+        ? ((parsed as Record<string, unknown>).id as string)
+        : undefined;
+    return { ...extractInboundContent(parsed), id };
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return { text: raw, sender: null, senderId: null };
+  }
 }
 
 /**
@@ -73,7 +97,7 @@ async function collectSiblingTopLevel(
 
   if (timeline.root) {
     const r = timeline.root;
-    const c = parseInboundContent(r.content);
+    const c = parseTimelineContent(r.content);
     if (c.text && c.senderId !== 'system' && c.sender !== 'system' && !c.text.startsWith('System instruction:')) {
       // Host-injected triggers (the welcome hand-off) are attributed to the
       // OWNER for sender-gating, so filter them by shape too — internal
@@ -85,12 +109,14 @@ async function collectSiblingTopLevel(
         senderId: c.senderId ?? '',
         text: c.text,
         self: false,
+        // A held message carries the platform's id as `id` (the chat library's serialized message).
+        platformMessageId: c.id,
       });
     }
   }
 
   for (const r of timeline.outbound) {
-    const c = parseInboundContent(r.content);
+    const c = parseTimelineContent(r.content);
     if (!c.text) continue;
     rows.push({
       timestamp: r.timestamp,
@@ -98,6 +124,7 @@ async function collectSiblingTopLevel(
       senderId: agentGroup.id,
       text: c.text,
       self: true,
+      platformMessageId: r.platformMessageId,
     });
   }
   return rows;
@@ -180,7 +207,8 @@ export async function backfillSession(
     const surface = isGroupSurface ? ECHO_CHANNEL_TIMELINE_SURFACE : ECHO_TIMELINE_SURFACE;
     // One batch id per wake keeps repeated catch-ups of the same session collision-free.
     const batch = new Date(now).toISOString();
-    await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
+    // A writer prepares: a just-born session's mailbox may not exist before its first write.
+    await withMailboxSession(agentGroup.id, session.id, async (mailbox) => {
       for (const [i, row] of newest.entries()) {
         // The most recent entry is what a short opener ("sure") is usually
         // answering — deliver it whole; earlier entries get the normal cap.
@@ -197,6 +225,7 @@ export async function backfillSession(
             sender: row.sender,
             senderId: row.senderId,
             ...(row.self ? { self: true } : {}),
+            platformMessageId: row.platformMessageId,
             echo: { surface, label },
           }),
           processAfter: null,

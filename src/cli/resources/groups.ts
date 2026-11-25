@@ -24,6 +24,7 @@ import {
 import { getSessionDriver } from '../../drivers/index.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
+import { reservedMountClass } from '../../modules/mount-security/index.js';
 import { getProviderHostContract } from '../../provider-contracts/registry.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
@@ -56,6 +57,19 @@ function parseTimezoneFlag(value: unknown): string | null | undefined {
     );
   }
   return tz;
+}
+
+/**
+ * The argv parser turns `--ro yes` into the string "yes". A loose truthy check let
+ * `--ro yes --rw` pass the conflict check and store read-write, so accept only the
+ * boolean spellings the other CLI flags accept and reject anything else.
+ */
+function parseMountFlag(args: Record<string, unknown>, name: 'ro' | 'rw' | 'readonly'): boolean | undefined {
+  const v = args[name];
+  if (v === undefined) return undefined;
+  if (v === true || v === 'true' || v === '1') return true;
+  if (v === false || v === 'false' || v === '0') return false;
+  throw new Error(`--${name} is a flag; pass it on its own, without a value (got "${String(v)}")`);
 }
 
 /**
@@ -372,7 +386,8 @@ registerResource({
       access: 'approval',
       description:
         'Restart containers for a group. Use --id <group-id> [--rebuild] [--message <text>]. ' +
-        'From inside a container, --id is auto-filled and only the calling session is restarted. ' +
+        'From inside a container, --id is auto-filled and only the calling session is restarted; ' +
+        'an explicit --id of another group (global scope only) restarts that group’s running containers. ' +
         '--rebuild rebuilds the container image first (required for package changes). ' +
         '--message sets an on-wake instruction for the fresh container to act on when it starts — ' +
         'use this when you need to continue after the restart (e.g. verify a new tool works, notify the user). ' +
@@ -398,8 +413,10 @@ registerResource({
         }
         const message = args.message as string | undefined;
 
-        // From an agent: scope to the calling session only
-        if (ctx.caller === 'agent') {
+        // From an agent about its own group: scope to the calling session only.
+        // A foreign --id (global scope, after approval) takes the group path
+        // below; this branch would restart the caller instead (#3911).
+        if (ctx.caller === 'agent' && id === ctx.agentGroupId) {
           if (message) {
             await writeSessionMessage(id, ctx.sessionId, {
               id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -427,7 +444,7 @@ registerResource({
           return { restarted: 1, rebuilt: !!args.rebuild };
         }
 
-        // From the host: restart all running containers in the group
+        // From the host, or an agent naming another group: restart all running containers in the group
         const count = await restartAgentGroupContainers(id, 'restarted via ncl', message);
         return { restarted: count, rebuilt: !!args.rebuild };
       },
@@ -648,7 +665,10 @@ registerResource({
       description:
         "Mount a host directory into a group's containers. OPERATOR-ONLY — never runnable from " +
         'inside a container (mounting host paths is a filesystem-access boundary). Requires ' +
-        '`ncl groups restart` to take effect. Use --id <group-id> --host <host-path> --container <container-path> [--ro].',
+        '`ncl groups restart` to take effect. Use --id <group-id> --host <host-path> --container <container-path> ' +
+        '[--ro | --rw]. Mounts are read-only by default; --ro states that explicitly. --rw requests read-write, which ' +
+        'is granted only when the matched mount-allowlist root also has `allowReadWrite: true` — otherwise the mount ' +
+        'is still created but forced read-only at spawn time.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -659,17 +679,53 @@ registerResource({
         const row = await getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
+        // Stored, a path the driver reserves would make it refuse every start of the group.
+        // A copy is fine advice for install content, never for keys and certificates.
+        const reserved = await reservedMountClass(id, hostPath);
+        if (reserved === 'install-surface') {
+          throw new Error(`${hostPath} is NanoClaw's own ${reserved} content; only NanoClaw mounts it. Mount a copy.`);
+        }
+        if (reserved) {
+          throw new Error(`${hostPath} holds NanoClaw's ${reserved} keys or certificates; only NanoClaw mounts it.`);
+        }
+
+        // Read-only stays the default: no flag stores no `readonly` key, which
+        // `validateMount` reads as read-only. Only `--rw` stores `readonly: false`.
+        // `--readonly false` used to store read-only (the string "false" was truthy),
+        // so it must not start granting write now.
+        const [ro, rw, readonlyArg] = (['ro', 'rw', 'readonly'] as const).map((f) => parseMountFlag(args, f));
+        const readWrite = rw === true;
+        const readOnly = ro === true || readonlyArg === true;
+        if (readWrite && readOnly) throw new Error('--ro (or --readonly) and --rw are mutually exclusive');
+
         const mount: AdditionalMountConfig = {
           hostPath,
           containerPath,
-          ...(args.ro || args.readonly ? { readonly: true } : {}),
+          ...(readWrite ? { readonly: false } : readOnly ? { readonly: true } : {}),
         };
         const existing = JSON.parse(row.additional_mounts) as AdditionalMountConfig[];
-        if (!existing.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
-          existing.push(mount);
-          await updateContainerConfigJson(id, 'additional_mounts', existing);
+        const at = existing.findIndex((m) => m.hostPath === hostPath && m.containerPath === containerPath);
+        // Re-adding an existing mount used to be a silent no-op that still reported
+        // success. That makes the most likely use of these flags — "I mounted this
+        // read-only, now make it read-write" — restart the group and come back to a
+        // still-read-only mount with nothing to explain why. Update the access mode
+        // in place instead, and say which of the two happened.
+        const updated = at !== -1;
+        const rwGate =
+          'Read-write requested. It is granted only if the matched mount-allowlist root has `allowReadWrite: true`; ' +
+          'otherwise the mount is forced read-only.';
+        // A re-add with the same effective mode (an absent key and `true` are both read-only)
+        // writes nothing, so it cannot overwrite a concurrent remove-mount, and needs no restart.
+        if (updated && (existing[at].readonly === false) === readWrite) {
+          return readWrite ? { unchanged: existing[at], note: rwGate } : { unchanged: existing[at] };
         }
-        return { added: mount, note: `Run \`ncl groups restart --id ${id}\` for the mount to take effect.` };
+        if (updated) existing[at] = mount;
+        else existing.push(mount);
+        await updateContainerConfigJson(id, 'additional_mounts', existing);
+        const note = readWrite
+          ? `${rwGate} Run \`ncl groups restart --id ${id}\` to apply.`
+          : `Run \`ncl groups restart --id ${id}\` for the mount to take effect.`;
+        return updated ? { updated: mount, note } : { added: mount, note };
       },
     },
     'config remove-mount': {

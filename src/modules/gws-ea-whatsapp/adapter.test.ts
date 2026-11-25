@@ -73,11 +73,11 @@ describe('WhatsApp transport lifecycle', () => {
     await adapter.setup(setup());
     await adapter.reconnect();
     await expect(
-      adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hi' } }, 'row-1'),
+      adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hi' }, deliveryId: 'row-1' }),
     ).rejects.toBeInstanceOf(ChannelNotConnectedError);
     expect(sockets[0].sends).toEqual([]);
     await sockets[0].emit('connection.update', { connection: 'open' });
-    await adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hi' } }, 'row-1');
+    await adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hi' }, deliveryId: 'row-1' });
     expect(sockets[0].sends).toHaveLength(1);
     await adapter.teardown();
   });
@@ -199,7 +199,7 @@ describe('WhatsApp transport lifecycle', () => {
     await adapter.reconnect();
     expect(sockets).toHaveLength(1);
     await expect(
-      adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hi' } }, 'row'),
+      adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hi' }, deliveryId: 'row' }),
     ).rejects.toBeInstanceOf(ChannelNotConnectedError);
     await adapter.teardown();
   });

@@ -5,6 +5,7 @@ import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getPendingApproval, getPendingApprovalsByAction, getSession } from '../../db/sessions.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { formatLocalTime, resolveTimezone } from '../../timezone.js';
@@ -19,6 +20,7 @@ import {
 } from '../approvals/primitive.js';
 import { quoted } from '../approvals/request-text.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
+import { editApprovalCard } from '../approvals/terminal-card.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
@@ -988,6 +990,7 @@ export async function resolveHeldCallFromWeb(
   }
   const threadId = await resolveCardThreadId(approval);
   const canEditCard = Boolean(approval.platform_message_id && approval.channel_type && approval.platform_id);
+  let cardEdit: Promise<void> | undefined;
   const handled = await handleApprovalsResponse({
     questionId: approval.approval_id,
     value: decision === 'approve' ? APPROVE_OPTION : REJECT_OPTION,
@@ -997,8 +1000,21 @@ export async function resolveHeldCallFromWeb(
     threadId,
     ...(approval.platform_message_id ? { messageId: approval.platform_message_id } : {}),
     ...(approval.instance ? { instance: approval.instance } : {}),
-    deferResolution: canEditCard,
+    ...(canEditCard
+      ? {
+          accepted: () => {
+            const adapter = getDeliveryAdapter();
+            if (adapter) {
+              cardEdit = editApprovalCard(adapter, approval, decision === 'approve' ? '✅ Approved' : '❌ Rejected', {
+                threadId,
+                recordOutcome: false,
+              });
+            }
+          },
+        }
+      : {}),
   });
+  await cardEdit;
 
   const store = (await activeDependencies.store?.()) ?? lastHoldStore;
   const [currentRow, relayCall, invocation] = await Promise.all([
@@ -1022,7 +1038,7 @@ export async function resolveHeldCallFromWeb(
     ) {
       return { status: 'already_resolved', resolvedAs: 'declined', payload };
     }
-    if (!handled && relayCall === undefined && invocation?.state !== 'settled') {
+    if (handled !== 'accepted' && relayCall === undefined && invocation?.state !== 'settled') {
       return { status: 'already_resolved', resolvedAs: 'unknown', payload };
     }
     return { status: 'approved', payload };
@@ -1031,7 +1047,7 @@ export async function resolveHeldCallFromWeb(
   if (currentRow?.status === 'approved' || relayCall !== undefined || invocation?.state === 'settled') {
     return { status: 'already_resolved', resolvedAs: 'approved', payload };
   }
-  if (!handled && invocation?.state !== 'declined') {
+  if (handled !== 'accepted' && invocation?.state !== 'declined') {
     return { status: 'already_resolved', resolvedAs: 'unknown', payload };
   }
   return { status: 'declined', payload };

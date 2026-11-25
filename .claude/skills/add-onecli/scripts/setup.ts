@@ -16,10 +16,11 @@ import fs from 'fs';
 import net from 'net';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 import { log } from '../../../../src/log.js';
 import { emitStatus } from '../../../../setup/status.js';
+import { REFUSED_HINT, rotateDefaultPassword, seedPassword } from './postgres-password.js';
 import { login } from './secret-input.js';
 
 const LOCAL_BIN = path.join(os.homedir(), '.local', 'bin');
@@ -230,6 +231,14 @@ function installOnecli(): { stdout: string; ok: boolean } {
 
   const cleanup = removeLegacyOnecliContainers();
   if (cleanup) stdout += cleanup + '\n';
+  // The installer and the compose calls below must use the password in ~/.onecli/.env; an exported one wins in compose.
+  delete process.env.POSTGRES_PASSWORD;
+  try {
+    if (seedPassword()) log.info('Generated a OneCLI database password in ~/.onecli/.env');
+  } catch (err) {
+    log.error('Could not write the OneCLI database password', { err });
+    return { stdout, ok: false };
+  }
 
   // Gateway install (docker-compose based, no rate-limit concerns).
   // Pipe into the system shell by absolute path. `sh` resolved through PATH can
@@ -265,6 +274,42 @@ function installOnecli(): { stdout: string; ok: boolean } {
     return { stdout, ok: false };
   }
   return { stdout, ok: true };
+}
+
+/**
+ * Moves a local OneCLI database off the compose default password. A refusal
+ * changed nothing and comes back as a hint; a failure fails the step.
+ */
+function securePostgres(): { restarted?: boolean; hint?: string; error?: string } {
+  try {
+    const result = rotateDefaultPassword();
+    if (result.status === 'rotated') {
+      log.info('Moved the OneCLI database to its own password');
+      return { restarted: true };
+    }
+    if (result.status === 'stopped') {
+      return {
+        hint: "OneCLI's database is stopped, so its password was not checked. Start OneCLI and run setup again.",
+      };
+    }
+    if (result.status !== 'refused') return {};
+    log.warn('OneCLI database still uses the compose default password', { reason: result.detail });
+    return { hint: `OneCLI's database still uses the default password: ${result.detail}. ${REFUSED_HINT}` };
+  } catch (err) {
+    log.error('OneCLI database password change failed', { err });
+    return { error: (err as Error).message };
+  }
+}
+
+function postgresFailed(error: string): never {
+  emitStatus('ONECLI', {
+    INSTALLED: true,
+    STATUS: 'failed',
+    ERROR: 'postgres_password_failed',
+    HINT: error,
+    LOG: 'logs/setup.log',
+  });
+  process.exit(1);
 }
 
 function runInstall(cmd: string): {
@@ -353,17 +398,32 @@ function installOnecliCliDirect(): { stdout: string; ok: boolean } {
  * separate component that the agent runs via docs/onecli-upgrades.md during
  * /update-nanoclaw, so this step only surfaces the condition and points there.
  */
-export async function verifyGatewayV1(
+export async function verifyGatewayV1(url: string, deadline: number, fetchImpl: typeof fetch = fetch) {
+  return pollGatewayHealth(`${url}/v1/health`, deadline, fetchImpl);
+}
+
+async function pollGatewayHealth(
   url: string,
-  fetchImpl: typeof fetch = fetch,
+  deadline: number,
+  fetchImpl: typeof fetch,
 ): Promise<'ok' | 'incompatible' | 'unreachable'> {
-  try {
-    const res = await fetchImpl(`${url}/v1/health`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    return res.ok ? 'ok' : 'incompatible';
-  } catch {
-    return 'unreachable';
+  let result: 'incompatible' | 'unreachable' = 'unreachable';
+  for (;;) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return result;
+    try {
+      const res = await fetchImpl(url, {
+        signal: AbortSignal.timeout(Math.min(5000, remainingMs)),
+      });
+      // Probes need only the status; release the body before the next attempt.
+      void res.body?.cancel().catch(() => {});
+      if (res.ok) return 'ok';
+      result = 'incompatible';
+    } catch {
+      // A failed retry must not discard an earlier HTTP response.
+    }
+    const delayMs = Math.min(1000, deadline - Date.now());
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
 
@@ -387,19 +447,19 @@ export function gatewayReadinessError(result: 'ok' | 'incompatible' | 'unreachab
     : 'OneCLI gateway /v1 API is unreachable';
 }
 
-export async function pollHealth(url: string, timeoutMs: number): Promise<boolean> {
+export async function pollHealth(url: string, deadline: number, fetchImpl: typeof fetch = fetch): Promise<boolean> {
   // `/api/health` matches the path probe.sh uses — keep them aligned.
+  return (await pollGatewayHealth(`${url}/api/health`, deadline, fetchImpl)) === 'ok';
+}
+
+export async function pollGatewayReadiness(url: string, timeoutMs: number, fetchImpl: typeof fetch = fetch) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${url}/api/health`);
-      if (res.ok) return true;
-    } catch {
-      // not ready yet
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  return false;
+  // Run together: an auth-gated /api/health must not consume /v1's whole budget.
+  const [healthy, v1Status] = await Promise.all([
+    pollHealth(url, deadline, fetchImpl),
+    verifyGatewayV1(url, deadline, fetchImpl),
+  ]);
+  return { healthy, v1Status };
 }
 
 export async function run(args: string[]): Promise<void> {
@@ -449,8 +509,7 @@ export async function run(args: string[]): Promise<void> {
       writeEnvVar('ONECLI_API_KEY', remoteToken);
       log.info('Wrote ONECLI_API_KEY to .env');
     }
-    const healthy = await pollHealth(remoteUrl, 5000);
-    const v1Status = await verifyGatewayV1(remoteUrl);
+    const { healthy, v1Status } = await pollGatewayReadiness(remoteUrl, 5000);
     const v1Hint = gatewayV1Hint(v1Status);
     const readinessError = gatewayReadinessError(v1Status);
     emitStatus('ONECLI', {
@@ -468,8 +527,9 @@ export async function run(args: string[]): Promise<void> {
   }
 
   if (reuse) {
-    // Reuse-mode: don't touch the running gateway at all. Just verify it
-    // exists, read its api-host, write ONECLI_URL to .env, and move on.
+    // Reuse-mode: don't reinstall or rebind the running gateway. Verify it
+    // exists, read its api-host, write ONECLI_URL to .env, and move a local
+    // database off the default password (a one-time restart).
     const version = onecliVersion();
     if (!version) {
       emitStatus('ONECLI', {
@@ -494,8 +554,9 @@ export async function run(args: string[]): Promise<void> {
     }
     writeEnvOnecliUrl(url);
     log.info('Reusing existing OneCLI', { url });
-    const healthy = await pollHealth(url, 5000);
-    const v1Status = await verifyGatewayV1(url);
+    const pg = securePostgres();
+    if (pg.error) postgresFailed(pg.error);
+    const { healthy, v1Status } = await pollGatewayReadiness(url, pg.restarted ? 60000 : 5000);
     const v1Hint = gatewayV1Hint(v1Status);
     const readinessError = gatewayReadinessError(v1Status);
     emitStatus('ONECLI', {
@@ -506,6 +567,7 @@ export async function run(args: string[]): Promise<void> {
       STATUS: readinessError ? 'failed' : 'success',
       ...(readinessError ? { ERROR: 'gateway_not_ready', HINT: readinessError } : {}),
       ...(v1Hint ? { GATEWAY_HINT: v1Hint } : {}),
+      ...(pg.hint ? { POSTGRES_HINT: pg.hint } : {}),
       LOG: 'logs/setup.log',
     });
     if (readinessError) throw new Error(readinessError);
@@ -534,6 +596,9 @@ export async function run(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const pg = securePostgres();
+  if (pg.error) postgresFailed(pg.error);
+
   const url = extractUrlFromOutput(res.stdout);
   if (!url) {
     emitStatus('ONECLI', {
@@ -558,8 +623,7 @@ export async function run(args: string[]): Promise<void> {
   writeEnvOnecliUrl(url);
   log.info('Wrote ONECLI_URL to .env', { url });
 
-  const healthy = await pollHealth(url, 15000);
-  const v1Status = await verifyGatewayV1(url);
+  const { healthy, v1Status } = await pollGatewayReadiness(url, pg.restarted ? 60000 : 15000);
   const v1Hint = gatewayV1Hint(v1Status);
   const readinessError = gatewayReadinessError(v1Status);
 
@@ -570,6 +634,7 @@ export async function run(args: string[]): Promise<void> {
     STATUS: readinessError ? 'failed' : 'success',
     ...(readinessError ? { ERROR: 'gateway_not_ready', HINT: readinessError } : {}),
     ...(v1Hint ? { GATEWAY_HINT: v1Hint } : {}),
+    ...(pg.hint ? { POSTGRES_HINT: pg.hint } : {}),
     ...(healthy
       ? {}
       : {
@@ -581,6 +646,14 @@ export async function run(args: string[]): Promise<void> {
   if (readinessError) throw new Error(readinessError);
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
-  void run(process.argv.slice(2));
+if (
+  process.argv[1] &&
+  fs.existsSync(process.argv[1]) &&
+  import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href
+) {
+  void run(process.argv.slice(2)).catch((err) => {
+    log.error('OneCLI setup failed', { err });
+    // The shared logger handles unhandled rejections without failing the process.
+    process.exitCode = 1;
+  });
 }

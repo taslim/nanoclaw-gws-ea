@@ -93,12 +93,7 @@ export type SignInStartOutcome =
  * refused client is reported only after a sign-in this host started was claimed, so a forged return never reaches it.
  */
 export type SignInReturn =
-  | 'connected'
-  | 'cancelled'
-  | 'expired'
-  | 'failed'
-  | 'client_refused'
-  | 'assistant_client_refused';
+  'connected' | 'cancelled' | 'expired' | 'failed' | 'client_refused' | 'assistant_client_refused';
 
 export interface EnteredClient {
   readonly clientId: string;

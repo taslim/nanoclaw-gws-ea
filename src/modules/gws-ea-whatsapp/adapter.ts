@@ -19,6 +19,7 @@ import { createAnswers } from '../../channels/answers.js';
 import { resolveQuestionRender } from '../../channels/question-render-registry.js';
 import { log } from '../../log.js';
 import { OutboundRefusedError } from '../../delivery.js';
+import { quoted, REASON_LIMIT } from '../approvals/request-text.js';
 import { checkOutbound } from '../gws-ea-privacy/outbound.js';
 import { SqliteStateAdapter } from '../../state-sqlite.js';
 import { WhatsAppAuthStore } from './auth-store.js';
@@ -321,14 +322,35 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       adapterName: 'whatsapp',
       postedRequest: (id) => Promise.resolve(index.request(id)),
       render: resolveQuestionRender,
-      dispatch: async (answer) => {
-        await config?.onAction(
+      dispatch: async (answer, render) => {
+        const outcome = await config?.onAction(
           answer.questionId,
           answer.value,
           answer.userId,
           { platformId: answer.platformId, threadId: null, messageId: answer.messageId, instance: 'whatsapp' },
-          { deferResolution: true, ...(answer.reason ? { reason: answer.reason } : {}) },
+          { redeliverOnError: true, ...(answer.reason ? { reason: answer.reason } : {}) },
         );
+        if (render.deferResolution === true || (outcome !== 'accepted' && outcome !== 'closed')) return;
+        const chosen = render.options.find((option) => option.value === answer.value)?.selectedLabel ?? answer.value;
+        const reason = answer.reason?.trim();
+        const resolution =
+          outcome === 'closed' ? 'No longer available' : reason ? `${chosen}: ${quoted(reason, REASON_LIMIT)}` : chosen;
+        const question = render.question ?? '';
+        try {
+          await outbound.deliver(answer.platformId, {
+            kind: 'chat-sdk',
+            content: {
+              operation: 'edit',
+              questionId: answer.questionId,
+              messageId: answer.messageId,
+              text: [render.title, question, resolution].filter(Boolean).join('\n\n'),
+              terminalCard: { title: render.title, question, resolution },
+            },
+          });
+          // eslint-disable-next-line no-catch-all/no-catch-all -- the decision stands whether or not its edit lands
+        } catch (err) {
+          log.error("Failed to show an answered WhatsApp request's outcome", { questionId: answer.questionId, err });
+        }
       },
     });
     inbound = createWhatsAppInbound({
@@ -550,8 +572,8 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
     },
     fetchGroupMembers: groupEvents.fetchGroupMembers,
     ...outreach,
-    deliver: (platformId: string, _threadId: string | null, message: OutboundMessage, rowId?: string) =>
-      outbound.deliver(platformId, message, rowId),
+    deliver: (platformId: string, _threadId: string | null, message: OutboundMessage) =>
+      outbound.deliver(platformId, message, message.deliveryId),
     async setTyping(platformId) {
       if (socket && connected) await socket.sendPresenceUpdate('composing', platformId);
     },

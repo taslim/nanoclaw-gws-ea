@@ -410,8 +410,7 @@ function refusals(session: Session): string[] {
 function deliveryStatus(session: Session, id: string): string | undefined {
   const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
   const row = db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(id) as
-    | { status: string }
-    | undefined;
+    { status: string } | undefined;
   db.close();
   return row?.status;
 }
@@ -508,8 +507,7 @@ async function emailSend(
 
 function answerTo(session: Session, requestId: string): ResponseFrame {
   const answer = rows(session).find((row) => row.id === `action-resp-${requestId}`) as
-    | (Row & { frame?: ResponseFrame })
-    | undefined;
+    (Row & { frame?: ResponseFrame }) | undefined;
   if (answer?.frame === undefined) throw new Error(`${requestId} was not answered`);
   return answer.frame;
 }

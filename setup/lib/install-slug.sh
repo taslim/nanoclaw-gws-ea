@@ -7,28 +7,24 @@
 #   unit=$(systemd_unit)          # nanoclaw-v2-<slug>
 #   image=$(container_image_base) # nanoclaw-agent-v2-<slug>
 #
-# Slug is NANOCLAW_INSTALL_ID when set, else sha1(PROJECT_ROOT)[:8] — must
-# match the TS helper exactly so both halves of setup name things
-# consistently. An override the TS helper refuses is refused here too: each
-# helper then prints nothing and fails.
+# NANOCLAW_INSTALL_ID overrides the slug; otherwise it is sha1(PROJECT_ROOT)[:8] — must match the TS helper exactly so both
+# halves of setup name things consistently.
 
 _nanoclaw_install_slug() {
-  if [ -n "${NANOCLAW_INSTALL_ID:-}" ]; then
-    # The TS helper's /^[a-z0-9][a-z0-9_-]{0,31}$/, spelled out so no locale
-    # widens a range and no embedded newline passes as a second line.
-    case "$NANOCLAW_INSTALL_ID" in
-      [!abcdefghijklmnopqrstuvwxyz0123456789]* | *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
-        ;;
-      *)
-        if [ "${#NANOCLAW_INSTALL_ID}" -le 32 ]; then
-          printf '%s' "$NANOCLAW_INSTALL_ID"
-          return 0
-        fi
+  local override="${NANOCLAW_INSTALL_ID:-}"
+  if [ -n "$override" ]; then
+    case "$override" in
+      [!abcdefghijklmnopqrstuvwxyz0123456789]*|*[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
+        printf '%s\n' 'NANOCLAW_INSTALL_ID must be 1-32 chars of [a-z0-9_-] starting alphanumeric' >&2
+        return 1
         ;;
     esac
-    printf "NANOCLAW_INSTALL_ID must be 1-32 chars of [a-z0-9_-] starting alphanumeric (got '%s')\n" \
-      "$NANOCLAW_INSTALL_ID" >&2
-    return 1
+    if [ "${#override}" -gt 32 ]; then
+      printf '%s\n' 'NANOCLAW_INSTALL_ID must be 1-32 chars of [a-z0-9_-] starting alphanumeric' >&2
+      return 1
+    fi
+    printf '%s' "$override"
+    return
   fi
   local root="${NANOCLAW_PROJECT_ROOT:-${PROJECT_ROOT:-$PWD}}"
   if command -v shasum >/dev/null 2>&1; then
@@ -45,18 +41,18 @@ _nanoclaw_install_slug() {
 
 launchd_label() {
   local slug
-  slug="$(_nanoclaw_install_slug)" || return 1
+  slug=$(_nanoclaw_install_slug) || return
   printf 'com.nanoclaw-v2-%s' "$slug"
 }
 
 systemd_unit() {
   local slug
-  slug="$(_nanoclaw_install_slug)" || return 1
+  slug=$(_nanoclaw_install_slug) || return
   printf 'nanoclaw-v2-%s' "$slug"
 }
 
 container_image_base() {
   local slug
-  slug="$(_nanoclaw_install_slug)" || return 1
+  slug=$(_nanoclaw_install_slug) || return
   printf 'nanoclaw-agent-v2-%s' "$slug"
 }

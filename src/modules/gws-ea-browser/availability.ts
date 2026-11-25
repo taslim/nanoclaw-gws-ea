@@ -13,10 +13,7 @@ export type BrowserAvailability =
   | {
       readonly available: false;
       readonly reason:
-        | 'browser-root-unconfigured'
-        | 'browser-path-unavailable'
-        | 'chrome-missing'
-        | 'chrome-not-launchable';
+        'browser-root-unconfigured' | 'browser-path-unavailable' | 'chrome-missing' | 'chrome-not-launchable';
     };
 
 export function browserRoot(): string | undefined {

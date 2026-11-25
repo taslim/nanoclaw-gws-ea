@@ -178,7 +178,7 @@ const SKILLS_HOST_SUBPATH = path.join('container', 'skills');
  * server instructions it is taught, so it is never taught a tool it lacks.
  *
  * Reads nothing the agent can author except `instructions.prepend.md`, which
- * `readGroupPersona` opens with O_NOFOLLOW.
+ * `readGroupPersona` opens with O_NOFOLLOW | O_NONBLOCK.
  */
 export async function composeGroupProjectDoc(
   group: AgentGroup,

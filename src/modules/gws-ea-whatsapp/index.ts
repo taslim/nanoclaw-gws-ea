@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 
 import { getChannelAdapterExact, registerChannelAdapter } from '../../channels/channel-registry.js';
-import { registerPostDeliveryHook } from '../../delivery.js';
+import { deliveryIdFor, registerPostDeliveryHook } from '../../delivery.js';
 import type { WhatsAppAdapter } from './adapter.js';
 import { WHATSAPP_DEFAULTS } from './defaults.js';
 import { readWhatsAppLink, whatsappDirectory } from './paths.js';
@@ -23,8 +23,9 @@ registerChannelAdapter('whatsapp', {
     return createWhatsAppAdapter({ directory });
   },
 });
-registerPostDeliveryHook((message) => {
-  if (message.channelType === 'whatsapp') activeWhatsAppAdapter()?.completeDelivery(message.id);
+registerPostDeliveryHook((message, session) => {
+  if (message.channelType === 'whatsapp')
+    activeWhatsAppAdapter()?.completeDelivery(deliveryIdFor(session.id, message.id));
 });
 
 export { WHATSAPP_DEFAULTS } from './defaults.js';

@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { gatewayApprovalPresentation } from './gateway-approval-presentation.js';
+import { gatewayApprovalPresentation, MAX_CARD_TITLE_CHARS } from './gateway-approval-presentation.js';
 import type { GatewayApprovalRequest } from './gateway-providers/gateway-provider-registry.js';
 
 const request = (summary?: GatewayApprovalRequest['summary']) =>
@@ -23,28 +23,66 @@ it('asks as the assistant: the resource first, then the action and reason, and o
   expect(card.question).not.toContain('secret');
 });
 
-it('escapes supplied formatting, mentions, and links, and bounds the card', () => {
+it('escapes supplied formatting, mentions, and links, and keeps every detail in full', () => {
+  const values = Array.from({ length: 5 }, (_, i) => `${i}`.repeat(600));
   const card = gatewayApprovalPresentation(
     request({
       ...summary,
       details: [
         { label: 'To', value: '<users/all>\n*Admin* <https://evil.example|Approve>' },
-        ...Array.from({ length: 5 }, () => ({ label: 'Detail', value: 'a'.repeat(600) })),
+        ...values.map((value, i) => ({ label: `Detail ${i}`, value })),
       ],
     }),
   );
   expect(card.question).not.toMatch(/<users\/all>|<https:/u);
   expect(card.question).toContain('*To:* ‹users/all› \\*Admin\\* ‹https://evil.example|Approve›');
-  expect(card.question.length).toBeLessThanOrEqual(2600);
+  values.forEach((value, i) => expect(card.question).toContain(`*Detail ${i}:* ${value}\n`));
+  expect(card.question.endsWith('\nApproving lets me do this once.')).toBe(true);
+});
+
+it('shows a long action in full in the body, under a short fixed title', () => {
+  const action = 'Transfer funds '.repeat(40);
+  const card = gatewayApprovalPresentation(
+    request({ ...summary, action, details: [{ label: 'To', value: 'Savings' }] }),
+  );
+  expect(card.title).toBe('May I do this?');
+  expect(card.question.split('\n')[0]).toBe(`*Action:* ${action}`);
+});
+
+it('uses the action as the title only while it fits, measured after escaping', () => {
+  const titleFor = (action: string) =>
+    gatewayApprovalPresentation(request({ ...summary, action, details: [{ label: 'To', value: 'Savings' }] })).title;
+  expect(titleFor('a'.repeat(MAX_CARD_TITLE_CHARS))).toBe('a'.repeat(MAX_CARD_TITLE_CHARS));
+  expect(titleFor('a'.repeat(MAX_CARD_TITLE_CHARS + 1))).toBe('May I do this?');
+  expect(titleFor('_'.repeat(MAX_CARD_TITLE_CHARS / 2))).toBe('_'.repeat(MAX_CARD_TITLE_CHARS / 2));
+  expect(titleFor('_'.repeat(MAX_CARD_TITLE_CHARS / 2 + 1))).toBe('May I do this?');
 });
 
 it('rejects malformed structured details instead of trusting them', () => {
   expect(() => gatewayApprovalPresentation(request({ ...summary, details: 'bad' as never }))).toThrow();
   expect(() => gatewayApprovalPresentation(request({ ...summary, action: '' }))).toThrow();
+  for (const omittedDetails of [-1, 1.5, '2' as never])
+    expect(() => gatewayApprovalPresentation(request({ ...summary, omittedDetails }))).toThrow();
+});
+
+it('says how many details were left out', () => {
+  const card = gatewayApprovalPresentation(
+    request({ ...summary, details: [{ label: 'To', value: 'Savings' }], omittedDetails: 3 }),
+  );
+  expect(card.question).toContain('*To:* Savings\n… 3 more fields not shown\nApproving lets me do this once.');
 });
 
 it('keeps legacy adapters compatible', () => {
   expect(gatewayApprovalPresentation(request())).toEqual({ title: 'Legacy', question: 'Legacy question' });
+});
+
+it('moves a long legacy title, escaped, to the top of the body', () => {
+  const title = 'Delete *all* backups '.repeat(4);
+  const card = gatewayApprovalPresentation({ title, question: 'Legacy question' } as GatewayApprovalRequest);
+  expect(card.title).toBe('May I make this request?');
+  expect(card.question).toBe(`*Request:* ${'Delete \\*all\\* backups '.repeat(4)}\nLegacy question`);
+  const fits = 'x'.repeat(MAX_CARD_TITLE_CHARS);
+  expect(gatewayApprovalPresentation({ title: fits, question: 'q' } as GatewayApprovalRequest).title).toBe(fits);
 });
 
 it('shows a concrete action, full issue number and submitted comment without generic padding', () => {
@@ -58,6 +96,7 @@ it('shows a concrete action, full issue number and submitted comment without gen
     }),
   );
   expect(card.title).toBe('Post a comment');
+  expect(card.question.split('\n')[0]).toBe('*Action:* Post a comment');
   expect(card.question).toContain('*Where:* example/repo · issue or PR #548');
   expect(card.question).toContain('*Comment:* great job');
   expect(card.question).not.toContain('business action');
@@ -97,4 +136,59 @@ it('preserves account names and resource punctuation in summaries and typed fiel
   });
   expect(typed.question).toContain(escaped);
   expect(typed.question).toContain('some\\_file\\(1\\).txt');
+});
+
+it('makes bidi and line-separator characters visible in gateway values', () => {
+  const card = gatewayApprovalPresentation(request({ ...summary, resource: 'abc\u202Edef\u2028ghi' }));
+  expect(card.question).not.toContain('\u202E');
+  expect(card.question).not.toContain('\u2028');
+  expect(card.question).toContain('u202e');
+  expect(card.question).toContain('u2028');
+});
+it('makes bidi and zero-width characters in a title visible', () => {
+  const hidden = 'Pay \u202Etxt.exe\u200B';
+  const shown = 'Pay \\u202etxt.exe\\u200b';
+  expect(gatewayApprovalPresentation({ ...request(), title: hidden }).title).toBe(shown);
+  const action = gatewayApprovalPresentation(
+    request({ ...summary, action: hidden, details: [{ label: 'To', value: 'Savings' }] }),
+  );
+  expect(action.title).toBe(shown);
+});
+
+// Shown hidden characters can push a title past a channel's title cap.
+it('moves a typed title with hidden characters into the body, and keeps a plain one', () => {
+  const card = gatewayApprovalPresentation({ ...request(), title: 'Pay ' + '\u202E'.repeat(30), displayFields: [] });
+  expect(card.title).toBe('May I make this request?');
+  // The body is Markdown, so the shown backslash is escaped too.
+  expect(card.question.startsWith('*Request:* Pay ' + '\\\\u202e'.repeat(30) + '\n')).toBe(true);
+  expect(gatewayApprovalPresentation({ ...request(), title: 'Pay rent', displayFields: [] }).title).toBe('Pay rent');
+});
+
+it('escapes legacy provider markup before rendering', () => {
+  const card = gatewayApprovalPresentation({
+    title: '[Admin](https://evil.test)',
+    question: '[Approve](https://evil.test)\n<@123>',
+  } as GatewayApprovalRequest);
+  expect(card.title).toBe('[Admin](https://evil.test)');
+  expect(card.question).toContain('\\[');
+  expect(card.question).toContain('‹@123›');
+  expect(card.question).not.toContain('<@123>');
+});
+
+// The title is a plain-text Card field; body values are Markdown.
+it('keeps ordinary whitespace and backticks readable in gateway text', () => {
+  const value = 'first\tcolumn\r\n`command`\rnext';
+  const card = gatewayApprovalPresentation({ ...request(), displayFields: [{ label: 'Value', type: 'text', value }] });
+  expect(card.question).toContain('first\tcolumn\r\n\\`command\\`\rnext');
+  expect(card.question).not.toMatch(/\\u00(?:09|0d|60)/);
+});
+
+it('measures legacy title budget after escaping, but returns a plain title', () => {
+  const title = 'file_' + '_'.repeat(27);
+  const fits = gatewayApprovalPresentation({ ...request(), title });
+  expect(fits.title).toBe(title);
+  const oversized = title + '_';
+  const card = gatewayApprovalPresentation({ ...request(), title: oversized });
+  expect(card.title).toBe('May I make this request?');
+  expect(card.question).toContain('*Request:* ' + oversized.replaceAll('_', '\\_'));
 });

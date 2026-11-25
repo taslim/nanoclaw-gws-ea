@@ -167,7 +167,7 @@ beforeEach(async () => {
     onInbound,
     onInboundEvent: vi.fn(),
     onMetadata: vi.fn(),
-    onAction: vi.fn(async () => undefined),
+    onAction: vi.fn(async () => 'ignored' as const),
   }));
   linking = new WhatsAppLinking({ directory, paths, instanceId });
 });
@@ -614,19 +614,22 @@ it('blocks a bound principal LID whose authenticated phone changed before answer
   expect((await mailboxRows()).some(({ id }) => id === 'changed:main')).toBe(false);
   expect((await linking.status()).principal?.phoneJid).toBe('447700900123@s.whatsapp.net');
   await expect(
-    (getChannelAdapterExact('whatsapp') as WhatsAppAdapter).deliver(
-      '12000@lid',
-      null,
-      { kind: 'chat', content: { text: 'A private followup' } },
-      'changed-number-followup',
-    ),
+    (getChannelAdapterExact('whatsapp') as WhatsAppAdapter).deliver('12000@lid', null, {
+      kind: 'chat',
+      content: { text: 'A private followup' },
+      deliveryId: 'changed-number-followup',
+    }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:principal-unbound' });
 });
 
 it('unlink removes binding, auth, old held messages and claim, retains the account ledger, and admits a fresh principal', async () => {
   const { socket, code } = await connect();
   const adapter = getChannelAdapterExact('whatsapp') as WhatsAppAdapter;
-  await adapter.deliver('15000@lid', null, { kind: 'chat', content: { text: 'First contact' } }, 'refused-contact');
+  await adapter.deliver('15000@lid', null, {
+    kind: 'chat',
+    content: { text: 'First contact' },
+    deliveryId: 'refused-contact',
+  });
   const sent = socket.sends.at(-1);
   await socket.emit('messages.update', [
     {
@@ -665,12 +668,11 @@ it('unlink removes binding, auth, old held messages and claim, retains the accou
   });
   expect((await linking.status()).principal).toEqual({ lid: '14000', phoneJid: '447700900999@s.whatsapp.net' });
   await expect(
-    (getChannelAdapterExact('whatsapp') as WhatsAppAdapter).deliver(
-      '15000@lid',
-      null,
-      { kind: 'chat', content: { text: 'Refused again' } },
-      'after-unlink',
-    ),
+    (getChannelAdapterExact('whatsapp') as WhatsAppAdapter).deliver('15000@lid', null, {
+      kind: 'chat',
+      content: { text: 'Refused again' },
+      deliveryId: 'after-unlink',
+    }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   expect((await mailboxRows()).some(({ id }) => id === 'old-held:main')).toBe(false);
 });
@@ -680,7 +682,7 @@ it('enforces no outbound handoff or native resend to the pending principal numbe
   await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('pending', 'Hello')] });
   const adapter = getChannelAdapterExact('whatsapp') as WhatsAppAdapter;
   await expect(
-    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Too early' } }, 'before-proof'),
+    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Too early' }, deliveryId: 'before-proof' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:principal-unbound' });
   expect(socket.sends).toHaveLength(0);
 });
@@ -794,23 +796,21 @@ it('retains a handed-off row receipt through unlink and same-number re-link with
   const { socket, code } = await connect();
   await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('bind', code)] });
   const adapter = getChannelAdapterExact('whatsapp') as WhatsAppAdapter;
-  const id = await adapter.deliver(
-    'team@g.us',
-    null,
-    { kind: 'chat', content: { text: 'A single handoff' } },
-    'accepted-before-unlink',
-  );
+  const id = await adapter.deliver('team@g.us', null, {
+    kind: 'chat',
+    content: { text: 'A single handoff' },
+    deliveryId: 'accepted-before-unlink',
+  });
   await linking.unlink();
   await linking.link('+15550000000', '+447700900123', caller);
   const fresh = sockets.at(-1)!;
   await fresh.emit('connection.update', { connection: 'open' });
   expect(
-    await (getChannelAdapterExact('whatsapp') as WhatsAppAdapter).deliver(
-      'team@g.us',
-      null,
-      { kind: 'chat', content: { text: 'A single handoff' } },
-      'accepted-before-unlink',
-    ),
+    await (getChannelAdapterExact('whatsapp') as WhatsAppAdapter).deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: 'A single handoff' },
+      deliveryId: 'accepted-before-unlink',
+    }),
   ).toBe(id);
   expect(fresh.sends).toHaveLength(0);
 });

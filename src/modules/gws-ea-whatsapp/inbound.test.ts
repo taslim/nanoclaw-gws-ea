@@ -121,12 +121,11 @@ describe('durable WhatsApp inbound and trusted context', () => {
   });
   it('uses stored quote text and sender, ignores a forged quoted snapshot and retains old own sends', async () => {
     const adapter = await h.start();
-    const id = await adapter.deliver(
-      'team@g.us',
-      null,
-      { kind: 'chat', content: { text: 'The host wrote this' } },
-      'own-old',
-    );
+    const id = await adapter.deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: 'The host wrote this' },
+      deliveryId: 'own-old',
+    });
     h.now.value += 65 * 24 * 60 * 60 * 1000;
     await h.socket().emit('connection.update', { connection: 'open' });
     await h.socket().emit('messages.upsert', {
@@ -235,7 +234,11 @@ describe('durable WhatsApp inbound and trusted context', () => {
   });
   it('emits reactions on own sends with the native target shape and no written text', async () => {
     const adapter = await h.start();
-    const id = await adapter.deliver('team@g.us', null, { kind: 'chat', content: { text: 'Dinner is booked' } }, 'own');
+    const id = await adapter.deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: 'Dinner is booked' },
+      deliveryId: 'own',
+    });
     await h.socket().emit('messages.upsert', {
       type: 'notify',
       messages: [

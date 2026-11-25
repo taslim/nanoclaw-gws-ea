@@ -191,9 +191,9 @@ async function start(startDelivery?: ConstructorParameters<typeof AssistantChatA
 it('uses one stable Google create request ID for a repeated durable text row', async () => {
   await start();
   const message = { kind: 'chat', content: { text: 'A durable notice' } };
-  await channel!.deliver(`gchat:${DM}`, null, message, 'notice-row');
-  await channel!.deliver(`gchat:${DM}`, null, message, 'notice-row');
-  await channel!.deliver(`gchat:${DM}`, null, message, 'another-row');
+  await channel!.deliver(`gchat:${DM}`, null, { ...message, deliveryId: 'notice-row' });
+  await channel!.deliver(`gchat:${DM}`, null, { ...message, deliveryId: 'notice-row' });
+  await channel!.deliver(`gchat:${DM}`, null, { ...message, deliveryId: 'another-row' });
   const ids = api.calls(`${DM}/messages`).map(({ url }) => url.searchParams.get('requestId'));
   expect(ids).toHaveLength(3);
   expect(ids[0]).toMatch(/^[0-9a-f]{64}$/u);
@@ -1564,7 +1564,7 @@ describe('a picture on an approval request', () => {
         'approve',
         'users/2001',
         { instance: 'gchat', messageId: card!.name, platformId: `gchat:${DM}` },
-        { deferResolution: true },
+        { redeliverOnError: true },
       ],
     ]);
   });

@@ -77,8 +77,7 @@ function insertOutbound(target: Session, msgId: string): void {
 function deliveredStatus(target: Session, msgId: string): string | undefined {
   const db = new Database(inboundDbPath(target.agent_group_id, target.id), { readonly: true });
   const row = db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(msgId) as
-    | { status: string }
-    | undefined;
+    { status: string } | undefined;
   db.close();
   return row?.status;
 }

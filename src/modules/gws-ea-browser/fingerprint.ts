@@ -505,8 +505,7 @@ export function freeCommitBooks(facts: FreeCommitFacts): boolean {
  */
 export function guaranteeCoversReservation(
   grant:
-    | { readonly currency: string; readonly max_total_minor: number; readonly revoked_at: string | null }
-    | undefined,
+    { readonly currency: string; readonly max_total_minor: number; readonly revoked_at: string | null } | undefined,
   facts: PurchaseFacts,
   bounds: PurchaseBounds,
 ): boolean {

@@ -22,16 +22,19 @@ const finalizing = new Set<string>();
 
 /**
  * Claims the rejection and its reason in one write; false when another answer
- * claimed the row first. A module's rejection finalizer settles its state and
- * notification before the row is removed, and any failure leaves the rejected
- * row for replay at startup and on the host sweep.
+ * claimed the row first. `from` is the status the row must still hold (default:
+ * its status as read); `accepted` is told once the reject is recorded, before
+ * the agent is notified and woken. A module's rejection finalizer settles its
+ * state and notification before the row is removed, and any failure leaves the
+ * rejected row for replay at startup and on the host sweep.
  */
 export async function finalizeReject(
   approval: PendingApproval,
   userId: string,
-  reason?: string,
-  expectedStatus: 'pending' | 'awaiting_reason' = approval.status === 'awaiting_reason' ? 'awaiting_reason' : 'pending',
+  options: { reason?: string; from?: 'pending' | 'awaiting_reason'; accepted?: () => void } = {},
 ): Promise<boolean> {
+  const { reason, accepted } = options;
+  const expectedStatus = options.from ?? (approval.status === 'awaiting_reason' ? 'awaiting_reason' : 'pending');
   const claimed = await getDb().run(
     `UPDATE pending_approvals SET status = 'rejected', rejection_user_id = ?, rejection_reason = ?, rejected_at = ?
      WHERE approval_id = ? AND status = ?`,
@@ -42,6 +45,7 @@ export async function finalizeReject(
     expectedStatus,
   );
   if (claimed.changes === 0) return false;
+  accepted?.();
 
   log.info('Approval rejected', {
     approvalId: approval.approval_id,

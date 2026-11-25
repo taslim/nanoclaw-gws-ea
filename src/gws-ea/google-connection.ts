@@ -221,8 +221,7 @@ function gmailModifyProblem(secrets: readonly VaultSecret[]): string | undefined
 }
 
 type CalendarCredentialAnswer =
-  | { readonly revoked: true }
-  | { readonly revoked: false; readonly fallback?: CredentialFallback };
+  { readonly revoked: true } | { readonly revoked: false; readonly fallback?: CredentialFallback };
 
 /**
  * Asks Google by minting the credential agents' Calendar rides on: a revoked or

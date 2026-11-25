@@ -106,6 +106,7 @@ function buildReadingSection(): string {
     'Chat turns can include:',
     '',
     "- `<message>` — the message you are answering. `<dm-history>` and `<channel-history>` are this thread's own earlier timeline.",
+    '- Any other tagged block carries an `about` attribute that says what it holds.',
     "- `<cross-session-context>` — a copy of something from elsewhere in this conversation: another thread, or a message you or a scheduled task posted here. Its `from` says where; `sender=\"you\"` marks your own. If you can't tell whether the current message refers to it or to this thread, ask.",
     '- `<task>` — a scheduled task you set to come back to this conversation, carrying the instructions you wrote then. Answer it as a turn here: address a `<message>` block to whoever should hear, and when there is nothing to say, end the turn without a block.',
   ].join('\n');

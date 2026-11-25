@@ -20,9 +20,7 @@ export interface LoginRow {
 }
 
 export type LoginsView =
-  | { readonly kind: 'list' }
-  | { readonly kind: 'add' }
-  | { readonly kind: 'detail' | 'edit'; readonly handle: string };
+  { readonly kind: 'list' } | { readonly kind: 'add' } | { readonly kind: 'detail' | 'edit'; readonly handle: string };
 
 export interface LoginsPageState {
   readonly view: LoginsView;

@@ -249,8 +249,7 @@ it('replays a historical success as currently unusable when operator state canno
   const inbox = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
   try {
     const row = inbox.prepare('SELECT content FROM messages_in WHERE id=?').get('action-resp-receipt') as
-      | { content: string }
-      | undefined;
+      { content: string } | undefined;
     if (!row) throw new Error('No replay answer');
     expect(JSON.parse(row.content)).toMatchObject({
       frame: { ok: true, data: { state: 'active', current_access: { usable: false } } },

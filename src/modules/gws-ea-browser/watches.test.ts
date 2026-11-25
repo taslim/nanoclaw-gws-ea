@@ -1426,7 +1426,7 @@ describe('a watch the principal declines', () => {
     expect(job).toBeDefined();
     jobId = job!.id;
     const { approval, session } = await awaitingCard('planner-declined');
-    await finalizeReject(approval, 'gchat:users/watch-principal', 'another evening');
+    await finalizeReject(approval, 'gchat:users/watch-principal', { reason: 'another evening' });
     const notes = await told(session);
     expect(notes).toHaveLength(1);
     const notice = JSON.parse(notes[0]) as { message: string };
@@ -1447,7 +1447,7 @@ describe('a watch the principal declines', () => {
       return run(sql, ...params);
     });
     try {
-      await finalizeReject(approval, 'gchat:users/watch-principal', 'too late');
+      await finalizeReject(approval, 'gchat:users/watch-principal', { reason: 'too late' });
       expect((await getBrowserWatch('declined-interrupted'))?.status).toBe('awaiting_principal');
       expect(await told(session)).toEqual([]);
     } finally {
@@ -1464,7 +1464,7 @@ describe('a watch the principal declines', () => {
 
   it('carries the reason the principal gave', async () => {
     const { approval, session } = await awaitingCard('declined-why');
-    await finalizeReject(approval, 'gchat:users/watch-principal', 'too late on a weeknight');
+    await finalizeReject(approval, 'gchat:users/watch-principal', { reason: 'too late on a weeknight' });
     const notes = await told(session);
     expect(notes).toHaveLength(1);
     expect((JSON.parse(notes[0]) as { message: string }).message).toContain('"too late on a weeknight"');

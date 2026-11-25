@@ -143,8 +143,7 @@ async function assertTools(runner: SanitizedCommandOutcomeRunner): Promise<void>
 }
 
 type DockerDaemonState =
-  | { readonly state: 'running' }
-  | { readonly state: 'stopped' | 'no-permission'; readonly evidence: string };
+  { readonly state: 'running' } | { readonly state: 'stopped' | 'no-permission'; readonly evidence: string };
 
 function pingDocker(socketPath: string): Promise<DockerDaemonState> {
   return new Promise((resolve) => {

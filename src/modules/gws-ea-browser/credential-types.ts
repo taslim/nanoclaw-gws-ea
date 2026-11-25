@@ -2,12 +2,7 @@ import { isRecord } from '../../gws-ea/validation.js';
 
 export type CredentialAttemptKind = 'signup' | 'rotation';
 export type CredentialAttemptPhase =
-  | 'saved'
-  | 'exposed'
-  | 'awaiting_verification'
-  | 'unknown'
-  | 'finalized'
-  | 'rejected';
+  'saved' | 'exposed' | 'awaiting_verification' | 'unknown' | 'finalized' | 'rejected';
 export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown'] as const;
 export const RELEASABLE_PHASES: readonly CredentialAttemptPhase[] = ['unknown', 'awaiting_verification'];
 interface CredentialAttemptRecord {

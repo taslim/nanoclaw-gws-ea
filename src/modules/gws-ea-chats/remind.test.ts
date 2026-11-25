@@ -77,8 +77,11 @@ it('stores a real in-conversation reminder in the calling chat and wakes that se
   expect(deliveredToChat).toHaveBeenCalledWith(
     'context@g.us',
     null,
-    expect.objectContaining({ kind: 'chat', content: { text: 'Choose the venue today.' } }),
-    'reminder-answer',
+    expect.objectContaining({
+      kind: 'chat',
+      content: { text: 'Choose the venue today.' },
+      deliveryId: `${session.id}:reminder-answer`,
+    }),
   );
 });
 it('refuses past times and cross-chat fields without creating a reminder', async () => {

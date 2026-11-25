@@ -994,12 +994,10 @@ describe('gws-ea stop summaries and exit codes', () => {
     const input = await reserveInstance(paths, reservation());
     const io = lines();
     const decided: boolean[] = [];
-    const attendPause = vi.fn(
-      async (): Promise<PauseResponse> => ({
-        kind: 'continue',
-        decisions: { chatConfigured: true },
-      }),
-    );
+    const attendPause = vi.fn(async (): Promise<PauseResponse> => ({
+      kind: 'continue',
+      decisions: { chatConfigured: true },
+    }));
 
     expect(
       await runCli(['resume', '--id', input.instance_id], {

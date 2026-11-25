@@ -23,25 +23,33 @@ async function changedAccount() {
 
 it('retains the completed send receipt after host delivery cleanup and a later account change', async () => {
   const first = await h.start();
-  const message = { kind: 'chat', content: { text: 'Already delivered before the snapshot restore' } };
-  const id = await first.deliver('team@g.us', null, message, 'completed-before-account-change');
+  const message = {
+    kind: 'chat',
+    content: { text: 'Already delivered before the snapshot restore' },
+    deliveryId: 'completed-before-account-change',
+  };
+  const id = await first.deliver('team@g.us', null, message);
   first.completeDelivery('completed-before-account-change');
   await first.teardown();
   const fresh = await changedAccount();
-  expect(await fresh.deliver('team@g.us', null, message, 'completed-before-account-change')).toBe(id);
+  expect(await fresh.deliver('team@g.us', null, message)).toBe(id);
   expect(h.socket().sends).toHaveLength(0);
 });
 
 it('keeps an accepted logical row globally handed off after an account change but refuses an old unaccepted row', async () => {
   const first = await h.start();
   const content = { kind: 'chat', content: { text: 'One delivery' } };
-  const accepted = await first.deliver('team@g.us', null, content, 'accepted-old-account');
+  const accepted = await first.deliver('team@g.us', null, { ...content, deliveryId: 'accepted-old-account' });
   await h.socket().emit('connection.update', { connection: 'close' });
-  await expect(first.deliver('team@g.us', null, content, 'unaccepted-old-account')).rejects.toThrow();
+  await expect(
+    first.deliver('team@g.us', null, { ...content, deliveryId: 'unaccepted-old-account' }),
+  ).rejects.toThrow();
   await first.teardown();
   const fresh = await changedAccount();
-  expect(await fresh.deliver('team@g.us', null, content, 'accepted-old-account')).toBe(accepted);
-  await expect(fresh.deliver('team@g.us', null, content, 'unaccepted-old-account')).rejects.toMatchObject({
+  expect(await fresh.deliver('team@g.us', null, { ...content, deliveryId: 'accepted-old-account' })).toBe(accepted);
+  await expect(
+    fresh.deliver('team@g.us', null, { ...content, deliveryId: 'unaccepted-old-account' }),
+  ).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:account-changed',
   });
   expect(h.socket().sends).toHaveLength(0);
@@ -52,12 +60,11 @@ it('isolates old inbound, held, aliases, names, own-message quotes, questions an
   await h
     .socket()
     .emit('messages.upsert', { type: 'notify', messages: [incoming('old-inbound', 'Private prior account text')] });
-  const ownId = await first.deliver(
-    'team@g.us',
-    null,
-    { kind: 'chat', content: { text: 'Old account’s own text' } },
-    'old-owned',
-  );
+  const ownId = await first.deliver('team@g.us', null, {
+    kind: 'chat',
+    content: { text: 'Old account’s own text' },
+    deliveryId: 'old-owned',
+  });
   const old = new WhatsAppIndex(h.directory, () => oldAccount);
   old.intake(incoming('pending-old-account'));
   old.intake(incoming('held-old-account'));

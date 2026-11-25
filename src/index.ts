@@ -10,6 +10,7 @@ import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js
 import {
   abortGatewaySessionObservers,
   adoptRunningSessions,
+  refreshStaleGroupImages,
   resumeGatewaySessionAdmission,
   stopGatewaySessionsForUnavailability,
 } from './container-runner.js';
@@ -31,20 +32,9 @@ import { enforceUpgradeTripwire } from './upgrade-state.js';
 // circular import cycle: src/index.ts imports src/modules/index.js for side
 // effects, and the modules call registerResponseHandler at top level — which
 // would hit a TDZ error if the array lived here.
-import { getResponseHandlers, type ResponsePayload } from './response-registry.js';
+import { dispatchResponse } from './response-registry.js';
 
 const hostAbortController = new AbortController();
-
-/**
- * A handler that throws rejects the dispatch: the answer is not handled, and
- * a channel that redelivers hands it over again.
- */
-async function dispatchResponse(payload: ResponsePayload): Promise<void> {
-  for (const handler of getResponseHandlers()) {
-    if (await handler(payload)) return;
-  }
-  log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
-}
 
 // Channel barrel — each enabled channel self-registers on import.
 // Channel skills uncomment lines in channels/index.ts to enable them.
@@ -165,22 +155,25 @@ async function main(): Promise<void> {
         });
       },
       // Like onInbound: an answer waits for inbound readiness, and the promise
-      // settles once its handler has, rejecting when the handler fails.
+      // settles with what the host did. When the channel sets redeliverOnError,
+      // a pre-acceptance failure rejects so it can hand the answer over again.
       onAction(questionId, selectedOption, userId, address, answer) {
         return inboundReady
           .then(() =>
-            dispatchResponse({
-              questionId,
-              value: selectedOption,
-              reason: answer?.reason,
-              userId,
-              channelType: adapter.channelType,
-              instance: address?.instance ?? adapter.instance ?? adapter.channelType,
-              messageId: address?.messageId,
-              platformId: address?.platformId ?? '',
-              threadId: address?.threadId ?? null,
-              deferResolution: answer?.deferResolution,
-            }),
+            dispatchResponse(
+              {
+                questionId,
+                value: selectedOption,
+                reason: answer?.reason,
+                userId,
+                channelType: adapter.channelType,
+                instance: address?.instance ?? adapter.instance ?? adapter.channelType,
+                messageId: address?.messageId,
+                platformId: address?.platformId ?? '',
+                threadId: address?.threadId ?? null,
+              },
+              { rethrow: answer?.redeliverOnError },
+            ),
           )
           .catch((err: unknown) => {
             log.error('Failed to handle question response', { questionId, err });
@@ -230,6 +223,10 @@ async function main(): Promise<void> {
   await startCliServer();
 
   log.info('NanoClaw running');
+
+  // In the background, one group at a time: after an update the agent image is
+  // new but groups with extra packages still run images built on the old one.
+  void refreshStaleGroupImages();
 }
 
 /** Graceful shutdown. */

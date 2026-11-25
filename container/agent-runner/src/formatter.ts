@@ -56,7 +56,8 @@ function isConversationTask(msg: MessageInRow): boolean {
 
 /**
  * Command categories for messages starting with '/'.
- * - admin: sender must be in NANOCLAW_ADMIN_USER_IDS
+ * - admin: admin-only; the host router gates them on channel messages
+ *   (src/command-gate.ts)
  * - filtered: silently drop (mark completed without processing)
  * - passthrough: pass raw to the agent (no XML wrapping)
  * - none: not a command — format normally
@@ -111,12 +112,12 @@ export interface CommandInfo {
  * Only applies to chat/chat-sdk messages. `providerName` is the active
  * provider whose contract supplies the native command lists.
  *
- * The extracted `senderId` is compared against `NANOCLAW_ADMIN_USER_IDS`
- * which stores ids in the namespaced form `<channel_type>:<raw>` (see
- * src/db/users.ts). chat-sdk-bridge serializes `author.userId` as a raw
- * platform id with no prefix, so we prefix it here. If the id already
- * contains a `:` we assume it's pre-namespaced (non-chat-sdk adapters
- * that populate `senderId` directly) and leave it alone.
+ * The extracted `senderId` uses the namespaced user-id form
+ * `<channel_type>:<raw>` (see src/cli/resources/users.ts). chat-sdk-bridge
+ * serializes `author.userId` as a raw platform id with no prefix, so we
+ * prefix it here. If the id already contains a `:` we assume it's
+ * pre-namespaced (non-chat-sdk adapters that populate `senderId` directly)
+ * and leave it alone.
  */
 export function categorizeMessage(msg: MessageInRow, providerName: string): CommandInfo {
   const text = commandText(msg.content);
@@ -408,6 +409,8 @@ function formatReaction(msg: MessageInRow, content: any): string {
  */
 function formatEchoMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
+  const block = formatContextBlock(content.block, msg.timestamp);
+  if (block) return block;
   const label = content.echo?.label || 'another conversation';
   // `self` marks the agent's own post; the host sets it in backfill and the outbound fan.
   const sender = content.self ? 'you' : content.sender || 'Unknown';
@@ -422,6 +425,34 @@ function formatEchoMessage(msg: MessageInRow): string {
     return `<${tag} sender="${escapeXml(sender)}" time="${escapeXml(time)}">${escapeXml(content.text || '')}</${tag}>`;
   }
   return `<cross-session-context from="${escapeXml(label)}" sender="${escapeXml(sender)}" time="${escapeXml(time)}">${escapeXml(content.text || '')}</cross-session-context>`;
+}
+
+/** Element names a context block may use: nothing that could close or open other markup. */
+const CONTEXT_BLOCK_TAG = /^[a-z][a-z-]{0,39}$/;
+
+interface ContextBlockContent {
+  tag?: unknown;
+  about?: unknown;
+  lines?: Array<{ sender?: string; time?: string; text?: string; self?: boolean }>;
+}
+
+/**
+ * Render a host-written context block (one row, many lines) as
+ * `<tag about="...">` with one line element per line. The block says what it
+ * holds in `about`, so no block needs its own branch here. Null when the row
+ * carries no valid block.
+ */
+function formatContextBlock(block: ContextBlockContent | undefined, fallbackTime: string): string | null {
+  if (!block || typeof block.tag !== 'string' || !CONTEXT_BLOCK_TAG.test(block.tag) || !Array.isArray(block.lines)) {
+    return null;
+  }
+  const lines = block.lines.map((line) => {
+    const sender = line.self ? 'you' : String(line.sender || 'Unknown');
+    const time = formatLocalStamp(new Date(line.time ?? fallbackTime), TIMEZONE);
+    return `<line sender="${escapeXml(sender)}" time="${escapeXml(time)}">${escapeXml(String(line.text ?? ''))}</line>`;
+  });
+  const about = typeof block.about === 'string' ? block.about : '';
+  return `<${block.tag} about="${escapeXml(about)}">\n${lines.join('\n')}\n</${block.tag}>`;
 }
 
 /**
@@ -449,11 +480,11 @@ function formatTaskMessage(msg: MessageInRow): string {
   });
   const parts: string[] = [];
   if (content.scriptOutput) {
-    // A script's data can carry outside text, which must never close the
-    // <task> block, so it is escaped like any other inbound text.
-    parts.push('Script output:', escapeXml(JSON.stringify(content.scriptOutput, null, 2)), '');
+    parts.push('Script output:', jsonForBlock(content.scriptOutput, 2), '');
   }
-  parts.push('Instructions:', stripLegacyTaskContract(content.prompt || ''));
+  // Only '<' can close the block. Prompts often hold shell commands and URLs,
+  // so '&', '>' and '"' must reach the agent unchanged.
+  parts.push('Instructions:', stripLegacyTaskContract(content.prompt || '').replace(/</g, '&lt;'));
   return `<task${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
 }
 
@@ -483,13 +514,13 @@ function formatWebhookMessage(msg: MessageInRow): string {
   const source = content.source || 'unknown';
   const event = content.event || 'unknown';
   const from = originAttr(msg);
-  return `<webhook${from} source="${escapeXml(source)}" event="${escapeXml(event)}">${JSON.stringify(content.payload || content, null, 2)}</webhook>`;
+  return `<webhook${from} source="${escapeXml(source)}" event="${escapeXml(event)}">${jsonForBlock(content.payload || content, 2)}</webhook>`;
 }
 
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const from = originAttr(msg);
-  return `<system_response${from} action="${escapeXml(content.action || 'unknown')}" status="${escapeXml(content.status || 'unknown')}">${JSON.stringify(content.result || null)}</system_response>`;
+  return `<system_response${from} action="${escapeXml(content.action || 'unknown')}" status="${escapeXml(content.status || 'unknown')}">${jsonForBlock(content.result || null)}</system_response>`;
 }
 
 /**
@@ -665,6 +696,15 @@ function parseContent(json: string): any {
 
 function escapeXml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * JSON embedded in a prompt block. '<' only ever occurs inside JSON strings,
+ * where `<` is an equivalent escape — so the payload cannot close its
+ * block and stays valid, readable JSON.
+ */
+function jsonForBlock(value: unknown, space?: number): string {
+  return JSON.stringify(value, null, space).replace(/</g, '\\u003c');
 }
 
 /**

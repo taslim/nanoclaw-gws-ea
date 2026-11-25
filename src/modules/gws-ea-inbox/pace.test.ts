@@ -106,8 +106,7 @@ function processAfter(session: Session, id: string): string | null {
   const db = inbound(session);
   try {
     const row = db.prepare('SELECT process_after FROM messages_in WHERE id = ?').get(id) as
-      | { process_after: string | null }
-      | undefined;
+      { process_after: string | null } | undefined;
     if (!row) throw new Error(`${id} is not in the session`);
     return row.process_after;
   } finally {

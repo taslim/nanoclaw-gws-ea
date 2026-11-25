@@ -39,10 +39,9 @@ it('migrates an existing central database to the same concrete schema as a fresh
   await runMigrations(upgraded, [artifactsMigration]);
   const schema = () =>
     sqliteRaw(getDb())
-      .prepare<
-        [],
-        { name: string; sql: string | null }
-      >("SELECT name,sql FROM sqlite_master WHERE name LIKE 'gws_ea_artifact%' ORDER BY name")
+      .prepare<[], { name: string; sql: string | null }>(
+        "SELECT name,sql FROM sqlite_master WHERE name LIKE 'gws_ea_artifact%' ORDER BY name",
+      )
       .all();
   const expected = schema();
   expect(expected.map((entry) => entry.name)).toEqual(

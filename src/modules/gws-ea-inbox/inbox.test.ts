@@ -788,8 +788,7 @@ function queueReply(session: Session, id: string, platformId: string, threadKey:
 function deliveryStatus(session: Session, id: string): string | undefined {
   const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
   const row = db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(id) as
-    | { status: string }
-    | undefined;
+    { status: string } | undefined;
   db.close();
   return row?.status;
 }
@@ -2052,8 +2051,7 @@ async function mainAsks(action: string, fields: Record<string, unknown>): Promis
   await handler({ ...fields, action, requestId }, main);
   const db = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
   const answer = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`action-resp-${requestId}`) as
-    | { content: string }
-    | undefined;
+    { content: string } | undefined;
   db.close();
   if (!answer) throw new Error(`${requestId} was not answered`);
   return (JSON.parse(answer.content) as { frame: ResponseFrame }).frame;

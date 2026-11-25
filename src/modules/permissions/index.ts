@@ -30,7 +30,8 @@ import {
 } from '../../router.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { NormalizedOption } from '../../channels/ask-question.js';
-import { registerResponseHandler, showRequestOutcome, type ResponsePayload } from '../../response-registry.js';
+import { getDb } from '../../db/connection.js';
+import { registerResponseHandler, type ResponseOutcome, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
@@ -48,6 +49,8 @@ import {
   NEW_AGENT_VALUE,
   REJECT_VALUE,
   requestChannelApproval,
+  recordChannelApprovalCard,
+  isCurrentChannelApprovalCard,
 } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
 import {
@@ -72,6 +75,15 @@ interface PendingNameInput {
   dmInstance: string;
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
+
+// ── Agent card replacing the first card ──
+// Card buttons are decoded by position against the stored options, and the
+// first card keeps its buttons until the host accepts. So while an agent card
+// is sent no card click counts, once it is out the card clicked for it is
+// ignored, and an agent card whose options weren't stored is ignored for good
+// (if its id is unknown, that request is blocked; replacements require a known card).
+// Keyed by messaging group, in memory alongside the delivery receipts.
+const agentCards = new Map<string, { retired: Set<string>; sending: boolean; blocked?: string }>();
 
 async function extractAndUpsertUser(event: InboundEvent): Promise<string | null> {
   let content: Record<string, unknown>;
@@ -137,10 +149,10 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-async function showApprovalOutcome(
+async function recordApprovalOutcome(
   about: string,
   answer: ResponsePayload,
-  request: { title: string; question: string; options_json: string },
+  request: { title: string; options_json: string },
 ): Promise<void> {
   const options = JSON.parse(request.options_json) as NormalizedOption[];
   await recordRequestOutcome(
@@ -157,11 +169,6 @@ async function showApprovalOutcome(
       outcome: options.find((option) => option.value === answer.value)?.selectedLabel ?? answer.value,
     },
   );
-  await showRequestOutcome(getDeliveryAdapter(), answer, {
-    title: request.title,
-    question: request.question,
-    options,
-  });
 }
 
 async function handleUnknownSender(
@@ -317,7 +324,7 @@ setSenderScopeGate(
  * Deny: delete the row (no "deny list" — a future message re-triggers a
  * fresh card per ACTION-ITEMS item 5 "no denial persistence").
  */
-async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<boolean> {
+async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<ResponseOutcome | false> {
   const row = await getPendingSenderApproval(payload.questionId);
   if (!row) return false;
 
@@ -339,29 +346,39 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
       clickerId,
       expectedApprover: row.approver_user_id,
     });
-    return true; // claim the response so it's not unclaimed-logged, but do nothing
+    return 'refused'; // the card keeps its buttons for a real approver
   }
   const approverId = clickerId;
   const approved = payload.value === 'approve';
 
+  // Deleting the row claims the decision: of two responses, only one proceeds.
+  // One transaction with the member insert, so a failed insert keeps the request.
+  // It also clears the row BEFORE re-routing, so the gate check on the second
+  // attempt doesn't see the in-flight row and short-circuit.
+  const claimed = await getDb().transaction(async () => {
+    if (!(await deletePendingSenderApproval(row.id))) return false;
+    if (approved) {
+      await addMember({
+        user_id: row.sender_identity,
+        agent_group_id: row.agent_group_id,
+        added_by: approverId,
+        added_at: new Date().toISOString(),
+      });
+    }
+    return true;
+  });
+  if (!claimed) return 'ignored';
+  // Recorded: the card can show it while the held message is replayed.
+  payload.accepted?.();
+
   if (approved) {
-    await addMember({
-      user_id: row.sender_identity,
-      agent_group_id: row.agent_group_id,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
     log.info('Unknown sender approved — member added', {
       approvalId: row.id,
       senderIdentity: row.sender_identity,
       agentGroupId: row.agent_group_id,
       approverId,
     });
-
-    // Clear the pending row BEFORE re-routing so the gate check on the
-    // second attempt doesn't see the in-flight row and short-circuit.
-    await deletePendingSenderApproval(row.id);
-    await showApprovalOutcome(NEW_SENDER, payload, row);
+    await recordApprovalOutcome(NEW_SENDER, payload, row);
 
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
@@ -369,7 +386,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     } catch (err) {
       log.error('Failed to replay message after sender approval', { approvalId: row.id, err });
     }
-    return true;
+    return 'accepted';
   }
 
   log.info('Unknown sender denied', {
@@ -378,9 +395,8 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     agentGroupId: row.agent_group_id,
     approverId,
   });
-  await deletePendingSenderApproval(row.id);
-  await showApprovalOutcome(NEW_SENDER, payload, row);
-  return true;
+  await recordApprovalOutcome(NEW_SENDER, payload, row);
+  return 'accepted';
 }
 
 registerResponseHandler(handleSenderApprovalResponse);
@@ -394,8 +410,11 @@ setChannelRequestGate(async (mg, event) => {
 /**
  * Wire an approved channel to an agent group and return the event to replay.
  * Shared by both approve paths (connect-existing button, free-text new-agent
- * name reply) so they produce identical wirings. Returns null if wiring failed
- * — callers must not confirm success to the approver otherwise.
+ * name reply) so they produce identical wirings. Returns 'accepted' (with the
+ * event to replay) when this call claimed the request and created the wiring,
+ * 'ignored' when another response claimed it first, 'closed' when the request
+ * had to be dropped; callers must not confirm success to the approver unless
+ * 'accepted'.
  *
  * Engage defaults come from the channel's declared defaults (DM vs group
  * context). isGroup uses the adapter's own flag with the persisted row as
@@ -407,7 +426,7 @@ async function wireApprovedChannel(
   agentGroupId: string,
   approverId: string,
   answer?: ResponsePayload,
-): Promise<InboundEvent | null> {
+): Promise<{ outcome: 'accepted'; event: InboundEvent } | { outcome: 'ignored' | 'closed' }> {
   let event: InboundEvent;
   try {
     event = JSON.parse(row.original_message) as InboundEvent;
@@ -417,7 +436,7 @@ async function wireApprovedChannel(
       err,
     });
     await deletePendingChannelApproval(row.messaging_group_id);
-    return null;
+    return { outcome: 'closed' };
   }
 
   const mg = await getMessagingGroup(row.messaging_group_id);
@@ -440,25 +459,43 @@ async function wireApprovedChannel(
       err,
     });
     await deletePendingChannelApproval(row.messaging_group_id);
-    return null;
+    return { outcome: 'closed' };
   }
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await createMessagingGroupAgent({
-    id: mgaId,
-    messaging_group_id: row.messaging_group_id,
-    agent_group_id: agentGroupId,
-    engage_mode: engage.engage_mode,
-    engage_pattern: engage.engage_pattern,
-    // Deliberate card-flow choices, not channel defaults: the triggering
-    // sender is auto-admitted below, so 'known' keeps other strangers gated;
-    // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
-    sender_scope: 'known',
-    ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: new Date().toISOString(),
+  // Deleting the row claims the choice: of two, only one wires the channel. One
+  // transaction with the wiring, so a failed write keeps the request.
+  const claimed = await getDb().transaction(async () => {
+    if (!(await deletePendingChannelApproval(row.messaging_group_id))) return false;
+    await createMessagingGroupAgent({
+      id: mgaId,
+      messaging_group_id: row.messaging_group_id,
+      agent_group_id: agentGroupId,
+      engage_mode: engage.engage_mode,
+      engage_pattern: engage.engage_pattern,
+      // Deliberate card-flow choices, not channel defaults: the triggering
+      // sender is auto-admitted below, so 'known' keeps other strangers gated;
+      // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: new Date().toISOString(),
+    });
+    const senderUserId = await extractAndUpsertUser(event);
+    if (senderUserId) {
+      await addMember({
+        user_id: senderUserId,
+        agent_group_id: agentGroupId,
+        added_by: approverId,
+        added_at: new Date().toISOString(),
+      });
+    }
+    return true;
   });
+  if (!claimed) return { outcome: 'ignored' };
+  // Recorded: the card can show it while the message is replayed.
+  answer?.accepted?.();
   log.info('Channel registration approved — wiring created', {
     messagingGroupId: row.messaging_group_id,
     agentGroupId,
@@ -466,20 +503,8 @@ async function wireApprovedChannel(
     engageMode: engage.engage_mode,
     approverId,
   });
-
-  const senderUserId = await extractAndUpsertUser(event);
-  if (senderUserId) {
-    await addMember({
-      user_id: senderUserId,
-      agent_group_id: agentGroupId,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
-  }
-
-  await deletePendingChannelApproval(row.messaging_group_id);
-  if (answer) await showApprovalOutcome(CHANNEL_REGISTRATION, answer, row);
-  return event;
+  if (answer) await recordApprovalOutcome(CHANNEL_REGISTRATION, answer, row);
+  return { outcome: 'accepted', event };
 }
 
 async function replayApprovedChannel(event: InboundEvent, messagingGroupId: string): Promise<void> {
@@ -491,6 +516,100 @@ async function replayApprovedChannel(event: InboundEvent, messagingGroupId: stri
       err,
     });
   }
+}
+
+/**
+ * Sends the agent-selection card that replaces the clicked card (`sent` once it is out), then stores its
+ * options. `unstored` gets the card's id when they weren't, and whether the first card's are still stored.
+ */
+async function sendAgentCard(
+  row: PendingChannelApproval,
+  payload: ResponsePayload,
+  approverId: string,
+  on: { sent: () => void; unstored: (cardId: string | undefined, firstCardStored: boolean) => void },
+): Promise<ResponseOutcome> {
+  const origin = await getMessagingGroup(row.messaging_group_id);
+  const approverDm = await ensureUserDm(row.approver_user_id, {
+    instance: payload.channelType === origin?.channel_type ? origin.instance : undefined,
+  });
+  if (!approverDm) {
+    log.error('Channel registration: no DM channel for approver', {
+      messagingGroupId: row.messaging_group_id,
+      approverUserId: row.approver_user_id,
+    });
+    return 'ignored';
+  }
+
+  const adapter = getDeliveryAdapter();
+  if (!adapter) return 'ignored';
+
+  const agentGroups = await getAllAgentGroups();
+  const options = await buildAgentSelectionOptions(agentGroups, approverId);
+  const title = '📋 Choose an agent';
+  const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
+
+  // Sent before its options are stored, so a send that fails leaves the first card as it was.
+  let cardId: string | undefined;
+  try {
+    cardId = await adapter.deliver(
+      approverDm.channel_type,
+      approverDm.platform_id,
+      null,
+      'chat-sdk',
+      JSON.stringify({
+        type: 'ask_question',
+        questionId: row.messaging_group_id,
+        title,
+        question,
+        options,
+      }),
+      undefined,
+      approverDm.instance,
+    );
+  } catch (err) {
+    log.error('Channel registration: agent-selection card delivery failed', {
+      messagingGroupId: row.messaging_group_id,
+      err,
+    });
+    return 'ignored'; // the first card keeps its buttons for another try
+  }
+  on.sent();
+  // Decided meanwhile (a Reject), or a newer request: leave that card as it is.
+  let stored: boolean;
+  try {
+    stored = await updatePendingChannelApprovalCard(
+      row.messaging_group_id,
+      row.created_at,
+      title,
+      question,
+      JSON.stringify(options),
+    );
+  } catch (err) {
+    log.error('Channel registration: agent-selection card options not stored', {
+      messagingGroupId: row.messaging_group_id,
+      err,
+    });
+    // The store may have failed after the row was replaced: check it is still this request.
+    const current = await getPendingChannelApproval(row.messaging_group_id).catch(() => undefined);
+    on.unstored(cardId, current?.created_at === row.created_at && current?.options_json === row.options_json);
+    return 'ignored';
+  }
+  if (!stored) {
+    on.unstored(cardId, false);
+    return 'ignored';
+  }
+  recordChannelApprovalCard(row.messaging_group_id, row.created_at, cardId);
+  await recordApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
+  await recordRequestPosted(
+    {
+      channelType: approverDm.channel_type,
+      platformId: approverDm.platform_id,
+      instance: approverDm.instance,
+      threadId: null,
+    },
+    { id: row.messaging_group_id, about: CHANNEL_REGISTRATION, title, options, answerFrom: row.approver_user_id },
+  );
+  return 'accepted';
 }
 
 /**
@@ -507,7 +626,7 @@ async function replayApprovedChannel(event: InboundEvent, messagingGroupId: stri
  *                     captures the reply and creates immediately)
  *   reject          — set denied_at, delete pending row
  */
-async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<boolean> {
+async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<ResponseOutcome | false> {
   const row = await getPendingChannelApproval(payload.questionId);
   if (!row) return false;
 
@@ -529,80 +648,63 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       expectedApprover: row.approver_user_id,
       reason: decision.reason,
     });
-    return true;
+    return 'refused';
   }
   const approverId = clickerId;
+  const swap = agentCards.get(row.messaging_group_id);
+  // Never forget an unknown stale card just because the request was replaced:
+  // a tap on it would decide the newer request by button position and could
+  // connect the chat to the wrong agent. A newer request recovers only through
+  // a card with a known id; if that has none either, it waits for a restart.
+  if (
+    swap?.blocked &&
+    (swap.blocked === row.created_at ||
+      !isCurrentChannelApprovalCard(row.messaging_group_id, row.created_at, payload.messageId))
+  )
+    return 'ignored';
+  if (swap && payload.messageId && (swap.sending || swap.retired.has(payload.messageId))) return 'ignored';
 
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
-    await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
-    await deletePendingChannelApproval(row.messaging_group_id);
-    await showApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
+    // Claimed like a connect: of a racing Reject and connect, only one decides.
+    const claimed = await getDb().transaction(async () => {
+      if (!(await deletePendingChannelApproval(row.messaging_group_id))) return false;
+      await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
+      return true;
+    });
+    if (!claimed) return 'ignored';
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       approverId,
     });
-    return true;
+    await recordApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
+    return 'accepted';
   }
 
   // ── Choose existing agent — send agent-selection follow-up card ──
   if (payload.value === CHOOSE_EXISTING_VALUE) {
-    const origin = await getMessagingGroup(row.messaging_group_id);
-    const approverDm = await ensureUserDm(row.approver_user_id, {
-      instance: payload.channelType === origin?.channel_type ? origin.instance : undefined,
-    });
-    if (!approverDm) {
-      log.error('Channel registration: no DM channel for approver', {
-        messagingGroupId: row.messaging_group_id,
-        approverUserId: row.approver_user_id,
-      });
-      return true;
-    }
-
-    const adapter = getDeliveryAdapter();
-    if (!adapter) return true;
-
-    // This request is answered; the choice of an agent is asked next, under the same question id.
-    await showApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
-    const agentGroups = await getAllAgentGroups();
-    const options = await buildAgentSelectionOptions(agentGroups, approverId);
-    const title = '📋 Choose an agent';
-    const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
-    await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
-
+    // Set before any wait, so a second tap can't start another, nor a typed answer (no card id).
+    const guard = agentCards.get(row.messaging_group_id) ?? { retired: new Set<string>(), sending: false };
+    if (guard.sending) return 'ignored';
+    guard.sending = true;
+    agentCards.set(row.messaging_group_id, guard);
     try {
-      await adapter.deliver(
-        approverDm.channel_type,
-        approverDm.platform_id,
-        null,
-        'chat-sdk',
-        JSON.stringify({
-          type: 'ask_question',
-          questionId: row.messaging_group_id,
-          title,
-          question,
-          options,
-        }),
-        undefined,
-        approverDm.instance,
-      );
-    } catch (err) {
-      log.error('Channel registration: agent-selection card delivery failed', {
-        messagingGroupId: row.messaging_group_id,
-        err,
+      return await sendAgentCard(row, payload, approverId, {
+        sent: () => {
+          if (payload.messageId) guard.retired.add(payload.messageId);
+        },
+        // While the first card's options are still the stored ones it works again.
+        unstored: (cardId, firstCardStored) => {
+          if (!cardId) guard.blocked = row.created_at;
+          else guard.retired.add(cardId);
+          if (cardId && firstCardStored && payload.messageId) guard.retired.delete(payload.messageId);
+        },
       });
-      return true;
+    } finally {
+      guard.sending = false;
+      if (guard.retired.size === 0 && !guard.blocked && agentCards.get(row.messaging_group_id) === guard)
+        agentCards.delete(row.messaging_group_id);
     }
-    await recordRequestPosted(
-      {
-        channelType: approverDm.channel_type,
-        platformId: approverDm.platform_id,
-        instance: approverDm.instance,
-        threadId: null,
-      },
-      { id: row.messaging_group_id, about: CHANNEL_REGISTRATION, title, options, answerFrom: row.approver_user_id },
-    );
-    return true;
   }
 
   // ── Create new agent — prompt for free-text name ──
@@ -616,7 +718,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         messagingGroupId: row.messaging_group_id,
         approverUserId: row.approver_user_id,
       });
-      return true;
+      return 'ignored';
     }
 
     const adapter = getDeliveryAdapter();
@@ -624,9 +726,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       log.error('Channel registration: no delivery adapter for name prompt', {
         messagingGroupId: row.messaging_group_id,
       });
-      return true;
+      return 'ignored';
     }
-    await showApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
     const prompt = {
       channelMgId: row.messaging_group_id,
       dmChannelType: approverDm.channel_type,
@@ -652,8 +753,10 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       });
       // A newer prompt (a refused name's re-arm, or another channel's) may have replaced this one.
       if (awaitingNameInput.get(row.approver_user_id) === prompt) awaitingNameInput.delete(row.approver_user_id);
+      return 'ignored';
     }
-    return true;
+    await recordApprovalOutcome(CHANNEL_REGISTRATION, payload, row);
+    return 'accepted';
   }
 
   // ── Resolve target agent group (connect to existing or create new) ──
@@ -667,8 +770,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         messagingGroupId: row.messaging_group_id,
         targetAgentGroupId,
       });
-      await deletePendingChannelApproval(row.messaging_group_id);
-      return true;
+      return (await deletePendingChannelApproval(row.messaging_group_id)) ? 'closed' : 'ignored';
     }
     if (!(await hasAdminPrivilege(approverId, targetAgentGroupId))) {
       log.warn('Channel registration: target agent group rejected for unauthorized approver', {
@@ -676,20 +778,20 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         targetAgentGroupId,
         approverId,
       });
-      return true;
+      return 'refused';
     }
   } else {
     log.warn('Channel registration: unknown response value', {
       messagingGroupId: row.messaging_group_id,
       value: payload.value,
     });
-    return true;
+    return 'ignored';
   }
 
   // ── Wire + replay (shared path for connect and create) ──
-  const event = await wireApprovedChannel(row, targetAgentGroupId, approverId, payload);
-  if (event) await replayApprovedChannel(event, row.messaging_group_id);
-  return true;
+  const wired = await wireApprovedChannel(row, targetAgentGroupId, approverId, payload);
+  if (wired.outcome === 'accepted') await replayApprovedChannel(wired.event, row.messaging_group_id);
+  return wired.outcome;
 }
 
 registerResponseHandler(handleChannelApprovalResponse);
@@ -768,7 +870,7 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const wired = await wireApprovedChannel(row, ag.id, userId);
   // This interceptor holds the DM's route tail. Enqueue replay after wiring,
   // but release the current route before waiting on that same conversation.
-  if (wired) void replayApprovedChannel(wired, row.messaging_group_id);
+  if (wired.outcome === 'accepted') void replayApprovedChannel(wired.event, row.messaging_group_id);
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
@@ -779,9 +881,10 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
         null,
         'chat-sdk',
         JSON.stringify({
-          text: wired
-            ? `✅ Agent "${ag.name}" created and connected.`
-            : `⚠️ Agent "${ag.name}" was created but the channel couldn't be connected — check the host logs.`,
+          text:
+            wired.outcome === 'accepted'
+              ? `✅ Agent "${ag.name}" created and connected.`
+              : `⚠️ Agent "${ag.name}" was created but the channel couldn't be connected — check the host logs.`,
         }),
         undefined,
         event.instance,

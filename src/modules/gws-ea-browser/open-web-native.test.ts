@@ -532,9 +532,8 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
   /** One batch through the executor, as the browser agent sends it, aimed by each control's accessible name. */
   async function act(...steps: Array<[kind: 'click' | 'key', name: string]>): Promise<Record<string, unknown>> {
     const observation = await observePage(page);
-    const actions = steps.map(
-      ([kind, name]): BrowserAction =>
-        kind === 'key' ? { kind, ...refIn(observation, name), key: 'Enter' } : { kind, ...refIn(observation, name) },
+    const actions = steps.map(([kind, name]): BrowserAction =>
+      kind === 'key' ? { kind, ...refIn(observation, name), key: 'Enter' } : { kind, ...refIn(observation, name) },
     );
     return executeBrowserBatch(jobContext(db, page, JOB), { actions }, { record: false });
   }

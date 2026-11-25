@@ -24,9 +24,9 @@ it('passes stable per-part delivery keys only to an adapter’s opt-in text post
     },
   } as unknown as Adapter;
   const bridge = createChatSdkBridge({ adapter, supportsThreads: false, maxTextLength: 5 });
-  const message = { kind: 'chat', content: { text: 'hello\nworld' } };
-  await expect(bridge.deliver('space', null, message, 'durable-row')).rejects.toThrow('accepted before disconnect');
-  await bridge.deliver('space', null, message, 'durable-row');
+  const message = { kind: 'chat', content: { text: 'hello\nworld' }, deliveryId: 'durable-row' };
+  await expect(bridge.deliver('space', null, message)).rejects.toThrow('accepted before disconnect');
+  await bridge.deliver('space', null, message);
   expect(keys).toEqual(['durable-row:0', 'durable-row:0', 'durable-row:1']);
   expect([...messages.values()]).toEqual(['hello', 'world']);
   expect(ordinary).toEqual([]);

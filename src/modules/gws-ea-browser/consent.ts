@@ -46,14 +46,7 @@ import {
 // ---------------------------------------------------------------- what a choice's wording means
 
 export type ConsentLabelKind =
-  | 'terms'
-  | 'marketing'
-  | 'opt_out'
-  | 'add_on'
-  | 'agreement'
-  | 'bundled'
-  | 'double_negative'
-  | 'functional';
+  'terms' | 'marketing' | 'opt_out' | 'add_on' | 'agreement' | 'bundled' | 'double_negative' | 'functional';
 
 /** The site's own terms: what a delegated signup accepts with the account. */
 const siteTerms =
@@ -364,8 +357,7 @@ export interface ConsentChoice {
 }
 /** A choice to set: a box, switch or radio option to this state, or a select to this option. */
 export type ConsentSetting =
-  | { readonly id: number; readonly checked: boolean }
-  | { readonly id: number; readonly option: number };
+  { readonly id: number; readonly checked: boolean } | { readonly id: number; readonly option: number };
 /** Wording only the principal can agree to, and the choice that agreeing ticks. */
 export interface ConsentItem {
   readonly id: number;

@@ -109,13 +109,13 @@ describe('delivery during a channel outage', () => {
     const attempted: string[] = [];
     const sent: string[] = [];
     setDeliveryAdapter({
-      async deliver(channel, _platform, _thread, _kind, content, _files, _instance, messageId) {
+      async deliver(channel, _platform, _thread, _kind, content, _files, _instance, deliveryId) {
         attempted.push(channel);
         if (channel === 'whatsapp' && !connected) throw new ChannelNotConnectedError();
         const value: unknown = JSON.parse(content);
-        expect(value).toEqual({ text: messageId });
-        sent.push(messageId!);
-        return `platform-${messageId}`;
+        expect(value).toEqual({ text: deliveryId!.slice(`${session.id}:`.length) });
+        sent.push(deliveryId!);
+        return `platform-${deliveryId}`;
       },
     });
     for (let poll = 0; poll < 5; poll += 1) {
@@ -123,9 +123,9 @@ describe('delivery during a channel outage', () => {
       const delivered = await withMailboxSession('main', session.id, (mailbox) => mailbox.getDeliveredIds());
       expect(delivered.has('wa-first')).toBe(false);
       expect(delivered.has('wa-second')).toBe(false);
-      expect(await getDeliveryAttempt('wa-first')).toBeUndefined();
-      expect(await getDeliveryAttempt('wa-second')).toBeUndefined();
-      expect(sent).toEqual(['gchat-reply']);
+      expect(await getDeliveryAttempt(`${session.id}:wa-first`)).toBeUndefined();
+      expect(await getDeliveryAttempt(`${session.id}:wa-second`)).toBeUndefined();
+      expect(sent).toEqual([`${session.id}:gchat-reply`]);
       expect(actionRuns).toBe(1);
       vi.setSystemTime(Date.now() + 1_000);
     }
@@ -133,7 +133,7 @@ describe('delivery during a channel outage', () => {
     connected = true;
     await deliverSessionMessages(session);
     await deliverSessionMessages(session);
-    expect(sent).toEqual(['gchat-reply', 'wa-first', 'wa-second']);
+    expect(sent).toEqual([`${session.id}:gchat-reply`, `${session.id}:wa-first`, `${session.id}:wa-second`]);
   });
 
   it('keeps a spent task session open until its waiting reply is delivered', async () => {
@@ -143,10 +143,10 @@ describe('delivery during a channel outage', () => {
     let connected = false;
     const sent: string[] = [];
     setDeliveryAdapter({
-      async deliver(channel, _platform, _thread, _kind, _content, _files, _instance, messageId) {
+      async deliver(channel, _platform, _thread, _kind, _content, _files, _instance, deliveryId) {
         if (channel === 'whatsapp' && !connected) throw new ChannelNotConnectedError();
-        sent.push(messageId!);
-        return `platform-${messageId}`;
+        sent.push(deliveryId!);
+        return `platform-${deliveryId}`;
       },
     });
     await deliverSessionMessages(task);
@@ -155,7 +155,7 @@ describe('delivery during a channel outage', () => {
     connected = true;
     vi.setSystemTime(Date.now() + 1_000);
     await deliverSessionMessages(task);
-    expect(sent).toEqual(['task-reply']);
+    expect(sent).toEqual([`${task.id}:task-reply`]);
     await reconcileSession(task.id);
     expect((await getSession(task.id))?.status).toBe('closed');
   });
@@ -172,8 +172,8 @@ describe('delivery during a channel outage', () => {
       async setup() {},
       async teardown() {},
       isConnected: () => true,
-      async deliver(_platform, _thread, message, messageId) {
-        received.push({ id: messageId, timestamp: message.timestamp });
+      async deliver(_platform, _thread, message) {
+        received.push({ id: message.deliveryId, timestamp: message.timestamp });
         return 'platform-id';
       },
     };
@@ -181,6 +181,6 @@ describe('delivery during a channel outage', () => {
     await initChannelAdapters(() => ({ onInbound() {}, onInboundEvent() {}, onMetadata() {}, onAction() {} }));
     setDeliveryAdapter(createChannelDeliveryAdapter());
     await deliverSessionMessages(session);
-    expect(received).toEqual([{ id: 'durable-row', timestamp: '2026-10-18T12:00:00.000Z' }]);
+    expect(received).toEqual([{ id: `${session.id}:durable-row`, timestamp: '2026-10-18T12:00:00.000Z' }]);
   });
 });

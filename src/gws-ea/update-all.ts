@@ -70,9 +70,7 @@ export type AssistantUpdate =
   | { readonly kind: 'completed'; readonly release: ReleaseCoordinates };
 
 export type UpdateTurn =
-  | AssistantUpdate
-  | { readonly kind: 'failed'; readonly exitCode?: number }
-  | { readonly kind: 'busy' };
+  AssistantUpdate | { readonly kind: 'failed'; readonly exitCode?: number } | { readonly kind: 'busy' };
 
 export type UpdateTargetResult =
   | { readonly instance_id: string; readonly outcome: 'completed'; readonly update: AssistantUpdate }

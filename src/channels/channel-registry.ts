@@ -106,19 +106,20 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       content: string,
       files?: OutboundFile[],
       instance?: string,
-      messageId?: string,
+      deliveryId?: string,
       timestamp?: string,
     ): Promise<string | undefined> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       if (!adapter) {
         throw new MissingChannelAdapterError(channelType, instance);
       }
-      return adapter.deliver(
-        platformId,
-        threadId,
-        { kind, content: JSON.parse(content), files, ...(timestamp === undefined ? {} : { timestamp }) },
-        messageId,
-      );
+      return adapter.deliver(platformId, threadId, {
+        kind,
+        content: JSON.parse(content),
+        files,
+        deliveryId,
+        ...(timestamp === undefined ? {} : { timestamp }),
+      });
     },
     async setTyping(
       channelType: string,

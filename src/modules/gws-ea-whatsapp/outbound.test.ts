@@ -15,10 +15,11 @@ afterEach(async () => {
   await h.close();
 });
 const message = { kind: 'chat', content: { text: '👍' } };
+const msg = (deliveryId: string, extra: Record<string, unknown> = {}) => ({ ...message, ...extra, deliveryId });
 describe('durable WhatsApp outbound rows', () => {
   it('leaves a prepared record before any send and sends the row once after restart', async () => {
     const adapter = await h.start({}, false);
-    await expect(adapter.deliver('team@g.us', null, message, 'row-before-send')).rejects.toBeInstanceOf(
+    await expect(adapter.deliver('team@g.us', null, msg('row-before-send'))).rejects.toBeInstanceOf(
       ChannelNotConnectedError,
     );
     const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
@@ -27,27 +28,27 @@ describe('durable WhatsApp outbound rows', () => {
     expect(h.socket().sends).toEqual([]);
     await adapter.teardown();
     const fresh = await h.start();
-    await fresh.deliver('team@g.us', null, message, 'row-before-send');
+    await fresh.deliver('team@g.us', null, msg('row-before-send'));
     expect(h.socket().sends).toHaveLength(1);
   });
   it('resends an ambiguous send with the same caller message id after restart', async () => {
     const adapter = await h.start();
     h.socket().sendError = new Error('process died after socket handoff');
-    await expect(adapter.deliver('team@g.us', null, message, 'ambiguous')).rejects.toThrow('process died');
+    await expect(adapter.deliver('team@g.us', null, msg('ambiguous'))).rejects.toThrow('process died');
     const handedId = h.socket().sends[0].options.messageId;
     expect(handedId).toMatch(/^3EB0[0-9A-F]{28}$/u);
     await adapter.teardown();
     const fresh = await h.start();
-    await fresh.deliver('team@g.us', null, message, 'ambiguous');
+    await fresh.deliver('team@g.us', null, msg('ambiguous'));
     expect(h.socket().sends[0].options.messageId).toBe(handedId);
   });
   it('does not resend a completed socket handoff after a crash before markDelivered', async () => {
     const first = await h.start();
-    const handedId = await first.deliver('team@g.us', null, message, 'accepted');
+    const handedId = await first.deliver('team@g.us', null, msg('accepted'));
     if (!handedId) throw new Error('WhatsApp did not name the accepted message');
     await first.teardown();
     const fresh = await h.start();
-    expect(await fresh.deliver('team@g.us', null, message, 'accepted')).toBe(handedId);
+    expect(await fresh.deliver('team@g.us', null, msg('accepted'))).toBe(handedId);
     expect(h.socket().sends).toEqual([]);
     const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(disk.pending('accepted')?.accepted).toBe(true);
@@ -61,19 +62,19 @@ describe('durable WhatsApp outbound rows', () => {
   it('gives identical replies in different rows separate message ids and coalesces concurrent same-row calls', async () => {
     const adapter = await h.start();
     await Promise.all([
-      adapter.deliver('team@g.us', null, message, 'thumb-1'),
-      adapter.deliver('team@g.us', null, message, 'thumb-1'),
+      adapter.deliver('team@g.us', null, msg('thumb-1')),
+      adapter.deliver('team@g.us', null, msg('thumb-1')),
     ]);
-    await adapter.deliver('team@g.us', null, message, 'thumb-2');
+    await adapter.deliver('team@g.us', null, msg('thumb-2'));
     expect(h.socket().sends).toHaveLength(2);
     expect(h.socket().sends[0].options.messageId).not.toBe(h.socket().sends[1].options.messageId);
   });
   it('returns a row held over four hours through the native refusal outcome', async () => {
     const adapter = await h.start({}, false);
-    await expect(adapter.deliver('team@g.us', null, message, 'stale')).rejects.toBeInstanceOf(ChannelNotConnectedError);
+    await expect(adapter.deliver('team@g.us', null, msg('stale'))).rejects.toBeInstanceOf(ChannelNotConnectedError);
     h.now.value += 4 * 60 * 60 * 1000 + 1;
     await h.socket().emit('connection.update', { connection: 'open' });
-    await expect(adapter.deliver('team@g.us', null, message, 'stale')).rejects.toMatchObject({
+    await expect(adapter.deliver('team@g.us', null, msg('stale'))).rejects.toMatchObject({
       guardId: 'gws-ea-whatsapp:stale',
       reason: expect.stringContaining('four hours'),
     });
@@ -82,16 +83,16 @@ describe('durable WhatsApp outbound rows', () => {
   it('expires an old original row on its first observation after host downtime', async () => {
     const adapter = await h.start();
     const timestamp = new Date(h.now.value - 5 * 60 * 60 * 1000).toISOString();
-    await expect(
-      adapter.deliver('team@g.us', null, { ...message, timestamp }, 'first-seen-stale'),
-    ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:stale' });
+    await expect(adapter.deliver('team@g.us', null, msg('first-seen-stale', { timestamp }))).rejects.toMatchObject({
+      guardId: 'gws-ea-whatsapp:stale',
+    });
     expect(h.socket().sends).toEqual([]);
   });
 
   it('does not treat an invalid original row timestamp as a fresh host send', async () => {
     const adapter = await h.start();
     await expect(
-      adapter.deliver('team@g.us', null, { ...message, timestamp: 'not-a-time' }, 'invalid-original'),
+      adapter.deliver('team@g.us', null, msg('invalid-original', { timestamp: 'not-a-time' })),
     ).rejects.toThrow('invalid original timestamp');
     expect(h.socket().sends).toEqual([]);
   });
@@ -108,16 +109,12 @@ describe('durable WhatsApp outbound rows', () => {
     };
     const original = h.socket().sendMessage.bind(h.socket());
     h.socket().sendMessage = async (...args) => ({ ...(await original(...args)), message: wire });
-    const id = await adapter.deliver(
-      'team@g.us',
-      null,
-      {
-        kind: 'chat',
-        content: { text: 'A picture' },
-        files: [{ filename: 'photo.png', mimeType: 'image/png', data: Buffer.from('photo') }],
-      },
-      'media-retry',
-    );
+    const id = await adapter.deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: 'A picture' },
+      files: [{ filename: 'photo.png', mimeType: 'image/png', data: Buffer.from('photo') }],
+      deliveryId: 'media-retry',
+    });
     await adapter.teardown();
     await h.start();
     const stored = await h.socketConfigs[1].getMessage?.({ remoteJid: 'team@g.us', id });
@@ -128,7 +125,7 @@ describe('durable WhatsApp outbound rows', () => {
   it('clears only a definitely refused send and throws the native refusal to its agent', async () => {
     const adapter = await h.start();
     h.socket().sendError = Object.assign(new Error('forbidden'), { output: { statusCode: 403 } });
-    await expect(adapter.deliver('team@g.us', null, message, 'refused')).rejects.toBeInstanceOf(OutboundRefusedError);
+    await expect(adapter.deliver('team@g.us', null, msg('refused'))).rejects.toBeInstanceOf(OutboundRefusedError);
     const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
     expect(disk.pending('refused')).toBeUndefined();
     disk.close();
@@ -149,24 +146,26 @@ describe('durable WhatsApp outbound rows', () => {
         { filename: 'one.png', mimeType: 'image/png', data: Buffer.from('one') },
         { filename: 'two.png', mimeType: 'image/png', data: Buffer.from('two') },
       ],
+      deliveryId: 'pictures',
     };
-    await expect(adapter.deliver('team@g.us', null, files, 'pictures')).rejects.toThrow('interrupted');
+    await expect(adapter.deliver('team@g.us', null, files)).rejects.toThrow('interrupted');
     await adapter.teardown();
     const fresh = await h.start();
-    await fresh.deliver('team@g.us', null, files, 'pictures');
+    await fresh.deliver('team@g.us', null, files);
     expect(h.socket().sends).toHaveLength(1);
     expect(h.socket().sends[0].content).toMatchObject({ image: Buffer.from('two') });
   });
   it('names the group member who sent a message when it reacts, and its own message without one', async () => {
     const adapter = await h.start();
     await h.socket().emit('messages.upsert', { type: 'notify', messages: [incoming('from-pat', 'Lunch at noon?')] });
-    const own = await adapter.deliver('team@g.us', null, message, 'own-message');
-    const react = (messageId: string | undefined) => ({
+    const own = await adapter.deliver('team@g.us', null, msg('own-message'));
+    const react = (messageId: string | undefined, deliveryId: string) => ({
       kind: 'chat',
       content: { operation: 'reaction', messageId, emoji: '👍' },
+      deliveryId,
     });
-    await adapter.deliver('team@g.us', null, react('from-pat'), 'react-member');
-    await adapter.deliver('team@g.us', null, react(own), 'react-own');
+    await adapter.deliver('team@g.us', null, react('from-pat', 'react-member'));
+    await adapter.deliver('team@g.us', null, react(own, 'react-own'));
     expect(
       h
         .socket()
@@ -178,7 +177,7 @@ describe('durable WhatsApp outbound rows', () => {
       },
       { react: { text: '👍', key: { remoteJid: 'team@g.us', id: own, fromMe: true } } },
     ]);
-    await expect(adapter.deliver('team@g.us', null, react('unknown'), 'react-unknown')).rejects.toThrow(
+    await expect(adapter.deliver('team@g.us', null, react('unknown', 'react-unknown'))).rejects.toThrow(
       'does not have',
     );
     expect(h.socket().sends).toHaveLength(3);
@@ -213,6 +212,7 @@ describe('WhatsApp questions use native text answers', () => {
     id === questionId
       ? {
           title: 'Allow this action?',
+          question: 'Approve the action.',
           kind: 'approval',
           options: [
             { label: 'Allow', selectedLabel: 'Allowed', value: 'approve' },
@@ -223,7 +223,7 @@ describe('WhatsApp questions use native text answers', () => {
   );
   it('takes a thumb on the posted approval through answers.ts and ignores slash commands', async () => {
     const adapter = await h.start();
-    const id = await adapter.deliver('team@g.us', null, approval, 'approval-row');
+    const id = await adapter.deliver('team@g.us', null, { ...approval, deliveryId: 'approval-row' });
     expect(h.socket().sends[0].content).toMatchObject({
       text: expect.stringContaining('Quote this message with yes or no'),
     });
@@ -241,13 +241,13 @@ describe('WhatsApp questions use native text answers', () => {
       'approve',
       'whatsapp:12000',
       { platformId: 'team@g.us', threadId: null, messageId: id, instance: 'whatsapp' },
-      { deferResolution: true },
+      { redeliverOnError: true },
     );
     expect(h.messages().map((message) => message.id)).toEqual(['slash']);
   });
   it('takes a quoted yes, but a forwarded quoted yes carries no approval authority', async () => {
     const adapter = await h.start();
-    const id = await adapter.deliver('team@g.us', null, approval, 'quoted-approval');
+    const id = await adapter.deliver('team@g.us', null, { ...approval, deliveryId: 'quoted-approval' });
     await h.socket().emit('messages.upsert', {
       type: 'notify',
       messages: [
@@ -259,5 +259,32 @@ describe('WhatsApp questions use native text answers', () => {
     });
     expect(vi.mocked(h.setup.onAction).mock.calls.map((call) => call[0])).toEqual([questionId]);
     expect(h.messages().map((message) => message.id)).toEqual(['forwarded-yes']);
+  });
+  it('edits the posted approval in place when the host accepts an answer, and leaves refused answers unedited', async () => {
+    const adapter = await h.start();
+    const id = await adapter.deliver('team@g.us', null, { ...approval, deliveryId: 'edit-approval' });
+    vi.mocked(h.setup.onAction).mockResolvedValueOnce('refused').mockResolvedValueOnce('accepted');
+    await h.socket().emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        incoming('refused-yes', '', {
+          message: { extendedTextMessage: { text: 'yes', contextInfo: { stanzaId: id } } },
+        }),
+      ],
+    });
+    expect(h.socket().sends).toHaveLength(1);
+    await h.socket().emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        incoming('accepted-yes', '', {
+          message: { extendedTextMessage: { text: 'yes', contextInfo: { stanzaId: id } } },
+        }),
+      ],
+    });
+    expect(h.socket().sends).toHaveLength(2);
+    expect(h.socket().sends[1].content).toMatchObject({
+      text: expect.stringContaining('Allowed'),
+      edit: { id, remoteJid: 'team@g.us', fromMe: true },
+    });
   });
 });

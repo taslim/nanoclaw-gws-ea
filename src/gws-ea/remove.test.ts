@@ -2096,9 +2096,11 @@ describe('Keychain key removal', () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput());
     const scene = world(input);
-    const runCommand = vi.fn(
-      async (): Promise<SanitizedCommandOutcome> => ({ exitCode: 36, stdout: '', stderr: 'unavailable' }),
-    );
+    const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ({
+      exitCode: 36,
+      stdout: '',
+      stderr: 'unavailable',
+    }));
     const outcome = await removeAssistant(paths, input.instance_id, {
       ...scene.dependencies,
       platform: 'linux',
@@ -2135,11 +2137,10 @@ describe('Keychain key removal', () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput());
     const scene = world(input);
-    const runCommand = vi.fn(
-      async (request: SanitizedCommand): Promise<SanitizedCommandOutcome> =>
-        request.args.includes('gws-ea.connections')
-          ? { exitCode: 36, stdout: '', stderr: 'locked' }
-          : { exitCode: 0, stdout: '', stderr: '' },
+    const runCommand = vi.fn(async (request: SanitizedCommand): Promise<SanitizedCommandOutcome> =>
+      request.args.includes('gws-ea.connections')
+        ? { exitCode: 36, stdout: '', stderr: 'locked' }
+        : { exitCode: 0, stdout: '', stderr: '' },
     );
     const outcome = await removeAssistant(paths, input.instance_id, {
       ...scene.dependencies,

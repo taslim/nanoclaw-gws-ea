@@ -151,12 +151,13 @@ beforeEach(async () => {
   }));
   setDeliveryAdapter({
     deliver: async (_channel, platform, _thread, kind, content, files, _instance, id, timestamp) =>
-      adapter.deliver(
-        platform,
-        null,
-        { kind, content: JSON.parse(content) as Record<string, unknown>, files, timestamp },
-        id,
-      ),
+      adapter.deliver(platform, null, {
+        kind,
+        content: JSON.parse(content) as Record<string, unknown>,
+        files,
+        deliveryId: id,
+        timestamp,
+      }),
   });
 });
 afterEach(async () => {
@@ -244,7 +245,11 @@ it('refuses missing principal evidence and non-main callers before any lookup or
 it('refuses a sixth new person before any send or chat handoff and tells main through the existing durable note', async () => {
   await mark('principal-outreach');
   for (let person = 1; person <= 5; person++)
-    await adapter.deliver(`${person}@lid`, null, { kind: 'chat', content: { text: 'Hello' } }, `first-${person}`);
+    await adapter.deliver(`${person}@lid`, null, {
+      kind: 'chat',
+      content: { text: 'Hello' },
+      deliveryId: `first-${person}`,
+    });
   expect(await request(fields)).toMatchObject({
     ok: false,
     error: { message: expect.stringContaining('contact-cap') },

@@ -53,10 +53,9 @@ export class WhatsAppNoticeStore {
 
   pending(): PendingWhatsAppNotice[] {
     return this.db
-      .prepare<
-        [],
-        PendingWhatsAppNotice
-      >('SELECT notice_id, kind, created_at FROM notices WHERE delivered_at IS NULL ORDER BY created_at, notice_id')
+      .prepare<[], PendingWhatsAppNotice>(
+        'SELECT notice_id, kind, created_at FROM notices WHERE delivered_at IS NULL ORDER BY created_at, notice_id',
+      )
       .all();
   }
 

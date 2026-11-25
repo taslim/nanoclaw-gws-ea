@@ -473,11 +473,10 @@ async function readUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Promis
   ]);
   if (!succeeded(listed)) return { failed: listed };
   return {
-    value: parseJsonList(listed.outcome.stdout, 'Google Cloud service-account keys').map(
-      (key) =>
-        requireString(isRecord(key) ? key.name : undefined, 'Google Cloud service-account key name', INVALID_OUTPUT)
-          .split('/')
-          .at(-1)!,
+    value: parseJsonList(listed.outcome.stdout, 'Google Cloud service-account keys').map((key) =>
+      requireString(isRecord(key) ? key.name : undefined, 'Google Cloud service-account key name', INVALID_OUTPUT)
+        .split('/')
+        .at(-1)!,
     ),
   };
 }
@@ -634,8 +633,7 @@ async function readMemberDomainOverrides(
 }
 
 type MemberDomainRestoreRefusal =
-  | { readonly failed: Ran }
-  | { readonly constraint: MemberDomainConstraint; readonly refused: Ran };
+  { readonly failed: Ran } | { readonly constraint: MemberDomainConstraint; readonly refused: Ran };
 
 /**
  * Returns what Google refused, or undefined once the project inherits its

@@ -595,8 +595,7 @@ export function readLatestDelivery(stateRoot: string): LatestDelivery | undefine
   try {
     if (!hasTable(central, 'gws_ea_profile')) return undefined;
     const profile = central.prepare('SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1').get() as
-      | { main_agent_group_id: string | null }
-      | undefined;
+      { main_agent_group_id: string | null } | undefined;
     if (!profile?.main_agent_group_id) return undefined;
     mainAgentGroupId = profile.main_agent_group_id;
     sessionId = mainSessionId(central, mainAgentGroupId);
@@ -658,8 +657,7 @@ export function readLatestProviderTurn(stateRoot: string): LatestProviderTurn | 
   try {
     if (!hasTable(central, 'gws_ea_profile')) return undefined;
     const profile = central.prepare('SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1').get() as
-      | { main_agent_group_id: string | null }
-      | undefined;
+      { main_agent_group_id: string | null } | undefined;
     if (!profile?.main_agent_group_id) return undefined;
     mainAgentGroupId = profile.main_agent_group_id;
     sessionId = hasTable(central, 'sessions') ? mainSessionId(central, mainAgentGroupId) : undefined;
@@ -683,8 +681,7 @@ export function readLatestProviderTurn(stateRoot: string): LatestProviderTurn | 
   try {
     if (!hasTable(outbound, 'session_state')) return result;
     const row = outbound.prepare('SELECT value FROM session_state WHERE key = ?').get(LATEST_PROVIDER_TURN_KEY) as
-      | { value: string }
-      | undefined;
+      { value: string } | undefined;
     if (!row) return result;
     try {
       return { ...result, last: parseProviderTurnOutcome(JSON.parse(row.value) as unknown) };

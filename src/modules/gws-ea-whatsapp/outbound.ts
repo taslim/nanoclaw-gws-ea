@@ -122,7 +122,11 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
     } else if (content.operation === 'edit') {
       const target =
         typeof content.questionId === 'string'
-          ? options.index.requestMessage(content.questionId, platformId)
+          ? typeof content.messageId === 'string' &&
+            options.index.request(content.messageId)?.questionId === content.questionId &&
+            options.index.request(content.messageId)?.platformId === platformId
+            ? content.messageId
+            : options.index.requestMessage(content.questionId, platformId)
           : typeof content.messageId === 'string'
             ? content.messageId
             : undefined;

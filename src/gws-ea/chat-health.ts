@@ -86,8 +86,7 @@ export function parseChatHealth(value: unknown): ChatHealth {
 }
 
 export type ChatReceiving =
-  | { readonly state: 'receiving' }
-  | { readonly state: 'sign_in_needed' | 'not_receiving'; readonly reason: string };
+  { readonly state: 'receiving' } | { readonly state: 'sign_in_needed' | 'not_receiving'; readonly reason: string };
 
 function failing(clause: string, error: ChatHealthError | null): string {
   return error ? `${clause} (${redact(error.message)})` : clause;

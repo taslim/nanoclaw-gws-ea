@@ -233,9 +233,9 @@ export async function createPendingQuestion(pq: PendingQuestion): Promise<boolea
       channel_type: pq.channel_type,
       thread_id: pq.thread_id,
       title: pq.title,
-      question: pq.question,
+      question: pq.question ?? '',
       options_json: JSON.stringify(pq.options),
-      deadline: pq.deadline,
+      deadline: pq.deadline ?? null,
       created_at: pq.created_at,
     },
   );
@@ -354,28 +354,37 @@ export async function getPendingApprovalsByAction(action: string): Promise<Pendi
 }
 
 /**
- * Resolve ask_question render metadata for any card. Approval-backed rows
- * include the original question body so the bridge can retain it when the
- * card resolves; generic pending_questions intentionally keep their existing
- * title + options shape, with the deadline past which they take no answer.
- * An approval whose status is no longer pending is resolved. Each render says
- * whether an agent asked it (a pending question) or it is an approval.
+ * Resolve ask_question render metadata for any card. Every row type includes
+ * the original question body (empty on rows older than its migration) so the
+ * bridge can retain it when the card resolves. Pending questions also carry
+ * the deadline past which they take no answer; an approval whose status is no
+ * longer pending is marked resolved. Each render says whether an agent asked it
+ * (a pending question) or it is an approval.
  */
 export async function getAskQuestionRender(id: string): Promise<
   | {
       title: string;
       question?: string;
+      fromAgent?: boolean;
       options: import('../channels/ask-question.js').NormalizedOption[];
       deferResolution?: boolean;
       expiresAt?: string;
       resolved?: boolean;
+      platformId?: string;
       kind: 'question' | 'approval';
     }
   | undefined
 > {
   const q = await getPendingQuestion(id);
+  // Only agent-asked questions land in pending_questions (delivery.ts).
   if (q)
-    return { title: q.title, kind: 'question', options: q.options, ...(q.deadline ? { expiresAt: q.deadline } : {}) };
+    return {
+      title: q.title,
+      kind: 'question',
+      ...(q.question ? { question: q.question, fromAgent: true } : {}),
+      options: q.options,
+      ...(q.deadline ? { expiresAt: q.deadline } : {}),
+    };
   const a = await getDb().get<{
     title: string;
     question: string;
@@ -383,8 +392,9 @@ export async function getAskQuestionRender(id: string): Promise<
     action: string;
     status: PendingApproval['status'];
     expires_at: string | null;
+    platform_id: string | null;
   }>(
-    'SELECT title, question, options_json, action, status, expires_at FROM pending_approvals WHERE approval_id = ?',
+    'SELECT title, question, options_json, action, status, expires_at, platform_id FROM pending_approvals WHERE approval_id = ?',
     id,
   );
   if (a?.title)
@@ -396,6 +406,7 @@ export async function getAskQuestionRender(id: string): Promise<
       ...(a.action === 'gateway_request' ? { deferResolution: true } : {}),
       ...(a.status === 'pending' ? {} : { resolved: true }),
       ...(a.status === 'pending' && a.expires_at ? { expiresAt: a.expires_at } : {}),
+      ...(a.platform_id ? { platformId: a.platform_id } : {}),
     };
 
   // Channel-registration + unknown-sender approvals persist the same render

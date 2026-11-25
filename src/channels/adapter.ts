@@ -4,6 +4,7 @@
  * Channel adapters bridge NanoClaw with messaging platforms (Discord, Slack, etc.).
  * Two patterns: native adapters (implement directly) or Chat SDK bridge (wrap a Chat SDK adapter).
  */
+import type { ResponseOutcome } from '../response-registry.js';
 
 import type { EngageMode } from '../types.js';
 
@@ -26,8 +27,10 @@ export interface ChannelSetup {
   /**
    * Called when someone answers a question or approval request, by a card's
    * button or in words on a channel whose requests are text. Waits for the
-   * same readiness as onInbound, then settles with the answer's handler,
-   * rejecting when it fails so a channel that redelivers can hand it over again.
+   * same readiness as onInbound, then resolves with what the host did: a card
+   * or text request shows a resolution only for 'accepted'. When
+   * `answer.redeliverOnError` is set, a pre-acceptance failure rejects so a
+   * channel that redelivers can hand it over again.
    */
   onAction(
     questionId: string,
@@ -40,16 +43,16 @@ export interface ChannelSetup {
       threadId?: string | null;
     },
     answer?: ActionAnswer,
-  ): void | Promise<void>;
+  ): void | Promise<ResponseOutcome>;
 }
 
 export interface ActionAnswer {
   /**
-   * The channel left the request as posted, for the answer's handler to edit
-   * to its outcome once it has authorized the answer. Set when a request's
-   * presentation defers resolution, and on channels whose requests are text.
+   * Reject on a pre-acceptance handler error instead of returning 'ignored',
+   * so a channel that redelivers (Google Chat Pub/Sub, WhatsApp) can hand the
+   * answer over again.
    */
-  deferResolution?: boolean;
+  redeliverOnError?: boolean;
   /** The reason given with a rejection: in words, the text after the no. */
   reason?: string;
 }
@@ -180,6 +183,8 @@ export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox, or a host request's pictures
+  /** Unique host-wide (session and outbound row id), the same on every retry of this message. */
+  deliveryId?: string;
   /** Original outbound row time, stamped by the host; absent for direct host sends. */
   timestamp?: string;
 }
@@ -199,6 +204,23 @@ export interface ResolvedConversation {
   participantNames?: string[];
   /** Parallel to participantNames (same length and order) when both are present. */
   participantIds?: string[];
+}
+
+/** One earlier line of a conversation, read back from the platform. */
+export interface HistoryLine {
+  /** Platform message id, the same id an inbound message of that line carries. */
+  id: string;
+  timestamp: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  isBot: boolean;
+  /** Written by this adapter's own bot user. */
+  isSelf: boolean;
+  /** The thread the line belongs to, when the platform says; a thread's opener carries its own thread's id. */
+  threadId?: string;
+  /** The platform's own message, as the adapter received it, for readers that need a platform-specific field. */
+  raw?: unknown;
 }
 
 /** Wiring/mg defaults for one conversation context (DM vs group/channel). */
@@ -314,16 +336,12 @@ export interface ChannelAdapter {
   isConnected(): boolean;
 
   /**
-   * Return the platform message ID after sending. `messageId` is the durable
-   * outbound row ID when delivery owns one, for platform idempotency. A linked
-   * but disconnected adapter throws ChannelNotConnectedError without sending.
+   * Return the platform message ID after sending. `message.deliveryId` is the
+   * durable host-wide delivery key when delivery owns one, for platform
+   * idempotency and split-reply resume. A linked but disconnected adapter
+   * throws ChannelNotConnectedError without sending.
    */
-  deliver(
-    platformId: string,
-    threadId: string | null,
-    message: OutboundMessage,
-    messageId?: string,
-  ): Promise<string | undefined>;
+  deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
 
   // Optional
   /**
@@ -380,6 +398,14 @@ export interface ChannelAdapter {
    * treats absence as a no-op.
    */
   subscribe?(platformId: string, threadId: string): Promise<void>;
+
+  /**
+   * Read the newest `limit` lines of a thread, or of the chat's top level when
+   * threadId is null, oldest first. Rejects a threadId that does not belong to
+   * platformId. Adapters whose platform has no way to read earlier messages
+   * omit this.
+   */
+  readHistory?(platformId: string, threadId: string | null, options: { limit: number }): Promise<HistoryLine[]>;
 
   /**
    * Open (or fetch) a DM with this user, returning the platform_id of the

@@ -37,10 +37,8 @@ registerCapability(MAIN_CONTEXT_CAPABILITY, {
 // Pinned because Claude Code otherwise picks its prompt by model: on any model
 // the shorter one keeps the agent loop and leaves out the software-engineering
 // framing, so the character leads.
-registerContainerEnv(
-  'gws-ea-main:system-prompt',
-  ({ capabilities }): Record<string, string> =>
-    capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' } : {},
+registerContainerEnv('gws-ea-main:system-prompt', ({ capabilities }): Record<string, string> =>
+  capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' } : {},
 );
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',

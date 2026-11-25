@@ -46,9 +46,13 @@ describe('native WhatsApp outreach', () => {
       content: { groupInvite: { inviteCode: 'person-only-invite', jid: 'team@g.us', subject: 'Dinner' } },
     });
     for (let number = 1; number <= 4; number++)
-      await adapter.deliver(`${number}@lid`, null, { kind: 'chat', content: { text: 'Hi' } }, `contact-${number}`);
+      await adapter.deliver(`${number}@lid`, null, {
+        kind: 'chat',
+        content: { text: 'Hi' },
+        deliveryId: `contact-${number}`,
+      });
     await expect(
-      adapter.deliver('5@lid', null, { kind: 'chat', content: { text: 'Hi' } }, 'sixth'),
+      adapter.deliver('5@lid', null, { kind: 'chat', content: { text: 'Hi' }, deliveryId: 'sixth' }),
     ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-cap' });
     expect(await adapter.addParticipant('team@g.us', person, request)).toBe('invited');
     expect(h.socket().participantUpdates).toHaveLength(1);
@@ -96,17 +100,21 @@ it('defers an admitted DM to the real outbound row and never lends a fresh post-
   expect(h.socket().sends).toEqual([]);
   h.socket().sendError = Object.assign(new Error('refused'), { output: { statusCode: 463 } });
   await expect(
-    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hello' } }, 'first-row'),
+    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hello' }, deliveryId: 'first-row' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   h.socket().sendError = undefined;
   h.now.value += 24 * 60 * 60 * 1000 + 1;
   await expect(
-    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Old reminder' } }, 'old-reminder'),
+    adapter.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Old reminder' }, deliveryId: 'old-reminder' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   await adapter.teardown();
   const offline = await h.start({}, false);
   await expect(
-    offline.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Offline reminder' } }, 'offline-reminder'),
+    offline.deliver('12000@lid', null, {
+      kind: 'chat',
+      content: { text: 'Offline reminder' },
+      deliveryId: 'offline-reminder',
+    }),
   ).rejects.toMatchObject({ name: 'ChannelNotConnectedError' });
   h.now.value += 1;
   await h.socket().emit('connection.update', { connection: 'open' });
@@ -114,29 +122,37 @@ it('defers an admitted DM to the real outbound row and never lends a fresh post-
   await offline.teardown();
   const fresh = await h.start();
   await expect(
-    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hello' } }, 'first-row'),
+    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Hello' }, deliveryId: 'first-row' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   await expect(
-    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Offline reminder' } }, 'offline-reminder'),
+    fresh.deliver('12000@lid', null, {
+      kind: 'chat',
+      content: { text: 'Offline reminder' },
+      deliveryId: 'offline-reminder',
+    }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   await expect(
-    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Old reminder' } }, 'old-reminder'),
+    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Old reminder' }, deliveryId: 'old-reminder' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   await expect(
-    fresh.deliver(
-      '12000@lid',
-      null,
-      {
-        kind: 'chat',
-        timestamp: new Date(h.now.value - 1).toISOString(),
-        content: { text: 'Queued before the new request' },
-      },
-      'older-queued-row',
-    ),
+    fresh.deliver('12000@lid', null, {
+      kind: 'chat',
+      timestamp: new Date(h.now.value - 1).toISOString(),
+      content: { text: 'Queued before the new request' },
+      deliveryId: 'older-queued-row',
+    }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
-  await fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'A newly requested hello' } }, 'fresh-row');
+  await fresh.deliver('12000@lid', null, {
+    kind: 'chat',
+    content: { text: 'A newly requested hello' },
+    deliveryId: 'fresh-row',
+  });
   await expect(
-    fresh.deliver('12000@lid', null, { kind: 'chat', content: { text: 'Unrelated reminder' } }, 'unrelated-row'),
+    fresh.deliver('12000@lid', null, {
+      kind: 'chat',
+      content: { text: 'Unrelated reminder' },
+      deliveryId: 'unrelated-row',
+    }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   expect(h.socket().sends).toHaveLength(1);
 });
@@ -146,7 +162,11 @@ it('checks cap and time-lock before group creation, participant adds and per-per
   const adapter = await h.start();
   h.socket().groups.set('team@g.us', { id: 'team@g.us', owner: undefined, subject: 'Dinner', participants: [] });
   for (let number = 1; number <= 5; number++)
-    await adapter.deliver(`${number}@lid`, null, { kind: 'chat', content: { text: 'Hi' } }, `new-${number}`);
+    await adapter.deliver(`${number}@lid`, null, {
+      kind: 'chat',
+      content: { text: 'Hi' },
+      deliveryId: `new-${number}`,
+    });
   await expect(adapter.createGroup('Dinner', [person], request)).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-cap',
   });
@@ -251,12 +271,11 @@ it('refuses a private group subject before creating the group or reserving first
   });
   expect(h.socket().createdGroups).toEqual([]);
   for (let number = 1; number <= 5; number++)
-    await adapter.deliver(
-      `${number}@lid`,
-      null,
-      { kind: 'chat', content: { text: 'Hi' } },
-      `privacy-not-counted-${number}`,
-    );
+    await adapter.deliver(`${number}@lid`, null, {
+      kind: 'chat',
+      content: { text: 'Hi' },
+      deliveryId: `privacy-not-counted-${number}`,
+    });
 });
 
 it('checks the freshly read per-person invite subject before handing it to a nonmember', async () => {

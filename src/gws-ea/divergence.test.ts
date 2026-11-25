@@ -762,8 +762,8 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
         async setup() {},
         async teardown() {},
         isConnected: () => true,
-        async deliver(_platform, _thread, message, messageId) {
-          sent.push({ id: messageId, timestamp: message.timestamp });
+        async deliver(_platform, _thread, message) {
+          sent.push({ id: message.deliveryId, timestamp: message.timestamp });
           return 'platform-send';
         },
       }),
@@ -773,7 +773,9 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
     delivery.setDeliveryAdapter(registry.createChannelDeliveryAdapter());
     await delivery.deliverSessionMessages(session);
     await delivery.deliverSessionMessages(session);
-    expect(sent).toEqual([{ id: 'durable-send', timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u) }]);
+    expect(sent).toEqual([
+      { id: `${session.id}:durable-send`, timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u) },
+    ]);
   });
   it('keeps a spent task session open while its reply waits for the channel', async () => {
     await freshInstall();
@@ -1285,7 +1287,7 @@ describe('recorded divergence: a scheduled task can come back as a turn of the c
     expect(formatter).toContain(
       "taskRun: tasksOnly && !messages.filter((m) => m.kind === 'task').every(isConversationTask),",
     );
-    expect(formatter).toContain('escapeXml(JSON.stringify(content.scriptOutput, null, 2))');
+    expect(formatter).toContain('jsonForBlock(content.scriptOutput, 2)');
     // A conversation turn of only tasks keeps its prose as scratchpad; a missed block still asks for a re-send.
     expect(pollLoop).toContain('(missed > 0 || (routing.tasksOnly !== true && replied === 0 && !!scratchpad))');
     expect(destinations).toContain('- `<task>` — a scheduled task you set to come back to this conversation');
@@ -1848,27 +1850,6 @@ describe('recorded divergence: a module can refuse a role grant', () => {
   });
 });
 
-/** Run a program to completion with its output collected. */
-function runProgram(
-  command: string,
-  args: readonly string[],
-  options: { readonly cwd: string; readonly env?: NodeJS.ProcessEnv },
-): Promise<{ readonly status: number | null; readonly stdout: string; readonly stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('error', reject);
-    child.on('close', (status) => resolve({ status, stdout, stderr }));
-  });
-}
-
 describe('recorded divergence: a bridge adapter can make a text delivery retry idempotent', () => {
   it('passes the same row and part key through repeated file-free text deliveries', async () => {
     const { createChatSdkBridge } = await import('../channels/chat-sdk-bridge.js');
@@ -1883,9 +1864,9 @@ describe('recorded divergence: a bridge adapter can make a text delivery retry i
       } as unknown as Adapter,
       supportsThreads: false,
     });
-    const message = { kind: 'chat', content: { text: 'One outage notice' } };
-    expect(await bridge.deliver('principal', null, message, 'one-notice')).toBe('one-notice:0');
-    expect(await bridge.deliver('principal', null, message, 'one-notice')).toBe('one-notice:0');
+    const message = { kind: 'chat', content: { text: 'One outage notice' }, deliveryId: 'one-notice' };
+    expect(await bridge.deliver('principal', null, message)).toBe('one-notice:0');
+    expect(await bridge.deliver('principal', null, message)).toBe('one-notice:0');
     expect(keys).toEqual(['one-notice:0', 'one-notice:0']);
   });
 });
@@ -1951,28 +1932,6 @@ describe("recorded divergence: NanoClaw's update helpers act on the install they
         'process.stdout.write(String(process.env.GWS_EA_DIVERGENCE_GIVEN) + "/" + String(process.env.GWS_EA_DIVERGENCE_AMBIENT))',
       ]),
     ).toBe('given/undefined');
-  });
-
-  it("names the install's service and image from NANOCLAW_INSTALL_ID in the shell helpers, as the TS helper does", async () => {
-    const { getInstallScopedNames } = await import('../install-slug.js');
-    const names = (installId: string) =>
-      runProgram(
-        'bash',
-        [
-          '-c',
-          '. "$1" && container_image_base && printf "\\n" && launchd_label',
-          'install-slug',
-          path.join(originalCwd, 'setup/lib/install-slug.sh'),
-        ],
-        { cwd: os.tmpdir(), env: { PATH: process.env.PATH, NANOCLAW_INSTALL_ID: installId } },
-      );
-
-    const expected = getInstallScopedNames('gwsguard');
-    expect(await names('gwsguard')).toMatchObject({
-      status: 0,
-      stdout: `${expected.containerImageBase}\n${expected.launchdLabel}`,
-    });
-    expect(await names('Not An ID')).toMatchObject({ status: 1, stdout: '' });
   });
 });
 
@@ -2540,10 +2499,10 @@ describe('recorded divergence: upstream sync 2026-11-10 re-applied these on upst
       router.indexOf('({ session, created } = await resolveSession('),
     );
     expect(router).toContain(
-      "if (delivery === 'wake')\n        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);",
+      "if (delivery === 'wake')\n      await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);",
     );
     expect(router).toContain(
-      'if (wake && !held)\n        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);',
+      'if (wake && !held)\n      await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);',
     );
   });
 

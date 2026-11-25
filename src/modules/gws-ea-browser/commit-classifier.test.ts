@@ -152,9 +152,10 @@ describe('the open rule', () => {
       [button('Continue', { region: region() }), 'ordinary'],
       // An unnamed press in a transaction form is no preparation the host can name.
       [button('', checkout), 'purchase_control'],
-      ...preparation.map(
-        ([name, visibleLabel]): ClassCase => [button(name, { ...checkout, visibleLabel }), 'ordinary'],
-      ),
+      ...preparation.map(([name, visibleLabel]): ClassCase => [
+        button(name, { ...checkout, visibleLabel }),
+        'ordinary',
+      ]),
       [button('Increase quantity', { ...checkout, visibleLabel: 'Pay' }), 'purchase_control'],
       // Choices and fields are never a commit; a link is decided by its route.
       [button('Quantity', { ...checkout, tag: 'select', type: 'select-one' }), 'ordinary'],

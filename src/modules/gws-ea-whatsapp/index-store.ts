@@ -282,22 +282,19 @@ export class WhatsAppIndex {
   lid(phone: string): string | undefined {
     return (
       this.db.prepare('SELECT lid FROM aliases WHERE account=? AND phone=?').get(this.account(), phone) as
-        | { lid: string }
-        | undefined
+        { lid: string } | undefined
     )?.lid;
   }
   phone(lid: string): string | undefined {
     return (
       this.db.prepare('SELECT phone FROM aliases WHERE account=? AND lid=?').get(this.account(), lid) as
-        | { phone: string }
-        | undefined
+        { phone: string } | undefined
     )?.phone;
   }
   name(jid: string): string | undefined {
     return (
       this.db.prepare('SELECT name FROM names WHERE account=? AND jid=?').get(this.account(), jid) as
-        | { name: string }
-        | undefined
+        { name: string } | undefined
     )?.name;
   }
   rememberName(jid: string, name: string): void {

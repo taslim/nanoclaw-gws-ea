@@ -145,10 +145,9 @@ export class LoginStore {
     return {
       hasSecrets: () =>
         db
-          .prepare<
-            [],
-            { present: number }
-          >('SELECT EXISTS(SELECT 1 FROM logins UNION ALL SELECT 1 FROM attempts WHERE password IS NOT NULL) AS present')
+          .prepare<[], { present: number }>(
+            'SELECT EXISTS(SELECT 1 FROM logins UNION ALL SELECT 1 FROM attempts WHERE password IS NOT NULL) AS present',
+          )
           .get()?.present === 1,
       readCheck: () =>
         db.prepare<[], { key_check: Buffer }>('SELECT key_check FROM meta WHERE id = 1').get()?.key_check,
@@ -200,10 +199,9 @@ export class LoginStore {
         db
           .transaction(() => {
             const current = db
-              .prepare<
-                [string],
-                SavedLogin & { password: Buffer }
-              >(`SELECT ${COLUMNS}, password FROM logins WHERE id = ?`)
+              .prepare<[string], SavedLogin & { password: Buffer }>(
+                `SELECT ${COLUMNS}, password FROM logins WHERE id = ?`,
+              )
               .get(id);
             if (!current) throw new LoginStoreError('no_item_for_site');
             if (current.version !== version) throw new LoginDetailsError('login_changed');
@@ -360,10 +358,9 @@ export class LoginStore {
   async unresolvedAttempts(): Promise<CredentialAttempt[]> {
     return this.use((db) =>
       db
-        .prepare<
-          [],
-          CredentialAttempt
-        >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE phase NOT IN ('rejected','finalized') ORDER BY created_at, id`)
+        .prepare<[], CredentialAttempt>(
+          `SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE phase NOT IN ('rejected','finalized') ORDER BY created_at, id`,
+        )
         .all(),
     );
   }
@@ -371,10 +368,9 @@ export class LoginStore {
     return this.use(
       (db) =>
         db
-          .prepare<
-            [],
-            { count: number }
-          >("SELECT COUNT(*) AS count FROM attempts WHERE phase NOT IN ('rejected','finalized')")
+          .prepare<[], { count: number }>(
+            "SELECT COUNT(*) AS count FROM attempts WHERE phase NOT IN ('rejected','finalized')",
+          )
           .get()?.count ?? 0,
     );
   }
@@ -428,10 +424,9 @@ export class LoginStore {
                 )
                   throw new LoginDetailsError('login_changed');
                 const open = db
-                  .prepare<
-                    [string],
-                    CredentialAttempt
-                  >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE source_login_id = ? AND phase NOT IN ('rejected','finalized')`)
+                  .prepare<[string], CredentialAttempt>(
+                    `SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE source_login_id = ? AND phase NOT IN ('rejected','finalized')`,
+                  )
                   .get(login.id);
                 if (open) {
                   if (open.job_id === attempt.job_id || open.phase !== 'saved') return 'busy';
@@ -586,10 +581,9 @@ export class LoginStore {
       db
         .transaction(() => {
           const saved = db
-            .prepare<
-              [string],
-              CredentialAttempt
-            >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ? AND phase = 'saved' ORDER BY created_at, id`)
+            .prepare<[string], CredentialAttempt>(
+              `SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ? AND phase = 'saved' ORDER BY created_at, id`,
+            )
             .all(jobId);
           return saved.map((attempt) => this.move(db, attempt.id, ['saved'], 'rejected'));
         })
@@ -602,10 +596,9 @@ export class LoginStore {
     destination?: Pick<SavedLogin, 'domain' | 'username'>,
   ): CredentialAttempt[] {
     const open = db
-      .prepare<
-        [string | null, string | null, string | null],
-        CredentialAttempt
-      >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE (source_login_id = ? OR (kind = 'signup' AND site = ? AND username = ?)) AND phase NOT IN ('rejected','finalized')`)
+      .prepare<[string | null, string | null, string | null], CredentialAttempt>(
+        `SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE (source_login_id = ? OR (kind = 'signup' AND site = ? AND username = ?)) AND phase NOT IN ('rejected','finalized')`,
+      )
       .all(loginId, destination?.domain ?? null, destination?.username ?? null);
     if (open.some((attempt) => attempt.phase !== 'saved')) throw new LoginDetailsError('login_busy');
     return open;

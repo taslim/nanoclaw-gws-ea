@@ -21,12 +21,10 @@ registerCapability(JOB_DOCUMENTS_CAPABILITY, {
 });
 // Main's shorter system prompt, for external-chat's same character; a job
 // agent holds the chat tools too, beside its documents.
-registerContainerEnv(
-  'gws-ea-chat-agents:system-prompt',
-  ({ capabilities }): Record<string, string> =>
-    capabilities.has(CHAT_TOOLS_CAPABILITY) && !capabilities.has(JOB_DOCUMENTS_CAPABILITY)
-      ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' }
-      : {},
+registerContainerEnv('gws-ea-chat-agents:system-prompt', ({ capabilities }): Record<string, string> =>
+  capabilities.has(CHAT_TOOLS_CAPABILITY) && !capabilities.has(JOB_DOCUMENTS_CAPABILITY)
+    ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' }
+    : {},
 );
 
 export const EXTERNAL_CHAT_CAPABILITIES: readonly string[] = [

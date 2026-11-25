@@ -99,6 +99,8 @@ export interface GatewayApprovalRequest {
     resource: string;
     reason: string;
     details?: { label: string; value: string }[];
+    /** Details left out after the sixth; the card shows the count. */
+    omittedDetails?: number;
   };
   /** Policy-selected, privacy-reviewed fields. Rejected if oversized; never silently truncated. */
   displayFields?: Array<

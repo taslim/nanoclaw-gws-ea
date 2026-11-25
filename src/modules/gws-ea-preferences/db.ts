@@ -49,8 +49,7 @@ interface Provenance {
 
 /** Times are local `HH:MM` in the principal's timezone. */
 export type WorkingHoursPreference = Provenance & { readonly weekday: Weekday } & (
-    | { readonly off: false; readonly start: string; readonly end: string }
-    | { readonly off: true }
+    { readonly off: false; readonly start: string; readonly end: string } | { readonly off: true }
   );
 
 /** A weekly time kept free. No two windows share days and hours; `id` is the handle `ncl preferences` takes. */

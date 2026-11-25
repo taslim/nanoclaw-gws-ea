@@ -176,20 +176,25 @@ export async function waitForSessionChannelDelivery(sessionId: string): Promise<
     clearTimeout(timeout);
   }
 }
-function claimChannelDelivery(sessionId: string, messageId: string): void {
+/** Host-wide delivery key for one session's outbound row (same across retries). */
+export function deliveryIdFor(sessionId: string, messageId: string): string {
+  return `${sessionId}:${messageId}`;
+}
+
+function claimChannelDelivery(sessionId: string, deliveryId: string): void {
   let finish!: () => void;
   const done = new Promise<void>((resolve) => {
     finish = resolve;
   });
   const claims = inflightChannelDeliveries.get(sessionId) ?? new Map();
-  claims.set(messageId, { done, finish });
+  claims.set(deliveryId, { done, finish });
   inflightChannelDeliveries.set(sessionId, claims);
 }
-function finishChannelDelivery(sessionId: string, messageId: string): void {
+function finishChannelDelivery(sessionId: string, deliveryId: string): void {
   const claims = inflightChannelDeliveries.get(sessionId);
-  const claim = claims?.get(messageId);
+  const claim = claims?.get(deliveryId);
   if (!claims || !claim) return;
-  claims.delete(messageId);
+  claims.delete(deliveryId);
   if (claims.size === 0) inflightChannelDeliveries.delete(sessionId);
   claim.finish();
 }
@@ -238,8 +243,8 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
-    /** Durable outbound row ID, when the send belongs to a mailbox row. */
-    messageId?: string,
+    /** Session and outbound row id, unique host-wide and the same on every retry: lets a split reply resume. */
+    deliveryId?: string,
     /** Original outbound row time, independent of when the adapter first sees it. */
     timestamp?: string,
     /** Host-owned source session; its closure revokes a mailbox send even after guards awaited. */
@@ -349,14 +354,14 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
       content,
       files,
       instance,
-      messageId,
+      deliveryId,
       timestamp,
       sourceSessionId,
     ) {
       await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
       // Claim before the async status read so closure cannot finish between that read and adapter entry.
-      if (sourceSessionId !== undefined && messageId !== undefined && inflightDeliveries.has(sourceSessionId))
-        claimChannelDelivery(sourceSessionId, messageId);
+      if (sourceSessionId !== undefined && deliveryId !== undefined && inflightDeliveries.has(sourceSessionId))
+        claimChannelDelivery(sourceSessionId, deliveryId);
       if (sourceSessionId !== undefined && (await getSession(sourceSessionId))?.status !== 'active')
         throw new OutboundRefusedError('core:session-closed', 'The conversation that produced this message ended.');
       const key = instance ?? channelType;
@@ -373,7 +378,7 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
           content,
           files,
           instance,
-          messageId,
+          deliveryId,
           timestamp,
         );
       } catch (error) {
@@ -611,7 +616,7 @@ async function drainSession(session: Session): Promise<void> {
     } catch (err) {
       if ((await settleFailedSend(msg, session, agentGroup, err)) === 'given-up') givenUp.push(msg);
     } finally {
-      finishChannelDelivery(session.id, msg.id);
+      finishChannelDelivery(session.id, deliveryIdFor(session.id, msg.id));
     }
   }
 
@@ -651,7 +656,7 @@ async function completeDelivery(
   );
   await clearAttemptRow(msg.id);
   // Recorded: a cleanup waiting on this send need not wait for the hooks too.
-  finishChannelDelivery(session.id, msg.id);
+  finishChannelDelivery(session.id, deliveryIdFor(session.id, msg.id));
   if (msg.kind !== 'system' && msg.channelType !== 'agent') {
     pauseTypingRefreshAfterDelivery(session.id);
     if (msg.kind !== 'task_log') {
@@ -772,7 +777,7 @@ async function recordGivenUp(
  */
 function releaseGivenUp(msg: OutboundMessage, session: Session, agentGroup: AgentGroup, recorded: Set<string>): void {
   if (recorded.has(msg.id)) {
-    finishChannelDelivery(session.id, msg.id);
+    finishChannelDelivery(session.id, deliveryIdFor(session.id, msg.id));
     unparkDelivery(session.id, msg.id);
     return;
   }
@@ -890,7 +895,7 @@ function parkOverdueDelivery(
     })
     .finally(() => {
       if (gaveUp) return;
-      finishChannelDelivery(session.id, msg.id);
+      finishChannelDelivery(session.id, deliveryIdFor(session.id, msg.id));
       unparkDelivery(session.id, msg.id);
     });
 }
@@ -1103,6 +1108,8 @@ async function deliverMessage(
     content.type === 'ask_question'
       ? JSON.stringify({ ...content, fromAgent: true })
       : withPlatformMessageId(content, msg.content, session.agent_group_id);
+  // A row id is unique only within its session's mailbox; the session id makes it unique host-wide.
+  const deliveryId = deliveryIdFor(session.id, msg.id);
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channelType,
     msg.platformId,
@@ -1111,7 +1118,7 @@ async function deliverMessage(
     deliveredContent,
     files,
     deliverInstance,
-    msg.id,
+    deliveryId,
     msg.timestamp,
     session.id,
   );
@@ -1213,8 +1220,7 @@ export function registerDeliveryFailedHook(hook: DeliveryFailedHook): void {
 export type DeliveryActionHandler = (content: Record<string, unknown>, session: Session) => Promise<void>;
 
 type DeliveryEntry =
-  | { guard: Unguarded; handler: DeliveryActionHandler }
-  | { guard: DeliveryGuardSpec; handler: GuardedDeliveryHandler };
+  { guard: Unguarded; handler: DeliveryActionHandler } | { guard: DeliveryGuardSpec; handler: GuardedDeliveryHandler };
 
 const deliveryActions = new Map<string, DeliveryEntry>();
 

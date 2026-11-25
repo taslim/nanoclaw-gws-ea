@@ -134,7 +134,7 @@ CREATE TABLE pending_questions (
   title          TEXT NOT NULL,
   options_json   TEXT NOT NULL,
   created_at     TEXT NOT NULL,
-  question       TEXT NOT NULL DEFAULT '',  -- the body, kept for its outcome in place (migration 027)
+  question       TEXT NOT NULL DEFAULT '',  -- card body, added by migration 026 (guarded in 027)
   deadline       TEXT                       -- when the asking agent stops waiting (migration 027)
 );
 

@@ -52,11 +52,7 @@ import { recordCalendarSync } from './health.js';
 import type { ParsedMail } from './mime.js';
 
 export type CalendarNotificationType =
-  | 'eventCreation'
-  | 'eventChange'
-  | 'eventCancellation'
-  | 'eventResponse'
-  | 'agenda';
+  'eventCreation' | 'eventChange' | 'eventCancellation' | 'eventResponse' | 'agenda';
 
 export interface CalendarNotification {
   readonly type: CalendarNotificationType;

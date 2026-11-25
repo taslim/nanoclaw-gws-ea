@@ -52,10 +52,8 @@ registerCapability(EXTERNAL_EMAIL_TOOLS_CAPABILITY, {
   instructions: [EXTERNAL_EMAIL_TOOLS_CAPABILITY],
 });
 // Main's shorter system prompt, for the same character.
-registerContainerEnv(
-  'gws-ea-external-email:system-prompt',
-  ({ capabilities }): Record<string, string> =>
-    capabilities.has(EXTERNAL_EMAIL_TOOLS_CAPABILITY) ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' } : {},
+registerContainerEnv('gws-ea-external-email:system-prompt', ({ capabilities }): Record<string, string> =>
+  capabilities.has(EXTERNAL_EMAIL_TOOLS_CAPABILITY) ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' } : {},
 );
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */

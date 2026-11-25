@@ -139,12 +139,7 @@ export interface RecentRelayResult {
   readonly updatedAt: string;
 }
 export type ConnectionsStoreReason =
-  | 'store_unavailable'
-  | 'app_not_found'
-  | 'app_changed'
-  | 'duplicate_name'
-  | 'duplicate_host'
-  | 'invalid_details';
+  'store_unavailable' | 'app_not_found' | 'app_changed' | 'duplicate_name' | 'duplicate_host' | 'invalid_details';
 
 export class ConnectionsStoreError extends Error {
   constructor(readonly reason: ConnectionsStoreReason) {
@@ -1074,10 +1069,9 @@ export class ConnectionsStore {
   async refusedGrants(): Promise<readonly { readonly appId: string; readonly generation: number }[]> {
     return this.use((db) =>
       db
-        .prepare<
-          [],
-          { appId: string; generation: number }
-        >("SELECT app_id AS appId, generation FROM grants WHERE state = 'refused' ORDER BY app_id")
+        .prepare<[], { appId: string; generation: number }>(
+          "SELECT app_id AS appId, generation FROM grants WHERE state = 'refused' ORDER BY app_id",
+        )
         .all(),
     );
   }
@@ -1326,10 +1320,9 @@ export class ConnectionsStore {
     const stateHash = hashState(state);
     const pending = (db: Database.Database): SignInRow | undefined => {
       const row = db
-        .prepare<
-          [string],
-          SignInRow
-        >(`SELECT s.*, a.host FROM sign_ins s JOIN apps a ON a.id = s.app_id WHERE s.state_hash = ?`)
+        .prepare<[string], SignInRow>(
+          `SELECT s.*, a.host FROM sign_ins s JOIN apps a ON a.id = s.app_id WHERE s.state_hash = ?`,
+        )
         .get(stateHash);
       if (!row || row.host !== match.host || row.principal_id !== match.principalId || row.claimed_at !== null)
         return undefined;
@@ -1704,10 +1697,9 @@ export class ConnectionsStore {
   private readToolDecisionRevision(db: Database.Database, appId: string, name: string): number {
     return (
       db
-        .prepare<
-          [string, string],
-          { revision: number }
-        >('SELECT revision FROM app_tool_revisions WHERE app_id = ? AND name = ?')
+        .prepare<[string, string], { revision: number }>(
+          'SELECT revision FROM app_tool_revisions WHERE app_id = ? AND name = ?',
+        )
         .get(appId, name)?.revision ?? 0
     );
   }
@@ -1830,10 +1822,9 @@ export class ConnectionsStore {
         .transaction(
           (): 'applied' | 'already_settled' | 'grant_changed' | 'definition_changed' | 'principal_changed' => {
             const settled = db
-              .prepare<
-                [string],
-                { request_id: string }
-              >('SELECT request_id FROM settled_tool_ask_requests WHERE request_id = ?')
+              .prepare<[string], { request_id: string }>(
+                'SELECT request_id FROM settled_tool_ask_requests WHERE request_id = ?',
+              )
               .get(input.requestId);
             if (settled) return 'already_settled';
             if (input.expectedGrantGeneration !== undefined) {
@@ -2368,10 +2359,9 @@ export class ConnectionsStore {
       db
         .transaction(() => {
           const row = db
-            .prepare<
-              [string],
-              { app_id: string; approval_id: string | null; grant_generation: number }
-            >('SELECT app_id, approval_id, grant_generation FROM relay_calls WHERE id = ?')
+            .prepare<[string], { app_id: string; approval_id: string | null; grant_generation: number }>(
+              'SELECT app_id, approval_id, grant_generation FROM relay_calls WHERE id = ?',
+            )
             .get(id);
           let persistedOutcome = outcome.outcomeJson ?? null;
           if (row && row.approval_id === null && persistedOutcome !== null) {

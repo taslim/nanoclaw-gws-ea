@@ -11,16 +11,7 @@ import {
   LESSONS_DATA_SCHEMA,
 } from './result-schema.js';
 export type AttemptCommand =
-  | 'create'
-  | 'resume'
-  | 'connect-google'
-  | 'start'
-  | 'stop'
-  | 'restart'
-  | 'update'
-  | 'rollback'
-  | 'remove'
-  | 'cleanup';
+  'create' | 'resume' | 'connect-google' | 'start' | 'stop' | 'restart' | 'update' | 'rollback' | 'remove' | 'cleanup';
 
 export type CommandHandler =
   | { readonly kind: 'attempt'; readonly command: AttemptCommand }
@@ -67,13 +58,7 @@ export interface CommandDefinition {
   readonly options: readonly OptionDefinition[];
   readonly arguments?: readonly ArgumentDefinition[];
   readonly scope:
-    | 'new-assistant'
-    | 'assistant'
-    | 'registry'
-    | 'assistant-or-registry'
-    | 'tool-checkout'
-    | 'host'
-    | 'local-interface';
+    'new-assistant' | 'assistant' | 'registry' | 'assistant-or-registry' | 'tool-checkout' | 'host' | 'local-interface';
   readonly effects: readonly string[];
   readonly prerequisites: readonly string[];
   readonly recovery: readonly string[];
@@ -132,64 +117,62 @@ export const COMMON_OPTIONS: readonly OptionDefinition[] = [
 ];
 
 export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
-  ...(['link', 'unlink', 'status'] as const).map(
-    (command): CommandDefinition => ({
-      path: ['whatsapp', command],
-      group: 'Service',
-      handler: { kind: 'whatsapp', command },
-      scope: 'assistant',
-      summary:
-        command === 'link'
-          ? 'Link the assistant’s own WhatsApp number with a pairing code.'
-          : command === 'unlink'
-            ? 'Unlink WhatsApp and remove the principal’s WhatsApp binding.'
-            : 'Show the assistant’s WhatsApp link state.',
-      options: [
-        id,
-        ...(command === 'link'
+  ...(['link', 'unlink', 'status'] as const).map((command): CommandDefinition => ({
+    path: ['whatsapp', command],
+    group: 'Service',
+    handler: { kind: 'whatsapp', command },
+    scope: 'assistant',
+    summary:
+      command === 'link'
+        ? 'Link the assistant’s own WhatsApp number with a pairing code.'
+        : command === 'unlink'
+          ? 'Unlink WhatsApp and remove the principal’s WhatsApp binding.'
+          : 'Show the assistant’s WhatsApp link state.',
+    options: [
+      id,
+      ...(command === 'link'
+        ? [
+            value('number', 'e164', 'The assistant’s own WhatsApp number, with country code.'),
+            value(
+              'principal-number',
+              'e164',
+              'The principal’s WhatsApp number, with country code. Omit both numbers for a re-link.',
+            ),
+          ]
+        : []),
+    ],
+    effects:
+      command === 'status'
+        ? ['Reads the running host’s link state.']
+        : command === 'link'
           ? [
-              value('number', 'e164', 'The assistant’s own WhatsApp number, with country code.'),
-              value(
-                'principal-number',
-                'e164',
-                'The principal’s WhatsApp number, with country code. Omit both numbers for a re-link.',
-              ),
+              'Claims the assistant’s number and opens one pairing connection. The principal then proves their number with a binding code.',
             ]
-          : []),
-      ],
-      effects:
-        command === 'status'
-          ? ['Reads the running host’s link state.']
-          : command === 'link'
-            ? [
-                'Claims the assistant’s number and opens one pairing connection. The principal then proves their number with a binding code.',
-              ]
-            : ['Logs out and deletes the auth store and binding, retaining account-scoped contact refusals and locks.'],
-      prerequisites: [...assistantPrerequisites, 'A running assistant host.'],
-      recovery: ['Re-link needs no numbers restated; changed numbers require unlink and a fresh binding proof.'],
-      examples: [
-        `gws-ea whatsapp ${command} --id <instance_id>${command === 'link' ? ' --number +15550000000 --principal-number +447700900123' : ''}`,
-      ],
-      outputModes: ['human', 'json'],
-      resultSchema: managedResultSchema({
-        type: 'object',
-        properties: {
-          state: { enum: ['unlinked', 'linking', 'connected', 'needs-relink'] },
-          number: { type: 'string' },
-          principal: {
-            type: 'object',
-            properties: { lid: { type: 'string' }, phoneJid: { type: 'string' } },
-            required: ['lid'],
-            additionalProperties: false,
-          },
-          bindingPending: { type: 'boolean' },
-          pairingCode: { type: 'string' },
+          : ['Logs out and deletes the auth store and binding, retaining account-scoped contact refusals and locks.'],
+    prerequisites: [...assistantPrerequisites, 'A running assistant host.'],
+    recovery: ['Re-link needs no numbers restated; changed numbers require unlink and a fresh binding proof.'],
+    examples: [
+      `gws-ea whatsapp ${command} --id <instance_id>${command === 'link' ? ' --number +15550000000 --principal-number +447700900123' : ''}`,
+    ],
+    outputModes: ['human', 'json'],
+    resultSchema: managedResultSchema({
+      type: 'object',
+      properties: {
+        state: { enum: ['unlinked', 'linking', 'connected', 'needs-relink'] },
+        number: { type: 'string' },
+        principal: {
+          type: 'object',
+          properties: { lid: { type: 'string' }, phoneJid: { type: 'string' } },
+          required: ['lid'],
+          additionalProperties: false,
         },
-        required: ['state'],
-        additionalProperties: false,
-      }),
+        bindingPending: { type: 'boolean' },
+        pairingCode: { type: 'string' },
+      },
+      required: ['state'],
+      additionalProperties: false,
     }),
-  ),
+  })),
   {
     path: ['create'],
     group: 'Assistants',
@@ -298,28 +281,26 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('connect-google')),
   },
-  ...(['start', 'stop', 'restart'] as const).map(
-    (command): CommandDefinition => ({
-      path: [command],
-      group: 'Service',
-      handler: { kind: 'attempt', command },
-      summary: `${command[0].toUpperCase()}${command.slice(1)} the assistant's recorded host service.`,
-      scope: 'assistant',
-      options: [id],
-      effects:
-        command === 'stop'
-          ? [
-              'Stops the host service; agent containers keep running.',
-              'A later login or reboot can start the service again.',
-            ]
-          : ['Controls the recorded host service and verifies host readiness.'],
-      prerequisites: assistantPrerequisites,
-      recovery: ['Inspect status and logs for the explicitly named assistant.'],
-      examples: [`gws-ea ${command} --id <instance_id>`],
-      outputModes: managedModes,
-      resultSchema: managedResultSchema(operationDataSchema(command)),
-    }),
-  ),
+  ...(['start', 'stop', 'restart'] as const).map((command): CommandDefinition => ({
+    path: [command],
+    group: 'Service',
+    handler: { kind: 'attempt', command },
+    summary: `${command[0].toUpperCase()}${command.slice(1)} the assistant's recorded host service.`,
+    scope: 'assistant',
+    options: [id],
+    effects:
+      command === 'stop'
+        ? [
+            'Stops the host service; agent containers keep running.',
+            'A later login or reboot can start the service again.',
+          ]
+        : ['Controls the recorded host service and verifies host readiness.'],
+    prerequisites: assistantPrerequisites,
+    recovery: ['Inspect status and logs for the explicitly named assistant.'],
+    examples: [`gws-ea ${command} --id <instance_id>`],
+    outputModes: managedModes,
+    resultSchema: managedResultSchema(operationDataSchema(command)),
+  })),
   {
     path: ['update'],
     group: 'Assistants',
@@ -470,38 +451,36 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     resultSchema: managedResultSchema(CONNECTOR_LIST_SCHEMA),
   },
   ...CONNECTOR_CATALOG.flatMap((connector) =>
-    CONNECTOR_ACTIONS.map(
-      (command): CommandDefinition => ({
-        path: ['connectors', command, connector.name],
-        group: 'Connectors',
-        handler: { kind: 'connector', command, name: connector.name },
-        summary: `${command === 'install' ? 'Set up' : command === 'uninstall' ? 'Remove' : command === 'check' ? 'Verify' : 'Inspect'} ${connector.name}. ${connector.summary}`,
-        scope: command === 'show' || command === 'check' ? 'assistant-or-registry' : 'host',
-        options: connector.options[command],
-        effects: [
-          ...connector.effects[command],
-          `Installation: ${connector.scope.installation}; configuration: ${connector.scope.configuration}; resources: ${connector.scope.resources}.`,
-          connector.account,
-          connector.scope.access,
-        ],
-        prerequisites: connector.prerequisites,
-        recovery: [
-          `Inspect the reported reason; rerun gws-ea connectors ${command === 'uninstall' ? 'uninstall' : 'install'} ${connector.name} to continue setup or cleanup.`,
-        ],
-        examples:
-          connector.name === 'web' && command === 'install'
-            ? [
-                'gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID',
-                'gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID --credential-file ~/.config/gws-ea/cloudflare-api-token --no-input',
-                'gws-ea connectors install web',
-              ]
-            : [`gws-ea connectors ${command} ${connector.name}`],
-        outputModes: managedModes,
-        resultSchema: managedResultSchema(
-          command === 'show' || command === 'check' ? CONNECTOR_OBSERVATION_SCHEMA : CONNECTOR_OPERATION_SCHEMA,
-        ),
-      }),
-    ),
+    CONNECTOR_ACTIONS.map((command): CommandDefinition => ({
+      path: ['connectors', command, connector.name],
+      group: 'Connectors',
+      handler: { kind: 'connector', command, name: connector.name },
+      summary: `${command === 'install' ? 'Set up' : command === 'uninstall' ? 'Remove' : command === 'check' ? 'Verify' : 'Inspect'} ${connector.name}. ${connector.summary}`,
+      scope: command === 'show' || command === 'check' ? 'assistant-or-registry' : 'host',
+      options: connector.options[command],
+      effects: [
+        ...connector.effects[command],
+        `Installation: ${connector.scope.installation}; configuration: ${connector.scope.configuration}; resources: ${connector.scope.resources}.`,
+        connector.account,
+        connector.scope.access,
+      ],
+      prerequisites: connector.prerequisites,
+      recovery: [
+        `Inspect the reported reason; rerun gws-ea connectors ${command === 'uninstall' ? 'uninstall' : 'install'} ${connector.name} to continue setup or cleanup.`,
+      ],
+      examples:
+        connector.name === 'web' && command === 'install'
+          ? [
+              'gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID',
+              'gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID --credential-file ~/.config/gws-ea/cloudflare-api-token --no-input',
+              'gws-ea connectors install web',
+            ]
+          : [`gws-ea connectors ${command} ${connector.name}`],
+      outputModes: managedModes,
+      resultSchema: managedResultSchema(
+        command === 'show' || command === 'check' ? CONNECTOR_OBSERVATION_SCHEMA : CONNECTOR_OPERATION_SCHEMA,
+      ),
+    })),
   ),
   {
     path: ['alias'],
@@ -517,33 +496,31 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     outputModes: managedModes,
     resultSchema: managedResultSchema(ALIAS_OPERATION_SCHEMA),
   },
-  ...(['help', 'schema'] as const).map(
-    (command): CommandDefinition => ({
-      path: [command],
-      group: 'Discovery',
-      handler: { kind: 'discovery', command },
-      scope: 'local-interface',
-      options: [],
-      arguments: [{ name: 'command path', description: 'Optional exact command path to discover.', variadic: true }],
-      summary:
-        command === 'help'
-          ? 'Explain the root interface or a selected command.'
-          : 'Describe accepted commands and results as JSON.',
-      effects: ['Reads only local interface definitions.'],
-      prerequisites: command === 'schema' ? ['Pass --json.'] : [],
-      recovery: ['Use an accepted command path.'],
-      examples: [`gws-ea ${command} update${command === 'schema' ? ' --json' : ''}`],
-      outputModes: command === 'help' ? ['human'] : ['json'],
-      resultSchema:
-        command === 'help'
-          ? { type: 'string', description: 'Command help text.' }
-          : {
-              type: 'object',
-              properties: { schema_version: { const: 1 }, commands: { type: 'array', items: { type: 'object' } } },
-              required: ['schema_version', 'commands'],
-            },
-    }),
-  ),
+  ...(['help', 'schema'] as const).map((command): CommandDefinition => ({
+    path: [command],
+    group: 'Discovery',
+    handler: { kind: 'discovery', command },
+    scope: 'local-interface',
+    options: [],
+    arguments: [{ name: 'command path', description: 'Optional exact command path to discover.', variadic: true }],
+    summary:
+      command === 'help'
+        ? 'Explain the root interface or a selected command.'
+        : 'Describe accepted commands and results as JSON.',
+    effects: ['Reads only local interface definitions.'],
+    prerequisites: command === 'schema' ? ['Pass --json.'] : [],
+    recovery: ['Use an accepted command path.'],
+    examples: [`gws-ea ${command} update${command === 'schema' ? ' --json' : ''}`],
+    outputModes: command === 'help' ? ['human'] : ['json'],
+    resultSchema:
+      command === 'help'
+        ? { type: 'string', description: 'Command help text.' }
+        : {
+            type: 'object',
+            properties: { schema_version: { const: 1 }, commands: { type: 'array', items: { type: 'object' } } },
+            required: ['schema_version', 'commands'],
+          },
+  })),
   {
     path: ['completion'],
     group: 'Discovery',

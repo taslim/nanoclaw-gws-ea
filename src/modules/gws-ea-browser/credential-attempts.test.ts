@@ -134,10 +134,9 @@ it('replaces only the owned password and erases old ciphertext in the atomic con
   expect(await fixture.store.secret(login.id, 'password', ORIGIN)).toBe(result.credential.password);
   const blobs = local((db) =>
     db
-      .prepare<
-        [],
-        { password: Buffer }
-      >('SELECT password FROM logins UNION ALL SELECT password FROM attempts WHERE password IS NOT NULL')
+      .prepare<[], { password: Buffer }>(
+        'SELECT password FROM logins UNION ALL SELECT password FROM attempts WHERE password IS NOT NULL',
+      )
       .all(),
   );
   expect(blobs).toHaveLength(1);

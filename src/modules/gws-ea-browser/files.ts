@@ -61,9 +61,9 @@ async function equalFiles(left: number, right: number): Promise<boolean> {
 
 async function copyInto(input: number, output: number): Promise<void> {
   const buffer = Buffer.alloc(64 * 1024);
-  for (let position = 0; ; ) {
+  for (let position = 0; ;) {
     const bytes = await readChunk(input, buffer, position);
-    for (let written = 0; written < bytes; ) {
+    for (let written = 0; written < bytes;) {
       written += fs.writeSync(output, buffer, written, bytes - written, position + written);
     }
     position += bytes;

@@ -215,8 +215,7 @@ function responseFor(session: Session, requestId: string): ResponseFrame | undef
   const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
   try {
     const row = inbound.prepare('SELECT content FROM messages_in WHERE id=?').get(`action-resp-${requestId}`) as
-      | { content: string }
-      | undefined;
+      { content: string } | undefined;
     return row ? (JSON.parse(row.content) as { frame: ResponseFrame }).frame : undefined;
   } finally {
     inbound.close();

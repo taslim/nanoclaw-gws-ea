@@ -34,21 +34,21 @@ afterEach(async () => {
   fs.rmSync('/tmp/nanoclaw-wa-u2-contacts', { recursive: true, force: true });
 });
 const message = { kind: 'chat', content: { text: 'Hello there' } };
+const msg = (deliveryId: string) => ({ ...message, deliveryId });
 
 describe('first-contact enforcement through the production WhatsApp adapter', () => {
   it('refuses the sixth new person before socket handoff while existing-group replies still send', async () => {
     const adapter = await h.start();
-    for (let person = 1; person <= 5; person++)
-      await adapter.deliver(`${person}@lid`, null, message, `person-${person}`);
-    await expect(adapter.deliver('6@lid', null, message, 'sixth')).rejects.toMatchObject({
+    for (let person = 1; person <= 5; person++) await adapter.deliver(`${person}@lid`, null, msg(`person-${person}`));
+    await expect(adapter.deliver('6@lid', null, msg('sixth'))).rejects.toMatchObject({
       guardId: 'gws-ea-whatsapp:contact-cap',
     });
-    await adapter.deliver('team@g.us', null, message, 'group-reply');
+    await adapter.deliver('team@g.us', null, msg('group-reply'));
     expect(h.socket().sends.map(({ jid }) => jid)).toEqual(['1@lid', '2@lid', '3@lid', '4@lid', '5@lid', 'team@g.us']);
   });
   it('persists an asynchronous 463 after row completion and blocks followups and reminders after restart', async () => {
     const adapter = await h.start();
-    const id = await adapter.deliver('12000@lid', null, message, 'first');
+    const id = await adapter.deliver('12000@lid', null, msg('first'));
     adapter.completeDelivery('first');
     await h.socket().emit('messages.update', [
       {
@@ -59,7 +59,7 @@ describe('first-contact enforcement through the production WhatsApp adapter', ()
     await adapter.teardown();
     const fresh = await h.start();
     for (const row of ['followup', 'fired-reminder'])
-      await expect(fresh.deliver('12000@lid', null, message, row)).rejects.toMatchObject({
+      await expect(fresh.deliver('12000@lid', null, msg(row))).rejects.toMatchObject({
         guardId: 'gws-ea-whatsapp:contact-refused',
       });
     expect(h.socket().sends).toEqual([]);
@@ -71,26 +71,26 @@ describe('first-contact enforcement through the production WhatsApp adapter', ()
     });
     await adapter.teardown();
     const fresh = await h.start();
-    await expect(fresh.deliver('1@lid', null, message, 'locked')).rejects.toMatchObject({
+    await expect(fresh.deliver('1@lid', null, msg('locked'))).rejects.toMatchObject({
       guardId: 'gws-ea-whatsapp:contact-time-lock',
     });
-    await fresh.deliver('team@g.us', null, message, 'group');
+    await fresh.deliver('team@g.us', null, msg('group'));
     h.now.value += 60_001;
-    await fresh.deliver('1@lid', null, message, 'unlocked');
+    await fresh.deliver('1@lid', null, msg('unlocked'));
     expect(h.socket().sends.map(({ jid }) => jid)).toEqual(['team@g.us', '1@lid']);
   });
   it('does not mistake group participation for a 1:1 reply', async () => {
     const adapter = await h.start();
     await h.socket().emit('messages.upsert', { type: 'notify', messages: [incoming('group')] });
-    for (let person = 1; person <= 5; person++) await adapter.deliver(`${person}@lid`, null, message, `new-${person}`);
-    await expect(adapter.deliver('12000@lid', null, message, 'group-person')).rejects.toMatchObject({
+    for (let person = 1; person <= 5; person++) await adapter.deliver(`${person}@lid`, null, msg(`new-${person}`));
+    await expect(adapter.deliver('12000@lid', null, msg('group-person'))).rejects.toMatchObject({
       guardId: 'gws-ea-whatsapp:contact-cap',
     });
     await h.socket().emit('messages.upsert', {
       type: 'notify',
       messages: [incoming('direct', 'Yes', { key: { id: 'direct', remoteJid: '12000@lid' } })],
     });
-    await adapter.deliver('12000@lid', null, message, 'direct-person');
+    await adapter.deliver('12000@lid', null, msg('direct-person'));
     expect(h.socket().sends.at(-1)?.jid).toBe('12000@lid');
   });
 });
@@ -98,24 +98,24 @@ describe('first-contact enforcement through the production WhatsApp adapter', ()
 it('serializes simultaneous first contacts at the rolling cap and opens the next window at exactly 24 hours', async () => {
   const adapter = await h.start();
   const results = await Promise.allSettled(
-    Array.from({ length: 8 }, (_, index) => adapter.deliver(`${index + 1}@lid`, null, message, `parallel-${index}`)),
+    Array.from({ length: 8 }, (_, index) => adapter.deliver(`${index + 1}@lid`, null, msg(`parallel-${index}`))),
   );
   expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(5);
   expect(h.socket().sends).toHaveLength(5);
   h.now.value += 24 * 60 * 60 * 1000;
-  await adapter.deliver('20@lid', null, message, 'tomorrow');
+  await adapter.deliver('20@lid', null, msg('tomorrow'));
   expect(h.socket().sends.at(-1)?.jid).toBe('20@lid');
 });
 
 it('keeps the same-number ledger but starts a different linked number with no contacts, lock or refusals', async () => {
   const adapter = await h.start();
-  for (let person = 1; person <= 5; person++) await adapter.deliver(`${person}@lid`, null, message, `old-${person}`);
+  for (let person = 1; person <= 5; person++) await adapter.deliver(`${person}@lid`, null, msg(`old-${person}`));
   await h.socket().emit('connection.update', {
     reachoutTimeLock: { isActive: true, timeEnforcementEnds: new Date(h.now.value + 60_000) },
   });
   await adapter.teardown();
   const same = await h.start();
-  await expect(same.deliver('6@lid', null, message, 'same')).rejects.toMatchObject({
+  await expect(same.deliver('6@lid', null, msg('same'))).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-time-lock',
   });
   await same.teardown();
@@ -123,7 +123,7 @@ it('keeps the same-number ledger but starts a different linked number with no co
   h.socket().user.id = '15559999999:1@s.whatsapp.net';
   h.socket().user.lid = '777000:1@lid';
   await h.socket().emit('connection.update', { connection: 'open' });
-  await different.deliver('6@lid', null, message, 'different');
+  await different.deliver('6@lid', null, msg('different'));
   expect(h.socket().sends).toHaveLength(1);
 });
 
@@ -138,7 +138,7 @@ it('allows only a fresh admitted principal request after a 463 expiry; ordinary 
     adapter.reachOutDM({ lid: '12000' }, message, { requestId: 'soon-request', principalMessageId: 'own-too-soon' }),
   ).rejects.toMatchObject({ guardId: 'gws-ea-whatsapp:contact-refused' });
   h.now.value += 24 * 60 * 60 * 1000 + 1;
-  await expect(adapter.deliver('12000@lid', null, message, 'late-reminder')).rejects.toMatchObject({
+  await expect(adapter.deliver('12000@lid', null, msg('late-reminder'))).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-refused',
   });
   await adapter.reachOutDM({ lid: '12000' }, message, { requestId: 'fresh-request', principalMessageId: 'own-fresh' });
@@ -148,7 +148,7 @@ it('allows only a fresh admitted principal request after a 463 expiry; ordinary 
 it('ends first-contact restrictions on a real 1:1 reply but never reissues the refused original operation', async () => {
   const adapter = await h.start();
   h.socket().sendError = Object.assign(new Error('refused'), { output: { statusCode: 463 } });
-  await expect(adapter.deliver('12000@lid', null, message, 'refused-original')).rejects.toMatchObject({
+  await expect(adapter.deliver('12000@lid', null, msg('refused-original'))).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-refused',
   });
   h.socket().sendError = undefined;
@@ -159,8 +159,8 @@ it('ends first-contact restrictions on a real 1:1 reply but never reissues the r
   await h.socket().emit('connection.update', {
     reachoutTimeLock: { isActive: true, timeEnforcementEnds: new Date(h.now.value + 60_000) },
   });
-  await adapter.deliver('12000@lid', null, message, 'legitimate-reply');
-  await expect(adapter.deliver('12000@lid', null, message, 'refused-original')).rejects.toMatchObject({
+  await adapter.deliver('12000@lid', null, msg('legitimate-reply'));
+  await expect(adapter.deliver('12000@lid', null, msg('refused-original'))).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-refused',
   });
   expect(h.socket().sends).toHaveLength(2);
@@ -169,7 +169,7 @@ it('ends first-contact restrictions on a real 1:1 reply but never reissues the r
 it('delivers each 463 outcome to main through its real note writer, including a notice deferred across restart', async () => {
   const adapter = await h.start();
   h.socket().sendError = Object.assign(new Error('refused'), { output: { statusCode: 463 } });
-  await expect(adapter.deliver('12000@lid', null, message, 'note-refusal')).rejects.toMatchObject({
+  await expect(adapter.deliver('12000@lid', null, msg('note-refusal'))).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-refused',
   });
   await adapter.teardown();
@@ -192,8 +192,8 @@ it('delivers each 463 outcome to main through its real note writer, including a 
 
 it('withholds refused DM bodies from native Baileys retry requests while existing-group retries remain available', async () => {
   const adapter = await h.start();
-  const id = await adapter.deliver('12000@lid', null, message, 'retry-refused');
-  const groupId = await adapter.deliver('team@g.us', null, message, 'retry-group');
+  const id = await adapter.deliver('12000@lid', null, msg('retry-refused'));
+  const groupId = await adapter.deliver('team@g.us', null, msg('retry-group'));
   if (!id || !groupId) throw new Error('Expected native message ids');
   await h
     .socket()
@@ -209,8 +209,7 @@ it('withholds refused DM bodies from native Baileys retry requests while existin
 
 it('records a consumed binding DM and a durably replayed DM as real 1:1 replies', async () => {
   const adapter = await h.start();
-  for (let person = 1; person <= 5; person++)
-    await adapter.deliver(`${person}@lid`, null, message, `reply-cap-${person}`);
+  for (let person = 1; person <= 5; person++) await adapter.deliver(`${person}@lid`, null, msg(`reply-cap-${person}`));
   const unregister = registerWhatsAppObserver({ onMessage: async () => 'consume' });
   try {
     await h.socket().emit('messages.upsert', {
@@ -221,20 +220,20 @@ it('records a consumed binding DM and a durably replayed DM as real 1:1 replies'
   } finally {
     unregister();
   }
-  await adapter.deliver('12000@lid', null, message, 'consumed-known');
+  await adapter.deliver('12000@lid', null, msg('consumed-known'));
   const index = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
   index.intake(incoming('replayed-direct', 'Hello', { key: { id: 'replayed-direct', remoteJid: '13000@lid' } }));
   index.close();
   await adapter.teardown();
   const fresh = await h.start();
   expect(h.messages().map(({ id }) => id)).toContain('replayed-direct');
-  await fresh.deliver('13000@lid', null, message, 'replayed-known');
+  await fresh.deliver('13000@lid', null, msg('replayed-known'));
   expect(h.socket().sends.map(({ jid }) => jid)).toEqual(['13000@lid']);
 });
 
 it('serves only this account own DM bodies to native retry requests and rechecks a newly imposed time-lock', async () => {
   const adapter = await h.start();
-  const id = await adapter.deliver('12000@lid', null, message, 'retry-ordinary');
+  const id = await adapter.deliver('12000@lid', null, msg('retry-ordinary'));
   if (!id) throw new Error('Expected native message id');
   const retry = h.socketConfigs[0].getMessage;
   expect(await retry?.({ remoteJid: '12000@lid', id })).toEqual({ conversation: 'Hello there' });
@@ -252,7 +251,7 @@ it('shares cap reservations across independent transport instances using the sam
   const second = await h.start();
   const results = await Promise.allSettled(
     Array.from({ length: 8 }, (_, index) =>
-      (index % 2 ? first : second).deliver(`${index + 1}@lid`, null, message, `cross-instance-${index}`),
+      (index % 2 ? first : second).deliver(`${index + 1}@lid`, null, msg(`cross-instance-${index}`)),
     ),
   );
   expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(5);
@@ -270,9 +269,8 @@ it('does not carry an old number 1:1 reply into a different linked number', asyn
   h.socket().user.id = '15559999999:1@s.whatsapp.net';
   h.socket().user.lid = '777000:1@lid';
   await h.socket().emit('connection.update', { connection: 'open' });
-  for (let person = 1; person <= 5; person++)
-    await fresh.deliver(`${person}@lid`, null, message, `new-number-${person}`);
-  await expect(fresh.deliver('12000@lid', null, message, 'old-reply-new-contact')).rejects.toMatchObject({
+  for (let person = 1; person <= 5; person++) await fresh.deliver(`${person}@lid`, null, msg(`new-number-${person}`));
+  await expect(fresh.deliver('12000@lid', null, msg('old-reply-new-contact'))).rejects.toMatchObject({
     guardId: 'gws-ea-whatsapp:contact-cap',
   });
 });

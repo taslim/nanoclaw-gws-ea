@@ -18,7 +18,7 @@ describe('markdown at the WhatsApp send boundary', () => {
     ['**spaced words**\n*short*', '*spaced words*\n_short_'],
   ])('converts %s', async (input, expected) => {
     const adapter = await h.start();
-    await adapter.deliver('team@g.us', null, { kind: 'chat', content: { text: input } }, 'format');
+    await adapter.deliver('team@g.us', null, { kind: 'chat', content: { text: input }, deliveryId: 'format' });
     expect(h.socket().sends[0].content).toMatchObject({ text: expected });
   });
   it.each([
@@ -30,18 +30,21 @@ describe('markdown at the WhatsApp send boundary', () => {
     ['(@15551234567) wrote this', ['15551234567@s.whatsapp.net']],
   ])('preserves upstream mention boundaries for %s', async (input, mentions) => {
     const adapter = await h.start();
-    await adapter.deliver('team@g.us', null, { kind: 'chat', content: { text: input } }, 'mention-boundary');
+    await adapter.deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: input },
+      deliveryId: 'mention-boundary',
+    });
     expect(h.socket().sends[0].content).toEqual({ text: input, mentions });
   });
 
   it('extracts real phone mentions, normalizes plus signs and leaves code untagged', async () => {
     const adapter = await h.start();
-    await adapter.deliver(
-      'team@g.us',
-      null,
-      { kind: 'chat', content: { text: 'Hi @+15551112222 and @15553334444. `@15559998888` email@example.com' } },
-      'mentions',
-    );
+    await adapter.deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: 'Hi @+15551112222 and @15553334444. `@15559998888` email@example.com' },
+      deliveryId: 'mentions',
+    });
     expect(h.socket().sends[0].content).toEqual({
       text: 'Hi @15551112222 and @15553334444. `@15559998888` email@example.com',
       mentions: ['15551112222@s.whatsapp.net', '15553334444@s.whatsapp.net'],

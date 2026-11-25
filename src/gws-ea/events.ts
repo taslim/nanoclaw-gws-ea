@@ -164,8 +164,7 @@ export function googleSignInPause({ account, resumeCommand }: AssistantGoogleSig
 }
 
 export type PauseResponse =
-  | { readonly kind: 'stop' }
-  | { readonly kind: 'continue'; readonly decisions?: Partial<HumanDecisions> };
+  { readonly kind: 'stop' } | { readonly kind: 'continue'; readonly decisions?: Partial<HumanDecisions> };
 
 export interface ProviderCredentialRequest {
   readonly providerId: string;

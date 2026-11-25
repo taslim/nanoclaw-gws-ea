@@ -88,14 +88,12 @@ export async function connectionsLinkFacts(
         const pinnedTools = toolsByApp?.[id];
         const tools =
           pin && pinnedTools
-            ? pinnedTools.map(
-                (tool): ConnectionToolFact => ({
-                  name: tool.name,
-                  label: tool.label ?? 'unsorted',
-                  ...(tool.summary ? { summary: tool.summary } : {}),
-                  reason: tool.reason,
-                }),
-              )
+            ? pinnedTools.map((tool): ConnectionToolFact => ({
+                name: tool.name,
+                label: tool.label ?? 'unsorted',
+                ...(tool.summary ? { summary: tool.summary } : {}),
+                reason: tool.reason,
+              }))
             : undefined;
         return {
           name,

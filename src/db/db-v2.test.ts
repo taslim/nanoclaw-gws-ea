@@ -38,6 +38,8 @@ import {
   ensureContainerConfig,
   updateContainerConfigScalars,
 } from './index.js';
+import { migrations } from './migrations/index.js';
+import { getAskQuestionRender } from './sessions.js';
 
 function now() {
   return new Date().toISOString();
@@ -87,6 +89,26 @@ describe('migrations', () => {
         .get(table) as { type: string; notnull: number; dflt_value: string } | undefined;
       expect(col, table).toEqual({ type: 'TEXT', notnull: 1, dflt_value: "''" });
     }
+  });
+
+  it('persists ask_user_question card bodies for terminal rendering (026)', async () => {
+    const db = await initSqliteTestDb();
+    await runMigrations(db);
+    const col = sqliteRaw(db)
+      .prepare(`SELECT type, "notnull", dflt_value FROM pragma_table_info('pending_questions') WHERE name = 'question'`)
+      .get();
+    expect(col).toEqual({ type: 'TEXT', notnull: 1, dflt_value: "''" });
+  });
+
+  it('upgrades a live database that already applied 027-pending-question-deadline before 026-pending-question-body', async () => {
+    const db = await initSqliteTestDb();
+    const preSync = migrations.filter((m) => m.name !== 'pending-question-body');
+    await runMigrations(db, preSync);
+    await expect(runMigrations(db)).resolves.toBeUndefined();
+    const recorded = await db.get<{ name: string }>(
+      `SELECT name FROM schema_version WHERE name = 'pending-question-body'`,
+    );
+    expect(recorded).toEqual({ name: 'pending-question-body' });
   });
 });
 
@@ -485,6 +507,38 @@ describe('pending questions', () => {
     });
     await deletePendingQuestion('q-1');
     expect(await getPendingQuestion('q-1')).toBeUndefined();
+  });
+
+  it('keeps the question body for the answered card, marked as the agent own markup', async () => {
+    await createPendingQuestion({
+      question_id: 'q-1',
+      session_id: 'sess-1',
+      message_out_id: 'msg-out-1',
+      platform_id: 'chan-1',
+      channel_type: 'slack',
+      thread_id: null,
+      title: 'Deploy',
+      question: 'Ship **v2** today?',
+      options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
+      created_at: now(),
+    });
+    expect((await getPendingQuestion('q-1'))!.question).toBe('Ship **v2** today?');
+    expect(await getAskQuestionRender('q-1')).toEqual({
+      title: 'Deploy',
+      kind: 'question',
+      question: 'Ship **v2** today?',
+      fromAgent: true,
+      options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
+    });
+  });
+
+  it('renders a row stored without a body (older rows) as title and options only', async () => {
+    await getDb().run(
+      `INSERT INTO pending_questions (question_id, session_id, message_out_id, title, options_json, created_at)
+       VALUES ('q-old', 'sess-1', 'msg-out-1', 'Old', '[]', ?)`,
+      now(),
+    );
+    expect(await getAskQuestionRender('q-old')).toEqual({ title: 'Old', kind: 'question', options: [] });
   });
 });
 

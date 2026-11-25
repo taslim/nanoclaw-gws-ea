@@ -70,8 +70,7 @@ function response(id: string): ResponseFrame | undefined {
   const db = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
   try {
     const row = db.prepare('SELECT content FROM messages_in WHERE id=?').get(`action-resp-${id}`) as
-      | { content: string }
-      | undefined;
+      { content: string } | undefined;
     return row ? (JSON.parse(row.content) as { frame: ResponseFrame }).frame : undefined;
   } finally {
     db.close();

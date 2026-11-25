@@ -32,13 +32,7 @@ import {
 // ---------------------------------------------------------------- the rules
 
 export type CookieBannerPlatform =
-  | 'onetrust'
-  | 'cookiebot'
-  | 'didomi'
-  | 'usercentrics'
-  | 'trustarc'
-  | 'quantcast'
-  | 'sourcepoint';
+  'onetrust' | 'cookiebot' | 'didomi' | 'usercentrics' | 'trustarc' | 'quantcast' | 'sourcepoint';
 
 /** How the host recognizes one consent platform's banner and presses its reject. */
 interface CookieBannerRule {

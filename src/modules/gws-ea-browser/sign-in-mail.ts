@@ -42,8 +42,7 @@ import { signInAddress } from './web-address.js';
 
 /** Starts a sign-in by filling the alias into `email_field`, or finishes it with the emailed answer. */
 type SignInPayload =
-  | { readonly email_field: BrowserRef }
-  | { readonly code_field?: BrowserRef; readonly submit?: BrowserRef };
+  { readonly email_field: BrowserRef } | { readonly code_field?: BrowserRef; readonly submit?: BrowserRef };
 function browserRef(raw: unknown): BrowserRef {
   return readBrowserRef(raw, 'Choose the field and control from a fresh observation.');
 }

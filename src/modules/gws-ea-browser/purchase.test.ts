@@ -988,7 +988,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       .spyOn(browserNotices, 'writeBrowserNotice')
       .mockRejectedValueOnce(new Error('mailbox unavailable'));
     try {
-      await finalizeReject(approval, PRINCIPAL, 'too late on a weeknight');
+      await finalizeReject(approval, PRINCIPAL, { reason: 'too late on a weeknight' });
       expect(await approvals()).toEqual([
         expect.objectContaining({
           approval_id: approval.approval_id,
@@ -1032,7 +1032,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
   it('carries the principal’s purchase rejection reason in the browser outcome', async () => {
     await buy();
     const [approval] = await approvals();
-    await finalizeReject(approval, PRINCIPAL, 'choose a smaller kettle');
+    await finalizeReject(approval, PRINCIPAL, { reason: 'choose a smaller kettle' });
     await resumeRejectedApprovals();
     const told = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
       mailbox

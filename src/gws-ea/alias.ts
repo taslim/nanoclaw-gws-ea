@@ -76,8 +76,7 @@ const ROLE_ADDRESS_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 export type AliasStem =
-  | { readonly status: 'derived'; readonly stem: string }
-  | { readonly status: 'name_required'; readonly reason: string };
+  { readonly status: 'derived'; readonly stem: string } | { readonly status: 'name_required'; readonly reason: string };
 
 export function asciiName(name: string): string {
   return name

@@ -205,7 +205,6 @@ async function answer(questionId: string, value: string, reason?: string): Promi
     platformId: DM,
     messageId: `${DM}/messages/1`,
     threadId: null,
-    deferResolution: true,
   });
 }
 

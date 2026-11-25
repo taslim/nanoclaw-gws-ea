@@ -492,7 +492,9 @@ it('pauses native reminders immediately, moves live task rows once and preserves
   });
   await host.delivery.deliverSessionMessages(target);
   await host.delivery.deliverSessionMessages(target);
-  expect(deliveredToChat.mock.calls.filter(([, , , messageId]) => messageId === 'reminder-answer')).toHaveLength(1);
+  expect(
+    deliveredToChat.mock.calls.filter(([, , message]) => message.deliveryId === `${target.id}:reminder-answer`),
+  ).toHaveLength(1);
 });
 
 it('waits for a claimed reminder and its actual outbound delivery before stopping the old container', async () => {
@@ -609,16 +611,15 @@ it('records job admission and the checked handoff durably without doing the move
   const db = host.db.getDb();
   const transact = db.transaction.bind(db);
   let centralTransaction = false;
-  vi.spyOn(db, 'transaction').mockImplementation(
-    async <T>(work: () => Promise<T>): Promise<T> =>
-      transact(async () => {
-        centralTransaction = true;
-        try {
-          return await work();
-        } finally {
-          centralTransaction = false;
-        }
-      }),
+  vi.spyOn(db, 'transaction').mockImplementation(async <T>(work: () => Promise<T>): Promise<T> =>
+    transact(async () => {
+      centralTransaction = true;
+      try {
+        return await work();
+      } finally {
+        centralTransaction = false;
+      }
+    }),
   );
   const mailbox = host.session.withExistingMailboxSession;
   vi.spyOn(host.session, 'withExistingMailboxSession').mockImplementation(

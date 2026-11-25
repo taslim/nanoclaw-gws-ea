@@ -444,8 +444,7 @@ export const excerpt = (text: string): string =>
   text.length > WATCH_REGION_TEXT_LIMIT ? `${text.slice(0, WATCH_REGION_TEXT_LIMIT)}…` : text;
 /** What one model-free check read of a region watch's region. */
 export type RegionCheckRead =
-  | { status: 'region_read'; text: string }
-  | { status: 'region_missing'; reason: 'region_not_found' | 'route_changed' };
+  { status: 'region_read'; text: string } | { status: 'region_missing'; reason: 'region_not_found' | 'route_changed' };
 /**
  * Records what check `checkId` read for a region watch it served, while the watch is still that check's and its region
  * the one read. A changed text wakes the agent with the text before and after, untrusted, and the baseline moves on; a

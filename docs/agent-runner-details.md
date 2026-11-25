@@ -259,7 +259,7 @@ SDK message (so the idle timer stays honest) and maps recognized messages to `Pr
 - **PostToolUse / PostToolUseFailure** hooks clear the in-flight tool
 - **PostToolBatch** hook carries the acknowledgement reminder (`acknowledge.ts`): when a turn answers someone in a live chat (a waking `chat-sdk` row, `RoutingContext.personWaiting`) and nothing has gone out 10 seconds after the turn began, the next tool batch tells the agent once to send one line, in its own words, before more tools. The runner never writes to the person itself, and a subagent never gets the reminder. It exists because the channel shows no typing indicator; remove it once a channel offers a typing indicator or a native "working" signal.
 - **PreCompact** hook archives the transcript to `conversations/` before compaction
-- `maybeRotateContinuation` drops an oversized/aged transcript (default caps 12 MB / 14 days, both operator-overridable) so a cold container isn't killed reloading days of `.jsonl` before the host idle ceiling; `isSessionInvalid` clears a continuation whose transcript is gone
+- `maybeRotateContinuation` drops a continuation whose transcript is gone (Claude Code deletes transcripts after `cleanupPeriodDays`, 30 by default) or oversized/aged (default caps 12 MB / 14 days, both operator-overridable), so a cold container neither resumes into a deleted transcript nor is killed reloading days of `.jsonl` before the host idle ceiling; `isSessionInvalid` clears a continuation whose resume still fails
 - `additionalDirectories` for multi-directory access
 
 ### Codex Provider
@@ -777,7 +777,9 @@ admin approval, applied host-side):
 
 - **`install_packages`** — `{ apt?: string[], npm?: string[], reason?: string }`. Package
   names are validated at the tool boundary and re-validated on the host. On approval the
-  host rebuilds the per-agent image and restarts the container.
+  host rebuilds the per-agent image and restarts the container. When the shared agent image
+  changes later (an update or a manual rebuild), the host rebuilds the per-agent image on top
+  of it at the next start or spawn (`refreshStaleGroupImage`).
 - **`add_mcp_server`** — `{ name, command, args?, env? }`. Wires an existing third-party MCP
   server into the agent's `container.json`; on approval the host updates the config and
   restarts (no rebuild — Bun runs the TS directly).
@@ -850,9 +852,10 @@ The agent-runner tracks a single opaque `continuation` token per provider:
 
 Because it lives in the session folder's `outbound.db`, the continuation survives container
 teardown and restart — a fresh container reads it back and resumes. `/clear` deletes the row
-to start a clean session. Before resuming, `maybeRotateContinuation` may archive and drop an
-oversized/aged transcript (so a cold container isn't killed reloading it), and
-`isSessionInvalid` clears a continuation whose backing transcript has gone missing.
+to start a clean session. Before resuming, `maybeRotateContinuation` drops a continuation whose
+transcript is gone (so the turn starts fresh instead of failing with "No conversation found"),
+and may archive and drop an oversized/aged transcript (so a cold container isn't killed
+reloading it). `isSessionInvalid` clears a continuation whose resume still fails.
 
 ### Container Startup
 

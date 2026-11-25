@@ -10,12 +10,7 @@ export type ActivationKind = 'click' | 'submit' | 'select' | 'download';
 
 /** What the open rule decides for every control and navigation. */
 export type ActionClass =
-  | 'ordinary'
-  | 'purchase_control'
-  | 'speaks_as_principal'
-  | 'account_security'
-  | 'consent_control'
-  | 'blocked_address';
+  'ordinary' | 'purchase_control' | 'speaks_as_principal' | 'account_security' | 'consent_control' | 'blocked_address';
 /** A credential operation's own strict outcome: anything outside its vocabulary is an unsupported control. */
 export type CredentialActivationClass = ActionClass | 'unsupported_control';
 export interface ReviewedMerchantFlow {

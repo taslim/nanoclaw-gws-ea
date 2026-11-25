@@ -134,8 +134,7 @@ export class WhatsAppContacts {
         }
         if (!newPeople.length) return undefined;
         const lock = this.db.prepare('SELECT expires_at FROM locks WHERE account=?').get(account) as
-          | { expires_at: string | null }
-          | undefined;
+          { expires_at: string | null } | undefined;
         if (lock && (lock.expires_at === null || Date.parse(lock.expires_at) > this.now())) return 'contact-time-lock';
         const since = new Date(this.now() - DAY_MS).toISOString();
         const count = this.db
@@ -189,8 +188,7 @@ export class WhatsAppContacts {
         ORDER BY outbound_row_id IS NULL,rowid LIMIT 1`,
           )
           .get(this.account(), person, rowId, new Date(rowCreatedAt).toISOString()) as
-          | { id: number; request_id: string | null; principal_message_id: string | null }
-          | undefined;
+          { id: number; request_id: string | null; principal_message_id: string | null } | undefined;
         if (!receipt) {
           this.db
             .prepare('INSERT INTO dm_admissions(account,person,admitted_at,outbound_row_id) VALUES(?,?,?,?)')

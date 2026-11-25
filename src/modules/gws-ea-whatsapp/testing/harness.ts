@@ -24,7 +24,7 @@ export async function transportHarness() {
     onInbound: vi.fn(async () => undefined),
     onInboundEvent: vi.fn(),
     onMetadata: vi.fn(),
-    onAction: vi.fn(async () => undefined),
+    onAction: vi.fn(async () => 'ignored' as const),
   };
   const download = vi.fn(async () => Buffer.from('real media boundary bytes'));
   const now = { value: Date.parse('2026-10-18T12:00:00.000Z') };

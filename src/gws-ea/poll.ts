@@ -19,7 +19,7 @@ export async function pollUntil<T>(
 ): Promise<T> {
   const { intervalMs, maxIntervalMs = intervalMs, limitMs, sleep, signal } = options;
   let answer = await probe();
-  for (let waited = 0, next = intervalMs; !done(answer) && waited < limitMs && !signal?.aborted; ) {
+  for (let waited = 0, next = intervalMs; !done(answer) && waited < limitMs && !signal?.aborted;) {
     await sleep(next, signal);
     if (signal?.aborted) break;
     waited += next;

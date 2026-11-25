@@ -59,8 +59,7 @@ export class WhatsAppAuthStore {
 
   private read<T>(category: string, id: string): T | undefined {
     const row = this.db.prepare('SELECT value FROM auth WHERE category=? AND id=?').get(category, id) as
-      | { value: string }
-      | undefined;
+      { value: string } | undefined;
     return row === undefined ? undefined : (JSON.parse(row.value, BufferJSON.reviver) as T);
   }
 

@@ -13,9 +13,10 @@ export const migration027: Migration = {
   version: 27,
   name: 'pending-question-deadline',
   async up(db) {
-    await db.exec(`
-      ALTER TABLE pending_questions ADD COLUMN question TEXT NOT NULL DEFAULT '';
-      ALTER TABLE pending_questions ADD COLUMN deadline TEXT;
-    `);
+    const owners = await db.columnOwners?.('question');
+    if (owners === undefined || !owners.includes('pending_questions')) {
+      await db.exec(`ALTER TABLE pending_questions ADD COLUMN question TEXT NOT NULL DEFAULT ''`);
+    }
+    await db.exec(`ALTER TABLE pending_questions ADD COLUMN deadline TEXT`);
   },
 };

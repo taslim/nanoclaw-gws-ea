@@ -7,16 +7,11 @@
  * module registrations that would otherwise happen before index.ts's own
  * const initializers have run.
  *
- * Keep this file's imports minimal: log.js, and request-text.js for how an
- * approver's reason is quoted (its imports reach the DB layer, but nothing
- * that imports this file or registers a response handler). Nothing else
- * from modules/* or index.ts itself. Any file imported here must not in
- * turn import from src/index.ts, or the cycle returns.
+ * Keep this file's imports minimal: only log.js, nothing from modules/* or
+ * index.ts itself. Any file imported here must not in turn import from
+ * src/index.ts, or the cycle returns.
  */
-import type { NormalizedOption } from './channels/ask-question.js';
-import type { ChannelDeliveryAdapter } from './delivery.js';
 import { log } from './log.js';
-import { quoted, REASON_LIMIT } from './modules/approvals/request-text.js';
 
 export interface ResponsePayload {
   questionId: string;
@@ -29,15 +24,25 @@ export interface ResponsePayload {
   channelType: string;
   platformId: string;
   threadId: string | null;
-  /**
-   * The channel left the request as posted (ActionAnswer.deferResolution):
-   * the handler that resolves this answer shows its outcome
-   * (showRequestOutcome) once it has authorized it.
-   */
-  deferResolution?: boolean;
+  /** Set by dispatchResponse: a handler with slow work after its decision calls it once the decision is recorded. */
+  accepted?: () => void;
 }
 
-export type ResponseHandler = (payload: ResponsePayload) => Promise<boolean>;
+/**
+ * What a click did. A card shows a resolution only for 'accepted'. 'refused':
+ * the clicker may not answer it, so it keeps its buttons. 'closed': the request
+ * is gone (its session, event or target vanished), so the card says it is no
+ * longer available. 'ignored': nothing was decided (already resolved, expired,
+ * not ours).
+ */
+export type ResponseOutcome = 'accepted' | 'refused' | 'closed' | 'ignored';
+
+/**
+ * Returns the click's outcome when the handler owns it, else false to pass it
+ * on. true (handlers written before outcomes) owns the click but shows
+ * nothing: such handlers returned true for refused clicks too.
+ */
+export type ResponseHandler = (payload: ResponsePayload) => Promise<ResponseOutcome | boolean>;
 
 const responseHandlers: ResponseHandler[] = [];
 
@@ -50,50 +55,41 @@ export function getResponseHandlers(): readonly ResponseHandler[] {
   return responseHandlers;
 }
 
-export interface AnsweredRequest {
-  readonly title: string;
-  readonly question: string;
-  readonly options: readonly NormalizedOption[];
-}
-
 /**
- * When the channel left the request as posted (ResponsePayload.deferResolution),
- * edit it in place to what was asked and the option chosen, with a rejection's
- * reason quoted as someone else's text. Call only once the answer is
- * authorized and the request resolved; a refused answer leaves the request as
- * posted. A failed edit is logged, and the resolution stands.
+ * Offers a click to each handler in turn until one owns it. Resolves with its
+ * outcome as soon as that is known (an early `accepted()` call or the
+ * handler's return); an unowned or failed click is 'ignored' unless
+ * `options.rethrow` is set and the handler throws before accepting (so an
+ * at-least-once channel can redeliver the answer).
  */
-export async function showRequestOutcome(
-  adapter: ChannelDeliveryAdapter | null,
-  payload: ResponsePayload,
-  request: AnsweredRequest,
-  reason?: string,
-): Promise<void> {
-  if (payload.deferResolution !== true) return;
-  if (!adapter || !payload.platformId) {
-    log.warn('An answered request has no address to show its outcome at', { questionId: payload.questionId });
-    return;
-  }
-  const chosen = request.options.find((option) => option.value === payload.value)?.selectedLabel ?? payload.value;
-  const resolution = reason ? `${chosen}: ${quoted(reason, REASON_LIMIT)}` : chosen;
-  try {
-    await adapter.deliver(
-      payload.channelType,
-      payload.platformId,
-      payload.threadId,
-      'chat-sdk',
-      JSON.stringify({
-        operation: 'edit',
-        questionId: payload.questionId,
-        messageId: payload.messageId,
-        text: [request.title, request.question, resolution].filter(Boolean).join('\n\n'),
-        terminalCard: { title: request.title, question: request.question, resolution },
-      }),
-      undefined,
-      payload.instance,
-    );
-    // eslint-disable-next-line no-catch-all/no-catch-all -- the resolution stands whether or not its edit lands
-  } catch (err) {
-    log.error("Failed to show an answered request's outcome", { questionId: payload.questionId, err });
-  }
+export function dispatchResponse(payload: ResponsePayload, options?: { rethrow?: boolean }): Promise<ResponseOutcome> {
+  return new Promise((resolve, reject) => {
+    void (async () => {
+      let accepted = false;
+      const owned = {
+        ...payload,
+        accepted: () => {
+          accepted = true;
+          resolve('accepted');
+        },
+      };
+      for (const handler of responseHandlers) {
+        try {
+          const outcome = await handler(owned);
+          // So a skill author can see why the card didn't change.
+          if (outcome === true) log.warn('Response handler returned true: nothing shown', { code: 'legacy_true' });
+          if (outcome) return resolve(outcome === true ? 'ignored' : outcome);
+          // A handler that accepted the click owns it, whatever it returns.
+          if (accepted) return;
+        } catch (err) {
+          log.error('Response handler threw', { questionId: payload.questionId, err });
+          // A handler that accepted the click owns it, even when its follow-up work throws.
+          if (accepted) return;
+          if (options?.rethrow) return reject(err);
+        }
+      }
+      log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
+      resolve('ignored');
+    })();
+  });
 }

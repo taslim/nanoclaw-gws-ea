@@ -1,16 +1,22 @@
+import { escapeInvisibles } from './card-text.js';
 import type { GatewayApprovalRequest } from './gateway-providers/gateway-provider-registry.js';
 
-// Escape Markdown syntax instead of changing the displayed account or resource.
-// `<` and `>` become `‹` and `›`: a channel's own markup (a Chat mention
-// `<users/…>`, a link `<url|text>`) survives Markdown escapes.
-const safeMultiline = (text: string) =>
+// Gateway values are Markdown text, not fenced JSON: keep ordinary whitespace
+// and backticks, while making bidi/hidden characters visible. `<` and `>`
+// become `‹` and `›` before Markdown escaping: a channel's own markup (a Chat
+// mention `<users/…>`, a link `<url|text>`) survives Markdown escapes, and a
+// backslash before Unicode `‹`/`›` would show up literally in Google Chat.
+const visible = (text: string) =>
   text
-    // eslint-disable-next-line no-control-regex -- strip control bytes from gateway-supplied display text
-    .replace(/[\x00-\x09\x0b-\x1f]/g, ' ')
+    .split(/([\t\r\n`])/)
+    .map((part) => (/^[\t\r\n`]$/.test(part) ? part : escapeInvisibles(part)))
+    .join('');
+const safeMultiline = (text: string) =>
+  visible(text)
     .replace(/</g, '‹')
     .replace(/>/g, '›')
     .replace(/[\\&`*_~[\]()]/g, '\\$&');
-
+const plainTitle = (text: string) => visible(text.replace(/[\r\n]/g, ' '));
 const safe = (text: string) => safeMultiline(text.replace(/[\r\n]/g, ' '));
 
 /** An HTTP resource is shown as method, host and path, never its query or fragment. */
@@ -19,9 +25,16 @@ export function gatewayRequestResource(resource: string): string {
 }
 
 /**
+ * A rough cap, counted after escaping: channels cap or clip titles (the
+ * tightest at 60), some after expanding emoji names. A longer title or action
+ * goes in full into the body under a fixed title.
+ */
+export const MAX_CARD_TITLE_CHARS = 60;
+
+/**
  * One renderer for every gateway; no inference of business intent from HTTP
- * methods. A summary is shown in the assistant's voice, the request first: the
- * assistant is the one asking, so the agent's name is not shown.
+ * methods. A summary is shown in the assistant's voice, without exposing the
+ * internal agent name.
  */
 export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { title: string; question: string } {
   if (request.displayFields !== undefined) {
@@ -52,12 +65,22 @@ export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { 
         lines.push(`*${safe(field.label)}:* ${safeMultiline(field.value)}`);
       }
     }
-    const question = lines.join('\n');
+    let question = lines.join('\n');
+    let title = request.title;
+    // Showing hidden characters can make a title too long for a channel, so a
+    // title with any goes, shown, into the body under a fixed title.
+    if (plainTitle(title) !== title)
+      [title, question] = ['May I make this request?', `*Request:* ${safe(title)}\n${question}`];
     if (Buffer.byteLength(question, 'utf8') > 262144) throw new Error('Gateway display too large');
-    return { title: request.title, question };
+    return { title, question };
   }
   const summary = request.summary;
-  if (!summary) return { title: request.title, question: request.question };
+  if (!summary) {
+    const title = safe(request.title);
+    const question = safeMultiline(request.question);
+    if (title.length <= MAX_CARD_TITLE_CHARS) return { title: plainTitle(request.title), question };
+    return { title: 'May I make this request?', question: `*Request:* ${title}\n${question}` };
+  }
   for (const field of ['agent', 'action', 'resource', 'reason'] as const) {
     if (typeof summary[field] !== 'string' || !summary[field].trim() || summary[field].length > 600) {
       throw new Error('Invalid gateway approval summary');
@@ -66,12 +89,16 @@ export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { 
   if (summary.details !== undefined && (!Array.isArray(summary.details) || summary.details.length > 6)) {
     throw new Error('Invalid gateway approval details');
   }
+  const omitted = summary.omittedDetails;
+  if (omitted !== undefined && (!Number.isSafeInteger(omitted) || omitted < 0)) {
+    throw new Error('Invalid gateway approval details');
+  }
   const detailed = Boolean(summary.details?.length);
-  const lines = [
-    `*${detailed ? 'Where' : 'Resource'}:* ${safe(gatewayRequestResource(summary.resource))}`,
-    ...(detailed ? [] : [`*Action:* ${safe(summary.action)}`]),
-    ...(detailed ? [] : [`*Why I'm asking:* ${safe(summary.reason)}`]),
-  ];
+  const action = safe(summary.action);
+  const resource = gatewayRequestResource(summary.resource);
+  const lines = detailed
+    ? [`*Action:* ${action}`, `*Where:* ${safe(resource)}`]
+    : [`*Resource:* ${safe(resource)}`, `*Action:* ${action}`, `*Why I'm asking:* ${safe(summary.reason)}`];
   for (const detail of summary.details ?? []) {
     if (
       !detail ||
@@ -84,11 +111,13 @@ export function gatewayApprovalPresentation(request: GatewayApprovalRequest): { 
     }
     lines.push(`*${safe(detail.label)}:* ${safe(detail.value)}`);
   }
+  if (omitted) lines.push(`… ${omitted} more field${omitted === 1 ? '' : 's'} not shown`);
   const scope = detailed
     ? 'Approving lets me do this once.'
     : "Approving lets this one request through. It doesn't connect an account or change what I'm allowed to do.";
-  return {
-    title: detailed ? safe(summary.action) : 'May I make this request?',
-    question: lines.join('\n').slice(0, 2600 - scope.length - 1) + '\n' + scope,
-  };
+  let title = 'May I make this request?';
+  if (detailed) title = action.length <= MAX_CARD_TITLE_CHARS ? plainTitle(summary.action) : 'May I do this?';
+  // Never cut: the bridge posts long text in several blocks, and a channel
+  // that caps a whole card refuses one too long, so the approval fails closed.
+  return { title, question: [...lines, scope].join('\n') };
 }

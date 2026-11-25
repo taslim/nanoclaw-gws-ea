@@ -222,25 +222,25 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       const end = new Date(window.end).toISOString();
       if (isReadable(calendar)) {
         values.push(
-          ...(await deps.calendar().listEventDetails(calendar.id, start, end)).map(
-            (event): EventCopy => ({ calendarId: calendar.id, owner: 'principal', event }),
-          ),
+          ...(await deps.calendar().listEventDetails(calendar.id, start, end)).map((event): EventCopy => ({
+            calendarId: calendar.id,
+            owner: 'principal',
+            event,
+          })),
         );
       } else if (calendar.accessRole === 'freeBusyReader') {
         const busy = await deps.calendar().freeBusy([calendar.id], start, end);
         values.push(
-          ...(busy[calendar.id] ?? []).map(
-            (block): EventCopy => ({
-              calendarId: calendar.id,
-              owner: 'principal',
-              event: {
-                id: `busy-${digest(block)}`,
-                summary: 'Busy (details unavailable)',
-                start: { dateTime: block.start },
-                end: { dateTime: block.end },
-              },
-            }),
-          ),
+          ...(busy[calendar.id] ?? []).map((block): EventCopy => ({
+            calendarId: calendar.id,
+            owner: 'principal',
+            event: {
+              id: `busy-${digest(block)}`,
+              summary: 'Busy (details unavailable)',
+              start: { dateTime: block.start },
+              end: { dateTime: block.end },
+            },
+          })),
         );
       }
     }

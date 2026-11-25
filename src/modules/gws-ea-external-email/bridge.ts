@@ -186,8 +186,7 @@ function calendarIdOf(value: unknown): string | undefined {
 }
 
 type Target = { readonly people: readonly string[] } & (
-  | { readonly kind: 'thread'; readonly threadKey: string }
-  | { readonly kind: 'new' }
+  { readonly kind: 'thread'; readonly threadKey: string } | { readonly kind: 'new' }
 );
 
 /** Anyone but the principal and the assistant: an outside message, or someone `main` named. */

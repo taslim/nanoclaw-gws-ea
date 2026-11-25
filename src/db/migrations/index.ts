@@ -26,7 +26,8 @@ import { migration022 } from './022-messaging-group-detached.js';
 import { migration023 } from './023-approvals-instance.js';
 import { migration024 } from './024-host-coordination.js';
 import { migration025 } from './025-container-config-speed.js';
-import { migration026 } from './026-unregistered-sender-provenance.js';
+import { migration026 as upstreamMigration026PendingQuestionBody } from './026-pending-question-body.js';
+import { migration026 as migration026Provenance } from './026-unregistered-sender-provenance.js';
 import { migration027 } from './027-pending-question-deadline.js';
 import { migration028 } from './028-approval-rejection.js';
 
@@ -72,6 +73,23 @@ export type ModuleMigration = (Omit<PortableMigration, 'name'> | Omit<SqliteOnly
   name: ModuleMigrationName;
 };
 
+// Live GWS-EA assistants applied 027-pending-question-deadline (which already
+// added pending_questions.question) before upstream 026-pending-question-body
+// arrived. Keep upstream's migration file untouched and skip its ALTER TABLE
+// when the column is already present so upgrades still record its ledger name.
+const migration026PendingQuestionBody: PortableMigration = {
+  version: upstreamMigration026PendingQuestionBody.version,
+  name: upstreamMigration026PendingQuestionBody.name,
+  async up(db) {
+    const owners = await db.columnOwners?.('question');
+    if (owners === undefined || !owners.includes('pending_questions')) {
+      if (!upstreamMigration026PendingQuestionBody.sqliteOnly) {
+        await upstreamMigration026PendingQuestionBody.up(db);
+      }
+    }
+  },
+};
+
 export const migrations: Migration[] = [
   migration001,
   migration002,
@@ -96,7 +114,8 @@ export const migrations: Migration[] = [
   migration023,
   migration024,
   migration025,
-  migration026,
+  migration026PendingQuestionBody,
+  migration026Provenance,
   migration027,
   migration028,
 ];

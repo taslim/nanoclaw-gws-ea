@@ -11,7 +11,8 @@
  *      via finalizeReject.
  *
  * The response handler is registered via core's `registerResponseHandler`;
- * core iterates handlers and the first one to return `true` claims the response.
+ * core offers a click to each handler in turn, and the first to return an
+ * outcome owns it.
  */
 import { REJECT_WITH_REASON_OPTION } from '../../channels/ask-question.js';
 import { requestWake } from '../../request-wake.js';
@@ -22,8 +23,7 @@ import {
   getSession,
   transitionPendingApprovalStatus,
 } from '../../db/sessions.js';
-import { getDeliveryAdapter } from '../../delivery.js';
-import { showRequestOutcome, type ResponsePayload } from '../../response-registry.js';
+import type { ResponseOutcome, ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
@@ -33,7 +33,7 @@ import { getApprovalHandler, getRestartSafeApprovalActions, notifyApprovalResolv
 import { expireApproval } from './lifecycle.js';
 import { armReasonCapture, clampReason } from './reason-capture.js';
 
-export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
+export async function handleApprovalsResponse(payload: ResponsePayload): Promise<ResponseOutcome | false> {
   const approval = await getPendingApproval(payload.questionId);
   if (!approval) return false;
 
@@ -44,60 +44,53 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
       userId: payload.userId,
       channelType: payload.channelType,
     });
-    return true;
+    return 'refused';
   }
 
-  if (await expireApproval(approval.approval_id)) return true;
-  await handleRegisteredApproval(approval, payload, namespacedUserId(payload) ?? '');
-  return true;
-}
-
-function showOutcome(approval: PendingApproval, answer: ResponsePayload, reason?: string): Promise<void> {
-  return showRequestOutcome(
-    getDeliveryAdapter(),
-    answer,
-    { title: approval.title, question: approval.question, options: JSON.parse(approval.options_json) },
-    reason,
-  );
+  if (await expireApproval(approval.approval_id)) return 'ignored';
+  return handleRegisteredApproval(approval, payload, namespacedUserId(payload) ?? '');
 }
 
 async function handleRegisteredApproval(
   approval: PendingApproval,
   answer: ResponsePayload,
   userId: string,
-): Promise<void> {
+): Promise<ResponseOutcome> {
   const selectedOption = answer.value;
+  // The session that asked is gone: so is the request.
   if (!approval.session_id) {
     await deletePendingApproval(approval.approval_id);
-    return;
+    return 'closed';
   }
   const session = await getSession(approval.session_id);
   if (!session) {
     await deletePendingApproval(approval.approval_id);
-    return;
+    return 'closed';
   }
 
   // "Reject with reason…" — hold the row and capture the admin's next DM
   // instead of finalizing now. The agent is notified exactly once: after the
   // reason arrives, or after the sweep's timeout if the admin ghosts.
   if (selectedOption === REJECT_WITH_REASON_OPTION) {
-    await armReasonCapture(approval, session, userId);
-    return;
+    return (await armReasonCapture(approval, session, userId, answer.accepted)) ? 'accepted' : 'ignored';
   }
 
   // Plain Reject (or any other non-approve value) — instant fast path, with
-  // the reason an answer in words gave after its no.
+  // the reason an answer in words gave after its no. Only from 'pending':
+  // a card click must not cut short a reason the admin is typing.
   if (selectedOption !== 'approve') {
     const reason = answer.reason ? clampReason(answer.reason) || undefined : undefined;
-    if (await finalizeReject(approval, userId, reason)) await showOutcome(approval, answer, reason);
-    return;
+    return (await finalizeReject(approval, userId, { reason, from: 'pending', accepted: answer.accepted }))
+      ? 'accepted'
+      : 'ignored';
   }
 
-  if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) return;
-  // Decided: its outcome shows now, while the action may still take a while to apply.
-  await showOutcome(approval, answer);
+  if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) return 'ignored';
+  // The decision is recorded: the card can show it while the action runs.
+  answer.accepted?.();
 
   await applyApprovedApproval(approval, userId);
+  return 'accepted';
 }
 
 /** Replay only opted-in, idempotent handlers; the durable row remains their grant. */

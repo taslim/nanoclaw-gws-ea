@@ -301,7 +301,7 @@ export interface AnswersOptions {
   readonly postedRequest: (messageId: string) => Promise<PostedRequest | undefined>;
   readonly render: (questionId: string) => Promise<QuestionRender | undefined>;
   /** Rejects when the handler fails, which releases the answer for the platform's next delivery. */
-  readonly dispatch: (answer: Answer) => Promise<void>;
+  readonly dispatch: (answer: Answer, render: QuestionRender) => Promise<void>;
   /** How a message mentioning the assistant writes it, as `@name`: a reply may begin with it. */
   readonly selfMention?: string;
 }
@@ -319,7 +319,7 @@ type Before = { readonly kind: 'at'; readonly at: number } | { readonly kind: 'n
 /** `answer` is read only once earlier answers to the request have settled. */
 interface Candidate {
   readonly questionId: string;
-  readonly answer: () => Promise<Answer | undefined>;
+  readonly answer: () => Promise<{ readonly answer: Answer; readonly render: QuestionRender } | undefined>;
 }
 
 function isOpen(render: QuestionRender | undefined, now: number): render is QuestionRender {
@@ -399,12 +399,15 @@ export function createAnswers(options: AnswersOptions): Answers {
         const choice = choose(render);
         if (choice === undefined) return undefined;
         return {
-          questionId,
-          value: choice.value,
-          ...(choice.reason === undefined ? {} : { reason: choice.reason }),
-          userId: inbound.userId,
-          messageId,
-          platformId: inbound.platformId,
+          answer: {
+            questionId,
+            value: choice.value,
+            ...(choice.reason === undefined ? {} : { reason: choice.reason }),
+            userId: inbound.userId,
+            messageId,
+            platformId: inbound.platformId,
+          },
+          render,
         };
       },
     };
@@ -429,13 +432,13 @@ export function createAnswers(options: AnswersOptions): Answers {
     if (found === undefined) return false;
     return serialized(`request:${found.questionId}`, async () => {
       if ((await state.get<TakenAnswer>(key)) !== null) return true;
-      const answer = await found.answer();
-      if (answer === undefined) return false;
+      const resolved = await found.answer();
+      if (resolved === undefined) return false;
       const taken: TakenAnswer = { questionId: found.questionId };
       if (!(await state.setIfNotExists(key, taken, ANSWER_KEPT_MS))) return true;
       let handled = false;
       try {
-        await options.dispatch(answer);
+        await options.dispatch(resolved.answer, resolved.render);
         handled = true;
       } finally {
         if (!handled) await state.delete(key);

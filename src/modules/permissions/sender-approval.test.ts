@@ -171,12 +171,12 @@ async function pendingApprovalFromStranger(): Promise<string> {
   return (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!.id;
 }
 
-/** An answer in the owner's DM, by default from a channel that leaves the request as posted. */
+/** An answer in the owner's DM. */
 async function answer(
   questionId: string,
   value: string,
-  { userId = 'owner', deferResolution = true }: { userId?: string; deferResolution?: boolean } = {},
-): Promise<void> {
+  { userId = 'owner' }: { userId?: string } = {},
+): Promise<import('../../response-registry.js').ResponseOutcome | boolean> {
   const { getResponseHandlers } = await import('../../response-registry.js');
   for (const handler of getResponseHandlers()) {
     const claimed = await handler({
@@ -188,10 +188,10 @@ async function answer(
       messageId: 'request-message',
       platformId: 'dm-owner',
       threadId: null,
-      deferResolution,
     });
-    if (claimed) return;
+    if (claimed) return claimed;
   }
+  return false;
 }
 
 describe('unknown-sender request_approval flow', () => {
@@ -284,6 +284,84 @@ describe('unknown-sender request_approval flow', () => {
     expect(wakeContainer).toHaveBeenCalled();
   });
 
+  it('decides once when an approve and a reject arrive together', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { dispatchResponse } = await import('../../response-registry.js');
+
+    await expectAsyncDelivery(() => routeInbound(stranger('let me in')));
+    const { getDb } = await import('../../db/connection.js');
+    const pending = (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!;
+    const click = (value: string) =>
+      dispatchResponse({
+        questionId: pending.id,
+        value,
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+
+    const outcomes = await Promise.all([click('approve'), click('reject')]);
+    // Only one of them decided, so only one can be shown or confirmed.
+    expect([...outcomes].sort()).toEqual(['accepted', 'ignored']);
+    const member = await getDb().get(
+      'SELECT 1 AS x FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?',
+      'tg:stranger',
+      'ag-1',
+    );
+    expect(member !== undefined).toBe(outcomes[0] === 'accepted');
+  });
+
+  it('reports an approval accepted once it is recorded, before the held message is replayed', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { dispatchResponse } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+
+    await expectAsyncDelivery(() => routeInbound(stranger('early please')));
+    const { getDb } = await import('../../db/connection.js');
+    const pending = (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!;
+    // The replay's wake is slow (a cold start).
+    let wake!: () => void;
+    vi.mocked(wakeContainer).mockImplementationOnce(
+      () => new Promise((resolve) => (wake = () => resolve(true as never))),
+    );
+    const outcome = await Promise.race([
+      dispatchResponse({
+        questionId: pending.id,
+        value: 'approve',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve('still waiting'), 300)),
+    ]);
+    await vi.waitFor(() => expect(wake).toBeTypeOf('function'));
+    wake();
+    expect(outcome).toBe('accepted');
+  });
+
+  it('keeps the request pending when adding the member fails', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { dispatchResponse } = await import('../../response-registry.js');
+
+    await expectAsyncDelivery(() => routeInbound(stranger('add me')));
+    const { getDb } = await import('../../db/connection.js');
+    const pending = (await getDb().get<{ id: string }>('SELECT id FROM pending_sender_approvals'))!;
+    // Make the member insert fail.
+    await getDb().exec('DROP TABLE agent_group_members');
+    await dispatchResponse({
+      questionId: pending.id,
+      value: 'approve',
+      userId: 'owner',
+      channelType: 'telegram',
+      platformId: 'dm-owner',
+      threadId: null,
+    });
+    const stillPending = (await getDb().get<{ c: number }>('SELECT COUNT(*) AS c FROM pending_sender_approvals'))!.c;
+    expect(stillPending).toBe(1);
+  });
+
   it('deny → deletes the pending row without adding a member', async () => {
     const { routeInbound } = await import('../../router.js');
     const { getResponseHandlers } = await import('../../response-registry.js');
@@ -319,7 +397,7 @@ describe('unknown-sender request_approval flow', () => {
   it('rejects clicks from an unauthorized user (prevents self-admit via forwarded card)', async () => {
     // Stranger triggers the approval flow; card goes to the owner.
     const { routeInbound } = await import('../../router.js');
-    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { dispatchResponse } = await import('../../response-registry.js');
 
     await expectAsyncDelivery(() => routeInbound(stranger('can I play')));
 
@@ -329,18 +407,16 @@ describe('unknown-sender request_approval flow', () => {
 
     // A random user (not the stranger, not the owner, not an admin) tries to
     // click the approval — e.g. they got the card forwarded. Should be
-    // rejected without admitting them.
-    for (const handler of getResponseHandlers()) {
-      const claimed = await handler({
-        questionId: pending.id,
-        value: 'approve',
-        userId: 'random-bystander', // not owner, not admin
-        channelType: 'telegram',
-        platformId: 'dm-random',
-        threadId: null,
-      });
-      if (claimed) break;
-    }
+    // refused without admitting them, so the card keeps its buttons.
+    const outcome = await dispatchResponse({
+      questionId: pending.id,
+      value: 'approve',
+      userId: 'random-bystander', // not owner, not admin
+      channelType: 'telegram',
+      platformId: 'dm-random',
+      threadId: null,
+    });
+    expect(outcome).toBe('refused');
 
     // No member added for the stranger.
     const member = await getDb().get(
@@ -398,9 +474,7 @@ describe('unknown-sender request_approval flow', () => {
   });
 });
 
-describe('unknown-sender approval answered on a channel that left it as posted', () => {
-  // Text requests: the request stays as posted until the handler that
-  // authorizes an answer edits it to its outcome, by question id.
+describe('unknown-sender approval response outcomes', () => {
   function editsSinceRequest(): Array<{ platformId: unknown; instance: unknown; content: Record<string, unknown> }> {
     return deliverMock.mock.calls
       .slice(1)
@@ -412,35 +486,21 @@ describe('unknown-sender approval answered on a channel that left it as posted',
       .filter((call) => call.content.operation === 'edit');
   }
 
-  it("leaves it unedited for a bystander's answer, and edits it once its approver allows the sender", async () => {
+  it("refuses a bystander's answer and reports acceptance once its approver allows the sender", async () => {
     const questionId = await pendingApprovalFromStranger();
 
-    await answer(questionId, 'approve', { userId: 'random-bystander' });
+    expect(await answer(questionId, 'approve', { userId: 'random-bystander' })).toBe('refused');
     expect(editsSinceRequest()).toEqual([]);
 
-    await answer(questionId, 'approve');
-    expect(editsSinceRequest()).toEqual([
-      {
-        platformId: 'dm-owner',
-        instance: 'telegram',
-        content: expect.objectContaining({
-          operation: 'edit',
-          questionId,
-          messageId: 'request-message',
-          terminalCard: expect.objectContaining({ title: '👤 New sender', resolution: '✅ Allowed' }),
-        }),
-      },
-    ]);
+    expect(await answer(questionId, 'approve')).toBe('accepted');
+    expect(editsSinceRequest()).toEqual([]);
   });
 
-  it('edits it to its outcome when its approver denies the sender', async () => {
+  it('reports acceptance when its approver denies the sender', async () => {
     const questionId = await pendingApprovalFromStranger();
 
-    await answer(questionId, 'reject');
-
-    expect(editsSinceRequest().map((edit) => (edit.content.terminalCard as { resolution: string }).resolution)).toEqual(
-      ['❌ Denied'],
-    );
+    expect(await answer(questionId, 'reject')).toBe('accepted');
+    expect(editsSinceRequest()).toEqual([]);
   });
 });
 
@@ -502,8 +562,8 @@ describe("a new sender in the context of the agent that works in the approver's 
     );
     expect(details.conversation_name).toMatch(/\n---\nGroup Chat\n<<<END_EXTERNAL_UNTRUSTED_CONTENT/u);
 
-    // A card channel resolves the request itself; the note is the handler's either way.
-    await answer(questionId, 'reject', { deferResolution: false });
+    // The note is the handler's either way.
+    await answer(questionId, 'reject');
 
     expect((await notes()).at(-1)).toEqual({
       request: questionId,

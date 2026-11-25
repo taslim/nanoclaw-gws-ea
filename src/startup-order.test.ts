@@ -7,7 +7,6 @@ const state = vi.hoisted(() => ({
   routeInbound: vi.fn(),
   startChannels: vi.fn(),
   ready: vi.fn(),
-  responseHandlers: [] as Array<(payload: import('./response-registry.js').ResponsePayload) => Promise<boolean>>,
 }));
 vi.mock('./backfill-container-configs.js', () => ({ backfillContainerConfigs: vi.fn() }));
 vi.mock('./config.js', () => ({ CENTRAL_DB_PATH: ':memory:' }));
@@ -25,6 +24,7 @@ vi.mock('./container-runner.js', () => ({
     state.adopted = true;
   },
   abortGatewaySessionObservers: vi.fn(),
+  refreshStaleGroupImages: vi.fn(async () => {}),
   resumeGatewaySessionAdmission: vi.fn(),
   stopGatewaySessionsForUnavailability: vi.fn(),
 }));
@@ -60,7 +60,6 @@ vi.mock('./host-lifecycle.js', async () => ({
   stopHostModules: vi.fn(),
 }));
 vi.mock('./router.js', () => ({ routeInbound: state.routeInbound }));
-vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => state.responseHandlers }));
 vi.mock('./channels/index.js', () => ({}));
 vi.mock('./modules/index.js', () => ({}));
 vi.mock('./cli/commands/index.js', () => ({}));
@@ -78,7 +77,6 @@ afterEach(() => {
   state.adopted = false;
   state.approvalReady = false;
   state.releaseAdoption = undefined;
-  state.responseHandlers = [];
   state.routeInbound.mockReset();
   state.startChannels.mockReset();
   state.ready.mockReset();
@@ -209,59 +207,62 @@ it('holds an answer until inbound is ready, and settles it only once its handler
     await new Promise<void>((resolve) => {
       finish = resolve;
     });
-    return true;
+    return 'accepted' as const;
   });
-  state.responseHandlers = [handler];
-  let answered: void | Promise<void> = undefined;
+  const { registerResponseHandler } = await import('./response-registry.js');
+  registerResponseHandler(handler);
+  let answered: ReturnType<import('./channels/adapter.js').ChannelSetup['onAction']> = undefined;
   state.startChannels.mockImplementation(async (setup) => {
     answered = setup({ channelType: 'fixture' }).onAction(
       'q-1',
       'reject',
       'users/2001',
       { platformId: 'fixture:dm', messageId: 'fixture:dm/m-1' },
-      { deferResolution: true, reason: 'too expensive' },
+      { redeliverOnError: true, reason: 'too expensive' },
     );
   });
   await import('./index.js');
   await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
   expect(handler).not.toHaveBeenCalled();
 
-  let settled = false;
-  const settling = Promise.resolve(answered).then(() => {
-    settled = true;
+  let settled: import('./response-registry.js').ResponseOutcome | undefined;
+  const settling = Promise.resolve(answered).then((outcome) => {
+    settled = outcome ?? undefined;
   });
   state.releaseAdoption!();
   await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
-  expect(handler).toHaveBeenCalledWith({
-    questionId: 'q-1',
-    value: 'reject',
-    reason: 'too expensive',
-    userId: 'users/2001',
-    channelType: 'fixture',
-    instance: 'fixture',
-    messageId: 'fixture:dm/m-1',
-    platformId: 'fixture:dm',
-    threadId: null,
-    deferResolution: true,
-  });
+  expect(handler).toHaveBeenCalledWith(
+    expect.objectContaining({
+      questionId: 'q-1',
+      value: 'reject',
+      reason: 'too expensive',
+      userId: 'users/2001',
+      channelType: 'fixture',
+      instance: 'fixture',
+      messageId: 'fixture:dm/m-1',
+      platformId: 'fixture:dm',
+      threadId: null,
+    }),
+  );
   await Promise.resolve();
-  expect(settled).toBe(false);
+  expect(settled).toBeUndefined();
   finish();
   await settling;
-  expect(settled).toBe(true);
+  expect(settled).toBe('accepted');
 });
 
-it('rejects an answer whose handler fails, so its channel can hand it over again', async () => {
+it('rejects an answer whose handler fails when the channel asks to redeliver on error', async () => {
   vi.resetModules();
   vi.spyOn(process, 'on').mockReturnValue(process);
-  state.responseHandlers = [
-    async () => {
-      throw new Error('database is locked');
-    },
-  ];
-  let answered: void | Promise<void> = undefined;
+  const { registerResponseHandler } = await import('./response-registry.js');
+  registerResponseHandler(async () => {
+    throw new Error('database is locked');
+  });
+  let answered: ReturnType<import('./channels/adapter.js').ChannelSetup['onAction']> = undefined;
   state.startChannels.mockImplementation(async (setup) => {
-    answered = setup({ channelType: 'fixture' }).onAction('q-1', 'approve', 'users/2001');
+    answered = setup({ channelType: 'fixture' }).onAction('q-1', 'approve', 'users/2001', undefined, {
+      redeliverOnError: true,
+    });
   });
   await import('./index.js');
   await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
