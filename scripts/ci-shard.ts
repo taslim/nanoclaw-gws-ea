@@ -13,6 +13,28 @@ const DEFAULT_WEIGHT_MS = 1_000;
  */
 export const SHELL_TEST_FILES = new Set<string>(['src/gws-ea/cli-completion.test.ts', 'src/gws-ea/cutover.test.ts']);
 
+/**
+ * Heavy suites that launch real native Chrome processes. Spreading them evenly
+ * across shards prevents one 4-core runner from launching 4+ Chrome instances
+ * simultaneously and starving Playwright timeouts.
+ */
+export const CHROME_HEAVY_FILES = new Set<string>([
+  'src/modules/gws-ea-browser/open-web-native.test.ts',
+  'src/modules/gws-ea-browser/purchase.test.ts',
+  'src/modules/gws-ea-browser/credential-native.test.ts',
+  'src/modules/gws-ea-browser/fill-native.test.ts',
+  'src/modules/gws-ea-browser/open-web-watch-native.test.ts',
+  'src/modules/gws-ea-browser/logins-page.test.ts',
+  'src/modules/gws-ea-artifacts/viewer.test.ts',
+  'src/modules/gws-ea-browser/recipes.test.ts',
+  'src/modules/gws-ea-connections/page.test.ts',
+  'src/modules/gws-ea-browser/index.lifecycle.test.ts',
+  'src/modules/gws-ea-browser/reservation-execution.test.ts',
+  'src/modules/gws-ea-browser/queue.test.ts',
+  'src/modules/gws-ea-browser/document-gate.test.ts',
+  'src/modules/gws-ea-browser/resy-signature.test.ts',
+]);
+
 export interface ShardPlan {
   readonly shards: readonly (readonly string[])[];
   readonly weightsMs: readonly number[];
@@ -55,15 +77,39 @@ export function buildShardPlan(
   const weighted = uniqueFiles.map((file) => ({
     file,
     weightMs: timings[file] ?? DEFAULT_WEIGHT_MS,
+    chromeHeavy: CHROME_HEAVY_FILES.has(file),
   }));
 
-  // Largest files first; tie-break lexicographically for deterministic sharding across runners.
-  weighted.sort((a, b) => b.weightMs - a.weightMs || a.file.localeCompare(b.file));
+  const chromeItems = weighted
+    .filter((item) => item.chromeHeavy)
+    .sort((a, b) => b.weightMs - a.weightMs || a.file.localeCompare(b.file));
+  const otherItems = weighted
+    .filter((item) => !item.chromeHeavy)
+    .sort((a, b) => b.weightMs - a.weightMs || a.file.localeCompare(b.file));
 
   const buckets: string[][] = Array.from({ length: totalShards }, () => []);
   const weightsMs: number[] = Array.from({ length: totalShards }, () => 0);
+  const chromeCounts: number[] = Array.from({ length: totalShards }, () => 0);
 
-  for (const item of weighted) {
+  // Spread Chrome-heavy files evenly by count first (tie-broken by lightest weight)
+  // so no single runner launches 4+ native Chrome suites concurrently.
+  for (const item of chromeItems) {
+    let target = 0;
+    for (let i = 1; i < totalShards; i++) {
+      if (
+        chromeCounts[i]! < chromeCounts[target]! ||
+        (chromeCounts[i]! === chromeCounts[target]! && weightsMs[i]! < weightsMs[target]!)
+      ) {
+        target = i;
+      }
+    }
+    buckets[target]!.push(item.file);
+    weightsMs[target] = weightsMs[target]! + item.weightMs;
+    chromeCounts[target] = chromeCounts[target]! + 1;
+  }
+
+  // LPT bin-pack remaining files by weight to equalize total shard duration.
+  for (const item of otherItems) {
     let lightestIndex = 0;
     for (let i = 1; i < totalShards; i++) {
       if (weightsMs[i]! < weightsMs[lightestIndex]!) {
@@ -72,6 +118,10 @@ export function buildShardPlan(
     }
     buckets[lightestIndex]!.push(item.file);
     weightsMs[lightestIndex] = weightsMs[lightestIndex]! + item.weightMs;
+  }
+
+  for (const bucket of buckets) {
+    bucket.sort();
   }
 
   // Prove the shards partition the exact discovered set with zero omissions or duplicates.

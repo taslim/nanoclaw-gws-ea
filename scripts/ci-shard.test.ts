@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildShardPlan, loadTimings, parseShardSpec, SHELL_TEST_FILES, shardNeedsShells } from './ci-shard.js';
+import {
+  buildShardPlan,
+  CHROME_HEAVY_FILES,
+  loadTimings,
+  parseShardSpec,
+  SHELL_TEST_FILES,
+  shardNeedsShells,
+} from './ci-shard.js';
 
 describe('ci-shard', () => {
   it('partitions every file into exactly one shard deterministically regardless of input order', () => {
@@ -63,8 +70,12 @@ describe('ci-shard', () => {
     expect(() => parseShardSpec('abc')).toThrow();
   });
 
-  it('loads the checked-in CI timings file cleanly', () => {
+  it('loads the checked-in CI timings file cleanly and spreads Chrome-heavy suites evenly', () => {
     const timings = loadTimings();
     expect(Object.keys(timings).length).toBeGreaterThan(20);
+    const chromeFiles = [...CHROME_HEAVY_FILES];
+    const plan = buildShardPlan(chromeFiles, timings, 4);
+    const counts = plan.shards.map((shard) => shard.length);
+    expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(1);
   });
 });
