@@ -1780,6 +1780,13 @@ async function inspectImage(ref: string, format: string): Promise<string | null>
   }
 }
 
+let autoGroupImageRefresh = true;
+
+/** Control automatic background rebuilds of stale per-group images on startup and spawn. */
+export function setAutoGroupImageRefresh(enabled: boolean): void {
+  autoGroupImageRefresh = enabled;
+}
+
 /**
  * Rebuild a group's own image when it was layered onto an older agent image.
  * Updates and setup rebuild only the agent image, and spawn prefers the group's
@@ -1788,6 +1795,7 @@ async function inspectImage(ref: string, format: string): Promise<string | null>
  * current image, as it did before this check existed.
  */
 export function refreshStaleGroupImage(agentGroupId: string, imageTag: string | null | undefined): Promise<void> {
+  if (!autoGroupImageRefresh) return Promise.resolve();
   const derivedTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
   // A pin to any other image is the operator's choice, not something this host built.
   if (imageTag !== derivedTag) return Promise.resolve();
@@ -1847,6 +1855,7 @@ async function refreshGroupImageNow(agentGroupId: string, derivedTag: string): P
 
 /** Startup pass, so groups are usually current before their first message after an update. */
 export async function refreshStaleGroupImages(): Promise<void> {
+  if (!autoGroupImageRefresh) return;
   let rows: Awaited<ReturnType<typeof getAllContainerConfigs>>;
   try {
     rows = await getAllContainerConfigs();

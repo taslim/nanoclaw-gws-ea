@@ -1,5 +1,5 @@
 import { noVerifiedPrincipalMessage } from './approval-wording.js';
-import { registerSessionAdmissionPolicy } from '../../container-runner.js';
+import { registerSessionAdmissionPolicy, setAutoGroupImageRefresh } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
@@ -72,6 +72,9 @@ registerInboundPreparer(preparePrincipalMessageContent);
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.
 onHostStart(() => loadMainAgentGroupId());
+// GWS-EA assistants manage image rebuilds explicitly (gws-ea update / --rebuild),
+// not via background per-group docker rebuilds on startup or spawn.
+setAutoGroupImageRefresh(false);
 // The host releases the messages its channels held before it starts its
 // modules, so a spawn can come first: it reads main's group itself before its
 // environment is composed. An adopted container keeps the environment it has.

@@ -17,6 +17,7 @@ vi.mock('../../config.js', async (original) => ({
 }));
 vi.mock('../../container-runner.js', () => ({
   registerSessionAdmissionPolicy: vi.fn(),
+  setAutoGroupImageRefresh: vi.fn(),
   wakeContainer: vi.fn(async () => true),
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));

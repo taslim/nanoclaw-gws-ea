@@ -28,6 +28,7 @@ vi.mock('../../container-runner.js', () => ({
   isContainerRunning: vi.fn(() => false),
   killContainer: vi.fn(),
   registerSessionAdmissionPolicy: vi.fn(),
+  setAutoGroupImageRefresh: vi.fn(),
   wakeContainer: vi.fn().mockResolvedValue(true),
 }));
 

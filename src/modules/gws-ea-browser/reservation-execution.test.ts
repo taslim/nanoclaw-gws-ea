@@ -20,6 +20,7 @@ vi.mock('../../container-runner.js', () => ({
   isContainerRunning: () => false,
   killContainer: vi.fn(),
   registerSessionAdmissionPolicy: vi.fn(),
+  setAutoGroupImageRefresh: vi.fn(),
   wakeContainer: vi.fn(async () => true),
 }));
 vi.mock('../gws-ea-meetings/calendar-facts.js', () => ({ findPrincipalCalendarConflicts: calendar }));
