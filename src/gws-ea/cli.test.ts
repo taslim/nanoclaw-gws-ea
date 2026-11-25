@@ -41,6 +41,7 @@ import { activeStep } from './run-log.js';
 import { FULL_CHECK_MS } from './stray-install.js';
 import { expectResultContract } from './testing/result-contract.js';
 import { present, removeToolCheckouts, toolCheckoutWorld, type ToolCheckoutWorld } from './testing/stray-fixture.js';
+import type { AssistantVault } from './assistant-power.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type InstanceReservationInput } from './types.js';
 
 /** `connect-google`'s step resources: the real ones unless a test supplies its own. */
@@ -324,6 +325,7 @@ describe('managed machine results', () => {
         paths,
         ...already.runtime,
         serviceHelpers: running.helpers,
+        vault: running.vault,
       }),
     ).toBe(0);
     expect(JSON.parse(already.out.join('\n'))).toMatchObject({
@@ -339,6 +341,7 @@ describe('managed machine results', () => {
         paths,
         ...failed.runtime,
         serviceHelpers: stopped.helpers,
+        vault: stopped.vault,
       }),
     ).toBe(1);
     expect(JSON.parse(failed.out.join('\n'))).toMatchObject({
@@ -2175,8 +2178,20 @@ interface ServiceCall {
  * `running` does not name has no service installed. Every call records the
  * install and checkout it targeted.
  */
-function nanoclawServices(running: Record<string, boolean>, options: { readonly healthy?: boolean } = {}) {
+function nanoclawServices(
+  running: Record<string, boolean>,
+  options: {
+    readonly healthy?: boolean;
+    readonly disabled?: Record<string, boolean>;
+    readonly agents?: Record<string, boolean>;
+    readonly vaultRunning?: Record<string, boolean>;
+    readonly vaultFails?: boolean;
+  } = {},
+) {
   const calls: ServiceCall[] = [];
+  const disabled: Record<string, boolean> = { ...options.disabled };
+  const agents: Record<string, boolean> = { ...options.agents };
+  const vaults: Record<string, boolean> = { ...running, ...options.vaultRunning };
   const handle = (install: string): NanoclawServiceHandle =>
     Object.hasOwn(running, install)
       ? {
@@ -2187,10 +2202,23 @@ function nanoclawServices(running: Record<string, boolean>, options: { readonly 
         }
       : { mode: 'none', active: false };
   const helpers = {
-    createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => ({
-      run: () => '',
-      tryRun: () => ({ ok: true, stdout: '' }),
-    })),
+    createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(({ env }) => {
+      const install = env.NANOCLAW_INSTALL_ID ?? '';
+      return {
+        run: (command, args) => {
+          if (command !== 'launchctl') return '';
+          if (args[0] === 'print-disabled')
+            return disabled[install] ? `\t\t"com.nanoclaw-v2-${install}" => disabled\n` : '';
+          calls.push({ helper: args[0] ?? '', install });
+          disabled[install] = args[0] === 'disable';
+          return '';
+        },
+        tryRun: (command) => ({
+          ok: true,
+          stdout: command === 'docker' && agents[install] ? 'agent|session-1|\n' : '',
+        }),
+      };
+    }),
     detectService: vi.fn<NanoclawServiceHelpers['detectService']>((root, env) => {
       calls.push({ helper: 'detect', install: env.installSlug, root });
       return handle(env.installSlug);
@@ -2205,13 +2233,29 @@ function nanoclawServices(running: Record<string, boolean>, options: { readonly 
     }),
     drainContainers: vi.fn<NanoclawServiceHelpers['drainContainers']>(async (root, env) => {
       calls.push({ helper: 'drain', install: env.installSlug, root });
+      agents[env.installSlug] = false;
     }),
     verifyServiceHealth: vi.fn<NanoclawServiceHelpers['verifyServiceHealth']>(async (_handle, root, env) => {
       calls.push({ helper: 'health', install: env.installSlug, root });
       return options.healthy ?? true;
     }),
   } satisfies NanoclawServiceHelpers;
-  return { helpers, calls, running };
+  /** Each assistant's credential vault, its steps recorded among the helpers' calls. */
+  const vault = ({ install_id: install }: InstanceRuntimeConfig): AssistantVault => ({
+    bringUp: async () => {
+      if (vaults[install]) return;
+      vaults[install] = true;
+      calls.push({ helper: 'vault up', install });
+      if (options.vaultFails) throw new GwsEaError('onecli_unhealthy', 'The credential vault never became healthy.');
+    },
+    stop: async () => {
+      if (!vaults[install]) return 'already-stopped';
+      vaults[install] = false;
+      calls.push({ helper: 'vault stop', install });
+      return 'stopped';
+    },
+  });
+  return { helpers, calls, running, disabled, agents, vaults, vault };
 }
 
 interface Replacement {
@@ -2377,50 +2421,87 @@ describe('gws-ea connect-google', () => {
 });
 
 describe('gws-ea start, stop, and restart', () => {
-  it("stops only the named assistant's host while another runs, and stops neither one's agent containers", async () => {
+  it('turns off only the named assistant: its service, host, agent containers, and vault, while another runs', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
     const b = await createdAssistant(paths, 35_011);
-    const { helpers, calls, running } = nanoclawServices({ [a.install_id]: true, [b.install_id]: true });
+    const { helpers, calls, running, disabled, agents, vaults, vault } = nanoclawServices(
+      { [a.install_id]: true, [b.install_id]: true },
+      { agents: { [a.install_id]: true, [b.install_id]: true } },
+    );
     const io = lines();
 
-    expect(await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
+    expect(
+      await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+    ).toBe(0);
 
-    expect(calls).toEqual([
-      { helper: 'detect', install: a.install_id, root: a.checkout_root },
+    expect(calls.filter(({ helper }) => helper !== 'detect')).toEqual([
+      { helper: 'disable', install: a.install_id },
       { helper: 'stop', install: a.install_id },
+      { helper: 'drain', install: a.install_id, root: a.checkout_root },
+      { helper: 'vault stop', install: a.install_id },
     ]);
     expect(running).toEqual({ [a.install_id]: false, [b.install_id]: true });
+    expect(disabled).toEqual({ [a.install_id]: true });
+    expect(agents).toEqual({ [a.install_id]: false, [b.install_id]: true });
+    expect(vaults).toEqual({ [a.install_id]: false, [b.install_id]: true });
     expect(io.out).toContain(`Assistant ${a.instance_id} stopped.`);
-    expect(io.out.join('\n')).toContain('agent containers keep running');
+    expect(io.out.join('\n')).toContain('It stays off, through logins and reboots, until gws-ea start.');
   });
 
-  it('counts stopping an already-stopped assistant as success', async () => {
+  it('finishes turning off an assistant an older stop left enabled with its vault running', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
-    const { helpers, calls } = nanoclawServices({ [a.install_id]: false });
+    const { helpers, calls, vault } = nanoclawServices(
+      { [a.install_id]: false },
+      { vaultRunning: { [a.install_id]: true } },
+    );
     const io = lines();
 
-    expect(await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
+    expect(
+      await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+    ).toBe(0);
 
-    expect(calls.map(({ helper }) => helper)).toEqual(['detect']);
+    expect(calls.map(({ helper }) => helper).filter((helper) => helper !== 'detect')).toEqual([
+      'disable',
+      'vault stop',
+    ]);
+    expect(io.out).toContain(`Assistant ${a.instance_id} stopped.`);
+  });
+
+  it('counts stopping an assistant already off as success, changing nothing', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { helpers, calls, vault } = nanoclawServices(
+      { [a.install_id]: false },
+      { disabled: { [a.install_id]: true } },
+    );
+    const io = lines();
+
+    expect(
+      await runCli(['stop', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+    ).toBe(0);
+
+    expect(calls.map(({ helper }) => helper).filter((helper) => helper !== 'detect')).toEqual([]);
     expect(io.out).toContain(`Assistant ${a.instance_id} is already stopped.`);
   });
 
   it.each([
-    ['start', false, 'started', ['detect', 'start', 'detect', 'health']],
-    ['restart', true, 'restarted', ['detect', 'stop', 'start', 'detect', 'health']],
+    ['start', false, 'started', ['vault up', 'start', 'health']],
+    ['restart', true, 'restarted', ['stop', 'start', 'health']],
   ] as const)(
     '%s acts on the named service, then waits until its host answers, never draining its agents',
     async (command, wasRunning, outcome, sequence) => {
       const paths = await testPaths();
       const a = await createdAssistant(paths, 35_001);
-      const { helpers, calls } = nanoclawServices({ [a.install_id]: wasRunning });
+      const { helpers, calls, vault } = nanoclawServices({ [a.install_id]: wasRunning });
       const io = lines();
 
-      expect(await runCli([command, '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(0);
+      expect(
+        await runCli([command, '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+      ).toBe(0);
 
-      expect(calls.map(({ helper }) => helper)).toEqual(sequence);
+      expect(calls.map(({ helper }) => helper).filter((helper) => helper !== 'detect')).toEqual(sequence);
       expect(io.out).toContain(`Assistant ${a.instance_id} ${outcome}.`);
       // Every helper acts on the service the runtime record names: its checkout, install, home, and Docker endpoint.
       for (const { install, root } of calls) {
@@ -2439,11 +2520,68 @@ describe('gws-ea start, stop, and restart', () => {
   );
 
   it.each(['start', 'restart'] as const)(
+    '%s turns an assistant that was off back on: vault first, then its service, then its host',
+    async (command) => {
+      const paths = await testPaths();
+      const a = await createdAssistant(paths, 35_001);
+      const { helpers, calls, disabled, vault } = nanoclawServices(
+        { [a.install_id]: false },
+        { disabled: { [a.install_id]: true } },
+      );
+      const io = lines();
+
+      expect(
+        await runCli([command, '--id', a.instance_id, '--json'], {
+          paths,
+          ...io.runtime,
+          serviceHelpers: helpers,
+          vault,
+        }),
+      ).toBe(0);
+
+      expect(calls.map(({ helper }) => helper).filter((helper) => helper !== 'detect')).toEqual([
+        'vault up',
+        'enable',
+        'start',
+        'health',
+      ]);
+      expect(disabled[a.install_id]).toBe(false);
+      expect(JSON.parse(io.out.join('\n'))).toMatchObject({
+        outcome: 'succeeded',
+        changed: true,
+        data: { service: { action: command, result: 'started' } },
+      });
+    },
+  );
+
+  it('keeps an assistant that was off fully off when its vault cannot come up', async () => {
+    const paths = await testPaths();
+    const a = await createdAssistant(paths, 35_001);
+    const { helpers, calls, disabled, vaults, vault } = nanoclawServices(
+      { [a.install_id]: false },
+      { disabled: { [a.install_id]: true }, vaultFails: true },
+    );
+    const io = lines();
+
+    expect(
+      await runCli(['start', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+    ).toBe(1);
+
+    expect(calls.map(({ helper }) => helper).filter((helper) => helper !== 'detect')).toEqual([
+      'vault up',
+      'vault stop',
+    ]);
+    expect(disabled[a.install_id]).toBe(true);
+    expect(vaults[a.install_id]).toBe(false);
+    expect(io.err.join('\n')).toContain('The credential vault never became healthy.');
+  });
+
+  it.each(['start', 'restart'] as const)(
     '%s keeps the assistant ready when optional connector setup is pending',
     async (command) => {
       const paths = await testPaths();
       const a = await createdAssistant(paths, 35001);
-      const { helpers } = nanoclawServices({ [a.install_id]: true });
+      const { helpers, vault } = nanoclawServices({ [a.install_id]: true });
       const io = lines();
       const provision = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
         pending: [{ name: 'web', reason: 'profile_incomplete', message: 'Complete the web profile.' }],
@@ -2451,7 +2589,12 @@ describe('gws-ea start, stop, and restart', () => {
       });
       try {
         expect(
-          await runCli([command, '--id', a.instance_id, '--json'], { paths, ...io.runtime, serviceHelpers: helpers }),
+          await runCli([command, '--id', a.instance_id, '--json'], {
+            paths,
+            ...io.runtime,
+            serviceHelpers: helpers,
+            vault,
+          }),
         ).toBe(0);
         const result = JSON.parse(io.out.join('\n'));
         expectResultContract(command, result);
@@ -2469,10 +2612,12 @@ describe('gws-ea start, stop, and restart', () => {
   it('fails a start whose host never answers on its CLI socket, naming where its errors are', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
-    const { helpers } = nanoclawServices({ [a.install_id]: false }, { healthy: false });
+    const { helpers, vault } = nanoclawServices({ [a.install_id]: false }, { healthy: false });
     const io = lines();
 
-    expect(await runCli(['start', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(1);
+    expect(
+      await runCli(['start', '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+    ).toBe(1);
 
     expect(helpers.startService).toHaveBeenCalledOnce();
     const summary = io.err.join('\n');
@@ -2487,10 +2632,12 @@ describe('gws-ea start, stop, and restart', () => {
     async (command) => {
       const paths = await testPaths();
       const a = await createdAssistant(paths, 35_001);
-      const { helpers } = nanoclawServices({});
+      const { helpers, vault } = nanoclawServices({});
       const io = lines();
 
-      expect(await runCli([command, '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers })).toBe(1);
+      expect(
+        await runCli([command, '--id', a.instance_id], { paths, ...io.runtime, serviceHelpers: helpers, vault }),
+      ).toBe(1);
 
       expect(helpers.startService).not.toHaveBeenCalled();
       // The refusal and its log alone: rerunning the command cannot install the service.
@@ -2518,13 +2665,14 @@ describe('gws-ea start, stop, and restart', () => {
         ['start', false],
         ['restart', true],
       ] as const) {
-        const { helpers } = nanoclawServices({ [a.install_id]: wasRunning });
+        const { helpers, vault } = nanoclawServices({ [a.install_id]: wasRunning });
         expect(
           await runCli([command, '--id', a.instance_id], {
             paths,
             ...lines().runtime,
             environment: { PATH: bin },
             serviceHelpers: helpers,
+            vault,
           }),
         ).toBe(0);
       }

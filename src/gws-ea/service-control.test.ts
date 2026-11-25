@@ -626,6 +626,30 @@ describe('drain and health', () => {
     );
   });
 
+  it.each([
+    ['an agent container', 'a1|sess-1|\n', true],
+    ['a session auxiliary', 'a2|sess-1|gateway\n', true],
+    ['only a gateway-owned container, which a host start never recreates', 'g1||gateway\n', false],
+    ['nothing', '', false],
+  ] as const)('sees agents running when Docker lists %s', (_case, listed, expected) => {
+    const { helpers, runner } = nanoclaw(LOADED);
+    runner.tryRun.mockReturnValue({ ok: true, stdout: listed });
+
+    expect(control(helpers).service.agentsRunning()).toBe(expected);
+    expect(runner.tryRun).toHaveBeenCalledWith(
+      'docker',
+      [
+        'ps',
+        '--filter',
+        `label=nanoclaw-install=${INSTALL_ID}`,
+        '--format',
+        '{{.ID}}|{{.Label "nanoclaw-session"}}|{{.Label "nanoclaw-role"}}',
+      ],
+      undefined,
+      { timeoutMs: 30_000 },
+    );
+  });
+
   it('verifies health against the detected service marked active, so a stopped one is never taken as healthy', async () => {
     const { helpers } = nanoclaw(BOOTED_OUT);
     helpers.verifyServiceHealth.mockResolvedValueOnce(false);

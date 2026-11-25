@@ -1,3 +1,4 @@
+import { onecliVault, turnOff, turnOn, type AssistantVault } from './assistant-power.js';
 import { provisionInstalledConnectors } from './connector-provisioning.js';
 import { CONNECTOR_CATALOG, connectorDefinition, type ConnectorLifecycleContext } from './connectors.js';
 import { connectorLines } from './connector-inspection.js';
@@ -5,7 +6,7 @@ import { voiceCapabilityRecovery } from './voice-inspection.js';
 import { type WebCapabilityDependencies } from './web-connector.js';
 import { aliasDecision, runAliasStep, aliasNextActions, type AliasDecision } from './alias.js';
 import { withAssistantLock } from './assistant-lock.js';
-import { loadInstanceRuntimeConfig } from './service.js';
+import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -261,6 +262,8 @@ export interface CliRuntime {
   update?: UpdateSeams;
   /** The checkout this tool runs from, which only the launcher names: a stray NanoClaw install there is removed. */
   toolCheckout?: ToolCheckout;
+  /** Absent: the assistant's own OneCLI compose stack, through Docker. */
+  vault?: (runtime: InstanceRuntimeConfig) => AssistantVault;
 }
 
 type UpdateLauncher = Required<
@@ -1079,27 +1082,31 @@ class Cli {
           state.changed = combineEffects(state.changed, changed);
         },
       });
+      const vault =
+        this.#runtime.vault?.(record) ??
+        onecliVault(this.#paths, await getInstanceReservation(this.#paths, instanceId), record.docker_endpoint, {
+          ambientEnv: this.#runtime.environment ?? process.env,
+        });
       switch (command) {
         case 'start': {
-          const started = await runStep(reporter, { id: 'start', label: 'Starting the assistant…' }, () =>
-            service.start(),
+          const { turnedOn, started } = await runStep(reporter, { id: 'start', label: 'Starting the assistant…' }, () =>
+            turnOn(service, vault, () => service.start()),
           );
-          state.changed = combineEffects(state.changed, started === 'started');
-          state.data = { ...state.data, service: { action: command, result: started } };
+          const result = turnedOn ? 'started' : started;
+          state.changed = combineEffects(state.changed, result === 'started');
+          state.data = { ...state.data, service: { action: command, result } };
           await verifyServing(reporter, service, instanceId);
           const connectorActions = await this.#provisionConnectors(operation, reporter);
           return {
             status: 'ready',
             message:
-              started === 'started'
-                ? `Assistant ${instanceId} started.`
-                : `Assistant ${instanceId} is already running.`,
+              result === 'started' ? `Assistant ${instanceId} started.` : `Assistant ${instanceId} is already running.`,
             actions: connectorActions,
           };
         }
         case 'stop': {
           const stopped = await runStep(reporter, { id: 'stop', label: 'Stopping the assistant…' }, () =>
-            service.stop(),
+            turnOff(service, vault),
           );
           state.changed = combineEffects(state.changed, stopped === 'stopped');
           state.data = { ...state.data, service: { action: command, result: stopped } };
@@ -1108,15 +1115,17 @@ class Cli {
                 status: 'ready',
                 message: `Assistant ${instanceId} stopped.`,
                 details: [
-                  'Its agent containers keep running for the next start to adopt.',
-                  'It stays stopped until the next gws-ea start, login, or reboot.',
+                  'Its host, agent containers, and credential vault are stopped.',
+                  'It stays off, through logins and reboots, until gws-ea start.',
                 ],
               }
             : { status: 'ready', message: `Assistant ${instanceId} is already stopped.` };
         }
         case 'restart': {
-          const restarted = await runStep(reporter, { id: 'restart', label: 'Restarting the assistant…' }, () =>
-            service.restart(),
+          const { started: restarted } = await runStep(
+            reporter,
+            { id: 'restart', label: 'Restarting the assistant…' },
+            () => turnOn(service, vault, () => service.restart()),
           );
           state.changed = combineEffects(state.changed, restarted === 'restarted' || restarted === 'started');
           state.data = { ...state.data, service: { action: command, result: restarted } };

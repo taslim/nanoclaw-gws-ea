@@ -151,8 +151,10 @@ export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   /** Stands in for `process.env`; user-bus variables absent from it are derived from the UID. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
   /**
-   * (Re)starts the installed service as `gws-ea restart` does: a running host
-   * is stopped and its manager waited out before it starts again.
+   * Turns the installed service on and (re)starts it as `gws-ea restart` does:
+   * a running host is stopped and its manager waited out before it starts
+   * again. Turning it on clears an operator's stop, which launchd needs before
+   * it will load the job at all.
    */
   readonly restartService?: (config: InstanceRuntimeConfig) => Promise<unknown>;
 }
@@ -698,13 +700,6 @@ export async function reconcileInstanceService(
   if (layout.manager === 'systemd-user') await ensureLingering(command, dependencies);
   if (!(await isRegularFile(layout.serviceDefinitionPath))) {
     await installServiceDefinition(config, layout, renderInstanceService(config, layout), undefined, dependencies);
-  }
-  if (layout.manager !== 'launchd') {
-    await command('systemctl', [
-      ...(layout.manager === 'systemd-user' ? ['--user'] : []),
-      'enable',
-      layout.serviceIdentity,
-    ]);
   }
   await restartService(config);
   return { layout, pid: await instanceServicePid(config, dependencies) };

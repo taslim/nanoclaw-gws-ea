@@ -351,9 +351,8 @@ describe('GWS-EA instance runtime', () => {
     expect(calls.map((call) => [call.command, ...call.args])).toEqual([
       ['loginctl', 'show-user', '1000', '--property', 'Linger', '--value'],
       ['loginctl', 'enable-linger'],
-      // A new unit is written, so systemd is told before it is enabled and started.
+      // A new unit is written, so systemd is told before it is turned on and started.
       ['systemctl', '--user', 'daemon-reload'],
-      ['systemctl', '--user', 'enable', unit],
       ['restart'],
       ['systemctl', '--user', 'show', unit, '--property', 'MainPID', '--value'],
     ]);

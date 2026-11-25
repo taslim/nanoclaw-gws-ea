@@ -1398,8 +1398,11 @@ export async function runProductionProvision(
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
         hostPolicyRoot: operation.paths.configRoot,
-        restartService: (config) =>
-          createServiceControl(options.serviceHelpers, runtimeServiceTarget(config)).restart(),
+        restartService: (config) => {
+          const service = createServiceControl(options.serviceHelpers, runtimeServiceTarget(config));
+          service.enable();
+          return service.restart();
+        },
         platform: manifest?.platform ?? instanceServicePlatform(),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,

@@ -16,6 +16,8 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
+import { getInstallScopedNames } from '../install-slug.js';
+
 import { buildToolEnvironment } from './process.js';
 import { activeStep } from './run-log.js';
 import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
@@ -25,6 +27,13 @@ export { hostLogFiles, type HostLogFiles } from './service.js';
 
 /** Bounds a `systemctl` call a hung user bus would otherwise hold forever, leaving the assistant down. */
 const SYSTEMCTL_TIMEOUT_MS = 30_000;
+
+/**
+ * NanoClaw's drain filter (`drainContainers` in `scripts/update/service.ts`, which `src/` cannot import): the
+ * install's containers minus gateway-owned ones, which carry the gateway role and no session.
+ */
+const DRAIN_LIST_FORMAT = '{{.ID}}|{{.Label "nanoclaw-session"}}|{{.Label "nanoclaw-role"}}';
+const GATEWAY_ROLE = 'gateway';
 
 /** `systemctl is-enabled` states other than `disabled`, which it reports with a non-zero exit. */
 const SYSTEMD_UNIT_FILE_STATES: ReadonlySet<string> = new Set([
@@ -171,8 +180,10 @@ export interface InstanceServiceControl {
    */
   stopByLabel(label: string, definition: string): Promise<void>;
   restart(): Promise<RestartOutcome>;
-  /** Stops this assistant's agent containers and waits until none runs; for a fence and removal only. */
+  /** Stops this assistant's agent containers and waits until none runs; for a fence, removal, and turning it off. */
   drain(timeoutMs?: number): Promise<void>;
+  /** Whether any container `drain` would stop is running; a Docker it cannot ask counts as yes, leaving the answer to `drain`. */
+  agentsRunning(): boolean;
   /** Whether the host serves: its service active, its CLI socket up, and `ncl` answering. */
   verifyHealth(timeoutMs?: number): Promise<boolean>;
 }
@@ -408,6 +419,28 @@ export function createServiceControl(
           { cause },
         );
       }
+    },
+    agentsRunning() {
+      const listed = env.runner.tryRun(
+        'docker',
+        [
+          'ps',
+          '--filter',
+          `label=${getInstallScopedNames(target.installId).containerInstallLabel}`,
+          '--format',
+          DRAIN_LIST_FORMAT,
+        ],
+        undefined,
+        managerOptions,
+      );
+      if (!listed.ok) return true;
+      return listed.stdout
+        .split('\n')
+        .filter(Boolean)
+        .some((line) => {
+          const [, session, role] = line.split('|');
+          return Boolean(session) || role !== GATEWAY_ROLE;
+        });
     },
     verifyHealth: (timeoutMs) => helpers.verifyServiceHealth({ ...detect(), active: true }, root, env, timeoutMs),
   };
