@@ -20,6 +20,9 @@ export const SHELL_TEST_FILES = new Set<string>(['src/gws-ea/cli-completion.test
  */
 export const CHROME_HEAVY_FILES = new Set<string>([
   'src/modules/gws-ea-browser/open-web-native.test.ts',
+  'src/modules/gws-ea-browser/open-web-native.actions.test.ts',
+  'src/modules/gws-ea-browser/open-web-native.purchases.test.ts',
+  'src/modules/gws-ea-browser/open-web-native.purchases-flow.test.ts',
   'src/modules/gws-ea-browser/purchase.test.ts',
   'src/modules/gws-ea-browser/credential-native.test.ts',
   'src/modules/gws-ea-browser/fill-native.test.ts',
