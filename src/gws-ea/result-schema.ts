@@ -36,7 +36,7 @@ const phase = {
     object({ state: { const: 'unknown' }, reason: text }),
   ],
 };
-const serviceState = choices('running', 'stopped', 'not_installed', 'unmanaged', 'unknown');
+const serviceState = choices('running', 'stopped', 'off', 'not_installed', 'unmanaged', 'unknown');
 const releaseView = object({
   deployed_commit: text,
   tool_commit: nullable(text),

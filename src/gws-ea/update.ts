@@ -247,6 +247,8 @@ export function serviceRefusal(
   switch (state) {
     case 'stopped':
       return `It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${instanceId}, then update it.`;
+    case 'off':
+      return `It is turned off; start it with gws-ea start --id ${instanceId} to update it.`;
     case 'not_installed':
       return `No NanoClaw service is installed for it; gws-ea resume --id ${instanceId} installs it.`;
     case 'unmanaged':

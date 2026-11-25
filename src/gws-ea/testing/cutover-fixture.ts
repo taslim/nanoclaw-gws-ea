@@ -549,6 +549,8 @@ export interface World {
   onStart?: (checkout: string) => void;
   /** The service manager refuses to start the host. */
   startFails?: boolean;
+  /** The operator turned the job off: launchd neither bootstraps it nor loads it at login. */
+  disabled?: boolean;
   /** Runs as the release's tripwire is stamped, the first step of a switch. */
   onStamp?: () => void;
   rebuildFails?: boolean;
@@ -860,8 +862,26 @@ export function services(state: World): NanoclawServiceHelpers {
     throw new Error('the helpers run their commands through the fakes below');
   };
   const program = (root: string): boolean => existsSync(path.join(root, 'dist', 'gws-ea', 'process.js'));
+  /** launchctl as gws-ea asks it whether a job is turned off, and turns it off and on. */
+  const launchctl = (slug: string, args: readonly string[]): string => {
+    const label = `com.nanoclaw-v2-${slug}`;
+    const [verb, domain] = args;
+    if (verb === 'print-disabled' && args.length === 2) {
+      return ['disabled services = {', `\t"${label}" => ${state.disabled ? 'disabled' : 'enabled'}`, '}'].join('\n');
+    }
+    if ((verb === 'disable' || verb === 'enable') && domain?.endsWith(`/${label}`)) {
+      state.serviceCalls.push(`${verb} ${slug}`);
+      state.disabled = verb === 'disable';
+      return '';
+    }
+    return unused();
+  };
   return {
-    createCommandRunner: () => ({ run: unused, tryRun: unused }),
+    createCommandRunner: ({ env }) => ({
+      run: (command, args) =>
+        command === 'launchctl' ? launchctl(env.NANOCLAW_INSTALL_ID ?? unused(), args) : unused(),
+      tryRun: unused,
+    }),
     detectService: (_root, env) => {
       state.serviceCalls.push(`detect ${env.installSlug}`);
       return {
@@ -882,7 +902,7 @@ export function services(state: World): NanoclawServiceHelpers {
     startService: (handle, root, env) => {
       if (!handle.active) return;
       state.serviceCalls.push(`start ${env.installSlug}`);
-      if (state.startFails) throw new Error('Bootstrap failed: 5: Input/output error');
+      if (state.startFails || state.disabled) throw new Error('Bootstrap failed: 5: Input/output error');
       state.events.push('start');
       state.loaded = true;
       state.loadedDefinition = readFileSync(handle.definition!, 'utf8');
@@ -904,9 +924,15 @@ export function services(state: World): NanoclawServiceHelpers {
 
 /**
  * A reboot or login: launchd loads the job from its definition (`RunAtLoad`)
- * and runs the host only if the program the definition names exists.
+ * and runs the host only if the program the definition names exists. A job
+ * turned off is not loaded.
  */
 export function reboot(state: World, runtime: InstanceRuntimeConfig): void {
+  if (state.disabled) {
+    state.loaded = false;
+    state.running = false;
+    return;
+  }
   state.loaded = true;
   state.loadedDefinition = readFileSync(serviceDefinitionFile(runtime), 'utf8');
   state.running = existsSync(path.join(runtime.checkout_root, 'dist', 'gws-ea', 'process.js'));

@@ -79,6 +79,7 @@ import {
   runtimeServiceTarget,
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
+  type ServiceEnablement,
 } from './service-control.js';
 import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import { hasControlCharacters, isRecord, optionalString, unwrapData } from './validation.js';
@@ -116,8 +117,8 @@ export interface ProbeResult {
   readonly reason: string | null;
 }
 
-/** `unmanaged` is a host running outside its service. */
-export type ServiceState = 'running' | 'stopped' | 'not_installed' | 'unmanaged' | 'unknown';
+/** `unmanaged` is a host running outside its service; `off` is a service the operator turned off. */
+export type ServiceState = 'running' | 'stopped' | 'off' | 'not_installed' | 'unmanaged' | 'unknown';
 
 export interface DeliveryView {
   /** `delivered` or `failed`, as the mailbox recorded it. */
@@ -683,7 +684,26 @@ function observeService(
         platform: context.platform,
         uid: context.uid,
       });
-      return serviceObservation(control.detect());
+      const handle = control.detect();
+      if (handle.mode !== 'launchd' && handle.mode !== 'systemd-user' && handle.mode !== 'systemd-system')
+        return serviceObservation(handle);
+      let enablement: ServiceEnablement;
+      try {
+        enablement = control.enablement();
+      } catch (error) {
+        // Whether it is off is a refinement of what detection saw; failing to read it never hides that.
+        if (error instanceof GwsEaError && error.code === 'service_unobservable') return serviceObservation(handle);
+        throw error;
+      }
+      if (enablement === 'enabled') return serviceObservation(handle);
+      const id = runtime.instance_id;
+      return {
+        status: 'degraded',
+        reason: handle.active
+          ? `Turned off, but its host still runs; gws-ea stop --id ${id} finishes turning it off.`
+          : `Turned off; it stays off until gws-ea start --id ${id}.`,
+        state: 'off',
+      };
     },
     { state: 'unknown' },
   );
@@ -1464,7 +1484,9 @@ export async function observeAssistantStatus(
       subscription_expire_time: null,
       sign_in_needed: null,
     }),
-    probe(() => onecliProbe(subject), {}),
+    serviceObservation.state === 'off'
+      ? Promise.resolve({ status: 'unknown' as const, reason: 'Assistant is off; OneCLI was not checked.' })
+      : probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
     probe<ExternalEmailFacts>(() => externalEmailProbe(subject), { agent_group_id: null }),
     probe<WhatsAppFacts>(() => whatsAppProbe(subject), { state: null, number: null }),
@@ -2000,6 +2022,8 @@ function statusActions(status: AssistantStatus): NextAction[] {
     if (instruction && !actions.some((action) => action.kind === 'external' && action.instruction === instruction))
       actions.push({ kind: 'external', instruction });
   }
+  const off = status.probes.service.state === 'off';
+  if (off) actions.push(command('start'));
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));
@@ -2027,7 +2051,9 @@ function statusActions(status: AssistantStatus): NextAction[] {
       instruction:
         "For the recorded credential failure, check this assistant's provider sign-in in its operator credential console. A later successful turn confirms recovery. Keep credentials out of chat.",
     });
+  // An assistant turned off reports its probes down on purpose; its logs hold no fault to read.
   if (
+    !off &&
     PROBE_NAMES.some(
       (name) =>
         name !== 'voice' &&
