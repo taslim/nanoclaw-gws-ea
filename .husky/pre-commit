@@ -1,5 +1,6 @@
-staged=$(git diff --cached --name-only --diff-filter=ACM -- 'src/**/*.ts')
-pnpm run format:fix
-if [ -n "$staged" ]; then
-  echo "$staged" | xargs git add
+staged=$(git diff --cached --name-only --diff-filter=ACMR -- 'src/**/*.ts')
+if [ -z "$staged" ]; then
+  exit 0
 fi
+git diff --cached --name-only -z --diff-filter=ACMR -- 'src/**/*.ts' | xargs -0 pnpm exec prettier --write
+git diff --cached --name-only -z --diff-filter=ACMR -- 'src/**/*.ts' | xargs -0 git add
