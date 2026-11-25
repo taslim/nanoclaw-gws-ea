@@ -59,15 +59,21 @@ MB=$(git merge-base "$DOGFOOD_REF" upstream/main)
 
 When the harness names a session scratch directory, use it in place of `${TMPDIR:-/tmp}`.
 
-### 2. Create the worktree
+### 2. Create or reuse the worktree
 
-From the operator checkout (`$OPERATOR`):
+If the current session is already running inside a clean linked worktree distinct from `$OPERATOR` (for example, an orchestrator thread worktree — check `git rev-parse --show-toplevel` against `$OPERATOR` and `git status --short`), reuse it instead of adding another worktree:
+
+```bash
+git checkout -B "chore/sync-nanoclaw-$D" "$DOGFOOD_REF"
+```
+
+Otherwise, from the operator checkout (`$OPERATOR`), create a dedicated worktree:
 
 ```bash
 git worktree add ".claude/worktrees/sync-nanoclaw-$D" -b "chore/sync-nanoclaw-$D" "$DOGFOOD_REF"
 ```
 
-Run every later command inside that worktree. Never switch, merge or reset in the operator checkout.
+Note whether this step created `.claude/worktrees/sync-nanoclaw-$D` so step 11 cleans up only a worktree created here. Run every later command inside the sync worktree. Never switch, merge or reset in the operator checkout.
 
 ### 3. Map where the two sides meet
 
@@ -152,7 +158,7 @@ Save the merge commit only once the tree is green (step 7). Anything not needed 
 | Container tests | `cd container/agent-runner && bun run test` |
 | Skill pins | `pnpm run skill-pins:check` |
 
-A full local `vitest run` times out in a few heavy suites under load (often upstream's `scripts/update/transaction.e2e.test.ts`). Re-run each failing file alone. A timeout that passes when its file runs alone is load; an assertion failure, or any failure CI reproduces, is a regression to fix. Report it either way, and let CI decide. After every behavior change, re-run the whole suite, not just the files you touched.
+A full local `vitest run` times out in a few heavy suites under load (often upstream's `scripts/update/transaction.e2e.test.ts`). Re-run each failing file alone. A timeout that passes when its file runs alone is load; an assertion failure, or any failure CI reproduces, is a regression to fix. Report it either way, and let CI decide. After every behavior change, re-run the whole suite, not just the files you touched. On macOS, prefix local test runs with `SHLVL=2 TMPDIR=/tmp` (`SHLVL=2 TMPDIR=/tmp pnpm exec vitest run`; `TMPDIR=/tmp bun run test`) — see Gotchas.
 
 Commit the merge: `Merge upstream NanoClaw <version> into dogfood`, with the version from step 1 (or the tag named), with one bullet per area saying what was re-derived and where GWS-EA's code shrank.
 
@@ -196,7 +202,7 @@ git push origin "HEAD:refs/heads/$DOGFOOD_BRANCH"    # fast-forward only; never 
 
 - Watch CI on the push, since a sync never had a PR to run it: `gh run list --repo taslim/nanoclaw-gws-ea --branch "$DOGFOOD_BRANCH" --limit 3`. A red run is fixed forward in an ordinary PR.
 - Bring the operator checkout (`$OPERATOR`) to the updated dogfood branch, since `gws-ea` runs from its source. When `git branch --show-current` there prints `$DOGFOOD_BRANCH`, run `git pull --ff-only`, then `pnpm install --frozen-lockfile`, and confirm `gws-ea --help` loads. On any other branch, leave it: that is the maintainer's work in progress; tell them the dogfood branch moved.
-- `git worktree remove .claude/worktrees/sync-nanoclaw-$D` and `git branch -d chore/sync-nanoclaw-$D`.
+- If step 2 created `.claude/worktrees/sync-nanoclaw-$D`, run `git worktree remove .claude/worktrees/sync-nanoclaw-$D` and `git branch -d chore/sync-nanoclaw-$D`. If step 2 reused an externally managed linked worktree, leave that worktree in place.
 - Tell the maintainer that assistants get the sync through `gws-ea update`, their call. Say when the update rebuilds the agent image (a `container/` change).
 
 ## Gotchas
@@ -213,3 +219,4 @@ git push origin "HEAD:refs/heads/$DOGFOOD_BRANCH"    # fast-forward only; never 
 | `.claude/scheduled_tasks.lock` blocks a pull in the operator checkout | Upstream tracks it; the operator checkout hides it with `skip-worktree` | `git update-index --no-skip-worktree` it, `git checkout --` it, pull, then set `--skip-worktree` again |
 | The `skill-pins` CI job fails | The fork pins Chat SDK adapters above upstream's mirror | `pnpm run skill-pins:generate` and commit `.github/skill-pins` |
 | A stash vanishes | The stash stack is shared with every worktree | Never bare `git stash`; make a WIP commit instead |
+| macOS `vitest` / `bun test` hits Unix socket `sun_path > 104`, leaks `~/.claude/skills`, or `bash -c` tests hit the host's `~/.local/bin/onecli` | Harness `TMPDIR` sits deep under `$HOME`, and macOS bash 3.2 sources `~/.bashrc` when stdin is a socket (`spawnSync`) with `SHLVL < 2`, prepending `~/.local/bin` ahead of test stubs | Prefix local macOS test runs with `SHLVL=2 TMPDIR=/tmp` (`SHLVL=2 TMPDIR=/tmp pnpm exec vitest run`; `TMPDIR=/tmp bun run test`) |
