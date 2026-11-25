@@ -2000,7 +2000,11 @@ function statusActions(status: AssistantStatus): NextAction[] {
       ...(operation.revert_with !== null ? [command('rollback')] : []),
     ];
   if (operation.state === 'failed') return [command('update')];
-  if (operation.state === 'committed') return [command(operation.kind)];
+  const off = status.probes.service.state === 'off';
+  // A stop that disabled the service but left its host answering is finished by stop; start would undo it.
+  const offAction = status.probes.host.status === 'ok' ? command('stop') : command('start');
+  // Update refuses an assistant that is off, so it is started before its follow-ups can run.
+  if (operation.state === 'committed') return off ? [offAction, command(operation.kind)] : [command(operation.kind)];
   const actions: NextAction[] = status.connectors.flatMap((entry) =>
     entry.next_actions.filter(
       (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),
@@ -2012,8 +2016,7 @@ function statusActions(status: AssistantStatus): NextAction[] {
     if (instruction && !actions.some((action) => action.kind === 'external' && action.instruction === instruction))
       actions.push({ kind: 'external', instruction });
   }
-  const off = status.probes.service.state === 'off';
-  if (off) actions.push(command('start'));
+  if (off) actions.push(offAction);
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));

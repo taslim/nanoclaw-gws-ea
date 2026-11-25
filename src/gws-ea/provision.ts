@@ -54,7 +54,12 @@ import {
   type InstanceRuntimeDependencies,
   type UpsertEnvVars,
 } from './service.js';
-import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers } from './service-control.js';
+import {
+  createServiceControl,
+  restartTurnedOn,
+  runtimeServiceTarget,
+  type NanoclawServiceHelpers,
+} from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
@@ -1398,11 +1403,8 @@ export async function runProductionProvision(
       serviceDependencies: {
         upsertEnvVars: options.upsertEnvVars,
         hostPolicyRoot: operation.paths.configRoot,
-        restartService: (config) => {
-          const service = createServiceControl(options.serviceHelpers, runtimeServiceTarget(config));
-          service.enable();
-          return service.restart();
-        },
+        restartService: (config) =>
+          restartTurnedOn(createServiceControl(options.serviceHelpers, runtimeServiceTarget(config))),
         platform: manifest?.platform ?? instanceServicePlatform(),
         homeDirectory: runtime.home_directory,
         runningAsRoot: manifest?.running_as_root ?? process.getuid?.() === 0,

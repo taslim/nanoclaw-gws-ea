@@ -445,3 +445,9 @@ export function createServiceControl(
     verifyHealth: (timeoutMs) => helpers.verifyServiceHealth({ ...detect(), active: true }, root, env, timeoutMs),
   };
 }
+
+/** Create and resume leave the assistant on, so the service is turned on before launchd is asked to load it. */
+export async function restartTurnedOn(service: InstanceServiceControl): Promise<RestartOutcome> {
+  service.enable();
+  return service.restart();
+}

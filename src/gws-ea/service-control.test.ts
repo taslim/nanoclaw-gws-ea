@@ -13,6 +13,7 @@ import { createInstanceRuntimeConfig, reconcileInstanceService, type InstanceRun
 import {
   createServiceControl,
   hostLogFiles,
+  restartTurnedOn,
   type NanoclawCommandRunner,
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
@@ -609,6 +610,35 @@ describe('turning the service off and on', () => {
     for (const { calls } of [stopped, started]) {
       expect(calls.filter((call) => /^(launchctl|systemctl) /u.test(call))).toEqual([]);
     }
+  });
+});
+
+describe('starting as create and resume do', () => {
+  it.each([
+    ['disabled', ['launchctl print-disabled gui/501', `launchctl enable gui/501/${LABEL}`, 'start']],
+    ['enabled', ['launchctl print-disabled gui/501', 'start']],
+  ] as const)('turns a %s launchd job on before loading it', async (state, steps) => {
+    const { helpers, calls, runner } = nanoclaw(BOOTED_OUT);
+    runner.run.mockImplementation((command, args) => {
+      calls.push([command, ...args].join(' '));
+      return args[0] === 'print-disabled' ? `\t\t"${LABEL}" => ${state}\n` : '';
+    });
+
+    await expect(restartTurnedOn(control(helpers).service)).resolves.toBe('started');
+    expect(calls.filter((call) => call !== 'detect')).toEqual(steps);
+  });
+
+  it('turns a disabled systemd unit on before starting it', async () => {
+    const { helpers, calls, runner } = nanoclaw({ ...SYSTEMD_RUNNING, active: false });
+    runner.tryRun.mockReturnValue({ ok: false, stdout: 'disabled' });
+
+    await restartTurnedOn(control(helpers, { platform: 'linux' }).service);
+
+    expect(calls.filter((call) => call !== 'detect')).toEqual([
+      `systemctl --user enable ${UNIT}`,
+      `systemctl --user reset-failed ${UNIT}`,
+      'start',
+    ]);
   });
 });
 
