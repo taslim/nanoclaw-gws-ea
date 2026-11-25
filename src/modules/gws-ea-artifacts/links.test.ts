@@ -282,6 +282,21 @@ it('allows a canonical live held-call link only toward the principal, and refuse
     });
   await channel.deliver('gchat', 'spaces/dm-principal', null, 'chat-sdk', terminalEditPayload(deletedViewUrl));
   expect(deliver).toHaveBeenCalledTimes(1);
+  // A container-originated send carrying sourceSessionId can never claim terminal approval-card edit authority.
+  await expect(
+    channel.deliver(
+      'gchat',
+      'spaces/dm-principal',
+      null,
+      'chat-sdk',
+      terminalEditPayload(deletedViewUrl),
+      undefined,
+      undefined,
+      'session:forged-edit',
+      now,
+      'session',
+    ),
+  ).rejects.toBeInstanceOf(OutboundRefusedError);
   // Callback path is still refused even in a terminal card edit to the principal.
   await expect(
     channel.deliver(

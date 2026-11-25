@@ -15,7 +15,7 @@ interface ArtifactLinkCheckRequest {
   readonly recipients: readonly string[];
   readonly unknownRecipients?: boolean;
   readonly nonPrincipalChatMembers?: boolean;
-  /** True only when `judgeArtifactSend` checks a `chat-sdk` terminal approval card edit. */
+  /** True only when `judgeArtifactSend` checks a host-authored `chat-sdk` terminal approval card edit. */
   readonly terminalCardEdit?: boolean;
 }
 type ArtifactLinkCheck = { readonly allowed: true } | { readonly allowed: false; readonly reason: string };
@@ -157,6 +157,7 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
 }
 
 function isTerminalApprovalCardEdit(send: OutboundSend): boolean {
+  if (send.sourceSessionId !== undefined) return false;
   if (send.kind !== 'chat-sdk' || (send.files && send.files.length > 0)) return false;
   let parsed: unknown;
   try {
