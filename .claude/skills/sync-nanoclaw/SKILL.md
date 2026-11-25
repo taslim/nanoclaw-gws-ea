@@ -61,10 +61,10 @@ When the harness names a session scratch directory, use it in place of `${TMPDIR
 
 ### 2. Create or reuse the worktree
 
-If the current session is already running inside a clean linked worktree distinct from `$OPERATOR` (for example, an orchestrator thread worktree — check `git rev-parse --show-toplevel` against `$OPERATOR` and `git status --short`), reuse it instead of adding another worktree:
+If the current session is already running inside a clean linked worktree distinct from `$OPERATOR` (for example, an orchestrator thread worktree — check `git rev-parse --show-toplevel` against `$OPERATOR` and `git status --short`), reuse it instead of adding another worktree. Use non-forcing `-b` (never `-B`) so a second sync on the same date stops rather than overwriting an existing branch with committed unpushed work; if that branch already exists, pick a unique suffix:
 
 ```bash
-git checkout -B "chore/sync-nanoclaw-$D" "$DOGFOOD_REF"
+git checkout -b "chore/sync-nanoclaw-$D" "$DOGFOOD_REF"
 ```
 
 Otherwise, from the operator checkout (`$OPERATOR`), create a dedicated worktree:

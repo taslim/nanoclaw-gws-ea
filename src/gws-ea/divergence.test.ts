@@ -2569,9 +2569,10 @@ exit 0
     await updateContainerConfigScalars('ag-1', { image_tag: groupTag });
 
     const runner = await import('../container-runner.js');
-    await import('../modules/gws-ea-profile/index.js');
+    // Load the production host modules barrel so dropping gws-ea-profile from it fails this guard.
+    await import('../modules/index.js');
 
-    // Both startup and per-spawn auto-refresh hooks must be no-ops once gws-ea-profile loads.
+    // Both startup and per-spawn auto-refresh hooks must be no-ops once the host modules load.
     await runner.refreshStaleGroupImages();
     await runner.refreshStaleGroupImage('ag-1', groupTag);
     expect(existsSync(callsFile)).toBe(false);
@@ -2607,8 +2608,12 @@ exit 0
     expect(applied.map((r) => r.name)).toContain('pending-question-body');
     await dbMod.closeDb();
 
-    // Fresh install: 026 runs before 027, so 027 skips re-adding pending_questions.question.
+    // Fresh install: 026 itself adds pending_questions.question before 027 runs, then 027 adds deadline cleanly.
     const freshDb = await dbMod.initTestDb();
+    const indexOf026 = migrationsMod.migrations.findIndex((m) => m.name === 'pending-question-body');
+    expect(indexOf026).toBeGreaterThan(-1);
+    await migrationsMod.runMigrations(freshDb, migrationsMod.migrations.slice(0, indexOf026 + 1));
+    expect(await freshDb.columnOwners?.('question')).toContain('pending_questions');
     await migrationsMod.runMigrations(freshDb, migrationsMod.migrations);
     expect(await freshDb.columnOwners?.('question')).toContain('pending_questions');
     expect(await freshDb.columnOwners?.('deadline')).toContain('pending_questions');
@@ -2715,8 +2720,10 @@ exit 0
     await expect(dispatchResponse(basePayload, { rethrow: true })).resolves.toBe('accepted');
     expect(fallback).not.toHaveBeenCalled();
 
-    // Host wiring passes redeliverOnError through to dispatchResponse.
+    // Host wiring passes redeliverOnError through to dispatchResponse, and interactive write
+    // failures propagate instead of resolving 'ignored' so at-least-once channels retry.
     expect(await read('src/index.ts')).toContain('{ rethrow: answer?.redeliverOnError }');
+    expect(await read('src/modules/interactive/index.ts')).toContain('throw err;');
   });
 
   it('pre-escapes angle brackets to guillemets before Markdown escaping in gateway approval copy', async () => {

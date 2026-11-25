@@ -57,7 +57,6 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<Resp
           userId: payload.userId ?? '',
         }),
       });
-      // eslint-disable-next-line no-catch-all/no-catch-all -- logged; the card keeps its buttons for another try
     } catch (err) {
       if (isUniqueViolation(err)) {
         // Answered already, but that click failed after the write (the row's
@@ -70,7 +69,9 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<Resp
         return 'closed';
       }
       log.error('Question answer could not be written to the agent', { questionId: payload.questionId, err });
-      return 'ignored';
+      // Rethrow so at-least-once channels (redeliverOnError) retry; button clicks
+      // without rethrow still resolve 'ignored' in dispatchResponse.
+      throw err;
     }
     // Written: the card can show the answer.
     payload.accepted?.();

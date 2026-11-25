@@ -123,8 +123,8 @@ describe('delivery during a channel outage', () => {
       const delivered = await withMailboxSession('main', session.id, (mailbox) => mailbox.getDeliveredIds());
       expect(delivered.has('wa-first')).toBe(false);
       expect(delivered.has('wa-second')).toBe(false);
-      expect(await getDeliveryAttempt(`${session.id}:wa-first`)).toBeUndefined();
-      expect(await getDeliveryAttempt(`${session.id}:wa-second`)).toBeUndefined();
+      expect(await getDeliveryAttempt('wa-first')).toBeUndefined();
+      expect(await getDeliveryAttempt('wa-second')).toBeUndefined();
       expect(sent).toEqual([`${session.id}:gchat-reply`]);
       expect(actionRuns).toBe(1);
       vi.setSystemTime(Date.now() + 1_000);

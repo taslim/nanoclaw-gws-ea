@@ -103,6 +103,17 @@ describe('question answers', () => {
     expect(await getPendingQuestion('q-1')).toBeUndefined();
   });
 
+  it('rethrows a write failure when dispatchResponse enables rethrow for at-least-once redelivery', async () => {
+    vi.mocked(writeSessionMessage).mockRejectedValueOnce(new Error('SQLITE_BUSY: database is locked'));
+    await expect(
+      dispatchResponse(
+        { questionId: 'q-1', value: 'a', userId: 'u', channelType: 'gchat', platformId: 'spaces/1', threadId: null },
+        { rethrow: true },
+      ),
+    ).rejects.toThrow('SQLITE_BUSY: database is locked');
+    expect(await getPendingQuestion('q-1')).toBeDefined();
+  });
+
   it('a click that started before an earlier answer finished never answers again', async () => {
     let release!: () => void;
     // The first click's session read waits; a second click starts meanwhile.
