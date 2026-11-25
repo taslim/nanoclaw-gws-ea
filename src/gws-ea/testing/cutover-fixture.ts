@@ -862,20 +862,15 @@ export function services(state: World): NanoclawServiceHelpers {
     throw new Error('the helpers run their commands through the fakes below');
   };
   const program = (root: string): boolean => existsSync(path.join(root, 'dist', 'gws-ea', 'process.js'));
-  /** launchctl as gws-ea asks it whether a job is turned off, and turns it off and on. */
-  const launchctl = (slug: string, args: readonly string[]): string => {
-    const label = `com.nanoclaw-v2-${slug}`;
-    const [verb, domain] = args;
-    if (verb === 'print-disabled' && args.length === 2) {
-      return ['disabled services = {', `\t"${label}" => ${state.disabled ? 'disabled' : 'enabled'}`, '}'].join('\n');
-    }
-    if ((verb === 'disable' || verb === 'enable') && domain?.endsWith(`/${label}`)) {
-      state.serviceCalls.push(`${verb} ${slug}`);
-      state.disabled = verb === 'disable';
-      return '';
-    }
-    return unused();
-  };
+  /** launchctl as gws-ea asks it whether a job is turned off. */
+  const launchctl = (slug: string, args: readonly string[]): string =>
+    args[0] === 'print-disabled' && args.length === 2
+      ? [
+          'disabled services = {',
+          `\t"com.nanoclaw-v2-${slug}" => ${state.disabled ? 'disabled' : 'enabled'}`,
+          '}',
+        ].join('\n')
+      : unused();
   return {
     createCommandRunner: ({ env }) => ({
       run: (command, args) =>
