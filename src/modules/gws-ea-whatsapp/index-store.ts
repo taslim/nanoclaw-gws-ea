@@ -328,6 +328,9 @@ export class WhatsAppIndex {
       )
       .run(this.account(), messageId, chat, questionId, postedAt ?? null);
   }
+  forgetRequest(messageId: string): void {
+    this.db.prepare('DELETE FROM requests WHERE account=? AND message_id=?').run(this.account(), messageId);
+  }
   close(): void {
     this.db.close();
   }

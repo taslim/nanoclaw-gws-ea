@@ -296,6 +296,8 @@ export interface OutboundSend {
   /** The serialized message, exactly as the adapter receives it. */
   readonly content: string;
   readonly files: readonly OutboundFile[] | undefined;
+  /** Host-owned source session for container-originated sends; absent on host-authored sends. */
+  readonly sourceSessionId?: string;
 }
 
 export type OutboundGuardDecision =
@@ -358,7 +360,16 @@ function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
       timestamp,
       sourceSessionId,
     ) {
-      await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
+      await assertOutboundAllowed({
+        channelType,
+        platformId,
+        threadId,
+        instance,
+        kind,
+        content,
+        files,
+        ...(sourceSessionId !== undefined ? { sourceSessionId } : {}),
+      });
       // Claim before the async status read so closure cannot finish between that read and adapter entry.
       if (sourceSessionId !== undefined && deliveryId !== undefined && inflightDeliveries.has(sourceSessionId))
         claimChannelDelivery(sourceSessionId, deliveryId);
@@ -1031,13 +1042,64 @@ async function deliverMessage(
     deliverInstance = mg.instance;
   }
 
+  // Container-originated channel rows come from untrusted outbound.db state.
+  // Reject host-only protocol fields and allowlist container edits so a
+  // compromised container cannot hijack open approval messages or spoof
+  // host-authored terminal cards.
+  const record = isRecord(content) ? content : null;
+  const isEdit = record?.operation === 'edit';
+  let sanitizedEditContent: string | undefined;
+  if (isEdit) {
+    if (msg.kind !== 'chat') {
+      throw new OutboundRefusedError('core:container-edit', 'Agents can only edit plain chat messages.');
+    }
+    if (
+      hasOwnDefined(record, 'questionId') ||
+      hasOwnDefined(record, 'terminalCard') ||
+      hasOwnDefined(record, 'requirePresentation')
+    ) {
+      throw new OutboundRefusedError('core:container-edit', 'Agents cannot supply host-only fields in a message edit.');
+    }
+    if (typeof record.messageId !== 'string' || typeof record.text !== 'string') {
+      throw new OutboundRefusedError('core:container-edit', 'A message edit must specify a message id and text.');
+    }
+    const platformMessageId = stripAgentGroupSuffix(record.messageId, session.agent_group_id);
+    if (platformMessageId.length === 0) {
+      throw new OutboundRefusedError('core:container-edit', 'A message edit must specify a message id and text.');
+    }
+    if (msg.channelType && msg.platformId && (await hasTable(getDb(), 'pending_approvals'))) {
+      const approvalRow = await getDb().get(
+        'SELECT 1 FROM pending_approvals WHERE platform_message_id = ? AND (channel_type IS NULL OR channel_type = ?) AND (platform_id IS NULL OR platform_id = ?) LIMIT 1',
+        platformMessageId,
+        msg.channelType,
+        msg.platformId,
+      );
+      if (approvalRow) {
+        throw new OutboundRefusedError('core:container-edit', 'Agents cannot edit a host approval message.');
+      }
+    }
+    sanitizedEditContent = JSON.stringify({
+      operation: 'edit',
+      messageId: platformMessageId,
+      text: record.text,
+    });
+  } else if (
+    record !== null &&
+    (hasOwnDefined(record, 'terminalCard') || hasOwnDefined(record, 'requirePresentation'))
+  ) {
+    throw new OutboundRefusedError(
+      'core:container-outbound',
+      'Agents cannot supply host-only fields in an outbound message.',
+    );
+  }
+
   // The agent names its own question, and an answer resolves by that id
   // alone: getAskQuestionRender reads a pending question before any approval,
   // so a question carrying any open request's id would let a plain "yes" to
   // it decide that request. Refused before anything is stored or posted. The
   // one taken id it may carry is its own — the pending question this same row
   // stored on an earlier attempt whose send then failed.
-  if (content.type === 'ask_question' && content.questionId) {
+  if (!isEdit && content.type === 'ask_question' && content.questionId) {
     const questionId = content.questionId as string;
     if (await getAskQuestionRender(questionId)) {
       const stored = await getPendingQuestion(questionId);
@@ -1053,7 +1115,12 @@ async function deliverMessage(
   // but the response path has nowhere to land and will log unclaimed.
   // The agent waits timeoutSeconds for the answer; past the deadline stored
   // here, counted from now, the question takes no answer.
-  if (content.type === 'ask_question' && content.questionId && (await hasTable(getDb(), 'pending_questions'))) {
+  if (
+    !isEdit &&
+    content.type === 'ask_question' &&
+    content.questionId &&
+    (await hasTable(getDb(), 'pending_questions'))
+  ) {
     const title = content.title as string | undefined;
     const rawOptions = content.options as unknown;
     const timeoutSeconds = content.timeoutSeconds as unknown;
@@ -1098,16 +1165,18 @@ async function deliverMessage(
   // File I/O lives in session-manager.ts (symmetric with inbound
   // extractAttachmentFiles) — delivery just hands buffers to the adapter.
   const files =
-    Array.isArray(content.files) && content.files.length > 0
+    !isEdit && Array.isArray(content.files) && content.files.length > 0
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
   // Agent-asked questions keep their own markup; host-built cards never come
   // through here, so only they get a channel's card-text escape.
   const deliveredContent =
-    content.type === 'ask_question'
-      ? JSON.stringify({ ...content, fromAgent: true })
-      : withPlatformMessageId(content, msg.content, session.agent_group_id);
+    sanitizedEditContent !== undefined
+      ? sanitizedEditContent
+      : content.type === 'ask_question'
+        ? JSON.stringify({ ...content, fromAgent: true })
+        : withPlatformMessageId(content, msg.content, session.agent_group_id);
   // A row id is unique only within its session's mailbox; the session id makes it unique host-wide.
   const deliveryId = deliveryIdFor(session.id, msg.id);
   const platformMsgId = await deliveryAdapter.deliver(
@@ -1332,6 +1401,19 @@ export async function stopDeliveryPolls(maxWaitMs = STOP_WAIT_MS): Promise<void>
   clearTimeout(bound);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasOwnDefined(record: Record<string, unknown>, key: string): boolean {
+  return Object.hasOwn(record, key) && record[key] !== undefined;
+}
+
+function stripAgentGroupSuffix(messageId: string, agentGroupId: string): string {
+  const suffix = `:${agentGroupId}`;
+  return messageId.endsWith(suffix) ? messageId.slice(0, -suffix.length) : messageId;
+}
+
 /**
  * The router stores inbound rows as `<platform message id>:<agent group id>`
  * (see messageIdForAgent in router.ts), and the agent's add_reaction tool
@@ -1342,7 +1424,8 @@ export async function stopDeliveryPolls(maxWaitMs = STOP_WAIT_MS): Promise<void>
 export function withPlatformMessageId(content: unknown, raw: string, agentGroupId: string): string {
   if (!content || typeof content !== 'object') return raw;
   const { operation, messageId } = content as { operation?: unknown; messageId?: unknown };
-  const suffix = `:${agentGroupId}`;
-  if (!operation || typeof messageId !== 'string' || !messageId.endsWith(suffix)) return raw;
-  return JSON.stringify({ ...content, messageId: messageId.slice(0, -suffix.length) });
+  if (!operation || typeof messageId !== 'string') return raw;
+  const stripped = stripAgentGroupSuffix(messageId, agentGroupId);
+  if (stripped === messageId) return raw;
+  return JSON.stringify({ ...content, messageId: stripped });
 }

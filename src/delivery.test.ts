@@ -1372,11 +1372,28 @@ describe('outbound guard at the adapter boundary', () => {
         kind: 'chat',
         content: JSON.stringify({ text: 'see you at 3' }),
         files: undefined,
+        sourceSessionId: session.id,
       },
     ]);
-    expect(sent).toEqual(seen);
+    expect(sent).toEqual(seen.map(({ sourceSessionId: _sourceSessionId, ...rest }) => rest));
     expect(deliveryStatus('ag-1', session.id, 'ok-1')).toBe('delivered');
     expect(fanOutboundMessage).toHaveBeenCalledTimes(1);
+
+    // Direct host sends omit sourceSessionId so guards can distinguish host-authored rows.
+    seen.length = 0;
+    await getDeliveryAdapter()!.deliver('telegram', 'telegram:123', null, 'chat-sdk', JSON.stringify({ text: 'host' }));
+    expect(seen).toEqual([
+      {
+        channelType: 'telegram',
+        platformId: 'telegram:123',
+        threadId: null,
+        instance: undefined,
+        kind: 'chat-sdk',
+        content: JSON.stringify({ text: 'host' }),
+        files: undefined,
+      },
+    ]);
+    expect('sourceSessionId' in seen[0]!).toBe(false);
   });
 
   it('a refused send is closed unsent: no copy, no hook, no retry, and the sending agent is told why', async () => {
@@ -1557,5 +1574,207 @@ describe('a send ends the working signal of every turn anchored in its conversat
     } finally {
       stopTypingRefresh('sess-host');
     }
+  });
+});
+
+describe('deliverSessionMessages — container edit & host-only field boundary', () => {
+  it.each([
+    {
+      name: 'chat edit with questionId',
+      kind: 'chat',
+      content: { operation: 'edit', questionId: 'appr-1', messageId: 'plat-1', text: 'Harmless question' },
+    },
+    {
+      name: 'chat edit with questionId only',
+      kind: 'chat',
+      content: { operation: 'edit', questionId: 'appr-1', text: 'Harmless question' },
+    },
+    {
+      name: 'chat edit with terminalCard',
+      kind: 'chat',
+      content: {
+        operation: 'edit',
+        messageId: 'plat-1',
+        text: 'Decoy',
+        terminalCard: { title: 'T', question: 'Q', resolution: 'Approved' },
+      },
+    },
+    {
+      name: 'chat edit with requirePresentation',
+      kind: 'chat',
+      content: { operation: 'edit', messageId: 'plat-1', text: 'Decoy', requirePresentation: true },
+    },
+    {
+      name: 'chat-sdk edit carrying terminal approval card payload',
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        questionId: 'appr-1',
+        messageId: 'plat-1',
+        text: 'Decoy',
+        terminalCard: { title: 'T', question: 'Q', resolution: 'Approved' },
+      },
+    },
+    {
+      name: 'chat-sdk edit without host-only fields',
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: 'plat-1', text: 'Decoy' },
+    },
+    {
+      name: 'chat edit with empty messageId after stripping agent group suffix',
+      kind: 'chat',
+      content: { operation: 'edit', messageId: ':ag-1', text: 'Decoy' },
+    },
+    {
+      name: 'chat edit missing text string',
+      kind: 'chat',
+      content: { operation: 'edit', messageId: 'plat-1', markdown: 'Decoy' },
+    },
+    {
+      name: 'plain chat row carrying terminalCard',
+      kind: 'chat',
+      content: { text: 'Hi', terminalCard: { title: 'T', question: 'Q', resolution: 'R' } },
+    },
+    {
+      name: 'plain chat row carrying requirePresentation',
+      kind: 'chat',
+      content: { text: 'Hi', requirePresentation: true },
+    },
+  ])('refuses $name on attempt 1 without invoking the channel adapter', async ({ kind, content }) => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, { id: 'forged-1', kind, content });
+
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, body) {
+        sent.push(body);
+        return 'pm-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    // Second poll confirms it was closed on attempt 1 (zero retries).
+    await deliverSessionMessages(session);
+
+    expect(sent).toEqual([]);
+    expect(deliveryStatus('ag-1', session.id, 'forged-1')).toBe('failed');
+    expect(agentNotes('ag-1', session.id)).toEqual([
+      expect.objectContaining({ sender: 'system', text: expect.stringContaining('Your message was not sent:') }),
+    ]);
+  });
+
+  it('refuses a container ask_question with requirePresentation before persisting a pending question', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, {
+      id: 'forged-q',
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-forged-pres',
+        title: 'Pick one',
+        question: 'Which option?',
+        options: ['A', 'B'],
+        timeoutSeconds: 120,
+        requirePresentation: true,
+      },
+    });
+
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, body) {
+        sent.push(body);
+        return 'pm-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(sent).toEqual([]);
+    expect(deliveryStatus('ag-1', session.id, 'forged-q')).toBe('failed');
+    expect(await getPendingQuestion('q-forged-pres')).toBeUndefined();
+  });
+
+  it.each(['pending', 'approved'] as const)(
+    'refuses a container edit targeting a %s approval message id (with or without agent-group suffix)',
+    async (status) => {
+      await seedAgentAndChannel();
+      const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+      await createPendingApproval({
+        approval_id: `appr-${status}`,
+        session_id: session.id,
+        request_id: `appr-${status}`,
+        action: 'install_packages',
+        payload: '{}',
+        created_at: now(),
+        channel_type: 'telegram',
+        platform_id: 'telegram:123',
+        platform_message_id: 'plat-approval-7',
+        status,
+        title: 'Install packages',
+        question: 'Install ripgrep?',
+        options_json: JSON.stringify([{ label: 'Approve', selectedLabel: 'Approved', value: 'approve' }]),
+      });
+      insertRow('ag-1', session.id, {
+        id: 'edit-bare',
+        kind: 'chat',
+        content: { operation: 'edit', messageId: 'plat-approval-7', text: 'Reworded approval' },
+      });
+      insertRow('ag-1', session.id, {
+        id: 'edit-suffixed',
+        kind: 'chat',
+        content: { operation: 'edit', messageId: 'plat-approval-7:ag-1', text: 'Reworded approval' },
+      });
+
+      const sent: string[] = [];
+      setDeliveryAdapter({
+        async deliver(_ct, _pid, _tid, _kind, body) {
+          sent.push(body);
+          return 'pm-1';
+        },
+      });
+
+      await deliverSessionMessages(session);
+
+      expect(sent).toEqual([]);
+      expect(deliveryStatus('ag-1', session.id, 'edit-bare')).toBe('failed');
+      expect(deliveryStatus('ag-1', session.id, 'edit-suffixed')).toBe('failed');
+    },
+  );
+
+  it('allowlists legitimate container edits to { operation, messageId, text } after stripping the agent-group suffix', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertRow('ag-1', session.id, {
+      id: 'edit-legit',
+      kind: 'chat',
+      content: {
+        operation: 'edit',
+        messageId: 'plat-own-42:ag-1',
+        text: 'Moved to 3pm.',
+        batch: ['in-1'],
+        unexpectedField: 'must-not-forward',
+        type: 'ask_question',
+      },
+    });
+
+    const sent: Array<{ kind: string; content: string }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, kind, body) {
+        sent.push({ kind, content: body });
+        return 'plat-own-42';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(sent).toEqual([
+      {
+        kind: 'chat',
+        content: JSON.stringify({ operation: 'edit', messageId: 'plat-own-42', text: 'Moved to 3pm.' }),
+      },
+    ]);
+    expect(deliveryStatus('ag-1', session.id, 'edit-legit')).toBe('delivered');
   });
 });

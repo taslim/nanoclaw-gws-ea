@@ -98,6 +98,10 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
       admittedRequest ??= options.contacts.claimDM(canonicalLid, key, pending.createdAt);
     const socket = options.socket();
     if (!socket || !options.connected()) throw new ChannelNotConnectedError();
+    if (pending.accepted) {
+      if (rowId === undefined) options.index.complete(key);
+      return pending.messageId;
+    }
     const text = words(content);
     const formatted = formatWhatsApp(text);
     const parts: AnyMessageContent[] = [];
@@ -163,57 +167,58 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
     if (!parts.length || (!formatted.text && !message.files?.length && content.operation !== 'reaction'))
       throw new Error('WhatsApp outbound message has no content');
     let firstId = pending.messageId;
-    if (!pending.accepted) {
-      for (const [i, part] of parts.entries()) {
-        const id = whatsappMessageId(key, i);
-        if (i === 0) firstId = id;
-        if (options.index.message(platformId, id)?.fromMe) continue;
-        const person = !platformId.endsWith('@g.us') ? await options.resolvePerson(platformId) : undefined;
-        if (!platformId.endsWith('@g.us') && !person)
-          throw new Error('WhatsApp first contact requires a resolved recipient');
-        if (person) {
-          if (!(await options.directSendAllowed(person)))
-            throw new OutboundRefusedError(
-              'gws-ea-whatsapp:principal-unbound',
-              'The principal must send the binding code from their own WhatsApp before the assistant can write to them.',
-            );
-          admittedRequest ??= options.contacts.claimDM(person.lid, key, pending.createdAt);
-          await options.contacts.reserve([person.lid], key, admittedRequest);
-          options.contacts.handoff(id, person.lid, key, admittedRequest);
-        }
-        try {
-          const sent = await socket.sendMessage(platformId, part, { messageId: id });
-          if (sent?.key.id !== id)
-            throw new Error('WhatsApp returned a different message id from the caller-provided id');
-          options.index.sent(
-            {
-              chat: platformId,
-              id,
-              sender: options.sender(),
-              fromMe: true,
-              forwarded: false,
-              text: formatted.text,
-              at: options.now(),
-            },
-            sent.message,
+    for (const [i, part] of parts.entries()) {
+      const id = whatsappMessageId(key, i);
+      if (i === 0) firstId = id;
+      if (options.index.message(platformId, id)?.fromMe) continue;
+      const person = !platformId.endsWith('@g.us') ? await options.resolvePerson(platformId) : undefined;
+      if (!platformId.endsWith('@g.us') && !person)
+        throw new Error('WhatsApp first contact requires a resolved recipient');
+      if (person) {
+        if (!(await options.directSendAllowed(person)))
+          throw new OutboundRefusedError(
+            'gws-ea-whatsapp:principal-unbound',
+            'The principal must send the binding code from their own WhatsApp before the assistant can write to them.',
           );
-          if ('edit' in part && part.edit?.id) options.index.edit(platformId, part.edit.id, formatted.text);
-        } catch (error) {
-          const status = whatsappStatusCode(error);
-          if (status === 463 && person) {
-            await options.contacts.refused(person.lid, key, admittedRequest?.principalMessageId ?? null);
-            options.index.complete(key);
-            throw new OutboundRefusedError(
-              'gws-ea-whatsapp:contact-refused',
-              'WhatsApp refused first contact (463). Use email or tell the principal.',
-            );
-          }
-          if (status === 400 || status === 403 || status === 404) {
-            options.index.complete(key);
-            throw new OutboundRefusedError('gws-ea-whatsapp:refused', `WhatsApp refused the message (${status}).`);
-          }
-          throw error;
+        admittedRequest ??= options.contacts.claimDM(person.lid, key, pending.createdAt);
+        await options.contacts.reserve([person.lid], key, admittedRequest);
+        options.contacts.handoff(id, person.lid, key, admittedRequest);
+      }
+      try {
+        const sent = await socket.sendMessage(platformId, part, { messageId: id });
+        if (sent?.key.id !== id)
+          throw new Error('WhatsApp returned a different message id from the caller-provided id');
+        options.index.sent(
+          {
+            chat: platformId,
+            id,
+            sender: options.sender(),
+            fromMe: true,
+            forwarded: false,
+            text: formatted.text,
+            at: options.now(),
+          },
+          sent.message,
+        );
+        if ('edit' in part && part.edit?.id) {
+          options.index.edit(platformId, part.edit.id, formatted.text);
+          if (typeof content.questionId === 'string') options.index.forgetRequest(part.edit.id);
         }
+      } catch (error) {
+        const status = whatsappStatusCode(error);
+        if (status === 463 && person) {
+          await options.contacts.refused(person.lid, key, admittedRequest?.principalMessageId ?? null);
+          options.index.complete(key);
+          throw new OutboundRefusedError(
+            'gws-ea-whatsapp:contact-refused',
+            'WhatsApp refused first contact (463). Use email or tell the principal.',
+          );
+        }
+        if (status === 400 || status === 403 || status === 404) {
+          options.index.complete(key);
+          throw new OutboundRefusedError('gws-ea-whatsapp:refused', `WhatsApp refused the message (${status}).`);
+        }
+        throw error;
       }
     }
     if (content.type === 'ask_question' && typeof content.questionId === 'string') {

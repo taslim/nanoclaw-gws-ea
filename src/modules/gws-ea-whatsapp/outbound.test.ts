@@ -286,5 +286,79 @@ describe('WhatsApp questions use native text answers', () => {
       text: expect.stringContaining('Allowed'),
       edit: { id, remoteJid: 'team@g.us', fromMe: true },
     });
+
+    // Once the outcome edit lands, the request row is forgotten so later replies/reactions cannot answer it again.
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    expect(disk.request(id!)).toBeUndefined();
+    expect(disk.requestMessage(questionId, 'team@g.us')).toBeUndefined();
+    disk.close();
+
+    vi.mocked(h.setup.onAction).mockClear();
+    await h.socket().emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        incoming('late-thumb', '', {
+          message: { reactionMessage: { key: { id, remoteJid: 'team@g.us', fromMe: true }, text: '👍' } },
+        }),
+        incoming('late-yes', '', {
+          message: { extendedTextMessage: { text: 'yes', contextInfo: { stanzaId: id } } },
+        }),
+      ],
+    });
+    expect(h.setup.onAction).not.toHaveBeenCalled();
+  });
+
+  it('refuses plain edits to an open request and keeps the request tracked if an outcome edit fails before sending', async () => {
+    const adapter = await h.start();
+    const id = await adapter.deliver('team@g.us', null, { ...approval, deliveryId: 'open-approval' });
+    expect(id).toBeDefined();
+
+    await expect(
+      adapter.deliver('team@g.us', null, {
+        kind: 'chat',
+        content: { operation: 'edit', messageId: id, text: 'Reworded decoy' },
+        deliveryId: 'plain-edit',
+      }),
+    ).rejects.toThrow('An open WhatsApp request may only be edited by its outcome handler');
+    expect(h.socket().sends).toHaveLength(1);
+
+    // If the socket fails during a host outcome edit, the request remains tracked for retry / answers.
+    h.socket().sendError = new Error('transient socket error');
+    await expect(
+      adapter.deliver('team@g.us', null, {
+        kind: 'chat-sdk',
+        content: {
+          operation: 'edit',
+          questionId,
+          messageId: id,
+          text: 'Allowed',
+          terminalCard: { title: 'Allow this action?', question: 'Approve the action.', resolution: 'Allowed' },
+        },
+        deliveryId: 'outcome-edit-1',
+      }),
+    ).rejects.toThrow('transient socket error');
+    const stillOpen = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    expect(stillOpen.request(id!)).toMatchObject({ questionId, platformId: 'team@g.us' });
+    stillOpen.close();
+
+    // Once the retry lands, the request is forgotten and a duplicate retry of the accepted deliveryId stays idempotent.
+    h.socket().sendError = undefined;
+    const outcomeMessage = {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        questionId,
+        messageId: id,
+        text: 'Allowed',
+        terminalCard: { title: 'Allow this action?', question: 'Approve the action.', resolution: 'Allowed' },
+      },
+      deliveryId: 'outcome-edit-1',
+    };
+    const editId = await adapter.deliver('team@g.us', null, outcomeMessage);
+    expect(await adapter.deliver('team@g.us', null, outcomeMessage)).toBe(editId);
+    expect(h.socket().sends).toHaveLength(3); // original post + failed send attempt + succeeded retry
+    const forgotten = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    expect(forgotten.request(id!)).toBeUndefined();
+    forgotten.close();
   });
 });
