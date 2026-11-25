@@ -90,7 +90,7 @@ code { overflow-wrap: anywhere; }
 
 /* Shell */
 .shell {
-  width: min(680px, calc(100% - 48px));
+  width: min(760px, calc(100% - 48px));
   margin-inline: auto;
   padding-block: 16px;
   display: flex;
@@ -119,7 +119,7 @@ code { overflow-wrap: anywhere; }
 .shell-nav a[aria-current="page"]::before { content: ""; width: 6px; height: 6px; margin-right: 8px; border-radius: 50%; background: var(--accent); }
 
 main {
-  width: min(680px, calc(100% - 48px));
+  width: min(760px, calc(100% - 48px));
   margin-inline: auto;
   padding-block: 40px 80px;
   outline: none;

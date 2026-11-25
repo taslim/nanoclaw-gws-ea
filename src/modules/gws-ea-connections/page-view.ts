@@ -604,7 +604,6 @@ function pageContent(state: ConnectionsPageState): string {
 const STYLE = `
 /* Desktop-first workspace ergonomics (>=720px) */
 @media (min-width: 720px) {
-  .shell, main[data-view="list"], main[data-view="tools"], main[data-view="held"] { width: min(760px, calc(100% - 48px)); }
   main[data-view="held"] .page-heading { align-items: flex-start; }
 }
 .meta-dot { color: var(--line-strong); user-select: none; }
