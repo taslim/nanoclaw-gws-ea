@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import { turnOff, turnOn, type AssistantVault } from './assistant-power.js';
-import type { InstanceServiceControl, ServiceEnablement } from './service-control.js';
+import type { InstanceServiceControl, NanoclawServiceMode, ServiceEnablement } from './service-control.js';
 import { GwsEaError } from './types.js';
 
 interface World {
+  mode?: NanoclawServiceMode;
+  /** The manager cannot be asked whether the service is off. */
+  unobservable?: boolean;
   enablement: ServiceEnablement;
   hostRunning: boolean;
   agentsRunning: boolean;
@@ -17,8 +20,14 @@ interface World {
 function machine(world: World) {
   const log: string[] = [];
   const service = {
-    enablement: () => world.enablement,
+    detect: () => ({ mode: world.mode ?? 'launchd', active: world.hostRunning }),
+    enablement: () => {
+      if (world.unobservable) throw new GwsEaError('service_unobservable', 'launchctl did not answer');
+      return world.enablement;
+    },
     disable: () => {
+      // Service control refuses to switch anything but a launchd job or a systemd unit.
+      if (world.mode === 'none' || world.mode === 'nohup') throw new GwsEaError('service_not_installed', world.mode);
       if (world.enablement === 'disabled') return false;
       world.enablement = 'disabled';
       log.push('disable');
@@ -91,6 +100,16 @@ describe('turning an assistant off', () => {
     expect(world).toEqual(OFF);
   });
 
+  it.each(['none', 'nohup'] as const)(
+    'stops the agents and vault of an assistant whose service is %s, with no service to turn off',
+    async (mode) => {
+      const { service, vault, log } = machine({ ...OFF, mode, agentsRunning: true, vaultRunning: true });
+
+      await expect(turnOff(service, vault)).resolves.toBe('stopped');
+      expect(log).toEqual(['drain', 'vault stop']);
+    },
+  );
+
   it('changes nothing and says so when every part is already off', async () => {
     const { service, vault, log } = machine({ ...OFF });
 
@@ -126,17 +145,24 @@ describe('turning an assistant on', () => {
     expect(world).toMatchObject(OFF);
   });
 
-  it('leaves a running vault to its next start when the assistant was never off', async () => {
-    const { service, vault, log, world } = machine({
-      ...RUNNING,
-      hostRunning: false,
-      vaultFails: true,
-      vaultRunning: false,
-    });
+  it('starts an assistant that was never off without touching its vault', async () => {
+    const { service, vault, log } = machine({ ...RUNNING, hostRunning: false, vaultRunning: false, vaultFails: true });
 
-    await expect(turnOn(service, vault, () => service.start())).rejects.toMatchObject({ code: 'onecli_unhealthy' });
-    expect(log).toEqual(['vault up']);
-    expect(world.enablement).toBe('enabled');
+    await expect(turnOn(service, vault, () => service.start())).resolves.toEqual({
+      turnedOn: false,
+      started: 'started',
+    });
+    expect(log).toEqual(['start host']);
+  });
+
+  it('starts an assistant whose manager cannot say whether it is off, as status and update treat it', async () => {
+    const { service, vault, log } = machine({ ...OFF, enablement: 'enabled', unobservable: true });
+
+    await expect(turnOn(service, vault, () => service.start())).resolves.toEqual({
+      turnedOn: false,
+      started: 'started',
+    });
+    expect(log).toEqual(['start host']);
   });
 
   it('turns on a running assistant whose stop never finished', async () => {

@@ -260,7 +260,7 @@ export function serviceRefusal(
 }
 
 /** An update proves its release on a running host, and never starts one the operator turned off. */
-export function assertHostRunning(
+function assertHostRunning(
   runtime: InstanceRuntimeConfig,
   dependencies: Pick<CutoverDependencies, 'serviceHelpers' | 'service'>,
 ): void {

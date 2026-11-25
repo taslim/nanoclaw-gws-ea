@@ -246,7 +246,9 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
 
     expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(1);
 
-    expect(err.join('\n')).toContain(`It is turned off; start it with gws-ea start --id ${runtime.instance_id}`);
+    expect(err.join('\n')).toContain(
+      `is turned off; start it with gws-ea start --id ${runtime.instance_id} to roll it back`,
+    );
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
     expect(state.events).toEqual([]);
     expect(state.running).toBe(false);

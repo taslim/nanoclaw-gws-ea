@@ -1528,6 +1528,8 @@ describe('removal safety', () => {
   it.each([
     { state: 'disabled', enabled: true },
     { state: 'enabled', enabled: false },
+    // A leftover override is harmless once the plist is gone, so a launchctl that cannot answer never stops removal.
+    { state: 'unanswered', enabled: false },
   ] as const)(
     'clears the launchd override of a $state assistant before deleting its plist',
     async ({ state, enabled }) => {
@@ -1553,6 +1555,8 @@ describe('removal safety', () => {
           if (program !== 'launchctl') return '';
           launchctl.push(args.join(' '));
           if (args[0] === 'enable') order.push(`enable plist-present:${existsSync(definition)}`);
+          if (args[0] === 'print-disabled' && state === 'unanswered')
+            throw new Error('launchctl print-disabled timed out');
           return args[0] === 'print-disabled' ? `disabled services = {\n\t"${launchdLabel}" => ${state}\n}\n` : '';
         },
       );

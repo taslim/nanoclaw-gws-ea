@@ -1764,31 +1764,39 @@ describe('status', () => {
     );
   });
 
-  it('names start before the follow-ups of a committed update for an assistant turned off, since update refuses it', async () => {
-    const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
-    const id = reservation.instance_id;
-    const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
-    await recordedWith(host.paths, reservation, {
-      kind: 'update',
-      to,
-      followUp: { kind: 'rebuild_group_image', agent_group_id: 'ag-research' },
-    });
-    const state = world(reservation);
-    state.active.clear();
-    state.serving.clear();
-    state.disabled.add(installOf(reservation));
+  it.each([
+    ['stopped', false],
+    ['still answering', true],
+  ] as const)(
+    'names start before the follow-ups of a committed update for an assistant turned off with its host %s',
+    async (_case, answering) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+      const id = reservation.instance_id;
+      const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+      await recordedWith(host.paths, reservation, {
+        kind: 'update',
+        to,
+        followUp: { kind: 'rebuild_group_image', agent_group_id: 'ag-research' },
+      });
+      const state = world(reservation);
+      if (!answering) {
+        state.active.clear();
+        state.serving.clear();
+      }
+      state.disabled.add(installOf(reservation));
 
-    const { nextActions } = await statusJson(host, state, id, {
-      ...healthyObservers(state),
-      onecli: async () => STOPPED_VAULT,
-    });
+      const { nextActions } = await statusJson(host, state, id, {
+        ...healthyObservers(state),
+        onecli: async () => STOPPED_VAULT,
+      });
 
-    expect(nextActions).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'start', '--id', id] },
-      { kind: 'command', argv: ['gws-ea', 'update', '--id', id] },
-    ]);
-  });
+      expect(nextActions).toEqual([
+        { kind: 'command', argv: ['gws-ea', 'start', '--id', id] },
+        { kind: 'command', argv: ['gws-ea', 'update', '--id', id] },
+      ]);
+    },
+  );
 
   it('names a host never started as such', async () => {
     const host = await machine();

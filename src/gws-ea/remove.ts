@@ -552,6 +552,8 @@ function hostProcessPattern(install: NanoclawInstall, teardown: Pick<NanoclawTea
  * Stop the instance's host through NanoClaw's own service helpers, then clean
  * up whatever that stop leaves, so neither login nor boot starts it again.
  */
+const OVERRIDE_UNCLEARED: ReadonlySet<string> = new Set(['service_unobservable', 'service_enablement_failed']);
+
 export async function uninstallNanoclaw(install: NanoclawInstall, teardown: NanoclawTeardown): Promise<void> {
   const { platform, run, sleep } = teardown;
   const { installId, homeDirectory, dockerEndpoint } = install;
@@ -617,8 +619,13 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     const service = coordinates(false);
     if (detected.mode === 'launchd') {
       // An assistant turned off has its launchd override set to disabled; launchd clears it only with enable,
-      // which finds the job by its plist, so it runs before the plist goes.
-      control.enable();
+      // which finds the job by its plist, so it runs before the plist goes. A leftover override names a job that
+      // no longer exists, so a launchctl that cannot answer never holds up the rest of removal.
+      try {
+        control.enable();
+      } catch (error) {
+        if (!(error instanceof GwsEaError) || !OVERRIDE_UNCLEARED.has(error.code)) throw error;
+      }
     } else {
       // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is stopped
       // by its label, before the stray-host kill below: launchd would only start that host again.

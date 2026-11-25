@@ -696,6 +696,23 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(state.running).toBe(false);
   });
 
+  it('lets a stopped assistant that is not off retry its follow-ups, refusing only one that is off', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, NEW_IMAGE);
+    const state = world(runtime);
+    state.rebuildFails = true;
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    Object.assign(state, { loaded: false, running: false });
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    // The rebuild still needs the host, so it fails, but the follow-ups were attempted rather than refused.
+    expect(err.join('\n')).not.toContain('is turned off');
+    expect(err.join('\n')).not.toContain('cannot be updated');
+  });
+
   it('asks on a terminal with the preview, and a decline records nothing and leaves the staging for the next update', async () => {
     const host = await machine();
     const runtime = await assistant(host);

@@ -1,4 +1,4 @@
-import { onecliVault, turnOff, turnOn, type AssistantVault } from './assistant-power.js';
+import { onecliVault, refuseTurnedOff, turnOff, turnOn, type AssistantVault } from './assistant-power.js';
 import { provisionInstalledConnectors } from './connector-provisioning.js';
 import { CONNECTOR_CATALOG, connectorDefinition, type ConnectorLifecycleContext } from './connectors.js';
 import { connectorLines } from './connector-inspection.js';
@@ -133,7 +133,6 @@ import {
   type ToolCheckout,
 } from './stray-install.js';
 import {
-  assertHostRunning,
   confirmStagedUpdate,
   continueUpdate,
   prepareUpdate,
@@ -1196,8 +1195,14 @@ class Cli {
       };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
       if (unfinished?.phase === 'committed') {
-        // Follow-ups act through the running host; the open-update and supersede paths below run with it stopped.
-        assertHostRunning(await loadCreatedRuntime(this.#paths, request.instanceId), dependencies);
+        // A rebuild follow-up restarts groups through the host, which must not bring back an assistant that is off;
+        // prune and reclaim need no host, so a merely stopped one still finishes them.
+        const runtime = await loadCreatedRuntime(this.#paths, request.instanceId);
+        refuseTurnedOff(
+          createServiceControl(launcher.serviceHelpers, runtimeServiceTarget(runtime), seams.service),
+          request.instanceId,
+          'finish its update',
+        );
         await finishFollowUps(operation, dependencies);
         if (sameRelease(unfinished.to, intent.target)) {
           const nextActions = await this.#provisionConnectors(operation, reporter);

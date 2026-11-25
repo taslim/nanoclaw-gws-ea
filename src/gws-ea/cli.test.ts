@@ -2467,7 +2467,7 @@ describe('gws-ea start, stop, and restart', () => {
   });
 
   it.each([
-    ['start', false, 'started', ['vault up', 'start', 'health']],
+    ['start', false, 'started', ['start', 'health']],
     ['restart', true, 'restarted', ['stop', 'start', 'health']],
   ] as const)(
     '%s acts on the named service, then waits until its host answers, never draining its agents',

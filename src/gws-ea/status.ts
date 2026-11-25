@@ -2001,10 +2001,11 @@ function statusActions(status: AssistantStatus): NextAction[] {
     ];
   if (operation.state === 'failed') return [command('update')];
   const off = status.probes.service.state === 'off';
+  // Update and rollback refuse an assistant that is off, so it is started before its follow-ups can run.
+  if (operation.state === 'committed')
+    return off ? [command('start'), command(operation.kind)] : [command(operation.kind)];
   // A stop that disabled the service but left its host answering is finished by stop; start would undo it.
   const offAction = status.probes.host.status === 'ok' ? command('stop') : command('start');
-  // Update refuses an assistant that is off, so it is started before its follow-ups can run.
-  if (operation.state === 'committed') return off ? [offAction, command(operation.kind)] : [command(operation.kind)];
   const actions: NextAction[] = status.connectors.flatMap((entry) =>
     entry.next_actions.filter(
       (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),
