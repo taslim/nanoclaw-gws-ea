@@ -23,6 +23,7 @@ import {
   readOperationRecord,
   readRollbackPoint,
   type OperationFollowUp,
+  type OperationNodePathChange,
   type OperationStop,
 } from './operation.js';
 import { canonicalPath, isWithinDirectory, type ControlPlanePaths } from './paths.js';
@@ -46,6 +47,7 @@ import {
   loadInstanceRuntimeConfig,
   reloadInstanceService,
   stampUpgradeState,
+  updateInstanceRuntimeNodePath,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
   type InstanceServiceDependencies,
@@ -638,6 +640,7 @@ export async function switchTo(
   release: ReleaseCoordinates,
   leaving: ReleaseCoordinates,
   label: string,
+  targetNodePath?: string,
 ): Promise<boolean> {
   const name = releaseName(release.deployed_commit);
   return runStep(host.reporter, { id: 'switch_release', label }, async () => {
@@ -647,13 +650,15 @@ export async function switchTo(
       NANOCLAW_INSTALL_ID: runtime.install_id,
     });
     await rm(path.join(layout.state, 'data', 'circuit-breaker.json'), { force: true });
-    const service = cutoverServiceDependencies(host);
+    const nextRuntime =
+      targetNodePath !== undefined ? await updateInstanceRuntimeNodePath(runtime, targetNodePath) : runtime;
+    const service = cutoverServiceDependencies({ ...host, runtime: nextRuntime });
     const { definitionChanged } = await applyReleaseFiles(
-      { runtime, onecli: host.onecli, commit: release.deployed_commit, leaving: leaving.deployed_commit },
+      { runtime: nextRuntime, onecli: host.onecli, commit: release.deployed_commit, leaving: leaving.deployed_commit },
       { ...service, upsertEnvVars: dependencies.upsertEnvVars },
       onecliBoundaries(host),
     );
-    await reloadInstanceService(runtime, service);
+    await reloadInstanceService(nextRuntime, service);
     await pointCurrent(layout, name);
     return definitionChanged;
   });
@@ -673,7 +678,11 @@ export async function startRelease(host: CutoverHost, definitionChanged: boolean
  */
 export async function serveLeftRelease(
   host: CutoverHost,
-  move: { readonly from: ReleaseCoordinates; readonly to: ReleaseCoordinates },
+  move: {
+    readonly from: ReleaseCoordinates;
+    readonly to: ReleaseCoordinates;
+    readonly node_path?: OperationNodePathChange;
+  },
   beforeSwitch?: () => Promise<void>,
 ): Promise<void> {
   if ((await readCurrent(host.layout)) === releaseName(move.from.deployed_commit)) {
@@ -684,7 +693,13 @@ export async function serveLeftRelease(
   }
   await fenceInstance(host, 'Stopping the assistant to go back…');
   await beforeSwitch?.();
-  const changed = await switchTo(host, move.from, move.to, 'Switching back to the release it ran…');
+  const changed = await switchTo(
+    host,
+    move.from,
+    move.to,
+    'Switching back to the release it ran…',
+    move.node_path?.from,
+  );
   await startRelease(host, changed, 'Starting the assistant again…');
 }
 

@@ -61,10 +61,12 @@ import {
   recordOperationFacts,
   reservationAt,
   targetMayHaveStarted,
+  type OperationNodePathChange,
   type OperationRecord,
   type RollbackMode,
   type SnapshotManifest,
 } from './operation.js';
+import { instanceRuntimeFile } from './paths.js';
 import { readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import {
@@ -78,7 +80,8 @@ import {
   snapshotTakenAt,
 } from './release-layout.js';
 import { activeStep } from './run-log.js';
-import { bindInstanceHostPolicies } from './service.js';
+import { readOwnerOnlyJson } from './secrets.js';
+import { bindInstanceHostPolicies, validateRuntimeConfig } from './service.js';
 import { GwsEaError, releaseLine, releaseOf, type ReleaseCoordinates } from './types.js';
 import { backupCentralDatabase, printableName, readForgottenFingerprints, readSchemaManifest } from './verify.js';
 
@@ -513,6 +516,7 @@ interface RollbackPlan {
   readonly to: ReleaseCoordinates;
   /** The snapshot it restores in snapshot mode: the rollback point's, or the one the update it reverts took. */
   readonly snapshot: string;
+  readonly node_path?: OperationNodePathChange;
   readonly request: RollbackRequest;
 }
 
@@ -524,6 +528,20 @@ interface Rollback extends CutoverHost, RollbackPlan {
 }
 
 const STOP_LABEL = 'Stopping the assistant for the rollback…';
+
+async function readSnapshotNodePath(snapshotRoot: string): Promise<string | undefined> {
+  try {
+    const raw = await readOwnerOnlyJson(
+      instanceRuntimeFile(snapshotRoot),
+      'Snapshot runtime config',
+      'invalid_runtime_config',
+    );
+    return validateRuntimeConfig(raw).node_path;
+  } catch (error) {
+    if (isErrno(error, 'ENOENT')) return undefined;
+    throw error;
+  }
+}
 
 /**
  * A revert restores the snapshot its update took, which the rollback's own
@@ -537,7 +555,16 @@ async function rollbackOf(host: CutoverHost, record: OperationRecord, request: R
   if (!reverting && !point) {
     throw new GwsEaError('rollback_unavailable', `Assistant ${record.instance_id} has lost its rollback point.`);
   }
-  return { ...host, from: record.from, to: record.to, op, snapshot: point?.snapshot ?? op, reverting, request };
+  return {
+    ...host,
+    from: record.from,
+    to: record.to,
+    op,
+    snapshot: point?.snapshot ?? op,
+    ...(record.node_path ? { node_path: record.node_path } : {}),
+    reverting,
+    request,
+  };
 }
 
 function decideMode(
@@ -795,12 +822,24 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
           break;
         }
         case 'snapshotted':
-          definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
+          definitionChanged = await switchTo(
+            rollback,
+            record.to,
+            record.from,
+            'Switching to the previous release…',
+            record.node_path?.to,
+          );
           record = await advanceOperation(operation, 'switched');
           break;
         case 'switched':
           if ((await readCurrent(layout)) !== releaseName(record.to.deployed_commit)) {
-            definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
+            definitionChanged = await switchTo(
+              rollback,
+              record.to,
+              record.from,
+              'Switching to the previous release…',
+              record.node_path?.to,
+            );
           }
           await bindInstanceHostPolicies(
             rollback.runtime,
@@ -907,7 +946,12 @@ async function revertOpenUpdate(
   }
   const plan = { from: update.to, to: update.from, snapshot: operationName(update.started_at), request };
   await assertConfirmable(host, plan);
-  const record = await beginOperation(operation, { kind: 'rollback', from: plan.from, to: plan.to });
+  const record = await beginOperation(operation, {
+    kind: 'rollback',
+    from: plan.from,
+    to: plan.to,
+    ...(update.node_path ? { node_path: { from: update.node_path.to, to: update.node_path.from } } : {}),
+  });
   const rollback = await rollbackOf(host, record, request);
   return runRollback(rollback, record);
 }
@@ -953,7 +997,15 @@ async function rollBackCommitted(
       }),
   );
   await assertConfirmable(host, { from, to, snapshot: point.snapshot, request });
-  const record = await beginOperation(operation, { kind: 'rollback', from, to });
+  const snapshotNodePath = await readSnapshotNodePath(layout.snapshot(point.snapshot));
+  const record = await beginOperation(operation, {
+    kind: 'rollback',
+    from,
+    to,
+    ...(snapshotNodePath !== undefined && snapshotNodePath !== runtime.node_path
+      ? { node_path: { from: runtime.node_path, to: snapshotNodePath } }
+      : {}),
+  });
   return runRollback(await rollbackOf(host, record, request), record);
 }
 

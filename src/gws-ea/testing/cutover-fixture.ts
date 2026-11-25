@@ -324,6 +324,8 @@ async function setupCommand(command: SetupCommand): Promise<void> {
 /** How a test wants an assistant made: what an older release than this tool kept with its own. */
 export interface AssistantOptions {
   readonly port?: number;
+  /** The Node.js path recorded in `runtime.json`; defaults to the real path of this process's Node. */
+  readonly nodePath?: string;
   /** The gateway its release's Compose file names, as an older tool rendered it. */
   readonly gateway?: string;
   /** Its release's service definition, as an older tool rendered it. */
@@ -383,7 +385,7 @@ export async function assistant(host: Machine, options: AssistantOptions = {}): 
     dockerEndpoint: DOCKER,
   });
   const runtime = createInstanceRuntimeConfig(paths, reserved, onecli, {
-    nodePath: process.execPath,
+    nodePath: options.nodePath ?? (await realpath(process.execPath)),
     homeDirectory: host.root,
     selectedProvider: 'claude',
     dockerEndpoint: DOCKER,
@@ -554,6 +556,8 @@ export interface World {
   /** Runs as the release's tripwire is stamped, the first step of a switch. */
   onStamp?: () => void;
   rebuildFails?: boolean;
+  /** Overrides the Node.js binary `gws-ea update` sees for this run. */
+  nodePath?: string;
   /** The step a run never returns from, as if killed there; `reached` resolves once it is under way. */
   hangAt?: HangPoint;
   reached?: () => void;
@@ -1055,6 +1059,12 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
     freeBytes: async () => state.freeBytes,
     service: SERVICE,
     ambientEnv: {},
+    ...(state.nodePath
+      ? {
+          node: { version: process.version, execPath: state.nodePath, execve: process.execve },
+          resolvePersisted: async (command: string) => path.resolve(command),
+        }
+      : {}),
     onecli: {
       reverify: async (layout: OnecliRuntimeLayout) => {
         state.reverified.push(layout.project);

@@ -39,7 +39,7 @@ import {
   type InstanceReservation,
   type ReleaseCoordinates,
 } from './types.js';
-import { isRecord, requireCanonicalTimestamp, requireString } from './validation.js';
+import { isRecord, requireCanonicalTimestamp, requirePath, requireString } from './validation.js';
 
 const OPERATION_RECORD_SCHEMA_VERSION = 2 as const;
 
@@ -97,6 +97,12 @@ export type OperationFollowUp =
   /** Delete the releases, snapshots, and quarantines nothing keeps any more. */
   | { readonly kind: 'prune' };
 
+/** A Node.js binary transition recorded across an update or rollback. */
+export interface OperationNodePathChange {
+  readonly from: string;
+  readonly to: string;
+}
+
 export interface OperationRecord {
   readonly schema_version: typeof OPERATION_RECORD_SCHEMA_VERSION;
   readonly instance_id: string;
@@ -112,6 +118,8 @@ export interface OperationRecord {
   readonly stop?: OperationStop;
   /** The live schema: as staging read it, until the fence records it again. */
   readonly manifest?: SnapshotManifest;
+  /** Present when the operation also moves `runtime.json`'s `node_path`. */
+  readonly node_path?: OperationNodePathChange;
   /** A rollback's mode, decided while fenced; required from `snapshotted` on. */
   readonly mode?: RollbackMode;
   /** Planned by `verified`; what is left of it once committed. */
@@ -128,7 +136,7 @@ export interface OperationRecord {
 export type OperationFacts = Partial<Pick<OperationRecord, 'stop' | 'manifest' | 'mode' | 'follow_ups'>>;
 
 export type OperationStart = Pick<OperationRecord, 'kind' | 'from' | 'to'> &
-  Partial<Pick<OperationRecord, 'manifest' | 'no_rollback_target'>>;
+  Partial<Pick<OperationRecord, 'manifest' | 'node_path' | 'no_rollback_target'>>;
 
 /**
  * A command the operation gate admits, and for `update` the release it would
@@ -215,6 +223,14 @@ function parseRelease(value: unknown, label: string): ReleaseCoordinates {
 function parseStop(value: unknown): OperationStop {
   if (!isRecord(value) || typeof value.graceful !== 'boolean') throw invalid('Operation record stop is invalid');
   return { at: timestamp(value.at, 'stop time'), graceful: value.graceful };
+}
+
+function parseNodePathChange(value: unknown): OperationNodePathChange {
+  if (!isRecord(value)) throw invalid('Operation record node_path is invalid');
+  const from = requirePath(value.from, 'Operation record node_path.from', INVALID);
+  const to = requirePath(value.to, 'Operation record node_path.to', INVALID);
+  if (from === to) throw invalid('Operation record node_path must change the path');
+  return { from, to };
 }
 
 function parseManifest(value: unknown): SnapshotManifest {
@@ -321,6 +337,7 @@ function parseOperationRecord(value: unknown, instanceId: string): OperationReco
     updated_at: timestamp(value.updated_at, 'update time'),
     ...(stop ? { stop } : {}),
     ...(value.manifest === undefined ? {} : { manifest: parseManifest(value.manifest) }),
+    ...(value.node_path === undefined ? {} : { node_path: parseNodePathChange(value.node_path) }),
     ...(mode ? { mode } : {}),
     follow_ups: list(value.follow_ups, 'follow-ups', parseFollowUp),
     ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
@@ -716,6 +733,7 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
       started_at: startedAt,
       updated_at: now,
       ...(start.manifest ? { manifest: start.manifest } : {}),
+      ...(start.node_path ? { node_path: start.node_path } : {}),
       follow_ups: followUps,
       ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
     },
