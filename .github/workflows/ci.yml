@@ -27,8 +27,8 @@ concurrency:
 
 # The static checks, the host suite and the container suite are independent,
 # so each gets its own runner and the gate waits for the slowest one, not the
-# sum. The host suite is cut into shards; vitest assigns files to a shard by a
-# hash of their path, so every file runs in exactly one shard.
+# sum. The host suite is cut into duration-balanced shards by scripts/ci-shard.ts,
+# which verifies every discovered file is assigned to exactly one shard.
 env:
   HOST_TEST_SHARDS: 4
 
@@ -52,6 +52,9 @@ jobs:
 
       - name: Check release track configuration
         run: pnpm run release-tracks:check
+
+      - name: Verify balanced test shard partition
+        run: node --import tsx scripts/ci-shard.ts verify "${{ env.HOST_TEST_SHARDS }}"
 
       - name: Format check
         run: pnpm run format:check
@@ -85,7 +88,12 @@ jobs:
         working-directory: container/agent-runner
         run: bun install --frozen-lockfile
 
+      - name: Plan balanced test shard ${{ matrix.shard }} of ${{ env.HOST_TEST_SHARDS }}
+        id: shard
+        run: node --import tsx scripts/ci-shard.ts plan "${{ matrix.shard }}/${{ env.HOST_TEST_SHARDS }}" "$RUNNER_TEMP/shard-files.txt" >> "$GITHUB_OUTPUT"
+
       - name: Install completion test shells
+        if: steps.shard.outputs.needs_shells == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends zsh fish lsof
@@ -96,7 +104,9 @@ jobs:
           GWS_EA_BROWSER_TEST_CHROME: /usr/bin/google-chrome
         run: |
           test -x "$GWS_EA_BROWSER_TEST_CHROME"
-          xvfb-run --auto-servernum pnpm exec vitest run --shard=${{ matrix.shard }}/${{ env.HOST_TEST_SHARDS }}
+          mapfile -t shard_files < "$RUNNER_TEMP/shard-files.txt"
+          test "${#shard_files[@]}" -gt 0
+          xvfb-run --auto-servernum pnpm exec vitest run "${shard_files[@]}"
 
   container-test:
     runs-on: ubuntu-26.04
