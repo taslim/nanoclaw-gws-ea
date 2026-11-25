@@ -2525,3 +2525,324 @@ describe('recorded divergence: upstream sync 2026-11-10 re-applied these on upst
     ).toBeUndefined();
   });
 });
+
+describe('recorded divergence: upstream sync 2026-11-25 re-applied these on upstream code', () => {
+  const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+
+  it('disables automatic background group image refreshes in GWS-EA while keeping explicit rebuilds working', async () => {
+    const dir = await freshInstall();
+    const binDir = path.join(dir, 'bin');
+    const callsFile = path.join(dir, 'docker-calls.log');
+    await mkdir(binDir, { recursive: true });
+    vi.stubEnv('PATH', `${binDir}${path.delimiter}${process.env.PATH ?? ''}`);
+
+    const config = await import('../config.js');
+    await writeFile(
+      path.join(binDir, 'docker'),
+      `#!/bin/sh
+printf '%s\\n' "$1" >> "${callsFile}"
+if [ "$1" = image ]; then
+  if [ "$5" = "${config.CONTAINER_IMAGE}" ]; then printf 'sha256:new\\n'; exit 0; fi
+  printf 'sha256:old\\n'; exit 0
+fi
+exit 0
+`,
+      { mode: 0o755 },
+    );
+
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const { ensureContainerConfig, updateContainerConfigJson, updateContainerConfigScalars } =
+      await import('../db/container-configs.js');
+    const createdAt = new Date().toISOString();
+    const groupTag = `${config.CONTAINER_IMAGE_BASE}:ag-1`;
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: createdAt,
+    });
+    await ensureContainerConfig('ag-1');
+    await updateContainerConfigJson('ag-1', 'packages_apt', ['curl']);
+    await updateContainerConfigScalars('ag-1', { image_tag: groupTag });
+
+    const runner = await import('../container-runner.js');
+    await import('../modules/gws-ea-profile/index.js');
+
+    // Both startup and per-spawn auto-refresh hooks must be no-ops once gws-ea-profile loads.
+    await runner.refreshStaleGroupImages();
+    await runner.refreshStaleGroupImage('ag-1', groupTag);
+    expect(existsSync(callsFile)).toBe(false);
+
+    // Explicit rebuilds still run while auto-refresh is disabled.
+    await runner.buildAgentGroupImage('ag-1');
+    const explicitCalls = (await readFile(callsFile, 'utf8')).trim().split('\n');
+    expect(explicitCalls).toContain('build');
+
+    // Re-enabling auto-refresh proves the fixture triggers a refresh when the hook is off.
+    const countBefore = explicitCalls.length;
+    runner.setAutoGroupImageRefresh(true);
+    await runner.refreshStaleGroupImages();
+    const afterReenable = (await readFile(callsFile, 'utf8')).trim().split('\n');
+    expect(afterReenable.slice(countBefore)).toContain('build');
+  });
+
+  it('upgrades a live DB past 027 without failing on upstream 026 and installs fresh DBs cleanly while leaving 026 untouched', async () => {
+    await freshInstall();
+    const dbMod = await import('../db/index.js');
+    const migrationsMod = await import('../db/migrations/index.js');
+
+    // Upstream's 026 file remains unmodified; the live-upgrade guard lives in migrations/index.ts.
+    expect(await read('src/db/migrations/026-pending-question-body.ts')).not.toContain('columnOwners');
+
+    // Live assistant DB: already ran 027-pending-question-deadline before upstream 026 arrived.
+    const liveDb = await dbMod.initTestDb();
+    cleanups.push(() => dbMod.closeDb());
+    const preSync = migrationsMod.migrations.filter((m) => m.name !== 'pending-question-body');
+    await migrationsMod.runMigrations(liveDb, preSync);
+    await migrationsMod.runMigrations(liveDb, migrationsMod.migrations);
+    const applied = await liveDb.all<{ name: string }>('SELECT name FROM schema_version');
+    expect(applied.map((r) => r.name)).toContain('pending-question-body');
+    await dbMod.closeDb();
+
+    // Fresh install: 026 runs before 027, so 027 skips re-adding pending_questions.question.
+    const freshDb = await dbMod.initTestDb();
+    await migrationsMod.runMigrations(freshDb, migrationsMod.migrations);
+    expect(await freshDb.columnOwners?.('question')).toContain('pending_questions');
+    expect(await freshDb.columnOwners?.('deadline')).toContain('pending_questions');
+  });
+
+  it('does not invoke wake-context providers for held or delayed inbound messages', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const createdAt = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'ag-1',
+      name: 'Main',
+      folder: 'main',
+      agent_provider: null,
+      created_at: createdAt,
+    });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'trip@g.us',
+      name: 'Trip',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await db.createMessagingGroupAgent({
+      id: 'mga-1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: createdAt,
+    });
+
+    const wakeContext = await import('../wake-context.js');
+    const gather = vi.fn(async () => []);
+    wakeContext.registerWakeContext('divergence-guard', gather);
+    const router = await import('../router.js');
+    let delayMode: 'hold' | 'later' | 'now' = 'hold';
+    router.registerInboundDelay(() => {
+      if (delayMode === 'hold') return router.HOLD_UNTIL_RELEASED;
+      if (delayMode === 'later') return new Date(Date.now() + 60_000).toISOString();
+      return null;
+    });
+
+    const send = (id: string) =>
+      router.routeInbound({
+        channelType: 'whatsapp',
+        platformId: 'trip@g.us',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat',
+          content: JSON.stringify({ text: 'hello' }),
+          timestamp: createdAt,
+          isMention: true,
+          isGroup: true,
+        },
+      });
+
+    await send('msg-hold');
+    expect(gather).not.toHaveBeenCalled();
+
+    delayMode = 'later';
+    await send('msg-later');
+    expect(gather).not.toHaveBeenCalled();
+
+    delayMode = 'now';
+    await send('msg-now');
+    expect(gather).toHaveBeenCalledTimes(1);
+  });
+
+  it('rethrows pre-accept response errors only when requested and keeps post-accept throws owned', async () => {
+    await freshInstall();
+    const { dispatchResponse, registerResponseHandler } = await import('../response-registry.js');
+    const basePayload = {
+      questionId: 'q-1',
+      value: 'approve',
+      userId: 'gchat:u1',
+      channelType: 'gchat',
+      platformId: 'spaces/1',
+      threadId: null,
+    };
+
+    let throwMode: 'before' | 'after' = 'before';
+    const fallback = vi.fn(async () => 'closed' as const);
+    registerResponseHandler(async (payload) => {
+      if (throwMode === 'after') payload.accepted?.();
+      throw new Error('handler failed');
+    });
+    registerResponseHandler(fallback);
+
+    await expect(dispatchResponse(basePayload, { rethrow: true })).rejects.toThrow('handler failed');
+    expect(fallback).not.toHaveBeenCalled();
+
+    throwMode = 'after';
+    await expect(dispatchResponse(basePayload, { rethrow: true })).resolves.toBe('accepted');
+    expect(fallback).not.toHaveBeenCalled();
+
+    // Host wiring passes redeliverOnError through to dispatchResponse.
+    expect(await read('src/index.ts')).toContain('{ rethrow: answer?.redeliverOnError }');
+  });
+
+  it('pre-escapes angle brackets to guillemets before Markdown escaping in gateway approval copy', async () => {
+    await freshInstall();
+    const { gatewayApprovalPresentation } = await import('../gateway-approval-presentation.js');
+    const request: GatewayApprovalRequest = {
+      id: 'req-1',
+      agentGroupId: 'main',
+      createdAt: new Date().toISOString(),
+      title: 'Send email',
+      question: 'Approve?',
+      summary: {
+        agent: 'main',
+        action: 'Notify <users/all> about *lunch*',
+        resource: 'POST https://mail.example/send',
+        reason: 'See <https://evil.example|click> _now_',
+      },
+    };
+
+    const rendered = gatewayApprovalPresentation(request);
+    expect(rendered.title).toBe('May I make this request?');
+    expect(rendered.question).toContain('‹users/all›');
+    expect(rendered.question).toContain('‹https://evil.example|click›');
+    expect(rendered.question).toContain('\\*lunch\\*');
+    expect(rendered.question).not.toContain('<users/all>');
+    expect(rendered.question).not.toContain('\\‹');
+    expect(rendered.question).not.toContain('\\›');
+    expect(rendered.question).toContain("*Why I'm asking:*");
+  });
+
+  it('preserves voice-note speech alongside platformMessageId when backfilling top-level conversation history', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    await import('../modules/capabilities/index.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const { ensureContainerConfig } = await import('../db/container-configs.js');
+    const { resolveSession, writeSessionMessage } = await import('../session-manager.js');
+    const { inboundDbPath } = await import('../mailbox/sqlite/paths.js');
+    const { backfillSession } = await import('../modules/cross-session-context/backfill.js');
+
+    const now = Date.now();
+    const createdAt = new Date(now - 60_000).toISOString();
+    const rootAt = new Date(now - 30_000).toISOString();
+    const agentGroup: AgentGroup = {
+      id: 'ag-voice',
+      name: 'Avery',
+      folder: 'main',
+      agent_provider: null,
+      created_at: createdAt,
+    };
+    await db.createAgentGroup(agentGroup);
+    await ensureContainerConfig('ag-voice');
+    const mg = {
+      id: 'mg-voice',
+      channel_type: 'whatsapp',
+      platform_id: 'dm@s.whatsapp.net',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public' as const,
+      created_at: createdAt,
+    };
+    await db.createMessagingGroup(mg);
+
+    const { session: source } = await resolveSession('ag-voice', 'mg-voice', 'thread-1', 'per-thread');
+    await db.getDb().run('UPDATE sessions SET last_active = ? WHERE id = ?', rootAt, source.id);
+    await writeSessionMessage('ag-voice', source.id, {
+      id: 'voice-root:ag-voice',
+      kind: 'chat',
+      timestamp: rootAt,
+      platformId: 'dm@s.whatsapp.net',
+      channelType: 'whatsapp',
+      threadId: 'thread-1',
+      content: JSON.stringify({
+        id: 'wa-msg-42',
+        sender: 'Taslim',
+        senderId: 'whatsapp:1555',
+        text: '',
+        attachments: [
+          {
+            audioSource: { kind: 'voice-note', forwarded: true },
+            speech: { status: 'recognized', text: 'Move lunch to 2pm.', language: 'en' },
+          },
+        ],
+      }),
+      trigger: true,
+    });
+
+    const { session: target } = await resolveSession('ag-voice', 'mg-voice', 'thread-2', 'per-thread');
+    await backfillSession(agentGroup, target, mg, { created: true, now });
+
+    const inbound = new Database(inboundDbPath('ag-voice', target.id), { readonly: true });
+    try {
+      const rows = inbound.prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{ content: string }>;
+      expect(rows).toHaveLength(1);
+      const payload = JSON.parse(rows[0]!.content) as { text: string; platformMessageId?: string };
+      expect(payload.text).toContain('[Forwarded]\nMove lunch to 2pm.');
+      expect(payload.platformMessageId).toBe('wa-msg-42');
+    } finally {
+      inbound.close();
+    }
+  });
+
+  it('scopes Dependabot strictly to GWS-EA-only host npm packages on dogfood', async () => {
+    const { parse } = await import('yaml');
+    const config = parse(await read('.github/dependabot.yml')) as {
+      updates: Array<{
+        'package-ecosystem': string;
+        directory: string;
+        'target-branch'?: string;
+        allow?: Array<{ 'dependency-name': string }>;
+      }>;
+    };
+    expect(config.updates).toHaveLength(1);
+    const [entry] = config.updates;
+    expect(entry['package-ecosystem']).toBe('npm');
+    expect(entry.directory).toBe('/');
+    expect(entry['target-branch']).toBe('dogfood');
+    const allowed = (entry.allow ?? []).map((item) => item['dependency-name']);
+    expect(allowed.length).toBeGreaterThan(0);
+    // Upstream / tightly-pinned packages must move via upstream syncs or skill pins, not Dependabot.
+    expect(allowed).not.toContain('chat');
+    expect(allowed).not.toContain('@chat-adapter/gchat');
+    expect(allowed).not.toContain('@onecli-sh/sdk');
+    expect(allowed).not.toContain('better-sqlite3');
+    expect(allowed).not.toContain('typescript');
+  });
+});
