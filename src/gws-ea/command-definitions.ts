@@ -199,7 +199,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     options: [
       ...aliasOptions,
       flag('skip-alias', 'Skip optional web alias setup; configure it later with gws-ea alias.'),
-      value('track', 'track', 'Release track (dogfood or prod; other tracks require --source-remote).', true),
+      value('track', 'track', 'Release track (prod or dogfood; other tracks require --source-remote).', true),
       value('source-remote', 'remote', 'Repository holding this committed tool release.'),
       value('google-account', 'email', 'Operator Google Cloud account.'),
       value('assistant-first-name', 'name', 'Assistant first name.'),
@@ -227,7 +227,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     recovery: [
       'Continue the creation journal with resume --id <instance_id>; inspect with status or tear down with remove.',
     ],
-    examples: ['gws-ea create --track dogfood', 'gws-ea create --track=prod --principal-email=principal@example.com'],
+    examples: ['gws-ea create --track prod', 'gws-ea create --track=dogfood --principal-email=principal@example.com'],
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('create')),
   },

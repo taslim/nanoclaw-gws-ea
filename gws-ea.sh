@@ -8,8 +8,7 @@
 # It installs Node.js, pnpm, and the dependencies through NanoClaw's own
 # bootstrap (setup.sh, used unchanged), then links the gws-ea launcher into
 # ~/.local/bin, as NanoClaw's setup links ncl. Creating an assistant is a
-# separate step: gws-ea create. Offering to create the first assistant from
-# here waits until the prod track has a release, so create can default to it.
+# separate step: gws-ea create --track prod.
 
 set -euo pipefail
 
@@ -17,7 +16,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
 LAUNCHER="$PROJECT_ROOT/bin/gws-ea"
-NEXT='gws-ea create --track dogfood'
+NEXT='gws-ea create --track prod'
 
 case "${1:-}" in
   '') ;;
@@ -67,7 +66,7 @@ if [ -L "$LINK" ]; then
   fi
 elif [ -e "$LINK" ]; then
   printf '%s\n' "Left $LINK alone: it is not a link. Remove it and rerun to get the gws-ea command." >&2
-  NEXT="$LAUNCHER create --track dogfood"
+  NEXT="$LAUNCHER create --track prod"
 else
   ln -s "$LAUNCHER" "$LINK"
   printf '%s\n' "Linked $LINK."

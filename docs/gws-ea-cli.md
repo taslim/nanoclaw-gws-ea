@@ -251,13 +251,13 @@ or `--clear-last-name`. Omitted components stay unchanged. A change sends the
 principal a receipt, including a boundary change whose display text is the same.
 
 ```sh
-gws-ea create --track dogfood
+gws-ea create --track prod
 # After a reserved creation pauses:
 gws-ea resume --id 01234567-89ab-4def-8123-456789abcdef --chat-configured
 ```
 
-`create` deploys this tool's clean committed release. `dogfood` and `prod` are
-known tracks; another track requires `--source-remote`. The identities have
+`create` deploys this tool's clean committed release. `prod` (`main`) and
+`dogfood` (`dogfood`) are known tracks; another track requires `--source-remote`. The identities have
 different purposes:
 
 - `--google-account`: the operator managing Google Cloud resources.
@@ -306,9 +306,10 @@ pnpm run release-tracks:generate
 pnpm run release-tracks:check
 ```
 
-Use the resolved branch as the explicit base for dogfood PRs. The generator
-changes only marked filter sections; public `main` retains CI/review coverage
-while `prod` has no release. CI checks for drift without rewriting files.
+Use the resolved branch as the explicit base for dogfood PRs, and promote
+tested `dogfood` commits to `main` (`prod`) by fast-forward. The generator
+changes only marked filter sections and deduplicates `main`. CI checks for drift
+without rewriting files.
 
 ### Assistant lifecycle commands
 

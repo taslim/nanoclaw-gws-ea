@@ -6,16 +6,15 @@ on:
     # release-tracks:start
     branches:
       - 'main'
-      - 'rebuild-v2'
+      - 'dogfood'
     # release-tracks:end
-  # Post-merge runs keep both the public line and the temporary rebuild
-  # integration line independently verified. Nothing below reads the
-  # pull_request payload.
+  # Post-merge runs keep both the prod (main) and dogfood lines independently
+  # verified. Nothing below reads the pull_request payload.
   push:
     # release-tracks:start
     branches:
       - 'main'
-      - 'rebuild-v2'
+      - 'dogfood'
     # release-tracks:end
 
 # The static checks, the host suite and the container suite are independent,

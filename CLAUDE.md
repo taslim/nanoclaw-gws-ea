@@ -408,13 +408,13 @@ morning looks share a native task. Reminders and looks retain their local clock
 placement unless explicitly fixed. Contact remains an agent decision through
 the existing delivery tools and guards.
 
-## Rebuild Workflow (Temporary)
+## GWS-EA Release Workflow
 
-The `dogfood` track identifies the integration branch for the in-progress GWS-EA rebuild. Public
-`main` remains untouched until the user explicitly authorizes a promotion. The
-accepted product, architecture, slice, and acceptance decisions live in the
-local, gitignored `docs/rebuild/` tree; Compound Engineering uses that same tree
-as its artifact root.
+The `dogfood` track identifies the integration branch for GWS-EA changes, and
+`prod` follows `main`. Public `main` moves only by explicit user-authorized
+promotion from tested `dogfood` (fast-forward only, never squashed). Local,
+gitignored planning notes and documented solutions live under `docs/rebuild/`;
+Compound Engineering uses that same tree as its artifact root.
 
 `src/gws-ea/release-tracks.json` is the authoritative track-to-branch mapping.
 Resolve its current integration branch with
@@ -427,8 +427,8 @@ to update CI and CodeRabbit's marked branch filters. CI rejects drift with
 problems (bugs, best practices, and workflow patterns), organized by category
 with YAML frontmatter such as `module`, `tags`, and `problem_type`; it is relevant
 when implementing or debugging in an area it covers. Because `docs/rebuild/` is
-gitignored during the rebuild, these learnings remain local unless the user later
-chooses a tracked knowledge location.
+gitignored, these learnings remain local unless the user later chooses a tracked
+knowledge location.
 
 The operator runs `gws-ea` from a checkout of this repository
 (`~/.local/bin/gws-ea` links into it). In that checkout, do not run
@@ -437,27 +437,24 @@ each creates a separate NanoClaw install there, which gws-ea removes, its state
 included, on its next `create`, `update`, or `cleanup`.
 
 - For substantive work, use Compound Engineering. Use `$ce-brainstorm` only when
-  product behavior is genuinely unsettled, `$ce-plan` to turn an accepted rebuild
-  slice into an implementation-ready plan, and `$ce-work` to implement and verify
+  product behavior is genuinely unsettled, `$ce-plan` to turn a slice or spec
+  into an implementation-ready plan, and `$ce-work` to implement and verify
   that plan. `$lfg` may orchestrate those stages when the user asks for autonomous
   end-to-end delivery.
 - Before implementation, resolve the dogfood branch and create a short-lived
   descriptive branch from its latest `origin/<resolved branch>`. Do not implement
   directly on the integration branch or `main`.
-- Deliver the checkpoints in `docs/rebuild/06-slice-1-talkable-assistant.md` as
-  focused end-to-end changes with their stated acceptance evidence. A later
-  checkpoint must not silently widen an earlier checkpoint's accepted scope.
-- During the rebuild, the project-defined shipping process replaces Compound
-  Engineering's default PR handoff: finish the CE simplify, review, and validation
-  gates; commit only work-owned files; push the current feature branch; create the
-  PR with the dogfood track's resolved branch as its explicit base; then hand the resulting URL to
-  `$ce-babysit-pr`. Never rely on GitHub's default PR base and never use a full
-  `$ce-commit-push-pr` invocation that would target `main`.
-- An explicit `$lfg` invocation or explicit request to open a rebuild PR authorizes
-  that PR to target the dogfood branch; otherwise show the rebuild PR-hygiene evidence
+- The project-defined shipping process replaces Compound Engineering's default
+  PR handoff: finish the CE simplify, review, and validation gates; commit only
+  work-owned files; push the current feature branch; create the PR with the
+  dogfood track's resolved branch as its explicit base; then hand the resulting
+  URL to `$ce-babysit-pr`. Never rely on GitHub's default PR base and never use
+  a full `$ce-commit-push-pr` invocation that would target `main`.
+- An explicit `$lfg` invocation or explicit request to open a PR authorizes
+  that PR to target the dogfood branch; otherwise show the PR-hygiene evidence
   below and wait for approval before publishing.
 - Merge into the dogfood branch only with explicit user approval. Opening, retargeting,
-  or merging a PR to `main` requires a separate explicit promotion request.
+  or promoting to `main` requires a separate explicit promotion request.
 - Bringing official NanoClaw into the dogfood track is the maintainer's job: use
   `/sync-nanoclaw`. Nobody runs `/update-nanoclaw` in a GWS-EA checkout: it
   updates a plain NanoClaw install in place. An operator updates GWS-EA with
@@ -491,8 +488,8 @@ Before creating a PR, adding a skill, or preparing any contribution, you MUST re
 
 ## PR Hygiene
 
-Before creating a rebuild PR, update and compare against its actual integration
-base:
+Before creating a GWS-EA PR, update and compare against the `dogfood`
+integration base:
 
 ```bash
 DOGFOOD_BRANCH="$(pnpm --silent run release-tracks:branch dogfood)" || exit

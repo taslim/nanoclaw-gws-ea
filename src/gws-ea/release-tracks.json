@@ -1,4 +1,4 @@
 {
-  "prod": null,
-  "dogfood": "rebuild-v2"
+  "prod": "main",
+  "dogfood": "dogfood"
 }

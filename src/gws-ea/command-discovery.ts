@@ -48,7 +48,7 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
       '  --version  Identify this tool release and exact revision when available.',
       '',
       'Examples:',
-      '  gws-ea create --track dogfood',
+      '  gws-ea create --track prod',
       '  gws-ea list',
       '  gws-ea help update',
       '  gws-ea schema --json',

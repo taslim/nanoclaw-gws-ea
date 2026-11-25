@@ -149,7 +149,7 @@ async function machine(): Promise<Machine> {
   });
   const tool = path.join(root, 'tool');
   await mkdir(tool);
-  git(tool, 'init', '--quiet', '-b', 'dogfood');
+  git(tool, 'init', '--quiet', '-b', releaseTracks.dogfood);
   await writeFile(path.join(tool, '.gitignore'), 'data/\nlogs/\ngroups/\n.env\n');
   await writeFile(path.join(tool, 'release.txt'), 'first\n');
   return { root, paths, tool, release: commitAll(tool, 'first release') };
@@ -1856,7 +1856,7 @@ describe('status', () => {
     const commit = await nextRelease(host);
     const remote = path.join(host.root, track === 'dogfood' ? 'mirror source' : 'mirror');
     git(host.root, 'clone', '--quiet', host.tool, remote);
-    git(remote, 'branch', track === 'dogfood' ? releaseTracks.dogfood : track);
+    if (track !== 'dogfood') git(remote, 'branch', track);
     const target: ReleaseCoordinates = { source_remote: remote, release_track: track, deployed_commit: commit };
     await updateUnfinishedAt(host.paths, reservation, target);
     const state = world(reservation);

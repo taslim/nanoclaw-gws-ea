@@ -7,5 +7,5 @@ reviews:
     # release-tracks:start
     base_branches:
       - '^main$'
-      - '^rebuild-v2$'
+      - '^dogfood$'
     # release-tracks:end

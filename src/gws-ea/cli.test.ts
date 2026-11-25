@@ -1664,10 +1664,10 @@ describe('gws-ea release sources', () => {
     ]);
   });
 
-  it('refuses prod before it has a release, before asking anything', async () => {
+  it("installs prod from the public repository's main branch without asking for a remote", async () => {
     const paths = await testPaths();
-    const collectCreateInputs = vi.fn();
-    const resolveReleaseTarget = vi.fn();
+    const resolved: CreateTargetRequest[] = [];
+    const contexts: unknown[] = [];
     const io = lines();
 
     expect(
@@ -1675,14 +1675,32 @@ describe('gws-ea release sources', () => {
         paths,
         ...io.runtime,
         ...createRuntime(),
-        collectCreateInputs,
-        resolveReleaseTarget,
+        collectCreateInputs: async (context) => {
+          contexts.push(context);
+          return setupAnswers();
+        },
+        resolveReleaseTarget: async (request) => {
+          resolved.push(request);
+          return {
+            release: {
+              source_remote: request.source.remote,
+              release_track: request.track,
+              deployed_commit: 'd'.repeat(40),
+            },
+          };
+        },
+        advanceProvision: async () => ({ status: 'paused', pause: DM_PAUSE }),
       }),
-    ).toBe(1);
-    expect(io.err.join('\n')).toContain('Release track prod has no release yet; use --track dogfood.');
-    expect(collectCreateInputs).not.toHaveBeenCalled();
-    expect(resolveReleaseTarget).not.toHaveBeenCalled();
-    expect(io.out).toEqual([]);
+    ).toBe(10);
+    const prod = resolveReleaseSource('prod');
+    expect(prod.ref).toBe('refs/heads/main');
+    expect(resolved).toEqual([{ track: 'prod', source: prod }]);
+    expect(contexts).toEqual([expect.objectContaining({ sourceRemote: prod.remote, provided: {} })]);
+    const registry = await readRegistry(paths);
+    const instances = Object.values(registry.instances);
+    expect(instances.map((instance) => [instance.release_track, instance.source_remote])).toEqual([
+      ['prod', prod.remote],
+    ]);
   });
 
   it("reserves the tool's own commit, and reserves nothing when the tool cannot deploy", async () => {

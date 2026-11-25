@@ -118,7 +118,7 @@ describe('GWS-EA machine setup', () => {
     expect(await readFile(path.join(home, 'bootstrap-ran'), 'utf8')).toBe('diagnostics=1');
     expect(fresh.stdout).toContain(`Linked ${link}.`);
     expect(fresh.stdout).toContain('Add ~/.local/bin to your PATH in ~/.zshrc');
-    expect(fresh.stdout.trimEnd().split('\n').at(-1)).toBe('Next: gws-ea create --track dogfood');
+    expect(fresh.stdout.trimEnd().split('\n').at(-1)).toBe('Next: gws-ea create --track prod');
 
     // A rerun with ~/.local/bin on PATH leaves the link as it is and gives no PATH advice.
     const rerun = await setUp(first, home, { PATH: `${path.join(home, '.local', 'bin')}:/usr/bin:/bin` });
@@ -153,7 +153,7 @@ describe('GWS-EA machine setup', () => {
     const kept = await setUp(directory, home);
     expect(await readFile(link, 'utf8')).toBe('someone else');
     expect(kept.stderr).toContain(`Left ${link} alone`);
-    expect(kept.stdout).toContain(`Next: ${path.join(directory, 'bin', 'gws-ea')} create --track dogfood`);
+    expect(kept.stdout).toContain(`Next: ${path.join(directory, 'bin', 'gws-ea')} create --track prod`);
 
     await expect(setUp(directory, home, {}, ['create'])).rejects.toMatchObject({
       code: 2,
