@@ -22,9 +22,11 @@ vi.mock('./log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { wakeContainer } from './container-runner.js';
+import { isContainerRunning, wakeContainer } from './container-runner.js';
+import { getSessionClaim } from './db/coordination.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession } from './db/index.js';
+import { updateSession } from './db/sessions.js';
 import { asFailureError, deniedByPolicy } from './drivers/types.js';
 import { resetGatewayProvider } from './gateway-providers/index.js';
 import { log } from './log.js';
@@ -102,5 +104,44 @@ describe('wakeContainer when the driver refuses the start', () => {
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(log.warn).toHaveBeenCalledWith(RETRY_WARNING, expect.objectContaining({ sessionId: 'sess-1', err }));
     expect(log.error).not.toHaveBeenCalledWith(expect.stringMatching(/refused/i), expect.anything());
+  });
+
+  it('aborts startup and cleans up claim and gateway lease if the session closes while prepare is in flight', async () => {
+    const release = vi.fn(async () => {});
+    resetGatewayProvider({
+      kind: 'fixture',
+      agentSkills: [],
+      sessions: {
+        ensure: async () => ({
+          contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' as const } } },
+          release,
+        }),
+      },
+      approvals: { subscribe: async () => {} },
+    });
+    const start = vi.fn(async () => {});
+    const stop = vi.fn(async () => {});
+    prepare.mockImplementationOnce(async () => {
+      await updateSession('sess-1', { status: 'closed' });
+      return {
+        key: { installSlug: 'test', agentGroupId: 'ag-1', sessionId: 'sess-1' },
+        name: 'nanoclaw-sess-1',
+        start,
+        stop,
+        status: async () => ({ phase: 'stopped' }),
+        onTerminal: () => {},
+      };
+    });
+
+    expect(await wakeContainer(session())).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledWith('start-failed');
+    expect(isContainerRunning('sess-1')).toBe(false);
+    expect(release).toHaveBeenCalledOnce();
+    expect(await getSessionClaim('sess-1')).toMatchObject({
+      claimed_by: null,
+      claimed_at: null,
+      container_ref: null,
+    });
   });
 });

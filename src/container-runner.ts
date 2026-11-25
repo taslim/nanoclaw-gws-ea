@@ -609,7 +609,7 @@ async function spawnContainer(session: Session): Promise<void> {
     afterStart: () => {
       return markContainerRunning(session.id);
     },
-    beforeStart: () => {
+    beforeStart: async () => {
       if (
         gatewayUnavailableReason ||
         admissionGeneration !== gatewayAdmissionGeneration ||
@@ -619,6 +619,10 @@ async function spawnContainer(session: Session): Promise<void> {
       }
       if (armGatewayAvailability(session.id, gatewaySession)) {
         throw new Error('Gateway session became unavailable before agent start');
+      }
+      const fresh = await getSession(session.id);
+      if (!fresh || fresh.status === 'closed' || runtime.stopReason) {
+        throw new Error('Session closed or stopped before agent start');
       }
     },
     onFailure: async () => {

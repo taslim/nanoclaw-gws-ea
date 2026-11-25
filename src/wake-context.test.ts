@@ -41,7 +41,11 @@ vi.mock('./container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 // Lets a test make the backfill throw or hold: an exit or delay between taking the write turn and the write.
-const backfill = vi.hoisted(() => ({ fail: false, hold: undefined as Promise<void> | undefined }));
+const backfill = vi.hoisted(() => ({
+  fail: false,
+  hold: undefined as Promise<void> | undefined,
+  onHoldEntered: undefined as (() => void) | undefined,
+}));
 vi.mock('./modules/cross-session-context/index.js', async () => {
   const actual = await vi.importActual<typeof import('./modules/cross-session-context/index.js')>(
     './modules/cross-session-context/index.js',
@@ -51,7 +55,10 @@ vi.mock('./modules/cross-session-context/index.js', async () => {
     backfillSession: (async (...args: Parameters<typeof actual.backfillSession>) => {
       if (backfill.hold) {
         const wait = backfill.hold;
+        const onEntered = backfill.onHoldEntered;
         backfill.hold = undefined;
+        backfill.onHoldEntered = undefined;
+        onEntered?.();
         await wait;
       }
       if (backfill.fail) throw new Error('left before the write');
@@ -394,7 +401,10 @@ describe('wake context', () => {
 
     // Hold backfill for the slash command on S-A while a fast message arrives on S-B.
     let releaseBackfill!: () => void;
+    let holdEntered!: () => void;
+    const enteredHold = new Promise<void>((resolve) => (holdEntered = resolve));
     backfill.hold = new Promise<void>((resolve) => (releaseBackfill = resolve));
+    backfill.onHoldEntered = holdEntered;
     providers.first = async (wake) => (wake.trigger.id === 'msg-b' ? [block('b', 'beta', 'context for B')] : []);
 
     const cmd = routeInbound({
@@ -410,7 +420,7 @@ describe('wake context', () => {
         isGroup: false,
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await enteredHold;
     const msgB = routeInbound({
       channelType: 'testchat',
       platformId: 'testchat:S-B',
