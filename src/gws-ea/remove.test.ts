@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -148,11 +149,15 @@ function failed(stderr: string): SanitizedCommandOutcome {
  * NanoClaw's service helpers, faked: detection answers what the service is
  * now, a stop leaves it stopped, and a stop or drain lands in `order`.
  */
-function nanoclawService(order: string[], detected: NanoclawServiceHandle) {
+function nanoclawService(
+  order: string[],
+  detected: NanoclawServiceHandle,
+  run: (program: string, args: readonly string[]) => string = () => '',
+) {
   let current = detected;
   return {
     createCommandRunner: vi.fn<NanoclawServiceHelpers['createCommandRunner']>(() => ({
-      run: () => '',
+      run: (program, args) => run(program, args),
       tryRun: () => ({ ok: true, stdout: '' }),
     })),
     detectService: vi.fn<NanoclawServiceHelpers['detectService']>(() => current),
@@ -1517,6 +1522,65 @@ describe('removal safety', () => {
       expect(docker.map((command) => command.args.slice(0, 2).join(' '))).toEqual(['ps -aq', 'image ls']);
       for (const command of docker) expect(command.env?.DOCKER_HOST).toBe(recorded);
       await expectGone(paths, input);
+    },
+  );
+
+  it.each([
+    { state: 'disabled', enabled: true },
+    { state: 'enabled', enabled: false },
+    // A leftover override is harmless once the plist is gone, so a launchctl that cannot answer never stops removal.
+    { state: 'unanswered', enabled: false },
+  ] as const)(
+    'clears the launchd override of a $state assistant before deleting its plist',
+    async ({ state, enabled }) => {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(), {
+        started: ['materialize_checkout', 'start_nanoclaw'],
+      });
+      const home = path.join(paths.stateRoot, 'home');
+      await writePrivate(paths.runtimeFile(input.instance_id), {
+        home_directory: home,
+        docker_endpoint: 'unix:///run/user/501/docker.sock',
+      });
+      const { launchdLabel } = getInstallScopedNames(input.instance_id.replaceAll('-', ''));
+      const definition = path.join(home, 'Library', 'LaunchAgents', `${launchdLabel}.plist`);
+      await mkdir(path.dirname(definition), { recursive: true });
+      await writeFile(definition, 'unit', { mode: 0o600 });
+      const order: string[] = [];
+      const launchctl: string[] = [];
+      const serviceHelpers = nanoclawService(
+        order,
+        { mode: 'launchd', active: false, name: launchdLabel, definition },
+        (program, args) => {
+          if (program !== 'launchctl') return '';
+          launchctl.push(args.join(' '));
+          if (args[0] === 'enable') order.push(`enable plist-present:${existsSync(definition)}`);
+          if (args[0] === 'print-disabled' && state === 'unanswered')
+            throw new Error('launchctl print-disabled timed out');
+          return args[0] === 'print-disabled' ? `disabled services = {\n\t"${launchdLabel}" => ${state}\n}\n` : '';
+        },
+      );
+      const commands: SanitizedCommand[] = [];
+      const runCommand = async (command: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
+        commands.push(command);
+        if (['pkill', 'pgrep'].includes(command.command)) return failed('');
+        return ok();
+      };
+      const { uninstallNanoclaw: _fake, ...dependencies } = world(input).dependencies;
+
+      await removeAssistant(paths, input.instance_id, {
+        ...dependencies,
+        platform: 'macos',
+        runCommand,
+        serviceHelpers,
+      });
+
+      const enables = launchctl.filter((line) => line.startsWith('enable '));
+      expect(enables).toEqual(enabled ? [`enable gui/${process.getuid?.()}/${launchdLabel}`] : []);
+      // Enabling finds the job by its plist, so it comes before the plist goes.
+      if (enabled) expect(order).toContain('enable plist-present:true');
+      expect(await exists(definition)).toBe(false);
+      expect(commands.filter((command) => command.command === 'launchctl')).toEqual([]);
     },
   );
 

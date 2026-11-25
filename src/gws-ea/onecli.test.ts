@@ -15,6 +15,7 @@ import {
   prepareReleaseGatewayImage,
   reconcileOnecliRuntime,
   removeOnecliRuntime,
+  stopOnecliRuntime,
   verifyOnecliRuntime,
   type OnecliCommand,
   type OnecliCommandRunner,
@@ -376,6 +377,16 @@ function dockerWorld(
       // Provenance-label read: the label the image's build stamped, as Docker's template prints a missing one.
       return { stdout: `${world.provenance.get(args[2]!) ?? '<no value>'}\n`, stderr: '' };
     }
+    if (args[0] === 'container' && args[1] === 'stop') {
+      const ids = new Set(args.slice(2));
+      for (const [service, container] of world.services) {
+        if (ids.has(container.id)) world.services.set(service, { ...container, running: false });
+      }
+      for (const [id, stray] of world.strays) {
+        if (ids.has(id)) world.strays.set(id, { ...(stray as object), State: { Running: false, Status: 'exited' } });
+      }
+      return { stdout: '', stderr: '' };
+    }
     if (args[0] === 'compose' && args.includes('pull')) return { stdout: '', stderr: '' };
     if (args[0] === 'compose' && args.includes('config')) {
       const hashes = await fileHashes();
@@ -695,6 +706,102 @@ describe('OneCLI runtime observation', () => {
       status: 'unknown',
       evidence: expect.stringContaining('timed out'),
     });
+  });
+});
+
+describe('OneCLI runtime stop', () => {
+  it('stops each running owned container by ID, never taking the stack down or touching volumes', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'stopped' });
+    const running = ['postgres', 'app'].map((service) => world.services.get(service as ServiceName)!.id);
+
+    await expect(stopOnecliRuntime(layout, { dockerCommandRunner: runner })).resolves.toBe('stopped');
+
+    expect(world.calls.filter((call) => call.args.includes('stop')).map((call) => call.args)).toEqual([
+      ['container', 'stop', ...running],
+    ]);
+    expect(composeCalls(world)).toEqual([]);
+    const everyArg = world.calls.flatMap((call) => call.args);
+    expect(everyArg).not.toContain('down');
+    expect(everyArg).not.toContain('--volumes');
+    expect([...world.services.values()].every((container) => !container.running)).toBe(true);
+  });
+
+  it('stops a running owned container whose service the Compose file no longer defines', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy' });
+    const postgres = containerJson(layout, 'postgres', {
+      id: 'id-retired',
+      running: true,
+      health: 'healthy',
+      configHash: 'f'.repeat(64),
+    });
+    const labels = { ...postgres.Config.Labels, 'com.docker.compose.service': 'retired-service' };
+    world.strays.set('id-retired', { ...postgres, Id: 'id-retired', Config: { ...postgres.Config, Labels: labels } });
+
+    await expect(stopOnecliRuntime(layout, { dockerCommandRunner: runner })).resolves.toBe('stopped');
+
+    expect(world.strays.get('id-retired')).toMatchObject({ State: { Running: false } });
+    expect(world.calls.flatMap((call) => call.args)).not.toContain('rm');
+  });
+
+  it('runs nothing and reports no change when every container is already stopped', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'stopped', app: 'stopped', gateway: 'stopped' });
+
+    await expect(stopOnecliRuntime(layout, { dockerCommandRunner: runner })).resolves.toBe('already-stopped');
+
+    expect(composeCalls(world)).toEqual([]);
+  });
+
+  it('refuses a project container labelled for another instance without running Compose', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy' });
+    world.strays.set('foreign-1', {
+      Id: 'foreign-1',
+      Config: {
+        Labels: {
+          'com.docker.compose.project': layout.project,
+          'com.docker.compose.service': 'app',
+          'dev.gws-ea.instance-id': 'another-instance',
+        },
+      },
+      State: { Running: true, Status: 'running' },
+      NetworkSettings: { Ports: {} },
+    });
+
+    await expect(stopOnecliRuntime(layout, { dockerCommandRunner: runner })).rejects.toMatchObject({
+      code: 'unsafe_onecli_owner',
+    });
+    expect(composeCalls(world)).toEqual([]);
+  });
+
+  it('fails naming a container that is still running after the stop', async () => {
+    const layout = await layoutFixture();
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' });
+    const stubborn: OnecliCommandRunner = async (command) =>
+      command.args.includes('stop') ? { stdout: '', stderr: '' } : runner(command);
+
+    await expect(stopOnecliRuntime(layout, { dockerCommandRunner: stubborn })).rejects.toMatchObject({
+      code: 'onecli_stop_incomplete',
+      message: expect.stringContaining(world.services.get('postgres')!.id),
+    });
+  });
+
+  it('observes a stopped stack as absent and brings it back up verified', async () => {
+    const layout = await layoutFixture();
+    const written = await writeInstanceCompose(layout);
+    const { world, runner } = dockerWorld(layout, { postgres: 'healthy', app: 'healthy', gateway: 'healthy' }, written);
+    const dependencies = { dockerCommandRunner: runner, fetch: healthyFetch() };
+    await stopOnecliRuntime(layout, dependencies);
+
+    await expect(observeOnecliRuntime(layout, PINS, dependencies)).resolves.toMatchObject({ status: 'absent' });
+    await reconcileOnecliRuntime(layout, PINS, dependencies);
+
+    expect([...world.services.values()].every((container) => container.running && container.health === 'healthy')).toBe(
+      true,
+    );
+    expect(composeCalls(world).filter((args) => args[0] === 'up')).toHaveLength(1);
   });
 });
 

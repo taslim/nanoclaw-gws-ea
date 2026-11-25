@@ -36,7 +36,7 @@ const phase = {
     object({ state: { const: 'unknown' }, reason: text }),
   ],
 };
-const serviceState = choices('running', 'stopped', 'not_installed', 'unmanaged', 'unknown');
+const serviceState = choices('running', 'stopped', 'off', 'not_installed', 'unmanaged', 'unknown');
 const releaseView = object({
   deployed_commit: text,
   tool_commit: nullable(text),
@@ -78,7 +78,7 @@ const probe = (facts: Readonly<Record<string, ResultSchema>> = {}): ResultSchema
 const probes = object({
   checkout: probe({ commit: nullable(text) }),
   image: probe({ tag: nullable(text) }),
-  service: probe({ state: serviceState }),
+  service: probe({ state: serviceState, running: nullable(bool) }),
   host: probe(),
   onecli: probe(),
   principal: probe(),

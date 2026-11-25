@@ -291,10 +291,14 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     effects:
       command === 'stop'
         ? [
-            'Stops the host service; agent containers keep running.',
-            'A later login or reboot can start the service again.',
+            'Turns the assistant off: disables its service, then stops its host, agent containers, and credential vault.',
+            'It stays off through logins, reboots, and Docker restarts until gws-ea start or restart.',
+            'Update and rollback refuse an assistant that is off.',
           ]
-        : ['Controls the recorded host service and verifies host readiness.'],
+        : [
+            'Turns an assistant that is off back on: brings its credential vault up, then enables its service.',
+            'Controls the recorded host service and verifies host readiness.',
+          ],
     prerequisites: assistantPrerequisites,
     recovery: ['Inspect status and logs for the explicitly named assistant.'],
     examples: [`gws-ea ${command} --id <instance_id>`],

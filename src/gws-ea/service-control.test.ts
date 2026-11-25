@@ -13,6 +13,7 @@ import { createInstanceRuntimeConfig, reconcileInstanceService, type InstanceRun
 import {
   createServiceControl,
   hostLogFiles,
+  restartTurnedOn,
   type NanoclawCommandRunner,
   type NanoclawServiceHandle,
   type NanoclawServiceHelpers,
@@ -332,14 +333,14 @@ describe('stop', () => {
   });
 });
 
-describe('stop by label', () => {
+describe('stopping a launchd job without its plist', () => {
   const plist = LOADED.definition!;
 
-  it("stops a launchd job by its label through NanoClaw's stop, though detection, which needs its plist, finds none", async () => {
+  it("stops the install's launchd job by its label through NanoClaw's stop, though detection, which needs its plist, finds none", async () => {
     const { helpers, calls, runner } = nanoclaw(NOT_INSTALLED);
     const { service } = control(helpers);
 
-    await service.stopByLabel(LABEL, plist);
+    await service.stopJobWithoutPlist();
 
     // The environment every other helper gets: this assistant's home, user, install, and command runner.
     expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(
@@ -360,11 +361,19 @@ describe('stop by label', () => {
     const didNotStop = new Error(`NanoClaw service ${LABEL} did not stop (PID 4242).`);
     helpers.stopService.mockRejectedValueOnce(didNotStop);
 
-    await expect(control(helpers).service.stopByLabel(LABEL, plist)).rejects.toMatchObject({
+    await expect(control(helpers).service.stopJobWithoutPlist()).rejects.toMatchObject({
       code: 'service_still_running',
       message: `NanoClaw's service ${LABEL} did not stop: ${didNotStop.message}`,
       cause: didNotStop,
     });
+  });
+
+  it('does nothing off macOS, where no launchd job exists', async () => {
+    const { helpers } = nanoclaw(NOT_INSTALLED);
+
+    await control(helpers, { platform: 'linux' }).service.stopJobWithoutPlist();
+
+    expect(helpers.stopService).not.toHaveBeenCalled();
   });
 });
 
@@ -481,6 +490,166 @@ describe('refusals', () => {
   );
 });
 
+describe('turning the service off and on', () => {
+  /** launchd's override list as `print-disabled` prints it, with this assistant's row set to `state`. */
+  function overrides(state?: string): string {
+    const rows = ['"com.apple.some-agent" => enabled', `"${LABEL}-other" => disabled`];
+    if (state !== undefined) rows.push(`"${LABEL}" => ${state}`);
+    return `disabled services = {\n${rows.map((row) => `\t\t${row}`).join('\n')}\n\t}\n`;
+  }
+
+  /** NanoClaw's helpers whose runner answers launchctl's override list with `state` and records every command. */
+  function launchd(state?: string) {
+    const fake = nanoclaw(LOADED);
+    fake.runner.run.mockImplementation((command, args) => {
+      fake.calls.push([command, ...args].join(' '));
+      return args[0] === 'print-disabled' ? overrides(state) : '';
+    });
+    return fake;
+  }
+
+  /** NanoClaw's helpers whose runner answers `is-enabled` as systemctl does: non-zero for anything but enabled. */
+  function systemd(mode: 'systemd-user' | 'systemd-system', state: string) {
+    const fake = nanoclaw({ ...SYSTEMD_RUNNING, mode });
+    fake.runner.tryRun.mockImplementation((command, args) => {
+      fake.calls.push([command, ...args].join(' '));
+      return { ok: state === 'enabled', stdout: state };
+    });
+    return fake;
+  }
+
+  it.each([
+    ['disabled', 'disabled'],
+    ['true', 'disabled'],
+    ['enabled', 'enabled'],
+    ['false', 'enabled'],
+    [undefined, 'enabled'],
+  ] as const)('reads a launchd override of %s as %s', (state, expected) => {
+    const { helpers, runner } = launchd(state);
+
+    expect(control(helpers).service.enablement()).toBe(expected);
+    expect(runner.run).toHaveBeenCalledWith('launchctl', ['print-disabled', 'gui/501'], undefined, {
+      timeoutMs: 30_000,
+    });
+  });
+
+  it.each([
+    ['disabled', 'disabled'],
+    ['enabled', 'enabled'],
+    ['masked', 'enabled'],
+    ['static', 'enabled'],
+  ] as const)('reads systemd is-enabled %s as %s', (state, expected) => {
+    const { helpers, calls } = systemd('systemd-user', state);
+
+    expect(control(helpers, { platform: 'linux' }).service.enablement()).toBe(expected);
+    expect(calls).toEqual(['detect', `systemctl --user is-enabled ${UNIT}`]);
+  });
+
+  it('cannot tell whether a systemd unit is disabled when systemctl itself fails', () => {
+    const { helpers, runner } = nanoclaw(SYSTEMD_RUNNING);
+    runner.tryRun.mockReturnValue({ ok: false, stdout: 'Failed to connect to bus: No such file or directory' });
+
+    expect(() => control(helpers, { platform: 'linux' }).service.enablement()).toThrow(
+      expect.objectContaining({ code: 'service_unobservable' }),
+    );
+  });
+
+  it('disables and enables a launchd job by its label, reporting each change once', () => {
+    const disabled = launchd(undefined);
+    expect(control(disabled.helpers).service.disable()).toBe(true);
+    expect(disabled.calls).toContain(`launchctl disable gui/501/${LABEL}`);
+
+    const already = launchd('disabled');
+    expect(control(already.helpers).service.disable()).toBe(false);
+    expect(already.calls.filter((call) => call.startsWith('launchctl disable'))).toEqual([]);
+
+    const enabled = launchd('disabled');
+    expect(control(enabled.helpers).service.enable()).toBe(true);
+    expect(enabled.calls).toContain(`launchctl enable gui/501/${LABEL}`);
+
+    const on = launchd('enabled');
+    expect(control(on.helpers).service.enable()).toBe(false);
+    expect(on.calls.filter((call) => call.startsWith('launchctl enable'))).toEqual([]);
+  });
+
+  it.each([
+    ['systemd-user', ['--user']],
+    ['systemd-system', []],
+  ] as const)('disables and enables a %s unit', (mode, scope) => {
+    const on = systemd(mode, 'enabled');
+    on.runner.run.mockImplementation((command, args) => {
+      on.calls.push([command, ...args].join(' '));
+      return '';
+    });
+    expect(control(on.helpers, { platform: 'linux' }).service.disable()).toBe(true);
+    expect(on.calls).toContain(['systemctl', ...scope, 'disable', UNIT].join(' '));
+
+    const off = systemd(mode, 'disabled');
+    off.runner.run.mockImplementation((command, args) => {
+      off.calls.push([command, ...args].join(' '));
+      return '';
+    });
+    expect(control(off.helpers, { platform: 'linux' }).service.enable()).toBe(true);
+    expect(off.calls).toContain(['systemctl', ...scope, 'enable', UNIT].join(' '));
+  });
+
+  it('fails naming the label when launchd refuses to disable it, and reports the effect as uncertain', () => {
+    const { helpers, runner } = launchd(undefined);
+    const refused = new Error(`Command failed: launchctl disable gui/501/${LABEL}\nOperation not permitted`);
+    runner.run.mockImplementation((_command, args) => {
+      if (args[0] === 'disable') throw refused;
+      return overrides(undefined);
+    });
+    const effects: (true | null)[] = [];
+
+    expect(() => control(helpers, { recordEffect: (changed) => effects.push(changed) }).service.disable()).toThrow(
+      expect.objectContaining({ code: 'service_enablement_failed', message: expect.stringContaining(LABEL) }),
+    );
+    expect(effects).toEqual([null]);
+  });
+
+  it('never turns the service off or on from the start and stop that updates, rollbacks, and removal share', async () => {
+    const stopped = launchd(undefined);
+    await control(stopped.helpers).service.stop();
+    const started = launchd(undefined);
+    started.helpers.detectService.mockReturnValue(BOOTED_OUT);
+    await control(started.helpers).service.start();
+
+    for (const { calls } of [stopped, started]) {
+      expect(calls.filter((call) => /^(launchctl|systemctl) /u.test(call))).toEqual([]);
+    }
+  });
+});
+
+describe('starting as create and resume do', () => {
+  it.each([
+    ['disabled', ['launchctl print-disabled gui/501', `launchctl enable gui/501/${LABEL}`, 'start']],
+    ['enabled', ['launchctl print-disabled gui/501', 'start']],
+  ] as const)('turns a %s launchd job on before loading it', async (state, steps) => {
+    const { helpers, calls, runner } = nanoclaw(BOOTED_OUT);
+    runner.run.mockImplementation((command, args) => {
+      calls.push([command, ...args].join(' '));
+      return args[0] === 'print-disabled' ? `\t\t"${LABEL}" => ${state}\n` : '';
+    });
+
+    await expect(restartTurnedOn(control(helpers).service)).resolves.toBe('started');
+    expect(calls.filter((call) => call !== 'detect')).toEqual(steps);
+  });
+
+  it('turns a disabled systemd unit on before starting it', async () => {
+    const { helpers, calls, runner } = nanoclaw({ ...SYSTEMD_RUNNING, active: false });
+    runner.tryRun.mockReturnValue({ ok: false, stdout: 'disabled' });
+
+    await restartTurnedOn(control(helpers, { platform: 'linux' }).service);
+
+    expect(calls.filter((call) => call !== 'detect')).toEqual([
+      `systemctl --user enable ${UNIT}`,
+      `systemctl --user reset-failed ${UNIT}`,
+      'start',
+    ]);
+  });
+});
+
 describe('drain and health', () => {
   it("drains only the assistant's own containers, within the bound given", async () => {
     const { helpers } = nanoclaw(LOADED);
@@ -492,6 +661,30 @@ describe('drain and health', () => {
       TARGET.checkoutRoot,
       expect.objectContaining({ installSlug: INSTALL_ID }),
       5_000,
+    );
+  });
+
+  it.each([
+    ['an agent container', 'a1|sess-1|\n', true],
+    ['a session auxiliary', 'a2|sess-1|gateway\n', true],
+    ['only a gateway-owned container, which a host start never recreates', 'g1||gateway\n', false],
+    ['nothing', '', false],
+  ] as const)('sees agents running when Docker lists %s', (_case, listed, expected) => {
+    const { helpers, runner } = nanoclaw(LOADED);
+    runner.tryRun.mockReturnValue({ ok: true, stdout: listed });
+
+    expect(control(helpers).service.agentsRunning()).toBe(expected);
+    expect(runner.tryRun).toHaveBeenCalledWith(
+      'docker',
+      [
+        'ps',
+        '--filter',
+        `label=nanoclaw-install=${INSTALL_ID}`,
+        '--format',
+        '{{.ID}}|{{.Label "nanoclaw-session"}}|{{.Label "nanoclaw-role"}}',
+      ],
+      undefined,
+      { timeoutMs: 30_000 },
     );
   });
 

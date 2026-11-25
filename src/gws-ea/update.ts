@@ -89,6 +89,7 @@ import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
 import { readOwnerOnlyJson } from './secrets.js';
 import { bindInstanceHostPolicies, type InstanceRuntimeConfig } from './service.js';
+import { isTurnedOff } from './assistant-power.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import type { ServiceState } from './status.js';
@@ -247,6 +248,8 @@ export function serviceRefusal(
   switch (state) {
     case 'stopped':
       return `It is stopped, and an update proves its new release on a running assistant; start it with gws-ea start --id ${instanceId}, then update it.`;
+    case 'off':
+      return `It is turned off; start it with gws-ea start --id ${instanceId} to update it.`;
     case 'not_installed':
       return `No NanoClaw service is installed for it; gws-ea resume --id ${instanceId} installs it.`;
     case 'unmanaged':
@@ -256,13 +259,18 @@ export function serviceRefusal(
   }
 }
 
-function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateDependencies): void {
+/** An update proves its release on a running host, and never starts one the operator turned off. */
+function assertHostRunning(
+  runtime: InstanceRuntimeConfig,
+  dependencies: Pick<CutoverDependencies, 'serviceHelpers' | 'service'>,
+): void {
   const id = runtime.instance_id;
-  const handle = createServiceControl(
+  const service = createServiceControl(
     dependencies.serviceHelpers,
     runtimeServiceTarget(runtime),
     dependencies.service,
-  ).detect();
+  );
+  const handle = service.detect();
   const refused = (code: string, state: Exclude<ServiceState, 'running'>, reason: string | null = null) =>
     new GwsEaError(code, `Assistant ${id} cannot be updated. ${serviceRefusal(id, state, reason)}`);
   if (handle.mode === 'none') throw refused('service_not_installed', 'not_installed');
@@ -273,6 +281,7 @@ function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateD
       `A NanoClaw host runs from ${runtime.checkout_root} outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
     );
   }
+  if (isTurnedOff(service, handle)) throw refused('host_not_running', 'off');
   if (!handle.active) throw refused('host_not_running', 'stopped');
 }
 

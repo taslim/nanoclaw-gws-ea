@@ -44,7 +44,9 @@ import {
   type CutoverHost,
 } from './cutover.js';
 import { runStep } from './events.js';
-import { assertInstanceCreated, type InstanceOperation } from './journal.js';
+import { refuseTurnedOff } from './assistant-power.js';
+import { createServiceControl, runtimeServiceTarget } from './service-control.js';
+import { assertInstanceCreated, loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import {
   advanceOperation,
   assertNotCommitted,
@@ -965,6 +967,16 @@ export async function rollBack(
   const { paths, instanceId } = operation;
   await assertInstanceCreated(paths, instanceId);
   const record = await readOperationRecord(paths, instanceId);
+  // An open record blocks stop, so only a committed one can meet an assistant the operator turned off.
+  if (!record || record.phase === 'committed') {
+    const runtime = await loadCreatedRuntime(paths, instanceId);
+    const service = createServiceControl(
+      dependencies.serviceHelpers,
+      runtimeServiceTarget(runtime),
+      dependencies.service,
+    );
+    refuseTurnedOff(service, instanceId, 'roll it back');
+  }
   if (record?.phase === 'committed' && record.kind === 'rollback') {
     return { kind: 'follow_ups_finished', release: record.to };
   }

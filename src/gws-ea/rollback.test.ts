@@ -238,6 +238,22 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect(state.events).toEqual([]);
   });
 
+  it('refuses an assistant that is turned off, naming gws-ea start and changing nothing', async () => {
+    const { host, runtime, next, state } = await updatedAssistant();
+    Object.assign(state, { disabled: true, loaded: false, running: false });
+    state.events.length = 0;
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(
+      `is turned off; start it with gws-ea start --id ${runtime.instance_id} to roll it back`,
+    );
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
+    expect(state.events).toEqual([]);
+    expect(state.running).toBe(false);
+  });
+
   it('leaves the old browser policy untouched when rolling back to its earlier reader', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     const policy = path.join(runtime.instance_root, 'browser', 'policy.json');
@@ -489,6 +505,29 @@ describe('gws-ea rollback when a schema moved', GIT_HEAVY, () => {
     expect(releaseOf(await getInstanceReservation(host.paths, id))).toEqual(release(host, newer.commit));
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(newer.commit));
     expect(await readOperationRecord(host.paths, id)).toBeUndefined();
+  });
+});
+
+describe('a rollback of an assistant turned off with follow-ups left', GIT_HEAVY, () => {
+  it('refuses before running any follow-up', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, NEW_IMAGE);
+    const state = world(runtime);
+    state.rebuildFails = true;
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    const pending = (await readOperationRecord(host.paths, runtime.instance_id))?.follow_ups;
+    delete state.rebuildFails;
+    Object.assign(state, { disabled: true, loaded: false, running: false });
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toMatchObject({
+      kind: 'update',
+      phase: 'committed',
+      follow_ups: pending,
+    });
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
   });
 });
 

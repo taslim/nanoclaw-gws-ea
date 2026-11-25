@@ -217,7 +217,8 @@ identity, service and conversation condition, active operation, observation time
 and useful next actions. Browser availability, optional alias identity and each
 connector appear independently. Not installed is informational; owed operator
 setup is degraded. A stopped assistant shows local facts without live connector
-checks. `--details` adds probe facts, browser network isolation and technical diagnostics.
+checks. An assistant turned off with `gws-ea stop` shows as `off`, names
+`gws-ea start` as its next action, and skips its vault and connector checks. `--details` adds probe facts, browser network isolation and technical diagnostics.
 Status observes without repair, a run log or an operation lock. Live checks may
 use existing host credentials within their connector boundary; output never
 contains their values.
@@ -314,11 +315,23 @@ without rewriting files.
 ### Assistant lifecycle commands
 
 ```sh
+gws-ea stop --id 01234567-89ab-4def-8123-456789abcdef
+gws-ea start --id 01234567-89ab-4def-8123-456789abcdef
 gws-ea update --id 01234567-89ab-4def-8123-456789abcdef
 gws-ea update --all
 gws-ea rollback --id 01234567-89ab-4def-8123-456789abcdef
 gws-ea remove --id 01234567-89ab-4def-8123-456789abcdef
 ```
+
+`stop` turns an assistant off: it disables its launchd job or systemd unit,
+then stops its host, agent containers and credential vault. Nothing of it runs
+again, through logins, reboots and Docker restarts, until `start` or `restart`
+brings the vault up, turns the service back on and starts the host. A vault
+that cannot come up leaves the assistant off. Repeating `stop` finishes a stop
+that failed partway. Its web hostname stays configured and serves nothing while
+the host is off. `update --all` skips an assistant that is off, and
+`update --id` and `rollback --id` refuse it; start it first. An assistant
+stopped by a release before this behavior is not off until `stop` runs again.
 
 A single update prepares the release before confirmation. Its preview names
 current and target revisions, repository or track changes, migrations, images,

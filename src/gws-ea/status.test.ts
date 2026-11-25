@@ -378,6 +378,8 @@ interface World {
   readonly installed: ReadonlySet<string>;
   /** Installs whose service runs. */
   readonly active: Set<string>;
+  /** Installs whose service the operator turned off in launchd. */
+  readonly disabled: Set<string>;
   /** Checkouts whose host answers on its socket and `ncl`. */
   readonly serving: Set<string>;
   /** The agent image tags Docker holds. */
@@ -391,6 +393,7 @@ function world(...assistants: readonly InstanceReservation[]): World {
   return {
     installed: new Set(assistants.map(installOf)),
     active: new Set(assistants.map(installOf)),
+    disabled: new Set(),
     serving: new Set(checkouts),
     images: new Set(assistants.map(liveImageOf)),
     commands: [],
@@ -411,7 +414,17 @@ function serviceHelpers(state: World, home: string): NanoclawServiceHelpers {
   return {
     createCommandRunner: ({ env }) => {
       state.serviceEnvironments.push(env);
-      return { run: unused, tryRun: unused };
+      return {
+        // launchd's own record of which jobs are turned off, as `print-disabled` lists it.
+        run: (command, args) => {
+          if (command !== 'launchctl' || args.join(' ') !== 'print-disabled gui/501') return unused();
+          const rows = [...state.installed].map(
+            (slug) => `\t"com.nanoclaw-v2-${slug}" => ${state.disabled.has(slug) ? 'disabled' : 'enabled'}`,
+          );
+          return ['disabled services = {', ...rows, '}'].join('\n');
+        },
+        tryRun: unused,
+      };
     },
     detectService: (_root, env) => {
       if (env.home !== home || !state.installed.has(env.installSlug)) return { mode: 'none', active: false };
@@ -503,6 +516,9 @@ const onecliAgents: StatusObservers['onecliAgents'] = async () => [
   { id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' },
   { id: 'agent-ee', identifier: EXTERNAL_EMAIL, name: 'external-email', secretMode: 'selective' },
 ];
+
+/** OneCLI as observing finds it once its containers are stopped. */
+const STOPPED_VAULT = { status: 'absent', reason: 'its containers are not running' } as const;
 
 const MANIFEST: SnapshotManifest = {
   central_migrations: ['initial-v2-schema', 'host-coordination'],
@@ -603,7 +619,7 @@ async function statusJson(host: Machine, state: World, instanceId: string, obser
 
 type ProbeShape = { status: string; reason: string | null } & Record<string, unknown>;
 interface StatusShape {
-  connectors: { name: string; setup: string }[];
+  connectors: { name: string; setup: string; readiness: { checked: boolean } }[];
   main_turn: {
     provider: string | null;
     last: { status: string; at: string; cause: string | null } | null;
@@ -850,7 +866,12 @@ describe('status', () => {
     const { exitCode, status } = await statusJson(host, state, reservation.instance_id);
 
     expect(exitCode).toBe(0);
-    expect(status.probes.service).toEqual({ status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' });
+    expect(status.probes.service).toEqual({
+      status: 'degraded',
+      reason: 'Its service is stopped.',
+      state: 'stopped',
+      running: false,
+    });
     expect(status.probes.host).toEqual({
       status: 'degraded',
       reason: `The host is unreachable: NanoClaw is not running; see ${host.paths.instanceRoot(reservation.instance_id)}/logs/nanoclaw.error.log`,
@@ -862,6 +883,67 @@ describe('status', () => {
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
     }
   });
+
+  it('reports an assistant turned off as off, its vault and connectors not checked, with start as the next action', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const id = reservation.instance_id;
+    const state = world(reservation);
+    state.active.clear();
+    state.serving.clear();
+    state.disabled.add(installOf(reservation));
+    // Stop also stops the vault, which observing would otherwise report as missing.
+    const observers = { ...healthyObservers(state), onecli: async () => STOPPED_VAULT };
+
+    const { exitCode, status, nextActions } = await statusJson(host, state, id, observers);
+
+    expect(exitCode).toBe(0);
+    expect(status.probes.service).toEqual({
+      status: 'degraded',
+      reason: `Turned off; it stays off until gws-ea start --id ${id}.`,
+      state: 'off',
+      running: false,
+    });
+    expect(status.probes.onecli).toEqual({ status: 'unknown', reason: 'Assistant is off; OneCLI was not checked.' });
+    expect(status.connectors.map(({ readiness }) => readiness.checked)).not.toContain(true);
+    expect(nextActions).toEqual([{ kind: 'command', argv: ['gws-ea', 'start', '--id', id] }]);
+
+    const shown = command(host, state, observers);
+    expect(await runStatusCommand(shown.runtime, { instanceId: id, json: false })).toBe(0);
+    expect(shown.output.stdout).toContain(`  Service: off; Turned off; it stays off until gws-ea start --id ${id}.`);
+    expect(shown.output.stdout).toContain(`  Next: gws-ea start --id ${id}`);
+  });
+
+  it.each([
+    ['answering', true],
+    ['not answering', false],
+  ] as const)(
+    'reports a turned-off assistant whose host still runs, %s, as off, saying stop finishes turning it off',
+    async (_case, answering) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+      const id = reservation.instance_id;
+      const state = world(reservation);
+      state.disabled.add(installOf(reservation));
+      if (!answering) state.serving.clear();
+
+      const { status, nextActions } = await statusJson(host, state, id, {
+        ...healthyObservers(state),
+        onecli: async () => STOPPED_VAULT,
+      });
+
+      expect(status.probes.service).toEqual({
+        status: 'degraded',
+        reason: `Turned off, but its host still runs; gws-ea stop --id ${id} finishes turning it off.`,
+        state: 'off',
+        running: true,
+      });
+      // start would turn it back on; only stop finishes what the operator asked for.
+      expect(nextActions).toEqual([{ kind: 'command', argv: ['gws-ea', 'stop', '--id', id] }]);
+      expect(status.probes.onecli).toEqual({ status: 'unknown', reason: 'Assistant is off; OneCLI was not checked.' });
+      expect(status.connectors.map(({ readiness }) => readiness.checked)).not.toContain(true);
+    },
+  );
 
   it("reports a Google connection that stopped working as the workspace probe's failure, naming the account", async () => {
     const host = await machine();
@@ -1696,6 +1778,40 @@ describe('status', () => {
     );
   });
 
+  it.each([
+    ['stopped', false],
+    ['still answering', true],
+  ] as const)(
+    'names start before the follow-ups of a committed update for an assistant turned off with its host %s',
+    async (_case, answering) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+      const id = reservation.instance_id;
+      const to: ReleaseCoordinates = { ...releaseOf(reservation), deployed_commit: 'c'.repeat(40) };
+      await recordedWith(host.paths, reservation, {
+        kind: 'update',
+        to,
+        followUp: { kind: 'rebuild_group_image', agent_group_id: 'ag-research' },
+      });
+      const state = world(reservation);
+      if (!answering) {
+        state.active.clear();
+        state.serving.clear();
+      }
+      state.disabled.add(installOf(reservation));
+
+      const { nextActions } = await statusJson(host, state, id, {
+        ...healthyObservers(state),
+        onecli: async () => STOPPED_VAULT,
+      });
+
+      expect(nextActions).toEqual([
+        { kind: 'command', argv: ['gws-ea', 'start', '--id', id] },
+        { kind: 'command', argv: ['gws-ea', 'update', '--id', id] },
+      ]);
+    },
+  );
+
   it('names a host never started as such', async () => {
     const host = await machine();
     const unstarted = await assistant(host, { label: 'beta', port: 36_011 });
@@ -1711,7 +1827,7 @@ describe('status', () => {
       assistants: Array<{ service: unknown }>;
     };
 
-    expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown' });
+    expect(status.probes.service).toEqual({ status: 'unknown', reason: neverStarted, state: 'unknown', running: null });
     expect(listing.assistants.map(({ service }) => service)).toEqual([{ state: 'unknown', reason: neverStarted }]);
     const text = command(host, state);
     expect(
@@ -1754,7 +1870,12 @@ describe('status', () => {
     expect(exitCode).toBe(0);
     expect(status).toMatchObject({ phase: { state: 'fenced' }, operation: { state: 'none' } });
     expect(new Set(read)).toEqual(new Set([stateOf(reservation)]));
-    expect(status.probes.service).toEqual({ status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' });
+    expect(status.probes.service).toEqual({
+      status: 'degraded',
+      reason: 'Its service is stopped.',
+      state: 'stopped',
+      running: false,
+    });
     expect(status.schema).toMatchObject({ latest_migration: 'host-coordination', reason: null });
     for (const name of ['onecli', 'principal', 'delivery'])
       expect(status.probes[name], name).toMatchObject({ status: 'ok' });
@@ -2017,6 +2138,44 @@ describe('list', () => {
         `continue it with gws-ea update --id ${beta.instance_id}, or revert it with gws-ea rollback --id ${beta.instance_id}.`,
     );
     expect(lines).toMatch(new RegExp(`^${alpha.instance_id}: Removal .*gws-ea remove --id ${alpha.instance_id}`, 'mu'));
+  });
+
+  it('shows an assistant turned off as off beside the others running', async () => {
+    const host = await machine();
+    const alpha = await assistant(host, { label: 'alpha', port: 36_001 });
+    const beta = await assistant(host, { label: 'beta', port: 36_011 });
+    const state = world(alpha, beta);
+    state.active.delete(installOf(beta));
+    state.serving.delete(liveOf(beta));
+    state.disabled.add(installOf(beta));
+
+    const json = command(host, state);
+    expect(await runListCommand(json.runtime, { json: true })).toBe(0);
+    const result = JSON.parse(json.output.stdout.join('\n')) as {
+      data: { assistants: Array<{ instance_id: string; service: unknown }> };
+    };
+    expectResultContract('list', result);
+    expect(result.data.assistants.map(({ instance_id, service }) => [instance_id, service])).toEqual(
+      expect.arrayContaining([
+        [alpha.instance_id, { state: 'running', reason: null }],
+        [
+          beta.instance_id,
+          { state: 'off', reason: `Turned off; it stays off until gws-ea start --id ${beta.instance_id}.` },
+        ],
+      ]),
+    );
+
+    const text = command(host, state);
+    expect(await runListCommand({ ...text.runtime, columns: 500 }, { json: false })).toBe(0);
+    const lines = text.output.stdout.join('\n');
+    expect(lines).toMatch(new RegExp(`^${alpha.instance_id} .* running +live +-$`, 'mu'));
+    expect(lines).toMatch(new RegExp(`^${beta.instance_id} .* off +live +-$`, 'mu'));
+
+    const stacked = command(host, state);
+    expect(await runListCommand({ ...stacked.runtime, columns: 40 }, { json: false })).toBe(0);
+    expect(stacked.output.stdout).toContain(
+      `  Service: off; Turned off; it stays off until gws-ea start --id ${beta.instance_id}.`,
+    );
   });
 
   it("says whether each assistant is behind the tool's release, from the tool's own history", async () => {

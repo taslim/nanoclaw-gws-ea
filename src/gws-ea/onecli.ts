@@ -705,6 +705,41 @@ export async function removeOnecliRuntime(
   }
 }
 
+/**
+ * Stop the instance's OneCLI containers without removing them or their
+ * volumes. The services restart `unless-stopped`, which Docker honors across
+ * a daemon restart for a container someone stopped, so the vault stays down
+ * until reconcile starts it again. Containers are stopped by ID rather than
+ * through Compose, which skips one whose service the Compose file no longer
+ * defines; only reconcile removes such a container.
+ */
+export async function stopOnecliRuntime(
+  layout: OnecliRuntimeLayout,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+): Promise<'stopped' | 'already-stopped'> {
+  const docker = dockerContext(layout, dependencies);
+  const containers = await inspectProjectContainers(docker);
+  assertOwnedContainers(layout, containers);
+  const runningIds = containers.filter((container) => container.running).map((container) => container.id);
+  if (runningIds.length === 0) return 'already-stopped';
+  await docker.runner({
+    command: 'docker',
+    args: ['container', 'stop', ...runningIds],
+    cwd: path.dirname(layout.rootDirectory),
+    env: docker.environment,
+    timeoutMs: 120_000,
+    stream: true,
+  });
+  const running = (await inspectProjectContainers(docker)).filter((container) => container.running);
+  if (running.length > 0) {
+    throw new GwsEaError(
+      'onecli_stop_incomplete',
+      `OneCLI containers still running after stop: ${running.map((container) => container.id).join(', ')}`,
+    );
+  }
+  return 'stopped';
+}
+
 interface NamedDockerResource {
   readonly kind: 'network' | 'volume';
   readonly name: string;

@@ -74,6 +74,7 @@ import {
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
 } from './service.js';
+import { isTurnedOff } from './assistant-power.js';
 import {
   createServiceControl,
   runtimeServiceTarget,
@@ -116,8 +117,8 @@ export interface ProbeResult {
   readonly reason: string | null;
 }
 
-/** `unmanaged` is a host running outside its service. */
-export type ServiceState = 'running' | 'stopped' | 'not_installed' | 'unmanaged' | 'unknown';
+/** `unmanaged` is a host running outside its service; `off` is a service the operator turned off. */
+export type ServiceState = 'running' | 'stopped' | 'off' | 'not_installed' | 'unmanaged' | 'unknown';
 
 export interface DeliveryView {
   /** `delivered` or `failed`, as the mailbox recorded it. */
@@ -147,6 +148,8 @@ export interface ImageFacts {
 }
 export interface ServiceFacts {
   readonly state: ServiceState;
+  /** Whether the service manager reports its host running, whether or not the host answers; null when unobserved. */
+  readonly running: boolean | null;
 }
 export interface MainIdentityFacts {
   readonly agent_group_id: string | null;
@@ -654,20 +657,26 @@ const LAUNCHER_REQUIRED = 'Run gws-ea through its launcher, which supplies NanoC
 function serviceObservation(handle: NanoclawServiceHandle): ProbeResult & ServiceFacts {
   switch (handle.mode) {
     case 'none':
-      return { status: 'degraded', reason: 'No NanoClaw service is installed for it.', state: 'not_installed' };
+      return {
+        status: 'degraded',
+        reason: 'No NanoClaw service is installed for it.',
+        state: 'not_installed',
+        running: false,
+      };
     case 'unmanaged':
       return {
         status: 'degraded',
         reason: `A NanoClaw host runs from its checkout outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
         state: 'unmanaged',
+        running: true,
       };
     case 'launchd':
     case 'systemd-user':
     case 'systemd-system':
     case 'nohup':
       return handle.active
-        ? { ...OK, state: 'running' }
-        : { status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' };
+        ? { ...OK, state: 'running', running: true }
+        : { status: 'degraded', reason: 'Its service is stopped.', state: 'stopped', running: false };
   }
 }
 
@@ -683,9 +692,19 @@ function observeService(
         platform: context.platform,
         uid: context.uid,
       });
-      return serviceObservation(control.detect());
+      const handle = control.detect();
+      if (!isTurnedOff(control, handle)) return serviceObservation(handle);
+      const id = runtime.instance_id;
+      return {
+        status: 'degraded',
+        reason: handle.active
+          ? `Turned off, but its host still runs; gws-ea stop --id ${id} finishes turning it off.`
+          : `Turned off; it stays off until gws-ea start --id ${id}.`,
+        state: 'off',
+        running: handle.active,
+      };
     },
-    { state: 'unknown' },
+    { state: 'unknown', running: null },
   );
 }
 
@@ -1464,7 +1483,9 @@ export async function observeAssistantStatus(
       subscription_expire_time: null,
       sign_in_needed: null,
     }),
-    probe(() => onecliProbe(subject), {}),
+    serviceObservation.state === 'off'
+      ? Promise.resolve({ status: 'unknown' as const, reason: 'Assistant is off; OneCLI was not checked.' })
+      : probe(() => onecliProbe(subject), {}),
     probe<MainIdentityFacts>(() => mainIdentityProbe(subject, main, agents), { agent_group_id: null }),
     probe<ExternalEmailFacts>(() => externalEmailProbe(subject), { agent_group_id: null }),
     probe<WhatsAppFacts>(() => whatsAppProbe(subject), { state: null, number: null }),
@@ -1988,7 +2009,12 @@ function statusActions(status: AssistantStatus): NextAction[] {
       ...(operation.revert_with !== null ? [command('rollback')] : []),
     ];
   if (operation.state === 'failed') return [command('update')];
-  if (operation.state === 'committed') return [command(operation.kind)];
+  const off = status.probes.service.state === 'off';
+  // Update and rollback refuse an assistant that is off, so it is started before its follow-ups can run.
+  if (operation.state === 'committed')
+    return off ? [command('start'), command(operation.kind)] : [command(operation.kind)];
+  // A stop that disabled the service but left its host running, answering or not, is finished by stop; start would undo it.
+  const offAction = status.probes.service.running === true ? command('stop') : command('start');
   const actions: NextAction[] = status.connectors.flatMap((entry) =>
     entry.next_actions.filter(
       (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),
@@ -2000,6 +2026,7 @@ function statusActions(status: AssistantStatus): NextAction[] {
     if (instruction && !actions.some((action) => action.kind === 'external' && action.instruction === instruction))
       actions.push({ kind: 'external', instruction });
   }
+  if (off) actions.push(offAction);
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));
@@ -2027,7 +2054,9 @@ function statusActions(status: AssistantStatus): NextAction[] {
       instruction:
         "For the recorded credential failure, check this assistant's provider sign-in in its operator credential console. A later successful turn confirms recovery. Keep credentials out of chat.",
     });
+  // An assistant turned off reports its probes down on purpose; its logs hold no fault to read.
   if (
+    !off &&
     PROBE_NAMES.some(
       (name) =>
         name !== 'voice' &&
