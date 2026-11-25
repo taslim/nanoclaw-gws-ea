@@ -661,6 +661,41 @@ describe('gws-ea update', GIT_HEAVY, () => {
     expect(await exists(layoutOf(host, runtime).release(releaseName(next.commit)))).toBe(false);
   });
 
+  it('refuses an assistant that is turned off, naming gws-ea start and staging nothing', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    Object.assign(state, { disabled: true, loaded: false, running: false });
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(`It is turned off; start it with gws-ea start --id ${runtime.instance_id}`);
+    expect(await exists(layoutOf(host, runtime).release(releaseName(next.commit)))).toBe(false);
+    expect(state.running).toBe(false);
+  });
+
+  it('refuses an assistant turned off with follow-ups left, running none of them', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host, NEW_IMAGE);
+    const state = world(runtime);
+    state.rebuildFails = true;
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    const pending = (await readOperationRecord(host.paths, runtime.instance_id))?.follow_ups;
+    expect(pending).toContainEqual({ kind: 'rebuild_group_image', agent_group_id: 'ag-research' });
+    delete state.rebuildFails;
+    Object.assign(state, { disabled: true, loaded: false, running: false });
+    const { run, err } = cli(host, state, next, runtime);
+
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain(`start it with gws-ea start --id ${runtime.instance_id}`);
+    expect((await readOperationRecord(host.paths, runtime.instance_id))?.follow_ups).toEqual(pending);
+    expect(state.running).toBe(false);
+  });
+
   it('asks on a terminal with the preview, and a decline records nothing and leaves the staging for the next update', async () => {
     const host = await machine();
     const runtime = await assistant(host);

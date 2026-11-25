@@ -133,6 +133,7 @@ import {
   type ToolCheckout,
 } from './stray-install.js';
 import {
+  assertHostRunning,
   confirmStagedUpdate,
   continueUpdate,
   prepareUpdate,
@@ -1195,6 +1196,8 @@ class Cli {
       };
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
       if (unfinished?.phase === 'committed') {
+        // Follow-ups act through the running host; the open-update and supersede paths below run with it stopped.
+        assertHostRunning(await loadCreatedRuntime(this.#paths, request.instanceId), dependencies);
         await finishFollowUps(operation, dependencies);
         if (sameRelease(unfinished.to, intent.target)) {
           const nextActions = await this.#provisionConnectors(operation, reporter);

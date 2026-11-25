@@ -15,6 +15,22 @@ import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
 import type { InstanceServiceControl, StopOutcome } from './service-control.js';
 import { GwsEaError, type InstanceReservation } from './types.js';
 
+/**
+ * Whether the operator turned the assistant off. A host outside a service
+ * manager is never off, and a manager that cannot be asked leaves what
+ * detection saw to decide.
+ */
+export function isTurnedOff(service: InstanceServiceControl): boolean {
+  const { mode } = service.detect();
+  if (mode !== 'launchd' && mode !== 'systemd-user' && mode !== 'systemd-system') return false;
+  try {
+    return service.enablement() === 'disabled';
+  } catch (error) {
+    if (error instanceof GwsEaError && error.code === 'service_unobservable') return false;
+    throw error;
+  }
+}
+
 export interface AssistantVault {
   /** Starts the vault and proves it serves, unless it serves already. */
   readonly bringUp: () => Promise<void>;

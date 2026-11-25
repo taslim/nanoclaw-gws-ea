@@ -44,7 +44,9 @@ import {
   type CutoverHost,
 } from './cutover.js';
 import { runStep } from './events.js';
-import { assertInstanceCreated, type InstanceOperation } from './journal.js';
+import { isTurnedOff } from './assistant-power.js';
+import { createServiceControl, runtimeServiceTarget } from './service-control.js';
+import { assertInstanceCreated, loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import {
   advanceOperation,
   assertNotCommitted,
@@ -955,6 +957,22 @@ async function rollBackCommitted(
   return runRollback(await rollbackOf(host, record, request), record);
 }
 
+/** Rolling back starts the previous release, which an assistant the operator turned off must not do on its own. */
+async function refuseTurnedOff(operation: InstanceOperation, dependencies: CutoverDependencies): Promise<void> {
+  const { paths, instanceId } = operation;
+  const runtime = await loadCreatedRuntime(paths, instanceId);
+  const service = createServiceControl(
+    dependencies.serviceHelpers,
+    runtimeServiceTarget(runtime),
+    dependencies.service,
+  );
+  if (!isTurnedOff(service)) return;
+  throw new GwsEaError(
+    'host_not_running',
+    `Assistant ${instanceId} cannot be rolled back. It is turned off; start it with gws-ea start --id ${instanceId}, then roll it back.`,
+  );
+}
+
 /** `rollback --id`. A committed rollback's follow-ups are left for the caller to run (`finishFollowUps`). */
 export async function rollBack(
   operation: InstanceOperation,
@@ -965,6 +983,8 @@ export async function rollBack(
   const { paths, instanceId } = operation;
   await assertInstanceCreated(paths, instanceId);
   const record = await readOperationRecord(paths, instanceId);
+  // An open record blocks stop, so only a committed one can meet an assistant the operator turned off.
+  if (!record || record.phase === 'committed') await refuseTurnedOff(operation, dependencies);
   if (record?.phase === 'committed' && record.kind === 'rollback') {
     return { kind: 'follow_ups_finished', release: record.to };
   }
