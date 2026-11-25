@@ -629,7 +629,7 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     } else {
       // NanoClaw finds a launchd job by its plist, so a job still loaded after its plist was deleted is stopped
       // by its label, before the stray-host kill below: launchd would only start that host again.
-      await control.stopByLabel(service.serviceIdentity, service.serviceDefinitionPath);
+      await control.stopJobWithoutPlist();
     }
     await rm(service.serviceDefinitionPath, { force: true });
   }

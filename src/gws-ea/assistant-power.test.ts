@@ -14,6 +14,8 @@ interface World {
   vaultRunning: boolean;
   vaultFails?: boolean;
   hostWillNotStop?: boolean;
+  /** The host is run by a launchd job still loaded after its plist was lost, which detection sees as unmanaged. */
+  jobWithoutPlist?: boolean;
 }
 
 /** The service manager, the host, its agent containers, and the vault, as one machine whose steps are logged. */
@@ -39,8 +41,16 @@ function machine(world: World) {
       log.push('enable');
       return true;
     },
+    stopJobWithoutPlist: async () => {
+      if (!world.jobWithoutPlist) return;
+      world.jobWithoutPlist = false;
+      world.hostRunning = false;
+      world.mode = 'none';
+      log.push('stop job');
+    },
     stop: async () => {
       if (!world.hostRunning) return 'already-stopped' as const;
+      if (world.mode === 'unmanaged') throw new GwsEaError('service_unmanaged', 'a host runs outside its service');
       if (world.hostWillNotStop) throw new GwsEaError('service_still_running', 'the host did not stop');
       world.hostRunning = false;
       log.push('stop host');
@@ -109,6 +119,25 @@ describe('turning an assistant off', () => {
       expect(log).toEqual(['drain', 'vault stop']);
     },
   );
+
+  it('stops the host of a launchd job still loaded after its plist was lost, then its agents and vault', async () => {
+    const { service, vault, log, world } = machine({
+      ...RUNNING,
+      mode: 'unmanaged',
+      jobWithoutPlist: true,
+    });
+
+    await expect(turnOff(service, vault)).resolves.toBe('stopped');
+    expect(log).toEqual(['stop job', 'drain', 'vault stop']);
+    expect(world).toMatchObject({ hostRunning: false, agentsRunning: false, vaultRunning: false });
+  });
+
+  it('refuses a host running outside any service before stopping its agents or vault', async () => {
+    const { service, vault, log } = machine({ ...RUNNING, mode: 'unmanaged' });
+
+    await expect(turnOff(service, vault)).rejects.toMatchObject({ code: 'service_unmanaged' });
+    expect(log).toEqual([]);
+  });
 
   it('changes nothing and says so when every part is already off', async () => {
     const { service, vault, log } = machine({ ...OFF });

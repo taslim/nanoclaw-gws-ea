@@ -76,13 +76,16 @@ export function onecliVault(
  * longer start new ones.
  */
 export async function turnOff(service: InstanceServiceControl, vault: AssistantVault): Promise<StopOutcome> {
+  const { mode, active } = service.detect();
   // Without a service to turn off (a lost definition, a nohup host), what still runs is stopped all the same.
-  const disabled = switchable(service.detect().mode) && service.disable();
-  const host = await service.stop();
+  const disabled = switchable(mode) && service.disable();
+  // A launchd job loaded after its plist was lost runs a host detection cannot see as its own.
+  if (mode !== 'launchd') await service.stopJobWithoutPlist();
+  await service.stop();
   const agents = service.agentsRunning();
   if (agents) await service.drain();
   const vaulted = (await vault.stop()) === 'stopped';
-  return disabled || host === 'stopped' || agents || vaulted ? 'stopped' : 'already-stopped';
+  return disabled || active || agents || vaulted ? 'stopped' : 'already-stopped';
 }
 
 export interface TurnedOn<T> {

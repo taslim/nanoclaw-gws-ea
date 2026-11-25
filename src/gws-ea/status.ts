@@ -148,6 +148,8 @@ export interface ImageFacts {
 }
 export interface ServiceFacts {
   readonly state: ServiceState;
+  /** Whether the service manager reports its host running, whether or not the host answers; null when unobserved. */
+  readonly running: boolean | null;
 }
 export interface MainIdentityFacts {
   readonly agent_group_id: string | null;
@@ -655,20 +657,26 @@ const LAUNCHER_REQUIRED = 'Run gws-ea through its launcher, which supplies NanoC
 function serviceObservation(handle: NanoclawServiceHandle): ProbeResult & ServiceFacts {
   switch (handle.mode) {
     case 'none':
-      return { status: 'degraded', reason: 'No NanoClaw service is installed for it.', state: 'not_installed' };
+      return {
+        status: 'degraded',
+        reason: 'No NanoClaw service is installed for it.',
+        state: 'not_installed',
+        running: false,
+      };
     case 'unmanaged':
       return {
         status: 'degraded',
         reason: `A NanoClaw host runs from its checkout outside its service (PID ${handle.pid ?? handle.name ?? 'unknown'}).`,
         state: 'unmanaged',
+        running: true,
       };
     case 'launchd':
     case 'systemd-user':
     case 'systemd-system':
     case 'nohup':
       return handle.active
-        ? { ...OK, state: 'running' }
-        : { status: 'degraded', reason: 'Its service is stopped.', state: 'stopped' };
+        ? { ...OK, state: 'running', running: true }
+        : { status: 'degraded', reason: 'Its service is stopped.', state: 'stopped', running: false };
   }
 }
 
@@ -693,9 +701,10 @@ function observeService(
           ? `Turned off, but its host still runs; gws-ea stop --id ${id} finishes turning it off.`
           : `Turned off; it stays off until gws-ea start --id ${id}.`,
         state: 'off',
+        running: handle.active,
       };
     },
-    { state: 'unknown' },
+    { state: 'unknown', running: null },
   );
 }
 
@@ -2004,8 +2013,8 @@ function statusActions(status: AssistantStatus): NextAction[] {
   // Update and rollback refuse an assistant that is off, so it is started before its follow-ups can run.
   if (operation.state === 'committed')
     return off ? [command('start'), command(operation.kind)] : [command(operation.kind)];
-  // A stop that disabled the service but left its host answering is finished by stop; start would undo it.
-  const offAction = status.probes.host.status === 'ok' ? command('stop') : command('start');
+  // A stop that disabled the service but left its host running, answering or not, is finished by stop; start would undo it.
+  const offAction = status.probes.service.running === true ? command('stop') : command('start');
   const actions: NextAction[] = status.connectors.flatMap((entry) =>
     entry.next_actions.filter(
       (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),

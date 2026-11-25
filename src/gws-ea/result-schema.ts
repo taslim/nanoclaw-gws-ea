@@ -78,7 +78,7 @@ const probe = (facts: Readonly<Record<string, ResultSchema>> = {}): ResultSchema
 const probes = object({
   checkout: probe({ commit: nullable(text) }),
   image: probe({ tag: nullable(text) }),
-  service: probe({ state: serviceState }),
+  service: probe({ state: serviceState, running: nullable(bool) }),
   host: probe(),
   onecli: probe(),
   principal: probe(),

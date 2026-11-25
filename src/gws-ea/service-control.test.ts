@@ -333,14 +333,14 @@ describe('stop', () => {
   });
 });
 
-describe('stop by label', () => {
+describe('stopping a launchd job without its plist', () => {
   const plist = LOADED.definition!;
 
-  it("stops a launchd job by its label through NanoClaw's stop, though detection, which needs its plist, finds none", async () => {
+  it("stops the install's launchd job by its label through NanoClaw's stop, though detection, which needs its plist, finds none", async () => {
     const { helpers, calls, runner } = nanoclaw(NOT_INSTALLED);
     const { service } = control(helpers);
 
-    await service.stopByLabel(LABEL, plist);
+    await service.stopJobWithoutPlist();
 
     // The environment every other helper gets: this assistant's home, user, install, and command runner.
     expect(helpers.stopService).toHaveBeenCalledExactlyOnceWith(
@@ -361,11 +361,19 @@ describe('stop by label', () => {
     const didNotStop = new Error(`NanoClaw service ${LABEL} did not stop (PID 4242).`);
     helpers.stopService.mockRejectedValueOnce(didNotStop);
 
-    await expect(control(helpers).service.stopByLabel(LABEL, plist)).rejects.toMatchObject({
+    await expect(control(helpers).service.stopJobWithoutPlist()).rejects.toMatchObject({
       code: 'service_still_running',
       message: `NanoClaw's service ${LABEL} did not stop: ${didNotStop.message}`,
       cause: didNotStop,
     });
+  });
+
+  it('does nothing off macOS, where no launchd job exists', async () => {
+    const { helpers } = nanoclaw(NOT_INSTALLED);
+
+    await control(helpers, { platform: 'linux' }).service.stopJobWithoutPlist();
+
+    expect(helpers.stopService).not.toHaveBeenCalled();
   });
 });
 

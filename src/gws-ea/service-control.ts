@@ -20,6 +20,7 @@ import { getInstallScopedNames } from '../install-slug.js';
 
 import { buildToolEnvironment } from './process.js';
 import { activeStep } from './run-log.js';
+import { createInstanceServiceCoordinates } from './service-coordinates.js';
 import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 
@@ -170,11 +171,12 @@ export interface InstanceServiceControl {
   /** Lets the service start again; true when it changed. Starts nothing. */
   enable(): boolean;
   /**
-   * Stops a launchd job by its label, and returns once it has gone. NanoClaw
-   * finds a job by its plist, so a job still loaded after its plist was deleted
-   * is stopped this way; for removal only.
+   * Stops this install's launchd job by its label, and returns once it has
+   * gone. NanoClaw finds a job by its plist, so a job still loaded after its
+   * plist was lost is stopped this way, and without a plist it cannot load
+   * again. Does nothing off macOS or when no such job is loaded.
    */
-  stopByLabel(label: string, definition: string): Promise<void>;
+  stopJobWithoutPlist(): Promise<void>;
   restart(): Promise<RestartOutcome>;
   /** Stops this assistant's agent containers and waits until none runs; for a fence, removal, and turning it off. */
   drain(timeoutMs?: number): Promise<void>;
@@ -402,7 +404,17 @@ export function createServiceControl(
       await stopHost(handle);
       return 'stopped';
     },
-    stopByLabel: (name, definition) => stopHost({ mode: 'launchd', name, definition, active: true }),
+    async stopJobWithoutPlist() {
+      if (platform !== 'darwin') return;
+      const { serviceIdentity, serviceDefinitionPath } = createInstanceServiceCoordinates({
+        installId: target.installId,
+        homeDirectory: target.homeDirectory,
+        platform: 'macos',
+        runningAsRoot: false,
+      });
+      // NanoClaw's launchd stop treats a job that is not loaded as already stopped.
+      await stopHost({ mode: 'launchd', name: serviceIdentity, definition: serviceDefinitionPath, active: true });
+    },
     async restart() {
       const handle = installed(managed(detect()));
       await startAfresh(handle);
