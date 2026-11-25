@@ -30,6 +30,14 @@ const review = `reviews:
     base_branches: [stale]
     # release-tracks:end
 `;
+const dependabot = `version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    # release-tracks:start
+    target-branch: stale
+    # release-tracks:end
+`;
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -51,6 +59,7 @@ async function fixture(): Promise<string> {
   );
   await writeFile(path.join(root, '.github/workflows/ci.yml'), workflow);
   await writeFile(path.join(root, '.coderabbit.yaml'), review);
+  await writeFile(path.join(root, '.github/dependabot.yml'), dependabot);
   return root;
 }
 
@@ -61,10 +70,11 @@ function run(root: string, ...args: string[]) {
   });
 }
 
-async function configs(root: string): Promise<readonly [string, string]> {
+async function configs(root: string): Promise<readonly [string, string, string]> {
   return Promise.all([
     readFile(path.join(root, '.github/workflows/ci.yml'), 'utf8'),
     readFile(path.join(root, '.coderabbit.yaml'), 'utf8'),
+    readFile(path.join(root, '.github/dependabot.yml'), 'utf8'),
   ]);
 }
 
@@ -72,13 +82,13 @@ describe('release track tooling', () => {
   it('prints only the configured branch for operational shell commands', async () => {
     const root = await fixture();
     expect(run(root, '--branch', 'dogfood')).toMatchObject({ status: 0, stdout: 'integration.v3+trial\n', stderr: '' });
-    expect(await configs(root)).toEqual([workflow, review]);
+    expect(await configs(root)).toEqual([workflow, review, dependabot]);
   });
 
   it('generates native branch filters and exact review patterns, preserving other configuration', async () => {
     const root = await fixture();
     expect(run(root, '--generate')).toMatchObject({ status: 0, stderr: '' });
-    const [ci, rabbit] = await configs(root);
+    const [ci, rabbit, dep] = await configs(root);
     expect(parse(ci)).toEqual({
       name: 'CI',
       on: {
@@ -90,9 +100,13 @@ describe('release track tooling', () => {
     expect(parse(rabbit)).toEqual({
       reviews: { profile: 'chill', auto_review: { base_branches: ['^main$', '^integration\\.v3\\+trial$'] } },
     });
+    expect(parse(dep)).toEqual({
+      version: 2,
+      updates: [{ 'package-ecosystem': 'npm', directory: '/', 'target-branch': 'integration.v3+trial' }],
+    });
     expect(run(root, '--check')).toMatchObject({ status: 0, stderr: '' });
     expect(run(root, '--generate')).toMatchObject({ status: 0, stderr: '' });
-    expect(await configs(root)).toEqual([ci, rabbit]);
+    expect(await configs(root)).toEqual([ci, rabbit, dep]);
   });
 
   it('reports drift without writing either configuration', async () => {
@@ -101,8 +115,9 @@ describe('release track tooling', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('.github/workflows/ci.yml');
     expect(result.stderr).toContain('.coderabbit.yaml');
+    expect(result.stderr).toContain('.github/dependabot.yml');
     expect(result.stderr).toContain('pnpm run release-tracks:generate');
-    expect(await configs(root)).toEqual([workflow, review]);
+    expect(await configs(root)).toEqual([workflow, review, dependabot]);
   });
 
   it('regenerates both consumers after a track moves and deduplicates the public branch', async () => {
@@ -116,7 +131,7 @@ describe('release track tooling', () => {
     expect(run(root, '--generate').status).toBe(0);
     expect(run(root, '--branch', 'dogfood')).toMatchObject({ status: 0, stdout: 'next/integration\n' });
     expect(run(root, '--branch', 'prod')).toMatchObject({ status: 0, stdout: 'main\n' });
-    const [ci, rabbit] = await configs(root);
+    const [ci, rabbit, dep] = await configs(root);
     expect(parse(ci)).toMatchObject({
       on: {
         pull_request: { branches: ['main', 'next/integration'] },
@@ -125,6 +140,9 @@ describe('release track tooling', () => {
     });
     expect(parse(rabbit)).toMatchObject({
       reviews: { auto_review: { base_branches: ['^main$', '^next/integration$'] } },
+    });
+    expect(parse(dep)).toMatchObject({
+      updates: [{ 'target-branch': 'next/integration' }],
     });
     expect(ci).not.toContain('integration.v3');
     expect(run(root, '--check').status).toBe(0);
@@ -138,7 +156,7 @@ describe('release track tooling', () => {
       expect(result.stdout).toBe('');
     }
     expect(run(root, '--branch', 'prod').stderr).toContain('no release yet');
-    expect(await configs(root)).toEqual([workflow, review]);
+    expect(await configs(root)).toEqual([workflow, review, dependabot]);
   });
 
   it('refuses missing configuration markers before writing any file', async () => {
@@ -146,6 +164,6 @@ describe('release track tooling', () => {
     const unmarked = 'reviews: {}\n';
     await writeFile(path.join(root, '.coderabbit.yaml'), unmarked);
     expect(run(root, '--generate').status).toBe(1);
-    expect(await configs(root)).toEqual([workflow, unmarked]);
+    expect(await configs(root)).toEqual([workflow, unmarked, dependabot]);
   });
 });

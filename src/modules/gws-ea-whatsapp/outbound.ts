@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { AnyMessageContent } from '@whiskeysockets/baileys';
 
 import { ChannelNotConnectedError, type OutboundMessage } from '../../channels/adapter.js';
+import { escapeInvisibles } from '../../card-text.js';
 import { approveRejectRequest, normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { indexPostedRequest } from '../../channels/answers.js';
 import { OutboundRefusedError } from '../../delivery.js';
@@ -31,6 +32,14 @@ function rawOptions(value: unknown): RawOption[] {
       ...(typeof item.selectedLabel === 'string' ? { selectedLabel: item.selectedLabel } : {}),
     };
   });
+}
+
+/** Make control, bidi, and invisible characters visible while keeping ordinary whitespace and backticks. */
+function visibleText(text: string): string {
+  return text
+    .split(/([\t\r\n`])/u)
+    .map((part) => (/^[\t\r\n`]$/u.test(part) ? part : escapeInvisibles(part)))
+    .join('');
 }
 
 function words(content: Record<string, unknown>): string {
@@ -102,8 +111,12 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
       if (rowId === undefined) options.index.complete(key);
       return pending.messageId;
     }
-    const text = words(content);
-    const formatted = formatWhatsApp(text);
+    const isHostRequest =
+      (content.type === 'ask_question' && content.fromAgent !== true) ||
+      (content.operation === 'edit' && typeof content.questionId === 'string');
+    const rawText = words(content);
+    const text = isHostRequest ? visibleText(rawText) : rawText;
+    const formatted = formatWhatsApp(text, { mentions: !isHostRequest });
     const parts: AnyMessageContent[] = [];
     if (content.operation === 'reaction') {
       if (typeof content.messageId !== 'string' || typeof content.emoji !== 'string')

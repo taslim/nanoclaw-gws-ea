@@ -3011,3 +3011,69 @@ describe('recorded divergence: container outbound edits cannot hijack approvals 
     expect('sourceSessionId' in guardSeen[0]!).toBe(false);
   });
 });
+
+describe('recorded divergence: post-sync security and ordering guards stay intact', () => {
+  it('escapes displayFields questions and caps or re-houses hidden displayFields titles', async () => {
+    const { gatewayApprovalPresentation } = await import('../gateway-approval-presentation.js');
+    const presented = gatewayApprovalPresentation({
+      id: 'req-df',
+      agentGroupId: 'ag-1',
+      title: 'Hidden\u202etitle',
+      question: 'Line 1\u200b\nLine 2\u202e',
+      displayFields: [{ label: 'Action', type: 'text', value: 'POST /x' }],
+      createdAt: '2026-11-25T00:00:00.000Z',
+    });
+    expect(presented.title).toBe('May I make this request?');
+    expect(presented.question).toContain('*Request:* Hidden\\\\u202etitle');
+    expect(presented.question).toContain('Line 1\\\\u200b\nLine 2\\\\u202e');
+  });
+
+  it('validates apt and npm package names on groups config add-package while letting remove-package clear bad entries', async () => {
+    const { validateAptPackageName, validateNpmPackageName } = await import('../container-config.js');
+    expect(() => validateAptPackageName('curl && id')).toThrow(/Invalid apt package name/);
+    expect(() => validateNpmPackageName('foo;id')).toThrow(/Invalid npm package name/);
+    expect(() => validateAptPackageName('ripgrep')).not.toThrow();
+    expect(() => validateNpmPackageName('@scope/pkg-1')).not.toThrow();
+
+    const groupsSrc = await readFile(path.join(originalCwd, 'src/cli/resources/groups.ts'), 'utf8');
+    expect(groupsSrc).toContain('validateAptPackageName');
+    expect(groupsSrc).toContain('validateNpmPackageName');
+    const runnerSrc = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
+    expect(runnerSrc).toContain('validateAptPackageName');
+    expect(runnerSrc).toContain('validateNpmPackageName');
+  });
+
+  it('awaits the prior write turn before backfillSession and gatherWakeContext on agent-shared sessions', async () => {
+    const routerSrc = await readFile(path.join(originalCwd, 'src/router.ts'), 'utf8');
+    const takeTurnIdx = routerSrc.indexOf('const turn = takeWriteTurn(session.id);');
+    expect(takeTurnIdx).toBeGreaterThan(-1);
+    const slice = routerSrc.slice(takeTurnIdx, takeTurnIdx + 1200);
+    const prevIdx = slice.indexOf('await turn.previous;');
+    const backfillIdx = slice.indexOf('await backfillSession(');
+    const gatherIdx = slice.indexOf('await gatherWakeContext(');
+    expect(prevIdx).toBeGreaterThan(-1);
+    expect(backfillIdx).toBeGreaterThan(prevIdx);
+    expect(gatherIdx).toBeGreaterThan(prevIdx);
+  });
+
+  it('keeps PreToolUse onFailure: block on the Claude agent runner', async () => {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn(
+        'bun',
+        ['test', 'src/providers/claude.capabilities.test.ts', '--test-name-pattern', 'fails closed'],
+        { cwd: path.join(originalCwd, 'container/agent-runner'), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, output }));
+    });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('1 pass');
+  });
+});

@@ -105,8 +105,7 @@ export async function armReasonCapture(
       hasDeliveryAddress: Boolean(channelType && platformId),
       hasAdapter: Boolean(adapter),
     });
-    await finalizeReject(approval, userId, { from: 'awaiting_reason', accepted });
-    return true;
+    return finalizeReject(approval, userId, { from: 'awaiting_reason', accepted });
   }
 
   try {
@@ -126,8 +125,7 @@ export async function armReasonCapture(
       approvalId: approval.approval_id,
       err,
     });
-    await finalizeReject(approval, userId, { from: 'awaiting_reason', accepted });
-    return true;
+    return finalizeReject(approval, userId, { from: 'awaiting_reason', accepted });
   }
 
   // Prompt is out — now hold the row and arm capture. Order matters: a reply
@@ -151,29 +149,41 @@ export async function captureReasonReply(event: InboundEvent): Promise<boolean> 
   const arming = awaitingReason.get(key);
   if (!arming) return false;
 
-  // This DM is an armed reason channel — disarm regardless of outcome.
+  // Disarm before awaiting so a concurrent DM does not race the same row;
+  // restore arming on a transient failure before the reject is durably claimed.
   awaitingReason.delete(key);
+  let claimed = false;
+  try {
+    const approval = await getPendingApproval(arming.approvalId);
+    if (!approval || approval.status !== 'awaiting_reason') {
+      // Already finalized (e.g. ghosted by the sweep). The reply is no longer a
+      // reason — let it route normally instead of swallowing it.
+      return false;
+    }
 
-  const approval = await getPendingApproval(arming.approvalId);
-  if (!approval || approval.status !== 'awaiting_reason') {
-    // Already finalized (e.g. ghosted by the sweep). The reply is no longer a
-    // reason — let it route normally instead of swallowing it.
-    return false;
-  }
+    const session = approval.session_id ? await getSession(approval.session_id) : null;
+    if (!session) {
+      await deletePendingApproval(approval.approval_id);
+      return true;
+    }
 
-  const session = approval.session_id ? await getSession(approval.session_id) : null;
-  if (!session) {
-    await deletePendingApproval(approval.approval_id);
+    const reason = clampReason(extractText(event));
+    const rejected = await finalizeReject(approval, arming.userId, {
+      reason: reason || undefined,
+      accepted: () => {
+        claimed = true;
+      },
+    });
+    if (!rejected) return false;
+    log.info('reject-with-reason: reason captured and relayed', {
+      approvalId: approval.approval_id,
+      hasReason: reason.length > 0,
+    });
     return true;
+  } catch (err) {
+    if (!claimed && !awaitingReason.has(key)) awaitingReason.set(key, arming);
+    throw err;
   }
-
-  const reason = clampReason(extractText(event));
-  await finalizeReject(approval, arming.userId, { reason: reason || undefined });
-  log.info('reject-with-reason: reason captured and relayed', {
-    approvalId: approval.approval_id,
-    hasReason: reason.length > 0,
-  });
-  return true;
 }
 
 registerMessageInterceptor(captureReasonReply);
