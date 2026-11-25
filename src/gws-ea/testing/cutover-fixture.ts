@@ -1167,6 +1167,14 @@ export function cli(
       upsertEnvVars: upsert,
       hostStatus: host_,
       update: seams,
+      // start and restart bring the vault up as an update's reverify does, observed by the same state.
+      vault: () => ({
+        bringUp: async () => {
+          state.reverified.push(`gws-ea-${runtime.install_id}`);
+          if (state.reverifyFails) throw new GwsEaError('unhealthy_onecli', 'The OneCLI runtime is not serving.');
+        },
+        stop: async () => 'already-stopped' as const,
+      }),
       ...overrides,
     });
   return { run, out, err, transcript };
