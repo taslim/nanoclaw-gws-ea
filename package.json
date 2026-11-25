@@ -44,7 +44,7 @@
   "dependencies": {
     "@chat-adapter/gchat": "4.41.1",
     "@clack/core": "^1.2.0",
-    "@clack/prompts": "^1.2.0",
+    "@clack/prompts": "^1.9.0",
     "@modelcontextprotocol/sdk": "1.32.2",
     "@onecli-sh/sdk": "2.2.1",
     "@whiskeysockets/baileys": "7.0.0-rc14",
