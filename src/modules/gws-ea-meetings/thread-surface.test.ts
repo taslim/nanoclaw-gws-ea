@@ -1396,7 +1396,7 @@ describe('forgetting a person', () => {
     return (await threadAddresses(threadKey)).map((entry) => entry.address).sort();
   }
 
-  it("purges their threads' sessions without stopping a container itself, then their addresses, releasing nothing and needing nothing of the calendar", async () => {
+  it("stops any running container before purging their threads' sessions and addresses, releasing nothing and needing nothing of the calendar", async () => {
     const secrets = path.join(TEST_DIR, 'secrets');
     fs.mkdirSync(secrets, { mode: 0o700 });
     vi.stubEnv(GOOGLE_GRANT_FILE_ENV, path.join(secrets, 'google-grant.json'));
@@ -1408,7 +1408,7 @@ describe('forgetting a person', () => {
       basis: 'a friend',
       identity: `email:${REMY}`,
     });
-    // Thread A's container is up: the forget deletes its session, and the host's orphan sweep stops it.
+    // Thread A's container is up: the forget stops it before removing its session mailbox and directory.
     vi.mocked(isContainerRunning).mockImplementation((sessionId) => sessionId === sessionA.id);
     vi.mocked(killContainer).mockClear();
     vi.mocked(killContainer).mockImplementation((_sessionId, _reason, onExit) => onExit?.());
@@ -1418,7 +1418,7 @@ describe('forgetting a person', () => {
     const calls = calendar.calls;
     try {
       await forgetPerson({ id: remy.id });
-      expect(killContainer).not.toHaveBeenCalled();
+      expect(killContainer).toHaveBeenCalledWith(sessionA.id, 'person-forget-purge', expect.any(Function));
     } finally {
       vi.mocked(isContainerRunning).mockImplementation(() => false);
       vi.mocked(killContainer).mockReset();

@@ -7,9 +7,12 @@ import { resolveReleaseSource } from '../src/gws-ea/release-tracks.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const generateCommand = 'pnpm run release-tracks:generate';
-const targets = [
+const listTargets = [
   { file: '.github/workflows/ci.yml', property: 'branches', blocks: 2, escape: escapeGlob },
   { file: '.coderabbit.yaml', property: 'base_branches', blocks: 1, escape: exactPattern },
+] as const;
+const scalarTargets = [
+  { file: '.github/dependabot.yml', property: 'target-branch', track: 'dogfood', blocks: 1 },
 ] as const;
 
 function escapeGlob(branch: string): string {
@@ -20,10 +23,14 @@ function exactPattern(branch: string): string {
   return `^${branch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`;
 }
 
+function yamlSingleQuoted(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
 async function syncConfiguration(mode: '--check' | '--generate'): Promise<void> {
   const branches = [...new Set(['main', ...Object.values(productTracks).filter((branch) => branch !== null)])];
-  const prepared = await Promise.all(
-    targets.map(async (target) => {
+  const prepared = await Promise.all([
+    ...listTargets.map(async (target) => {
       const file = path.join(root, target.file);
       const before = await readFile(file, 'utf8');
       const newline = before.includes('\r\n') ? '\r\n' : '\n';
@@ -35,7 +42,7 @@ async function syncConfiguration(mode: '--check' | '--generate'): Promise<void> 
           return [
             `${indent}# release-tracks:start`,
             `${indent}${target.property}:`,
-            ...branches.map((branch) => `${indent}  - '${target.escape(branch).replaceAll("'", "''")}'`),
+            ...branches.map((branch) => `${indent}  - ${yamlSingleQuoted(target.escape(branch))}`),
             `${indent}# release-tracks:end`,
           ].join(newline);
         },
@@ -45,7 +52,29 @@ async function syncConfiguration(mode: '--check' | '--generate'): Promise<void> 
       }
       return { file, label: target.file, before, after };
     }),
-  );
+    ...scalarTargets.map(async (target) => {
+      const file = path.join(root, target.file);
+      const before = await readFile(file, 'utf8');
+      const newline = before.includes('\r\n') ? '\r\n' : '\n';
+      const branch = resolveReleaseSource(target.track).ref.slice('refs/heads/'.length);
+      let blocks = 0;
+      const after = before.replace(
+        /^([ \t]*)# release-tracks:start\r?\n[\s\S]*?^\1# release-tracks:end(?=\r?$)/gm,
+        (_block: string, indent: string) => {
+          blocks++;
+          return [
+            `${indent}# release-tracks:start`,
+            `${indent}${target.property}: ${yamlSingleQuoted(branch)}`,
+            `${indent}# release-tracks:end`,
+          ].join(newline);
+        },
+      );
+      if (blocks !== target.blocks) {
+        throw new Error(`${target.file}: expected ${target.blocks} release-tracks marker blocks, found ${blocks}`);
+      }
+      return { file, label: target.file, before, after };
+    }),
+  ]);
   const changed = prepared.filter(({ before, after }) => before !== after);
   if (mode === '--check' && changed.length > 0) {
     throw new Error(

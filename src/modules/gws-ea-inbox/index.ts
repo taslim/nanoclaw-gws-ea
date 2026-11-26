@@ -23,6 +23,7 @@ import fs from 'node:fs';
 
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { register } from '../../cli/registry.js';
+import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { deleteSession, getSessionsByAgentGroup, updateSession } from '../../db/sessions.js';
@@ -166,12 +167,35 @@ registerDeliveryFailedHook(async (failed) => {
   for (const msg of failed) await forgetSend(msg, 'pending');
 });
 
+const PURGE_STOP_TIMEOUT_MS = 30_000;
+
+async function stopRunningContainer(sessionId: string): Promise<void> {
+  if (!isContainerRunning(sessionId)) return;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Timed out waiting for container ${sessionId} to stop before purge.`));
+    }, PURGE_STOP_TIMEOUT_MS);
+    killContainer(sessionId, 'person-forget-purge', done);
+    if (!isContainerRunning(sessionId)) done();
+  });
+}
+
 /**
- * A container still running for the session is the host's orphan sweep to
- * stop (`stopOrphanedSessions`), within a sweep of the session's row going.
+ * Mark the session closed first so no new wake starts a container, wait for any
+ * running container to exit, then remove its mailbox and session directory.
  */
 async function purgeSession(sessionId: string, agentGroupId: string): Promise<void> {
   await updateSession(sessionId, { status: 'closed' });
+  await stopRunningContainer(sessionId);
   await destroySessionMailbox(agentGroupId, sessionId);
   fs.rmSync(sessionDir(agentGroupId, sessionId), { recursive: true, force: true });
   await deleteSession(sessionId);

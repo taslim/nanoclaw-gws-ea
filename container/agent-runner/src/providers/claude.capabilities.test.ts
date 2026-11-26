@@ -30,7 +30,7 @@ interface CapturedOptions {
   strictMcpConfig?: boolean;
   env?: Record<string, string | undefined>;
   settings?: Record<string, unknown>;
-  hooks?: { PreToolUse?: Array<{ hooks: PreToolUse[] }> };
+  hooks?: { PreToolUse?: Array<{ hooks: PreToolUse[]; onFailure?: 'continue' | 'block' }> };
   [key: string]: unknown;
 }
 let captured: CapturedOptions | undefined;
@@ -356,6 +356,11 @@ describe('the SDK options a group holding every key gets', () => {
     expect(Object.keys(options.mcpServers ?? {})).toEqual(['nanoclaw', 'custom.server']);
     expect(options.strictMcpConfig).toBeUndefined();
     expect(options.env).not.toHaveProperty('ENABLE_CLAUDEAI_MCP_SERVERS');
+  });
+
+  it('fails closed when the PreToolUse hook errors', async () => {
+    expect((await optionsFor(ALL)).hooks?.PreToolUse?.[0]?.onFailure).toBe('block');
+    expect((await optionsFor(REPLY_AND_TIME)).hooks?.PreToolUse?.[0]?.onFailure).toBe('block');
   });
 
   it('let the agent call a shell and a configured server', async () => {

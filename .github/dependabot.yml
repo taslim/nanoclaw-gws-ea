@@ -10,7 +10,9 @@ updates:
   # GWS-EA-only dependencies in the host pnpm project (pnpm-lock.yaml).
   - package-ecosystem: npm
     directory: /
-    target-branch: dogfood
+    # release-tracks:start
+    target-branch: 'dogfood'
+    # release-tracks:end
     schedule:
       interval: weekly
       day: monday

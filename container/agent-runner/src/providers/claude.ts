@@ -405,7 +405,12 @@ export class ClaudeProvider implements AgentProvider {
         ...(planning ? { agents: PLANNING_AGENTS } : {}),
         ...(toolOptions.strictMcpConfig ? { strictMcpConfig: true } : {}),
         hooks: {
-          PreToolUse: [{ hooks: [planning ? createPreToolUseHook(this.capabilities, planning) : this.preToolUseHook] }],
+          PreToolUse: [
+            {
+              hooks: [planning ? createPreToolUseHook(this.capabilities, planning) : this.preToolUseHook],
+              onFailure: 'block',
+            },
+          ],
           ...(planning ? { SubagentStart: [{ hooks: [planning.start] }] } : {}),
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],

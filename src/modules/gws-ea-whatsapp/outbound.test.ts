@@ -411,4 +411,58 @@ describe('WhatsApp questions use native text answers', () => {
       index.close();
     }
   });
+
+  it('neutralizes bidi/hidden characters and @digits mentions on host approval prompts and outcome edits', async () => {
+    const adapter = await h.start();
+    const id = await adapter.deliver('team@g.us', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId,
+        title: 'Allow \u202Eexe @15551234567?',
+        question: 'Send to @+15559876543\u200B now',
+        options: [
+          { label: 'Allow', value: 'approve' },
+          { label: 'Deny', value: 'reject' },
+        ],
+      },
+      deliveryId: 'host-bidi-approval',
+    });
+    expect(id).toBeDefined();
+    expect(h.socket().sends[0].content).toMatchObject({
+      text: expect.stringContaining('\\u202eexe @15551234567?'),
+      mentions: [],
+    });
+    expect(String((h.socket().sends[0].content as { text: string }).text)).toContain('\\u200b');
+    expect(String((h.socket().sends[0].content as { text: string }).text)).not.toContain('\u202E');
+    expect(String((h.socket().sends[0].content as { text: string }).text)).not.toContain('\u200B');
+
+    await adapter.deliver('team@g.us', null, {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        questionId,
+        messageId: id,
+        text: 'Denied: \u202Eping @15551234567',
+        terminalCard: { title: 'Allow?', question: 'Send?', resolution: 'Denied' },
+      },
+      deliveryId: 'host-bidi-edit',
+    });
+    expect(h.socket().sends[1].content).toMatchObject({
+      text: expect.stringContaining('\\u202eping @15551234567'),
+      mentions: [],
+    });
+    expect(String((h.socket().sends[1].content as { text: string }).text)).not.toContain('\u202E');
+
+    // Ordinary agent chat messages still parse @digits into WhatsApp mention JIDs.
+    await adapter.deliver('team@g.us', null, {
+      kind: 'chat',
+      content: { text: 'Ping @15551234567 please' },
+      deliveryId: 'normal-mention',
+    });
+    expect(h.socket().sends[2].content).toMatchObject({
+      text: 'Ping @15551234567 please',
+      mentions: ['15551234567@s.whatsapp.net'],
+    });
+  });
 });

@@ -46,14 +46,24 @@ export function parseWhatsAppMentions(text: string): { text: string; mentions: s
   return { text: out, mentions: [...mentions] };
 }
 
+export interface FormatWhatsAppOptions {
+  /** Parse `@<digits>` phone mentions into WhatsApp mention JIDs. Defaults to true. */
+  readonly mentions?: boolean;
+}
+
 /** Code spans pass through untouched, so phone-like digits inside code are never tagged. */
-export function formatWhatsApp(text: string): { text: string; mentions: string[] } {
+export function formatWhatsApp(
+  text: string,
+  options: FormatWhatsAppOptions = {},
+): { text: string; mentions: string[] } {
+  const parseMentions = options.mentions !== false;
   const segments = splitProtectedRegions(text);
   const mentions = new Set<string>();
   const out = segments
     .map(({ content, isProtected }) => {
       if (isProtected) return content;
       const transformed = transformForWhatsApp(content);
+      if (!parseMentions) return transformed;
       const { text: withMentions, mentions: found } = parseWhatsAppMentions(transformed);
       for (const m of found) mentions.add(m);
       return withMentions;

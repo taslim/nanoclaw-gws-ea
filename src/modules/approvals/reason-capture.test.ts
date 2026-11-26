@@ -365,6 +365,60 @@ describe('reject with reason', () => {
     });
     expect(consumed).toBe(false);
   });
+
+  it('returns ignored when reason-prompt delivery fails after the sweep already finalized the row', async () => {
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const { sweepAwaitingReasonRejects } = await import('./reason-capture.js');
+    await seedApproval('appr-late-fail', 'install_packages');
+
+    let failDelivery!: (err: Error) => void;
+    setDeliveryAdapter({
+      deliver: () =>
+        new Promise<string | undefined>((_resolve, reject) => {
+          failDelivery = reject;
+        }),
+    });
+
+    const outcomePromise = handleApprovalsResponse({
+      questionId: 'appr-late-fail',
+      value: REJECT_WITH_REASON_OPTION,
+      userId: 'admin-1',
+      channelType: DM_CHANNEL,
+      platformId: DM_PLATFORM,
+      threadId: null,
+    });
+    await vi.waitFor(() => expect(failDelivery).toBeDefined());
+
+    // Simulate the 5-minute window elapsing while prompt delivery hung.
+    const { getDb } = await import('../../db/index.js');
+    await getDb().run(
+      'UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?',
+      new Date(Date.now() - 1000).toISOString(),
+      'appr-late-fail',
+    );
+    await sweepAwaitingReasonRejects();
+    expect(await getPendingApproval('appr-late-fail')).toBeUndefined();
+
+    failDelivery(new Error('delivery timed out'));
+    expect(await outcomePromise).toBe('ignored');
+  });
+
+  it('keeps reason capture armed if a transient DB error throws before the reject is claimed', async () => {
+    const { captureReasonReply } = await import('./reason-capture.js');
+    const { getDb } = await import('../../db/index.js');
+    await seedApproval('appr-transient-db', 'install_packages');
+    await clickRejectWithReason('appr-transient-db');
+
+    const db = getDb();
+    const runSpy = vi.spyOn(db, 'run').mockRejectedValueOnce(new Error('SQLITE_BUSY'));
+    await expect(captureReasonReply(dmReply('too expensive'))).rejects.toThrow('SQLITE_BUSY');
+    runSpy.mockRestore();
+
+    // A redelivered reply still finds the armed capture and relays the reason.
+    expect(await captureReasonReply(dmReply('too expensive'))).toBe(true);
+    expect(await getPendingApproval('appr-transient-db')).toBeUndefined();
+    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "too expensive"');
+  });
 });
 
 describe('reject-with-reason host sweep', () => {
