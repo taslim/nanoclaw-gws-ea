@@ -14,6 +14,7 @@ import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.
 import { observeLiveCheckout } from './checkout.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
+import { readKeptRelease } from './kept-release.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
 import { observeOnecliRuntime, reconcileOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
@@ -23,6 +24,7 @@ import {
   readOperationRecord,
   readRollbackPoint,
   type OperationFollowUp,
+  type OperationNodePathChange,
   type OperationStop,
 } from './operation.js';
 import { canonicalPath, isWithinDirectory, type ControlPlanePaths } from './paths.js';
@@ -45,7 +47,9 @@ import { applyReleaseFiles } from './release-stage.js';
 import {
   loadInstanceRuntimeConfig,
   reloadInstanceService,
+  restoreInstanceServiceDefinition,
   stampUpgradeState,
+  updateInstanceRuntimeNodePath,
   type HostStatusHelpers,
   type InstanceRuntimeConfig,
   type InstanceServiceDependencies,
@@ -638,6 +642,7 @@ export async function switchTo(
   release: ReleaseCoordinates,
   leaving: ReleaseCoordinates,
   label: string,
+  targetNodePath?: string,
 ): Promise<boolean> {
   const name = releaseName(release.deployed_commit);
   return runStep(host.reporter, { id: 'switch_release', label }, async () => {
@@ -647,13 +652,15 @@ export async function switchTo(
       NANOCLAW_INSTALL_ID: runtime.install_id,
     });
     await rm(path.join(layout.state, 'data', 'circuit-breaker.json'), { force: true });
-    const service = cutoverServiceDependencies(host);
+    const nextRuntime =
+      targetNodePath !== undefined ? await updateInstanceRuntimeNodePath(runtime, targetNodePath) : runtime;
+    const service = cutoverServiceDependencies({ ...host, runtime: nextRuntime });
     const { definitionChanged } = await applyReleaseFiles(
-      { runtime, onecli: host.onecli, commit: release.deployed_commit, leaving: leaving.deployed_commit },
+      { runtime: nextRuntime, onecli: host.onecli, commit: release.deployed_commit, leaving: leaving.deployed_commit },
       { ...service, upsertEnvVars: dependencies.upsertEnvVars },
       onecliBoundaries(host),
     );
-    await reloadInstanceService(runtime, service);
+    await reloadInstanceService(nextRuntime, service);
     await pointCurrent(layout, name);
     return definitionChanged;
   });
@@ -667,24 +674,43 @@ export async function startRelease(host: CutoverHost, definitionChanged: boolean
 
 /**
  * Serve `move.from` again after an operation stopped short of `move.to` serving. While the live link still names
- * `move.from`, nothing of its own was touched, so only its host is started. Otherwise the assistant is fenced again,
- * `beforeSwitch` runs (a rollback puts its state back), and the switch puts `move.from`'s kept files back over what
- * the operation applied.
+ * `move.from`, nothing of its own was touched except any recorded Node.js path change written before `pointCurrent`,
+ * so `move.node_path.from` (in `runtime.json` and `move.from`'s kept service definition) is restored when present and
+ * its host is started. Otherwise the assistant is fenced again, `beforeSwitch` runs (a rollback puts its state back),
+ * and the switch puts `move.from`'s kept files back over what the operation applied.
  */
 export async function serveLeftRelease(
   host: CutoverHost,
-  move: { readonly from: ReleaseCoordinates; readonly to: ReleaseCoordinates },
+  move: {
+    readonly from: ReleaseCoordinates;
+    readonly to: ReleaseCoordinates;
+    readonly node_path?: OperationNodePathChange;
+  },
   beforeSwitch?: () => Promise<void>,
 ): Promise<void> {
   if ((await readCurrent(host.layout)) === releaseName(move.from.deployed_commit)) {
+    let definitionChanged = false;
+    if (move.node_path) {
+      const restored = await updateInstanceRuntimeNodePath(host.runtime, move.node_path.from);
+      const service = cutoverServiceDependencies({ ...host, runtime: restored });
+      const kept = await readKeptRelease(host.layout.kept(releaseName(move.from.deployed_commit)));
+      definitionChanged = await restoreInstanceServiceDefinition(restored, kept.serviceDefinition, service);
+      if (!definitionChanged) await reloadInstanceService(restored, service);
+    }
     await runStep(host.reporter, { id: 'start_release', label: 'Starting the assistant again…' }, async () => {
-      await host.service.start();
+      await host.service.start(definitionChanged ? { definitionChanged } : undefined);
     });
     return;
   }
   await fenceInstance(host, 'Stopping the assistant to go back…');
   await beforeSwitch?.();
-  const changed = await switchTo(host, move.from, move.to, 'Switching back to the release it ran…');
+  const changed = await switchTo(
+    host,
+    move.from,
+    move.to,
+    'Switching back to the release it ran…',
+    move.node_path?.from,
+  );
   await startRelease(host, changed, 'Starting the assistant again…');
 }
 

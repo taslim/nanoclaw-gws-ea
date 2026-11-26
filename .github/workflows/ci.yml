@@ -194,6 +194,10 @@ jobs:
             echo "::error file=$f::SHA256 is not GitHub's digest for v$v (${digest:-none}). If this PR bumps VERSION, set SHA256=\"${digest#sha256:}\". If it doesn't and SHA256 is unchanged too, the release asset changed after it was pinned: find out why before re-pinning, and don't re-pin in an unrelated PR."
             exit 1
           fi
+      - name: gogcli pin digests and security advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pnpm run gogcli:check
 
   # Repository rules require exact `ci`; always run it so matrix failures remain blocking.
   ci:

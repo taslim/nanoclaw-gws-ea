@@ -119,7 +119,7 @@ function supportedPlatform(platform: NodeJS.Platform): Prerequisites['platform']
 }
 
 /** The instance service replaces its launcher with the host process, which needs `process.execve`. */
-function assertNodeExecve(node: Pick<NodeJS.Process, 'version' | 'execve'>): void {
+export function assertNodeExecve(node: Pick<NodeJS.Process, 'version' | 'execve'>): void {
   if (typeof node.execve === 'function') return;
   throw new GwsEaError(
     'node_unsupported',

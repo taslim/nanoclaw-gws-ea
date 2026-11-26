@@ -47,6 +47,7 @@ import {
 } from './cutover.js';
 import { runStep } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
+import { keptReleaseFiles, writeKeptServiceDefinition } from './kept-release.js';
 import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
 import {
   advanceOperation,
@@ -63,12 +64,14 @@ import {
   revertClause,
   supersedable,
   targetMayHaveStarted,
+  type OperationNodePathChange,
   type OperationRecord,
   type SnapshotManifest,
 } from './operation.js';
 import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
 import { LAUNCHER_PINS } from './pins.js';
-import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
+import { assertNodeExecve } from './prerequisites.js';
+import { resolvePersistedExecutable, runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
@@ -87,8 +90,8 @@ import { stageRelease } from './release-stage.js';
 import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget } from './release-target.js';
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
-import { readOwnerOnlyJson } from './secrets.js';
-import { bindInstanceHostPolicies, type InstanceRuntimeConfig } from './service.js';
+import { readOwnerOnlyFile, readOwnerOnlyJson } from './secrets.js';
+import { bindInstanceHostPolicies, renderInstanceServiceDefinition, type InstanceRuntimeConfig } from './service.js';
 import { isTurnedOff } from './assistant-power.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
@@ -151,6 +154,9 @@ export interface UpdateSeams extends CutoverSeams {
   readonly runSetupCommand?: ReleasePreflightRuntime['runSetupCommand'];
   /** Bytes free to this user on the filesystem holding `directory`. */
   readonly freeBytes?: (directory: string) => Promise<number>;
+  /** The Node.js process running `gws-ea`; used to detect Node binary updates. */
+  readonly node?: Pick<NodeJS.Process, 'version' | 'execPath' | 'execve'>;
+  readonly resolvePersisted?: typeof resolvePersistedExecutable;
 }
 
 export interface UpdateDependencies extends CutoverDependencies, UpdateSeams {
@@ -175,6 +181,8 @@ export interface UpdatePreview {
   /** The central migrations the release adds, in the order they ran on the copy. */
   readonly migrations: readonly string[];
   readonly gateway: GatewayImageChange;
+  /** Present when the current Node.js binary differs from `runtime.json`'s `node_path`. */
+  readonly nodePath?: OperationNodePathChange;
   /** The groups whose own image is rebuilt on the new release's image once it is committed. */
   readonly groupImages: readonly DerivedImageGroup[];
   /** Those groups then run the previous agent-runner dependencies until their rebuild finishes. */
@@ -189,6 +197,8 @@ export interface StagedUpdate {
   readonly to: ReleaseCoordinates;
   /** The live schema as staging read it; the dry run left its migrations as they were. */
   readonly manifest: SnapshotManifest;
+  /** Present when the update also refreshes `runtime.json`'s `node_path`. */
+  readonly nodePath?: OperationNodePathChange;
   readonly preview: UpdatePreview;
 }
 
@@ -196,6 +206,7 @@ interface CheckedUpdate {
   readonly reservation: InstanceReservation;
   readonly runtime: InstanceRuntimeConfig;
   readonly target: UpdateReleaseTarget;
+  readonly targetNodePath: string;
 }
 
 function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
@@ -440,7 +451,11 @@ async function checkUpdate(
     assertHostRunning(runtime, dependencies);
     await assertDeploymentCheckoutUnmodified(paths, reservation, checkoutRuntime(dependencies));
   }
-  const checked = { reservation, runtime, target };
+  const node = dependencies.node ?? process;
+  assertNodeExecve(node);
+  const resolvePersisted = dependencies.resolvePersisted ?? resolvePersistedExecutable;
+  const targetNodePath = await resolvePersisted(node.execPath, { checkoutRoots: [paths.stateRoot] });
+  const checked = { reservation, runtime, target, targetNodePath };
   await assertFreeDisk(paths, checked, dependencies);
   return checked;
 }
@@ -596,7 +611,7 @@ async function sameFiles(left: string, right: string, files: readonly string[]):
 /** A release staged complete by an earlier update is reused with the dry run it kept. */
 async function stageUpdate(
   operation: InstanceOperation,
-  { reservation, runtime, target }: CheckedUpdate,
+  { reservation, runtime, target, targetNodePath }: CheckedUpdate,
   dependencies: UpdateDependencies,
 ): Promise<StagedUpdate> {
   const { paths, instanceId } = operation;
@@ -608,6 +623,13 @@ async function stageUpdate(
   const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
   const manifest = readSchemaManifest(layout.state);
   const live = manifest.central_migrations;
+  const nodePath = targetNodePath === runtime.node_path ? undefined : { from: runtime.node_path, to: targetNodePath };
+  const stagedRuntime = nodePath ? { ...runtime, node_path: targetNodePath } : runtime;
+  const serviceOptions = {
+    platform: instanceServicePlatform(dependencies.service?.platform),
+    homeDirectory: runtime.home_directory,
+    runningAsRoot: (dependencies.service?.uid ?? process.getuid?.()) === 0,
+  };
 
   const migrations = await runStep(
     reporter,
@@ -618,13 +640,9 @@ async function stageUpdate(
         {
           paths,
           view: reservationAt(reservation, release),
-          runtime,
+          runtime: stagedRuntime,
           onecli,
-          service: {
-            platform: instanceServicePlatform(dependencies.service?.platform),
-            homeDirectory: runtime.home_directory,
-            runningAsRoot: (dependencies.service?.uid ?? process.getuid?.()) === 0,
-          },
+          service: serviceOptions,
           provider: target.preflight,
           beforeLink: async (stagedRelease) => {
             const added = await dryRunReleaseMigrations(
@@ -646,6 +664,13 @@ async function stageUpdate(
           ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
         },
       );
+      // A release staged before Node moved still kept the older binary in its
+      // service definition; refresh that staged copy without touching live state.
+      if (tried === undefined) {
+        const expected = renderInstanceServiceDefinition(stagedRuntime, serviceOptions);
+        const current = await readOwnerOnlyFile(keptReleaseFiles(layout.kept(name)).serviceDefinition);
+        if (current !== expected) await writeKeptServiceDefinition(layout.kept(name), expected);
+      }
       return tried ?? keptDryRun(dryRunFile(paths, instanceId, name), live);
     },
   );
@@ -672,12 +697,14 @@ async function stageUpdate(
     from,
     to: release,
     manifest,
+    ...(nodePath ? { nodePath } : {}),
     preview: {
       instanceId,
       from,
       to: release,
       migrations,
       gateway,
+      ...(nodePath ? { nodePath } : {}),
       groupImages: readDerivedImageGroups(layout.state, getInstallScopedNames(runtime.install_id).containerImageBase),
       agentRunnerLockChanged: !lockUnchanged,
       sessionSchemaChanged: !sessionSchemaUnchanged,
@@ -716,6 +743,7 @@ export async function confirmStagedUpdate(
     from: staged.from,
     to: staged.to,
     manifest: staged.manifest,
+    ...(staged.nodePath ? { node_path: staged.nodePath } : {}),
   });
 }
 
@@ -727,6 +755,7 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
     `From: ${releaseLine(from)}`,
     `To: ${releaseLine(to)}`,
     ...(from.source_remote === to.source_remote ? [] : [`Source: ${from.source_remote} → ${to.source_remote}`]),
+    ...(preview.nodePath ? [`Node.js: ${preview.nodePath.from} → ${preview.nodePath.to}`] : []),
     `Database migrations to add: ${preview.migrations.length > 0 ? preview.migrations.join(', ') : 'none'}`,
     gateway.release === gateway.current
       ? `Gateway image: unchanged (${gateway.current})`
@@ -914,12 +943,24 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
         record = await advanceOperation(operation, 'snapshotted');
         break;
       case 'snapshotted':
-        definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
+        definitionChanged = await switchTo(
+          host,
+          record.to,
+          record.from,
+          'Switching to the new release…',
+          record.node_path?.to,
+        );
         record = await advanceOperation(operation, 'switched');
         break;
       case 'switched':
         if ((await readCurrent(layout)) !== name) {
-          definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
+          definitionChanged = await switchTo(
+            host,
+            record.to,
+            record.from,
+            'Switching to the new release…',
+            record.node_path?.to,
+          );
         }
         await bindInstanceHostPolicies(host.runtime, host.operation.paths.configRoot, host.dependencies.upsertEnvVars);
         await startRelease(host, definitionChanged, 'Starting the new release…');

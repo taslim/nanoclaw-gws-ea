@@ -1,0 +1,85 @@
+# Weekly check for security advisories affecting the pinned gogcli binary in
+# container/Dockerfile (which sits outside pnpm audit / Dependabot). Opens one
+# deduplicated issue per advisory ID when a vulnerability affects GOGCLI_VERSION.
+name: gogcli-advisory
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gogcli-advisory
+
+jobs:
+  check:
+    if: github.repository == 'taslim/nanoclaw-gws-ea'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Check gogcli pin and security advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/gogcli-report.json"
+          if node --import tsx scripts/gogcli-check.ts --json --strict-osv > "$report"; then
+            echo "gogcli pin verified with 0 advisories."
+            exit 0
+          fi
+          if [ ! -s "$report" ] || ! jq -e '(.pin.version | type == "string" and length > 0) and (.digestErrors | type == "array") and (.advisories | type == "array")' "$report" > /dev/null; then
+            echo "::error::gogcli-check failed without producing a valid JSON report" >&2
+            exit 1
+          fi
+          version=$(jq -r '.pin.version' "$report")
+          digest_count=$(jq '.digestErrors | length' "$report")
+          if [ "$digest_count" -gt 0 ]; then
+            jq -r '.digestErrors[]' "$report" >&2
+            exit 1
+          fi
+          advisory_count=$(jq '.advisories | length' "$report")
+          if [ "$advisory_count" -eq 0 ]; then
+            echo "::error::gogcli-check exited non-zero without digest errors or advisories" >&2
+            exit 1
+          fi
+          jq -c '.advisories[]' "$report" | while read -r hit; do
+            id=$(jq -r '.id' <<<"$hit")
+            severity=$(jq -r '.severity' <<<"$hit")
+            summary=$(jq -r '.summary' <<<"$hit")
+            url=$(jq -r '.url' <<<"$hit")
+            patched=$(jq -r '.patched // "unspecified"' <<<"$hit")
+            title="gogcli ${version}: security advisory ${id}"
+            search=$(gh api -X GET search/issues -f per_page=100 -f q="repo:${GITHUB_REPOSITORY} is:issue in:title \"${title}\"")
+            if [ "$(jq -r '.incomplete_results or .total_count > (.items | length)' <<<"$search")" != "false" ]; then
+              echo "::error::issue search came back incomplete; not risking a duplicate" >&2
+              exit 1
+            fi
+            if [ "$(jq --arg t "$title" '[.items[] | select(.title == $t)] | length' <<<"$search")" != "0" ]; then
+              echo "An issue for ${id} on gogcli ${version} already exists."
+              continue
+            fi
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "$title" --body-file - <<EOF
+          Security advisory \`${id}\` (severity: \`${severity}\`) affects the pinned \`gogcli\` version \`${version}\` in \`container/Dockerfile\`.
+
+          - **Summary:** ${summary}
+          - **Patched version:** ${patched}
+          - **Advisory:** ${url}
+
+          Update \`GOGCLI_VERSION\`, \`GOGCLI_SHA256_AMD64\`, and \`GOGCLI_SHA256_ARM64\` in \`container/Dockerfile\` together.
+          EOF
+          done

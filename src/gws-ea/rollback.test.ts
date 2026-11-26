@@ -57,7 +57,7 @@ import { readOperationRecord, readRollbackPoint, type OperationPhase, type Rollb
 import { getInstanceReservation } from './registry.js';
 import { releaseName } from './release-layout.js';
 import { rollBack, rollbackPreviewLines, summarizeDiscard, type RollbackPreview } from './rollback.js';
-import type { InstanceRuntimeConfig } from './service.js';
+import { loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { releaseOf } from './types.js';
 import { readCentralMigrations } from './verify.js';
 
@@ -999,3 +999,40 @@ it('keeps the current saved password through update and a snapshot rollback', GI
   expect(await run(['rollback', '--id', runtime.instance_id, '--snapshot', '--yes'])).toBe(0);
   expect(await store.secret(saved.id, 'password', 'https://cedar.example')).toBe('Cedar!after-snapshot');
 });
+
+it(
+  'restores prior node_path and service definition on code-only rollback and puts new ones back if rollback goes back',
+  GIT_HEAVY,
+  async () => {
+    const oldNode = '/opt/homebrew/Cellar/node@22/22.21.0/bin/node';
+    const newNode = '/opt/homebrew/Cellar/node/24.10.0/bin/node';
+    const host = await machine();
+    const runtime = await assistant(host, { nodePath: oldNode });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.nodePath = newNode;
+
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(newNode);
+    expect(await readFile(serviceDefinitionFile(runtime), 'utf8')).toContain(newNode);
+
+    // First try a rollback that fails to serve on the previous release: going back restores newNode.
+    state.onStart = (checkout) => {
+      state.chatDown = readlinkSync(checkout) === releaseName(host.first);
+    };
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(1);
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(newNode);
+    expect(await readFile(serviceDefinitionFile(runtime), 'utf8')).toContain(newNode);
+    expect(state.loadedDefinition).toContain(newNode);
+
+    // Now let the previous release serve: code-only rollback restores oldNode in runtime.json and the plist.
+    delete state.onStart;
+    state.chatDown = false;
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(oldNode);
+    const restored = await readFile(serviceDefinitionFile(runtime), 'utf8');
+    expect(restored).toContain(oldNode);
+    expect(restored).not.toContain(newNode);
+    expect(state.loadedDefinition).toBe(restored);
+  },
+);

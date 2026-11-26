@@ -72,7 +72,7 @@ import type { SanitizedCommandRunner } from './process.js';
 import { getInstanceReservation } from './registry.js';
 import { releaseName } from './release-layout.js';
 import type { RollbackPreview } from './rollback.js';
-import { launchInstanceHost, type InstanceRuntimeConfig } from './service.js';
+import { launchInstanceHost, loadInstanceRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError, PROVISION_STEPS, releaseOf, type ReleaseCoordinates } from './types.js';
 import {
   continueUpdate,
@@ -1624,5 +1624,64 @@ describe('the switch', GIT_HEAVY, () => {
     } finally {
       operation.release();
     }
+  });
+
+  it('refreshes node_path in runtime.json and the service definition on update, without mutating live state on decline', async () => {
+    const oldNode = '/opt/homebrew/Cellar/node@22/22.21.0/bin/node';
+    const newNode = '/opt/homebrew/Cellar/node/24.10.0/bin/node';
+    const newerNode = '/opt/homebrew/Cellar/node/24.11.0/bin/node';
+    const host = await machine();
+    const runtime = await assistant(host, { nodePath: oldNode });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.nodePath = newNode;
+
+    // Preview reports the Node transition and leaves live runtime.json & plist untouched when declined.
+    const declined = cli(host, state, next, runtime, {
+      confirmUpdate: async () => false,
+    });
+    expect(await declined.run(['update', '--id', runtime.instance_id])).toBe(0);
+    expect(declined.out.join('\n')).toContain(`Node.js: ${oldNode} → ${newNode}`);
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(oldNode);
+    expect(await readFile(serviceDefinitionFile(runtime), 'utf8')).toContain(oldNode);
+
+    // If Node moves again before confirming the already-staged release, its kept service-definition refreshes.
+    state.nodePath = newerNode;
+    const confirmed = cli(host, state, next, runtime);
+    expect(await confirmed.run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    expect(confirmed.out.join('\n')).toContain(`Node.js: ${oldNode} → ${newerNode}`);
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(newerNode);
+    const installed = await readFile(serviceDefinitionFile(runtime), 'utf8');
+    expect(installed).toContain(newerNode);
+    expect(installed).not.toContain(oldNode);
+    expect(state.loadedDefinition).toBe(installed);
+    const layout = layoutOf(host, runtime);
+    expect(await readFile(path.join(layout.kept(releaseName(next.commit)), 'service-definition'), 'utf8')).toContain(
+      newerNode,
+    );
+    expect(await readFile(path.join(layout.kept(releaseName(host.first)), 'service-definition'), 'utf8')).toContain(
+      oldNode,
+    );
+  });
+
+  it('restores the previous node_path and service definition when an update fails after switching', async () => {
+    const oldNode = '/opt/homebrew/Cellar/node@22/22.21.0/bin/node';
+    const newNode = '/opt/homebrew/Cellar/node/24.10.0/bin/node';
+    const host = await machine();
+    const runtime = await assistant(host, { nodePath: oldNode });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.nodePath = newNode;
+    state.onStart = (checkout) => {
+      state.chatDown = readlinkSync(checkout) === releaseName(next.commit);
+    };
+
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(oldNode);
+    const installed = await readFile(serviceDefinitionFile(runtime), 'utf8');
+    expect(installed).toContain(oldNode);
+    expect(installed).not.toContain(newNode);
+    expect(state.loadedDefinition).toBe(installed);
   });
 });

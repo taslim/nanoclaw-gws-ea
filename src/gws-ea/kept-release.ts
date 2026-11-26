@@ -82,6 +82,10 @@ export async function readKeptHostEnvironment(root: string): Promise<Record<stri
   return environment;
 }
 
+export async function writeKeptServiceDefinition(root: string, serviceDefinition: string): Promise<void> {
+  await writePrivateTextFile(keptReleaseFiles(root).serviceDefinition, serviceDefinition);
+}
+
 export async function readKeptRelease(root: string): Promise<KeptRelease> {
   const kept = keptReleaseFiles(root);
   const [compose, serviceDefinition, hostEnvironment] = await Promise.all([

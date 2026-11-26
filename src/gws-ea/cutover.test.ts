@@ -7,7 +7,7 @@
  * fault, on the fixture's assistants.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -16,6 +16,7 @@ import {
   assertInstanceQuiet,
   openCutoverHost,
   openFileHolders,
+  serveLeftRelease,
   verifyServingRelease,
   type CutoverDependencies,
   type QuietInstance,
@@ -25,7 +26,7 @@ import { withInstanceOperation } from './journal.js';
 import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { getInstanceReservation } from './registry.js';
 import { releaseName } from './release-layout.js';
-import type { InstanceRuntimeConfig } from './service.js';
+import { loadInstanceRuntimeConfig, updateInstanceRuntimeNodePath, type InstanceRuntimeConfig } from './service.js';
 import {
   assistant,
   cli,
@@ -34,6 +35,7 @@ import {
   nextRelease,
   release,
   removeTemporaryRoots,
+  serviceDefinitionFile,
   temporaryRoot,
   world,
   type Machine,
@@ -767,5 +769,83 @@ describe('update and rollback through the serving gate', { timeout: 90_000 }, ()
     expect(out).toContain(`Assistant ${id} was rolled back to dogfood ${host.first.slice(0, 12)}.`);
     expect(out).toContain(`${signInNeeded(id)}.`);
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+  });
+});
+
+describe('serving the left release after a partial switch', { timeout: 90_000 }, () => {
+  it('restores runtime.json and the kept service definition on the early-return path when move.node_path is set', async () => {
+    const host = await machine();
+    const oldNode = path.join(host.root, 'node-22', 'bin', 'node');
+    const newNode = path.join(host.root, 'node-24', 'bin', 'node');
+    const runtime = await assistant(host, { nodePath: oldNode });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    const definitionPath = serviceDefinitionFile(runtime);
+    const originalDefinition = await readFile(definitionPath, 'utf8');
+    expect(originalDefinition).toContain(oldNode);
+
+    // Simulate a partial switch that wrote the target node path and definition before failing prior to pointCurrent.
+    await updateInstanceRuntimeNodePath(runtime, newNode);
+    await writeFile(definitionPath, originalDefinition.replaceAll(oldNode, newNode));
+
+    const startCalls: Array<unknown> = [];
+    await withInstanceOperation(host.paths, runtime.instance_id, async (operation) => {
+      const cutoverHost = await openCutoverHost(
+        operation,
+        dependencies(state, { commit: host.first, tool: host.work }, runtime),
+      );
+      const originalStart = cutoverHost.service.start.bind(cutoverHost.service);
+      const instrumentedHost = {
+        ...cutoverHost,
+        service: {
+          ...cutoverHost.service,
+          start: async (options?: Parameters<typeof originalStart>[0]) => {
+            startCalls.push(options);
+            return originalStart(options);
+          },
+        },
+      };
+      await serveLeftRelease(instrumentedHost, {
+        from: release(host, host.first),
+        to: release(host, next.commit),
+        node_path: { from: oldNode, to: newNode },
+      });
+    });
+
+    expect((await loadInstanceRuntimeConfig(host.paths.runtimeFile(runtime.instance_id))).node_path).toBe(oldNode);
+    expect(await readFile(definitionPath, 'utf8')).toBe(originalDefinition);
+    expect(startCalls).toEqual([{ definitionChanged: true }]);
+  });
+
+  it('preserves plain service.start() on the early-return path when move.node_path is absent', async () => {
+    const host = await machine();
+    const runtime = await assistant(host);
+    const next = await nextRelease(host);
+    const state = world(runtime);
+
+    const startCalls: Array<unknown> = [];
+    await withInstanceOperation(host.paths, runtime.instance_id, async (operation) => {
+      const cutoverHost = await openCutoverHost(
+        operation,
+        dependencies(state, { commit: host.first, tool: host.work }, runtime),
+      );
+      const originalStart = cutoverHost.service.start.bind(cutoverHost.service);
+      const instrumentedHost = {
+        ...cutoverHost,
+        service: {
+          ...cutoverHost.service,
+          start: async (options?: Parameters<typeof originalStart>[0]) => {
+            startCalls.push(options);
+            return originalStart(options);
+          },
+        },
+      };
+      await serveLeftRelease(instrumentedHost, {
+        from: release(host, host.first),
+        to: release(host, next.commit),
+      });
+    });
+
+    expect(startCalls).toEqual([undefined]);
   });
 });

@@ -355,6 +355,24 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
 }
 
 /**
+ * Update `node_path` in the assistant's `runtime.json` while fenced, writing
+ * atomically in `state/`. Returns the validated runtime config.
+ */
+export async function updateInstanceRuntimeNodePath(
+  configInput: InstanceRuntimeConfig,
+  nodePath: string,
+): Promise<InstanceRuntimeConfig> {
+  const base = validateRuntimeConfig(configInput);
+  const file = instanceRuntimeFile(base.state_root);
+  const current = await loadInstanceRuntimeConfig(file);
+  const resolved = path.resolve(nodePath);
+  if (current.node_path === resolved) return current;
+  const next = validateRuntimeConfig({ ...persistedRuntime(current), node_path: resolved });
+  await writePrivateTextFile(file, runtimeFileContents(next));
+  return next;
+}
+
+/**
  * Write `runtime.json` once, re-bind the host-policy locators that differ, and
  * add the release keys (`INSTANCE_HOST_ENV_KEYS`) the assistant's `.env` does
  * not set. All are in the physical `state/`, never written through a link. A

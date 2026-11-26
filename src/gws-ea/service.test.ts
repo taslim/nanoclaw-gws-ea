@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { deriveGcpClaims, deriveGcpProjectId } from './gcp-identity.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
-import { CONTROL_PLANE_ROOT, resolveControlPlanePaths } from './paths.js';
+import { CONTROL_PLANE_ROOT, instanceRuntimeFile, resolveControlPlanePaths } from './paths.js';
 import type { SanitizedCommand } from './process.js';
 import { GwsEaError } from './types.js';
 
@@ -25,6 +25,7 @@ import {
   reloadInstanceService,
   renderInstanceServiceDefinition,
   restoreInstanceServiceDefinition,
+  updateInstanceRuntimeNodePath,
   type InstanceRuntimeConfig,
   type InstanceServiceLayout,
   type UpsertEnvVars,
@@ -743,5 +744,23 @@ describe('the service definition a switch installs', () => {
       ['systemctl', '--user', 'daemon-reload'],
       ['systemctl', '--user', 'daemon-reload'],
     ]);
+  });
+
+  it('atomically updates node_path in runtime.json while keeping all other persisted fields intact', async () => {
+    const { config } = await fixture();
+    await persistInstanceRuntime(config, upsertEnvVars);
+    const runtimeFile = instanceRuntimeFile(config.state_root);
+
+    const same = await updateInstanceRuntimeNodePath(config, config.node_path);
+    expect(same.node_path).toBe(config.node_path);
+
+    const upgradedPath = '/opt/homebrew/Cellar/node/24.10.0/bin/node';
+    const updated = await updateInstanceRuntimeNodePath(config, upgradedPath);
+    expect(updated.node_path).toBe(upgradedPath);
+    const reloaded = await loadInstanceRuntimeConfig(runtimeFile);
+    expect(reloaded.node_path).toBe(upgradedPath);
+    expect(reloaded.allocated_ports).toEqual(config.allocated_ports);
+    expect(reloaded.docker_endpoint).toBe(config.docker_endpoint);
+    expect((await stat(runtimeFile)).mode & 0o777).toBe(0o600);
   });
 });
