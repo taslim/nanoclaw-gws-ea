@@ -24,7 +24,7 @@ import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-prof
 import { browserAvailability } from './availability.js';
 import { hasBrowserAccess } from './access.js';
 import { browserDelegateGuard } from './cancel.js';
-import { ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
+import { browserCardBudget, clampBrowserCardText, ERRAND_ORIGIN_LINE, fitQuoted, SELLER_TEXT_LIMIT } from './cards.js';
 import {
   getConsentStop,
   liveConsentGrants,
@@ -89,14 +89,36 @@ function siteKey(raw: string): string {
   }
 }
 
-function consentQuestion(stop: ConsentStop): string {
-  return [
-    `To continue your errand, ${stop.site} asks me to agree to this:`,
-    quoted(stop.wording, 2000),
-    // A form another site serves inside this one, such as a booking widget, is named by its own address.
-    ...(siteKey(stop.origin) !== stop.site ? [`It is in a form from ${quoted(stop.origin, SELLER_TEXT_LIMIT)}.`] : []),
-    `If you approve, I'll tick it there now and whenever this exact wording appears on ${stop.site} again, until you ask me to stop. If the wording changes, I'll ask you again.`,
-  ].join('\n');
+export function consentCardTitle(site: string): string {
+  return `Agree to this on ${site}?`;
+}
+
+export function consentQuestion(stop: ConsentStop): string {
+  const budget = browserCardBudget(consentCardTitle(stop.site));
+  const header = `To continue your errand, ${stop.site} asks me to agree to this:`;
+  const footer = `If you approve, I'll tick it there now and whenever this exact wording appears on ${stop.site} again, until you ask me to stop. If the wording changes, I'll ask you again.`;
+  const crossOrigin = siteKey(stop.origin) !== stop.site;
+  const build = (wording: string, originLine?: string): string =>
+    [header, wording, ...(originLine ? [originLine] : []), footer].join('\n');
+
+  // A form another site serves inside this one, such as a booking widget, is named by its own address.
+  const fullOrigin = crossOrigin ? `It is in a form from ${quoted(stop.origin, SELLER_TEXT_LIMIT)}.` : undefined;
+  const full = build(quoted(stop.wording, 2000), fullOrigin);
+  if (full.length <= budget) return full;
+
+  const baseOverhead = header.length + footer.length + 2;
+  let originLine: string | undefined;
+  if (crossOrigin) {
+    const prefix = 'It is in a form from ';
+    const originCap = Math.min(
+      SELLER_TEXT_LIMIT,
+      Math.max(32, Math.floor((budget - baseOverhead - prefix.length - 2) / 3)),
+    );
+    originLine = `${prefix}${fitQuoted(stop.origin, originCap)}.`;
+  }
+  const wordingBudget = Math.max(2, budget - baseOverhead - (originLine ? originLine.length + 1 : 0));
+  const fitted = build(fitQuoted(stop.wording, wordingBudget), originLine);
+  return fitted.length <= budget ? fitted : clampBrowserCardText(fitted, budget);
 }
 
 /** to: browser */
@@ -166,7 +188,7 @@ export async function executeConsentRequest(
       agentName: 'browser',
       action: CONSENT_APPROVAL,
       payload: approval,
-      title: `Agree to this on ${stop.site}?`,
+      title: consentCardTitle(stop.site),
       question: consentQuestion(stop),
       approverUserId: decision.approverUserId,
       expiresAt: new Date(Date.now() + CONSENT_CARD_LIFE_MS).toISOString(),

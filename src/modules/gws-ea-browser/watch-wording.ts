@@ -1,5 +1,5 @@
 import { formatLocalTimeWithZone } from '../../timezone.js';
-import { cardEventSpan, SELLER_TEXT_LIMIT } from './cards.js';
+import { browserCardBudget, cardEventSpan, clampBrowserCardText, fitQuoted, SELLER_TEXT_LIMIT } from './cards.js';
 import { quoted } from '../approvals/request-text.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { boundsOf, type WatchRow } from './watch-state.js';
@@ -36,6 +36,21 @@ export function watchMessage(kind: keyof typeof watchMessages): string {
   return watchMessages[kind];
 }
 
+interface WatchCardCaps {
+  readonly quote: (text: string, limit: number) => string;
+  readonly seller: number;
+  readonly term: number;
+  readonly maxWindows: number;
+  readonly maxCommitments: number;
+}
+
+const WATCH_CARD_PROFILES: readonly WatchCardCaps[] = [
+  { quote: quoted, seller: SELLER_TEXT_LIMIT, term: 1200, maxWindows: Infinity, maxCommitments: Infinity },
+  { quote: fitQuoted, seller: 200, term: 360, maxWindows: 4, maxCommitments: 3 },
+  { quote: fitQuoted, seller: 100, term: 160, maxWindows: 2, maxCommitments: 2 },
+  { quote: fitQuoted, seller: 48, term: 64, maxWindows: 1, maxCommitments: 1 },
+];
+
 /**
  * Arrival windows read on the venue's clock; conversions and the deadline on the principal's.
  * to: principal
@@ -43,30 +58,50 @@ export function watchMessage(kind: keyof typeof watchMessages): string {
 export function renderWatchCard(watch: WatchRow, venueTimeZone: string, clock: PrincipalClock): string {
   const bounds = boundsOf(watch),
     financial = bounds.financial;
-  const lines = [
-    'Approve one reservation across this errand’s watches, within these bounds:',
-    `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
-    `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
-    `Party size: ${bounds.partySize}`,
-    ...bounds.windows.map(
-      (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, clock)}`,
-    ),
-    `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
-  ];
-  if (bounds.kind === 'region')
-    lines.push(
-      'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
-    );
-  else
-    lines.push(
-      `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
-      ...financial.policy!.commitments.map(
-        (term) =>
-          `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, clock(term.conversionAt))}` : ''}`,
+  const budget = browserCardBudget(watchCardTitle());
+  let rendered = '';
+  for (const caps of WATCH_CARD_PROFILES) {
+    const shownWindows = bounds.windows.slice(0, caps.maxWindows);
+    const omittedWindows = bounds.windows.length - shownWindows.length;
+    const lines = [
+      'Approve one reservation across this errand’s watches, within these bounds:',
+      `Site: ${caps.quote(watch.site, caps.seller)}`,
+      `Venue: ${caps.quote(bounds.venue.name, caps.seller)}`,
+      `Party size: ${bounds.partySize}`,
+      ...shownWindows.map(
+        (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, clock)}`,
       ),
-    );
-  lines.push(`Watch deadline: ${formatLocalTimeWithZone(bounds.until, clock(bounds.until))}`);
-  return lines.join('\n');
+      ...(omittedWindows > 0
+        ? [`More arrival windows: ${omittedWindows} additional ${omittedWindows === 1 ? 'window' : 'windows'}.`]
+        : []),
+      `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
+    ];
+    if (bounds.kind === 'region') {
+      lines.push(
+        'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
+      );
+    } else {
+      const commitments = financial.policy!.commitments;
+      const shownCommitments = commitments.slice(0, caps.maxCommitments);
+      const omittedCommitments = commitments.length - shownCommitments.length;
+      lines.push(
+        `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
+        ...shownCommitments.map(
+          (term) =>
+            `Merchant financial terms: ${caps.quote(term.terms, caps.term)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${caps.quote(term.trigger ?? '', caps.seller)}; cancellation ${caps.quote(term.cancellationTerms ?? '', caps.seller)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${caps.quote(term.frequency, caps.seller)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, clock(term.conversionAt))}` : ''}`,
+        ),
+        ...(omittedCommitments > 0
+          ? [
+              `More merchant financial terms: ${omittedCommitments} additional ${omittedCommitments === 1 ? 'term' : 'terms'}.`,
+            ]
+          : []),
+      );
+    }
+    lines.push(`Watch deadline: ${formatLocalTimeWithZone(bounds.until, clock(bounds.until))}`);
+    rendered = lines.join('\n');
+    if (rendered.length <= budget) return rendered;
+  }
+  return clampBrowserCardText(rendered, budget);
 }
 
 /** to: browser */

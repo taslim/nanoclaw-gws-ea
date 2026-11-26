@@ -1346,6 +1346,46 @@ describe('watches on sites with no reader', () => {
     expect(card).toContain('Any other booking, a recurring charge included, comes to you on its own card.');
     expect(card).not.toContain('merchant identity');
   });
+
+  it('keeps oversized watch approval cards within the 2,000-character card limit while preserving core bounds', async () => {
+    const { cardQuestionTooLong } = await import('../../channels/ask-question.js');
+    const { watchCardTitle } = await import('./watch-wording.js');
+    const longText = (label: string, n: number) => `${label} ${'X\u200BY'.repeat(Math.ceil(n / 3))}`;
+    const heavyPolicyBounds = {
+      ...bounds,
+      venue: { id: 'v-big', name: longText('The Very Long Restaurant Name', 360) },
+      windows: Array.from({ length: 8 }, (_, idx) => ({
+        start: `2026-10-${16 + idx}T02:00:00.000Z`,
+        end: `2026-10-${16 + idx}T04:00:00.000Z`,
+      })),
+      financial: {
+        ...bounds.financial,
+        policy: {
+          currency: 'USD',
+          dueNowMinor: 10_000,
+          commitments: Array.from({ length: 4 }, (_, idx) => ({
+            kind: 'conditional_fee' as const,
+            terms: longText(`Watch commitment ${idx + 1}`, 1200),
+            amountMinor: 5_000,
+            perPerson: true,
+            trigger: longText('Late cancellation', 300),
+            cancellationTerms: longText('24h notice required', 300),
+            cancellationBeforeMs: 24 * 60 * 60 * 1000,
+          })),
+        },
+      },
+    };
+    const card = renderWatchCard(
+      { id: 'heavy', site: 'reservations.example.test', bounds_json: JSON.stringify(heavyPolicyBounds) } as WatchRow,
+      'America/Los_Angeles',
+      () => 'Asia/Tokyo',
+    );
+    expect(cardQuestionTooLong(watchCardTitle(), `${card}\n\n${ERRAND_ORIGIN_LINE}`)).toBeUndefined();
+    expect(card).toContain('Site: "reservations.example.test"');
+    expect(card).toContain('Party size: 4');
+    expect(card).toContain('Maximum total exposure, all guests and fees:');
+    expect(card).toContain('Watch deadline:');
+  });
 });
 
 describe('a watch the principal declines', () => {

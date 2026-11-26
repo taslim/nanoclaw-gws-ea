@@ -156,6 +156,7 @@ export interface FileAttacher {
     threadId: string,
     message: AdapterPostableMessage,
     files: readonly OutboundFile[],
+    deliveryId?: string,
   ) => Promise<RawMessage<unknown>>;
 }
 
@@ -1191,11 +1192,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     tid: string,
     pictures: RequestPictures,
     compose: (missing?: string) => AdapterPostableMessage,
+    deliveryId?: string,
   ): Promise<RawMessage<unknown>> {
     if (pictures.named === 0) return adapter.postMessage(tid, compose());
     if (attacher && pictures.files) {
       try {
-        return await attacher.postWithFiles(tid, compose(), pictures.files);
+        return deliveryId === undefined
+          ? await attacher.postWithFiles(tid, compose(), pictures.files)
+          : await attacher.postWithFiles(tid, compose(), pictures.files, deliveryId);
       } catch (error) {
         if (!(error instanceof FilesNotAttachedError) || pictures.required) throw error;
         log.warn('Posting a request without its pictures, which could not be attached', {
@@ -1814,9 +1818,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           const asked = typeof question === 'string' ? question : '';
           // Every word of it shown, the options' labels too; answers match the stored options.
           const shown = options.map((option) => ({ ...option, label: escape(option.label) }));
-          const posted = await postWithPictures(tid, pictures, (missing) => ({
-            markdown: transformText(textRequest(escape(title), escape(asked), shown, missing)),
-          }));
+          const posted = await postWithPictures(
+            tid,
+            pictures,
+            (missing) => ({
+              markdown: transformText(textRequest(escape(title), escape(asked), shown, missing)),
+            }),
+            message.deliveryId ?? questionId,
+          );
           return rememberRequest(platformId, questionId, posted);
         }
         // Long text goes out as several blocks, measured after escaping, so no
@@ -1827,28 +1836,38 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           const tooLong = cardQuestionTooLong(cardTitle(title), blocks.join('\n'), config.maxCardTextLength);
           if (tooLong) throw new CardTooLongError(tooLong);
         }
-        const result = await postWithPictures(tid, pictures, (missing) => ({
-          card: Card({
-            title: cardTitle(title),
-            children: [
-              ...blocks.map((block) => CardText(block)),
-              ...(missing === undefined ? [] : [CardText(missing)]),
-              Actions(
-                // Encode button id/value with the option index rather than the
-                // full value. Telegram caps callback_data at 64 bytes, and
-                // long values (e.g. ISO datetimes, URLs) push the JSON payload
-                // well past that. The onAction handlers resolve the index back
-                // to the real value via resolveQuestionRender(questionId).
-                options.map((opt, idx) =>
-                  Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx), style: opt.style }),
+        const result = await postWithPictures(
+          tid,
+          pictures,
+          (missing) => ({
+            card: Card({
+              title: cardTitle(title),
+              children: [
+                ...blocks.map((block) => CardText(block)),
+                ...(missing === undefined ? [] : [CardText(missing)]),
+                Actions(
+                  // Encode button id/value with the option index rather than the
+                  // full value. Telegram caps callback_data at 64 bytes, and
+                  // long values (e.g. ISO datetimes, URLs) push the JSON payload
+                  // well past that. The onAction handlers resolve the index back
+                  // to the real value via resolveQuestionRender(questionId).
+                  options.map((opt, idx) =>
+                    Button({
+                      id: `ncq:${questionId}:${idx}`,
+                      label: opt.label,
+                      value: String(idx),
+                      style: opt.style,
+                    }),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            }),
+            fallbackText:
+              `${title}\n\n${escape(question)}${missing === undefined ? '' : `\n\n${missing}`}\n` +
+              `Options: ${options.map((o) => o.label).join(', ')}`,
           }),
-          fallbackText:
-            `${title}\n\n${escape(question)}${missing === undefined ? '' : `\n\n${missing}`}\n` +
-            `Options: ${options.map((o) => o.label).join(', ')}`,
-        }));
+          message.deliveryId ?? questionId,
+        );
         return result?.id;
       }
 
@@ -1866,7 +1885,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           return;
         }
         if (textRequests) {
-          const result = await adapter.postMessage(tid, { markdown: transformText(textDisplayCard(display)) });
+          const rendered = transformText(textDisplayCard(display));
+          const result =
+            message.deliveryId !== undefined && isIdempotentTextPoster(adapter)
+              ? await adapter.postTextOnce(tid, rendered, `${message.deliveryId}:0`)
+              : await adapter.postMessage(tid, { markdown: rendered });
           return result?.id;
         }
 
@@ -1906,20 +1929,31 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         let firstId = resumed?.firstId;
         for (let i = resumed?.posted ?? 0; i < chunks.length; i++) {
           const chunk = chunks[i];
-          const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
+          const attachFiles = i === 0 && message.files && message.files.length > 0;
           const result =
-            message.deliveryId !== undefined && !attachFiles && isIdempotentTextPoster(adapter)
-              ? await adapter.postTextOnce(tid, chunk, `${message.deliveryId}:${i}`)
-              : await adapter.postMessage(
-                  tid,
-                  attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-                );
+            attachFiles && attacher
+              ? message.deliveryId === undefined
+                ? await attacher.postWithFiles(tid, { markdown: chunk }, message.files!)
+                : await attacher.postWithFiles(tid, { markdown: chunk }, message.files!, `${message.deliveryId}:${i}`)
+              : message.deliveryId !== undefined && !attachFiles && isIdempotentTextPoster(adapter)
+                ? await adapter.postTextOnce(tid, chunk, `${message.deliveryId}:${i}`)
+                : await adapter.postMessage(
+                    tid,
+                    attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+                  );
           if (i === 0) firstId = result?.id;
           await progress?.save(i + 1, firstId);
         }
         return firstId;
       } else if (message.files && message.files.length > 0) {
         // Files only, no text
+        if (attacher) {
+          const result =
+            message.deliveryId === undefined
+              ? await attacher.postWithFiles(tid, { markdown: '' }, message.files)
+              : await attacher.postWithFiles(tid, { markdown: '' }, message.files, `${message.deliveryId}:0`);
+          return result?.id;
+        }
         const fileUploads = message.files.map((f: { data: Buffer; filename: string }) => ({
           data: f.data,
           filename: f.filename,

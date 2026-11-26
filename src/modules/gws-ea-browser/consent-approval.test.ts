@@ -277,6 +277,21 @@ describe('asking the principal for consent', () => {
     expect(await notices()).toHaveLength(1);
   });
 
+  it('fits a max-length cross-origin consent card within the 2,000-character limit so approval delivery succeeds', async () => {
+    const { cardQuestionTooLong } = await import('../../channels/ask-question.js');
+    const hugeWording = `I agree to the partner marketing terms: ${'Clause \u202Etext. '.repeat(220)}`;
+    const crossOrigin = `https://widget.partner-forms.example/${'embed/'.repeat(60)}`;
+    const id = await stop(hugeWording, job.id, 'join.example', crossOrigin);
+    expect(await ask(id, 'consent-huge')).toMatchObject({ status: 'awaiting_principal', stop_id: id });
+    const [approval] = await approvals();
+    expect(approval).toBeDefined();
+    expect(cardQuestionTooLong(approval.title, approval.question)).toBeUndefined();
+    expect(approval.question).toContain('join.example asks me to agree to this:');
+    expect(approval.question).toContain('It is in a form from');
+    expect(approval.question).toContain('until you ask me to stop');
+    expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
+  });
+
   it.each([
     ['rejects it', 'rejected', 'leaves this box unticked', async () => click((await approvals())[0], 'reject')],
     [

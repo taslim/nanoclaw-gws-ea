@@ -269,18 +269,29 @@ export class AssistantChatAdapter
     }
   }
 
+  private messageQuery(threadName: string | undefined, deliveryId?: string): string {
+    const query = new URLSearchParams();
+    if (deliveryId !== undefined) {
+      query.set('requestId', createHash('sha256').update(deliveryId).digest('hex'));
+    }
+    if (threadName !== undefined) query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD');
+    return query.size === 0 ? '' : `?${query.toString()}`;
+  }
+
   /** Google messages.create requestId makes a repeated text create return the original message. */
   async postTextOnce(threadId: string, text: string, deliveryId: string): Promise<RawMessage<unknown>> {
     const { spaceName, threadName } = this.decodeThreadId(threadId);
-    const query = new URLSearchParams({ requestId: createHash('sha256').update(deliveryId).digest('hex') });
-    if (threadName !== undefined) query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD');
-    const posted = await googleJson(this.chatClient, `${CHAT}/${spaceName}/messages?${query.toString()}`, {
-      method: 'POST',
-      body: {
-        text: convertEmojiPlaceholders(this.formatConverter.renderPostable({ markdown: text }), 'gchat'),
-        ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+    const posted = await googleJson(
+      this.chatClient,
+      `${CHAT}/${spaceName}/messages${this.messageQuery(threadName, deliveryId)}`,
+      {
+        method: 'POST',
+        body: {
+          text: convertEmojiPlaceholders(this.formatConverter.renderPostable({ markdown: text }), 'gchat'),
+          ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+        },
       },
-    });
+    );
     if (!isRecord(posted) || typeof posted.name !== 'string')
       throw new GoogleApiError(502, 'Chat posted a message without naming it');
     return { id: posted.name, threadId, raw: posted };
@@ -290,25 +301,30 @@ export class AssistantChatAdapter
    * The SDK's post drops files. One message carries the text and every upload,
    * so a reaction or quote answers one message. A file Chat does not take
    * rejects with FilesNotAttachedError before any message is posted. A file's
-   * bytes go only to Google.
+   * bytes go only to Google. When `deliveryId` is given, Google's `requestId`
+   * makes a retried post return the original message instead of a duplicate.
    */
   async postWithFiles(
     threadId: string,
     message: AdapterPostableMessage,
     files: readonly OutboundFile[],
+    deliveryId?: string,
   ): Promise<RawMessage<unknown>> {
     const { spaceName, threadName } = this.decodeThreadId(threadId);
     const attachment: Array<{ attachmentDataRef: Record<string, unknown> }> = [];
     for (const file of files) attachment.push({ attachmentDataRef: await this.upload(spaceName, file) });
-    const reply = threadName === undefined ? '' : '?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD';
-    const posted = await googleJson(this.chatClient, `${CHAT}/${spaceName}/messages${reply}`, {
-      method: 'POST',
-      body: {
-        text: convertEmojiPlaceholders(this.formatConverter.renderPostable(message), 'gchat'),
-        attachment,
-        ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+    const posted = await googleJson(
+      this.chatClient,
+      `${CHAT}/${spaceName}/messages${this.messageQuery(threadName, deliveryId)}`,
+      {
+        method: 'POST',
+        body: {
+          text: convertEmojiPlaceholders(this.formatConverter.renderPostable(message), 'gchat'),
+          attachment,
+          ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+        },
       },
-    });
+    );
     if (!isRecord(posted) || typeof posted.name !== 'string') {
       throw new GoogleApiError(502, 'Chat posted a message without naming it');
     }
