@@ -1,3 +1,4 @@
+import { MAX_CARD_QUESTION_LENGTH } from '../../channels/ask-question.js';
 import { getDb } from '../../db/connection.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
@@ -17,6 +18,7 @@ import {
   type PurchaseFacts,
 } from './fingerprint.js';
 import { quoted } from '../approvals/request-text.js';
+import { purchaseCardTitle } from './purchase-wording.js';
 import type { PrincipalClock } from './watch-policy.js';
 
 export interface PurchaseCard {
@@ -40,6 +42,145 @@ export interface PurchaseCard {
 export const ERRAND_ORIGIN_LINE = "From a website errand I'm working on for you.";
 /** The longest seller-controlled string a card quotes without a bound of its own; each is quoted (`quoted`). */
 export const SELLER_TEXT_LIMIT = 360;
+
+/**
+ * Character budget left for a browser approval card's question body so
+ * `title.length + question.length + originLine <= MAX_CARD_QUESTION_LENGTH`.
+ */
+export function browserCardBudget(title: string, originLine = ERRAND_ORIGIN_LINE): number {
+  return Math.max(0, MAX_CARD_QUESTION_LENGTH - title.length - (originLine ? originLine.length + 2 : 0));
+}
+
+/**
+ * Quote untrusted text with `quoted` while guaranteeing the final escaped
+ * string (including surrounding quotes and any `\uXXXX` escapes) fits within
+ * `maxLength` characters.
+ */
+export function fitQuoted(text: string, maxLength: number): string {
+  if (maxLength <= 0) return '';
+  if (maxLength <= 2) return '""'.slice(0, maxLength);
+  const direct = quoted(text, maxLength);
+  if (direct.length <= maxLength) return direct;
+  let lo = 1;
+  let hi = maxLength;
+  let best = '""';
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const candidate = quoted(text, mid);
+    if (candidate.length <= maxLength) {
+      best = candidate;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
+/** Last-resort clamp that preserves whole UTF-16 code points when even minimal caps exceed the card budget. */
+export function clampBrowserCardText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  if (maxLength <= 1) return text.slice(0, Math.max(0, maxLength));
+  const cut = text.slice(0, maxLength - 1).replace(/[\uD800-\uDBFF]$/u, '');
+  return `${cut}…`;
+}
+
+interface PurchaseCardCaps {
+  readonly quote: (text: string, limit: number) => string;
+  readonly seller: number;
+  readonly note: number;
+  readonly term: number;
+  readonly agreement: number;
+  readonly noCommitment: number;
+  readonly maxItems: number;
+  readonly maxAddOns: number;
+  readonly maxAgreements: number;
+  readonly maxCommitments: number;
+  readonly maxRecorded: number;
+  readonly maxEmails: number;
+}
+
+const PURCHASE_CARD_PROFILES: readonly PurchaseCardCaps[] = [
+  {
+    quote: quoted,
+    seller: SELLER_TEXT_LIMIT,
+    note: 700,
+    term: 700,
+    agreement: 2000,
+    noCommitment: 1200,
+    maxItems: Infinity,
+    maxAddOns: Infinity,
+    maxAgreements: Infinity,
+    maxCommitments: Infinity,
+    maxRecorded: Infinity,
+    maxEmails: Infinity,
+  },
+  {
+    quote: fitQuoted,
+    seller: 240,
+    note: 240,
+    term: 240,
+    agreement: 400,
+    noCommitment: 360,
+    maxItems: 6,
+    maxAddOns: 4,
+    maxAgreements: 3,
+    maxCommitments: 4,
+    maxRecorded: 3,
+    maxEmails: 4,
+  },
+  {
+    quote: fitQuoted,
+    seller: 140,
+    note: 120,
+    term: 140,
+    agreement: 200,
+    noCommitment: 180,
+    maxItems: 3,
+    maxAddOns: 2,
+    maxAgreements: 2,
+    maxCommitments: 2,
+    maxRecorded: 1,
+    maxEmails: 2,
+  },
+  {
+    quote: fitQuoted,
+    seller: 72,
+    note: 72,
+    term: 72,
+    agreement: 100,
+    noCommitment: 100,
+    maxItems: 2,
+    maxAddOns: 1,
+    maxAgreements: 1,
+    maxCommitments: 2,
+    maxRecorded: 1,
+    maxEmails: 1,
+  },
+  {
+    quote: fitQuoted,
+    seller: 36,
+    note: 36,
+    term: 36,
+    agreement: 48,
+    noCommitment: 48,
+    maxItems: 1,
+    maxAddOns: 1,
+    maxAgreements: 1,
+    maxCommitments: 1,
+    maxRecorded: 0,
+    maxEmails: 1,
+  },
+];
+
+function fitCardProfiles(budget: number, render: (caps: PurchaseCardCaps) => string): string {
+  let rendered = '';
+  for (const profile of PURCHASE_CARD_PROFILES) {
+    rendered = render(profile);
+    if (rendered.length <= budget) return rendered;
+  }
+  return clampBrowserCardText(rendered, budget);
+}
 function cardSpan(start: string, end: string, startZone: string, endZone: string): string {
   if (startZone !== endZone)
     return `${formatLocalTimeWithZone(start, startZone)} through ${formatLocalTimeWithZone(end, endZone)}`;
@@ -83,11 +224,21 @@ export interface EarlierPurchases {
   readonly recordedNotPlaced: readonly RecordedNotPlaced[];
 }
 export const NO_EARLIER_PURCHASES: EarlierPurchases = { unresolved: 0, recordedNotPlaced: [] };
-function earlierLines(earlier: EarlierPurchases, clock: PrincipalClock): string[] {
-  const lines = earlier.recordedNotPlaced.map(
+function earlierLines(earlier: EarlierPurchases, clock: PrincipalClock, maxRecorded: number): string[] {
+  const shown =
+    earlier.recordedNotPlaced.length > maxRecorded
+      ? earlier.recordedNotPlaced.slice(earlier.recordedNotPlaced.length - maxRecorded)
+      : earlier.recordedNotPlaced;
+  const omitted = earlier.recordedNotPlaced.length - shown.length;
+  const lines = shown.map(
     (recorded) =>
       `Earlier purchase here, tried ${formatLocalTimeWithZone(recorded.attemptedAt, clock(recorded.attemptedAt))}: I recorded it as not placed, from ${recorded.source === 'email' ? "the merchant's email" : 'what you told me'}.`,
   );
+  if (omitted > 0) {
+    lines.unshift(
+      `Earlier not-placed attempts on this site: ${omitted} older ${omitted === 1 ? 'record' : 'records'} omitted.`,
+    );
+  }
   if (!earlier.unresolved) return lines;
   const count =
     earlier.unresolved > 1
@@ -112,33 +263,57 @@ function termLines(
   partySize: number | undefined,
   money: ((amount: number) => string) | undefined,
   clock: PrincipalClock,
+  caps: PurchaseCardCaps,
 ): string[] {
   const lines: string[] = [];
-  for (const term of facts.commitments) {
-    lines.push(`Financial commitment: ${term.kind}; ${quoted(term.terms, 700)}`);
+  const shown = facts.commitments.slice(0, caps.maxCommitments);
+  for (const term of shown) {
+    lines.push(`Financial commitment: ${term.kind}; ${caps.quote(term.terms, caps.term)}`);
     if (term.amountMinor !== undefined && money)
       lines.push(
         `Amount due later/exposure: ${money(term.amountMinor)}${term.perPerson ? ` per person × ${partySize ?? 'unknown party size'}` : ' total'}`,
       );
-    if (term.trigger) lines.push(`Trigger: ${quoted(term.trigger, SELLER_TEXT_LIMIT)}`);
+    if (term.trigger) lines.push(`Trigger: ${caps.quote(term.trigger, caps.seller)}`);
     if (term.cancellationDeadline)
       lines.push(
         `Cancellation deadline: ${formatLocalTimeWithZone(term.cancellationDeadline, clock(term.cancellationDeadline))}`,
       );
-    if (term.cancellationTerms) lines.push(`Cancellation terms: ${quoted(term.cancellationTerms, 700)}`);
+    if (term.cancellationTerms) lines.push(`Cancellation terms: ${caps.quote(term.cancellationTerms, caps.term)}`);
     if (term.conversionAt)
       lines.push(`Trial conversion: ${formatLocalTimeWithZone(term.conversionAt, clock(term.conversionAt))}`);
-    if (term.frequency) lines.push(`Recurring frequency: ${quoted(term.frequency, SELLER_TEXT_LIMIT)}`);
+    if (term.frequency) lines.push(`Recurring frequency: ${caps.quote(term.frequency, caps.seller)}`);
+  }
+  const omitted = facts.commitments.length - shown.length;
+  if (omitted > 0) {
+    lines.push(
+      `More financial commitments: ${omitted} additional ${omitted === 1 ? 'commitment' : 'commitments'} on this checkout.`,
+    );
   }
   return lines;
 }
-function choiceLines(facts: PurchaseFacts): string[] {
+function choiceLines(facts: PurchaseFacts, caps: PurchaseCardCaps): string[] {
+  const addOns = facts.addOns ?? [];
+  const shownAddOns = addOns.slice(0, caps.maxAddOns);
+  const omittedAddOns = addOns.length - shownAddOns.length;
+  const agreements = facts.agreements ?? [];
+  const shownAgreements = agreements.slice(0, caps.maxAgreements);
+  const omittedAgreements = agreements.length - shownAgreements.length;
   return [
-    ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quoted(addOn, SELLER_TEXT_LIMIT)}`),
-    ...(facts.agreements ?? []).map(
+    ...shownAddOns.map((addOn) => `Extra charge the site keeps selected: ${caps.quote(addOn, caps.seller)}`),
+    ...(omittedAddOns > 0
+      ? [
+          `More extra charges: ${omittedAddOns} additional extra ${omittedAddOns === 1 ? 'charge' : 'charges'} selected.`,
+        ]
+      : []),
+    ...shownAgreements.map(
       (agreement) =>
-        `Agreement: ${quoted(agreement.wording, 2000)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
+        `Agreement: ${caps.quote(agreement.wording, caps.agreement)}. Approving agrees to it, here and whenever this exact wording appears on ${facts.site} again, until you withdraw it.`,
     ),
+    ...(omittedAgreements > 0
+      ? [
+          `More agreements: ${omittedAgreements} additional site ${omittedAgreements === 1 ? 'agreement' : 'agreements'} on this checkout.`,
+        ]
+      : []),
   ];
 }
 /** An unreviewed checkout's card. The assistant's own web address reads as the assistant's; no internal id appears. */
@@ -148,6 +323,7 @@ function renderGenericCard(
   clock: PrincipalClock,
   change: string | undefined,
   identity: CardIdentity,
+  budget: number,
 ): string {
   const generic = facts.generic;
   if (!generic) throw new Error('A generic card needs the generic facts');
@@ -158,53 +334,62 @@ function renderGenericCard(
   const hasDueNow = hasPurchaseDueNow(facts);
   const assistant = (address: string): boolean => isAssistantAddress(address, identity);
   const booking = generic.booking;
-  const accountText = generic.guest
-    ? 'guest checkout'
-    : assistant(facts.account)
-      ? "your assistant's account"
-      : review?.missing.includes('the account the purchase signs in with')
-        ? facts.account
-        : quoted(facts.account, SELLER_TEXT_LIMIT);
-  const lines = [
-    review
-      ? "I'd like to place this purchase, but I couldn't read every detail automatically. Check the attached screenshot before approving."
-      : "I'd like to place this purchase using the facts I read from the checkout.",
-    ...(change ? [change] : []),
-    ...earlierLines(earlier, clock),
-    `Site: ${facts.site}`,
-    ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
-    ...(review ? [`Button I'll press: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`] : []),
-    `Account: ${accountText}`,
-    ...(generic.contactEmail
-      ? [
-          `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : quoted(generic.contactEmail, SELLER_TEXT_LIMIT)}`,
-        ]
-      : review?.contactEmails?.length
+  return fitCardProfiles(budget, (caps) => {
+    const accountText = generic.guest
+      ? 'guest checkout'
+      : assistant(facts.account)
+        ? "your assistant's account"
+        : review?.missing.includes('the account the purchase signs in with')
+          ? facts.account
+          : caps.quote(facts.account, caps.seller);
+    const shownItems = generic.items.slice(0, caps.maxItems);
+    const omittedItems = generic.items.length - shownItems.length;
+    const shownEmails = review?.contactEmails ? review.contactEmails.slice(0, caps.maxEmails) : [];
+    const omittedEmails = (review?.contactEmails?.length ?? 0) - shownEmails.length;
+    const lines = [
+      review
+        ? "I'd like to place this purchase, but I couldn't read every detail automatically. Check the attached screenshot before approving."
+        : "I'd like to place this purchase using the facts I read from the checkout.",
+      ...(change ? [change] : []),
+      ...earlierLines(earlier, clock, caps.maxRecorded),
+      `Site: ${facts.site}`,
+      ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
+      ...(review ? [`Button I'll press: ${caps.quote(facts.control.label, caps.seller)}`] : []),
+      `Account: ${accountText}`,
+      ...(generic.contactEmail
         ? [
-            `Contact emails shown: ${review.contactEmails
-              .map((address) => (assistant(address) ? "your assistant's email" : quoted(address, SELLER_TEXT_LIMIT)))
-              .join(', ')}`,
+            `Contact email: ${assistant(generic.contactEmail) ? "your assistant's email" : caps.quote(generic.contactEmail, caps.seller)}`,
           ]
+        : shownEmails.length
+          ? [
+              `Contact emails shown: ${shownEmails
+                .map((address) => (assistant(address) ? "your assistant's email" : caps.quote(address, caps.seller)))
+                .join(', ')}${omittedEmails > 0 ? ` (+${omittedEmails} more)` : ''}`,
+            ]
+          : []),
+      ...shownItems.map((item) => `Item: ${caps.quote(item, caps.seller)}`),
+      ...(omittedItems > 0
+        ? [`More items: ${omittedItems} additional ${omittedItems === 1 ? 'item' : 'items'} in this checkout.`]
         : []),
-    ...generic.items.map((item) => `Item: ${quoted(item, SELLER_TEXT_LIMIT)}`),
-    ...(hasTotal && money ? [`Total: ${money(facts.totalMinor)} (${facts.currency})`] : []),
-    ...(hasDueNow && money ? [`Due now: ${money(facts.dueNowMinor)}`] : []),
-    ...(generic.payment ? [`Payment: ${quoted(generic.payment, SELLER_TEXT_LIMIT)}`] : []),
-    ...(generic.note ? [`Note: ${quoted(generic.note, 700)}`] : []),
-    ...(booking?.venue ? [`Venue: ${quoted(booking.venue, SELLER_TEXT_LIMIT)}`] : []),
-    ...(booking?.partySize !== undefined ? [`Party size: ${booking.partySize}`] : []),
-    ...(booking?.at && booking.timeZone
-      ? [`Time: ${cardEventTime(booking.at, booking.timeZone, clock)}`]
-      : booking?.timeText
-        ? [`Time as the page shows it: ${quoted(booking.timeText, SELLER_TEXT_LIMIT)}`]
-        : []),
-    ...choiceLines(facts),
-    ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, clock),
-    ...(review ? [`Could not verify automatically: ${review.missing.join(', ')}.`] : []),
-  ];
-  if (!review && !facts.commitments.length)
-    lines.push('Due later: none shown. The checkout states no hold, deposit, fee, trial or subscription.');
-  return lines.join('\n');
+      ...(hasTotal && money ? [`Total: ${money(facts.totalMinor)} (${facts.currency})`] : []),
+      ...(hasDueNow && money ? [`Due now: ${money(facts.dueNowMinor)}`] : []),
+      ...(generic.payment ? [`Payment: ${caps.quote(generic.payment, caps.seller)}`] : []),
+      ...(generic.note ? [`Note: ${caps.quote(generic.note, caps.note)}`] : []),
+      ...(booking?.venue ? [`Venue: ${caps.quote(booking.venue, caps.seller)}`] : []),
+      ...(booking?.partySize !== undefined ? [`Party size: ${booking.partySize}`] : []),
+      ...(booking?.at && booking.timeZone
+        ? [`Time: ${cardEventTime(booking.at, booking.timeZone, clock)}`]
+        : booking?.timeText
+          ? [`Time as the page shows it: ${caps.quote(booking.timeText, caps.seller)}`]
+          : []),
+      ...choiceLines(facts, caps),
+      ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, clock, caps),
+      ...(review ? [`Could not verify automatically: ${review.missing.join(', ')}.`] : []),
+    ];
+    if (!review && !facts.commitments.length)
+      lines.push('Due later: none shown. The checkout states no hold, deposit, fee, trial or subscription.');
+    return lines.join('\n');
+  });
 }
 /** Deadlines, charge dates and conversions read on the principal's clock; events on the venue's. */
 export function renderPurchaseCard(
@@ -215,41 +400,52 @@ export function renderPurchaseCard(
   change?: string,
   identity: CardIdentity = {},
 ): string {
-  if (facts.generic) return renderGenericCard(facts, earlier, clock, change, identity);
+  const budget = browserCardBudget(purchaseCardTitle());
+  if (facts.generic) return renderGenericCard(facts, earlier, clock, change, identity, budget);
   const money = (amount: number): string => formatMoney(amount, facts.currency);
-  const lines = [
-    "I'd like to place this purchase using the facts I read from the merchant's review page.",
-    ...(change ? [change] : []),
-    ...earlierLines(earlier, clock),
-    `Site: ${quoted(facts.origin, SELLER_TEXT_LIMIT)}`,
-    `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
-    `Button I'll press: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
-    ...facts.items.map((item) => `Item: ${quoted(item.title, SELLER_TEXT_LIMIT)}; quantity ${item.quantity}`),
-    `Total: ${money(facts.totalMinor)} (${facts.currency})`,
-    `Due now: ${money(facts.dueNowMinor)}`,
-    ...(facts.reservation
-      ? [
-          `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}`,
-          `Party size: ${facts.reservation.partySize}`,
-          `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, clock)}`,
-        ]
-      : []),
-    facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
-    facts.address === null ? 'Address: not applicable' : `Address: ${quoted(facts.address, SELLER_TEXT_LIMIT)}`,
-    `Delivery: ${facts.delivery ? quoted(facts.delivery.text, SELLER_TEXT_LIMIT) : 'Not applicable'}`,
-    ...(bounds.deliveryWindow
-      ? [
-          `Approved delivery window: ${quoted(bounds.deliveryWindow.start, SELLER_TEXT_LIMIT)} through ${quoted(bounds.deliveryWindow.end, SELLER_TEXT_LIMIT)}`,
-        ]
-      : []),
-    ...(bounds.neededBy ? [`Needed by: ${formatLocalTimeWithZone(bounds.neededBy, clock(bounds.neededBy))}`] : []),
-    ...choiceLines(facts),
-    ...termLines(facts, facts.reservation?.partySize, money, clock),
-  ];
-  if (facts.noCommitmentTerms) lines.push(`No financial commitment: ${quoted(facts.noCommitmentTerms, 1200)}`);
-  if (facts.commitments.length && facts.commitments.every((term) => term.kind === 'retail'))
-    lines.push('Due later: none. One-time retail purchase; no hold, deposit, conditional fee, trial or subscription.');
-  return lines.join('\n');
+  return fitCardProfiles(budget, (caps) => {
+    const shownItems = facts.items.slice(0, caps.maxItems);
+    const omittedItems = facts.items.length - shownItems.length;
+    const lines = [
+      "I'd like to place this purchase using the facts I read from the merchant's review page.",
+      ...(change ? [change] : []),
+      ...earlierLines(earlier, clock, caps.maxRecorded),
+      `Site: ${caps.quote(facts.origin, caps.seller)}`,
+      `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : caps.quote(facts.account, caps.seller)}`,
+      `Button I'll press: ${caps.quote(facts.control.label, caps.seller)}`,
+      ...shownItems.map((item) => `Item: ${caps.quote(item.title, caps.seller)}; quantity ${item.quantity}`),
+      ...(omittedItems > 0
+        ? [`More items: ${omittedItems} additional ${omittedItems === 1 ? 'item' : 'items'} in this checkout.`]
+        : []),
+      `Total: ${money(facts.totalMinor)} (${facts.currency})`,
+      `Due now: ${money(facts.dueNowMinor)}`,
+      ...(facts.reservation
+        ? [
+            `Venue: ${caps.quote(facts.reservation.venueName, caps.seller)}`,
+            `Party size: ${facts.reservation.partySize}`,
+            `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, clock)}`,
+          ]
+        : []),
+      facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
+      facts.address === null ? 'Address: not applicable' : `Address: ${caps.quote(facts.address, caps.seller)}`,
+      `Delivery: ${facts.delivery ? caps.quote(facts.delivery.text, caps.seller) : 'Not applicable'}`,
+      ...(bounds.deliveryWindow
+        ? [
+            `Approved delivery window: ${caps.quote(bounds.deliveryWindow.start, caps.seller)} through ${caps.quote(bounds.deliveryWindow.end, caps.seller)}`,
+          ]
+        : []),
+      ...(bounds.neededBy ? [`Needed by: ${formatLocalTimeWithZone(bounds.neededBy, clock(bounds.neededBy))}`] : []),
+      ...choiceLines(facts, caps),
+      ...termLines(facts, facts.reservation?.partySize, money, clock, caps),
+    ];
+    if (facts.noCommitmentTerms)
+      lines.push(`No financial commitment: ${caps.quote(facts.noCommitmentTerms, caps.noCommitment)}`);
+    if (facts.commitments.length && facts.commitments.every((term) => term.kind === 'retail'))
+      lines.push(
+        'Due later: none. One-time retail purchase; no hold, deposit, conditional fee, trial or subscription.',
+      );
+    return lines.join('\n');
+  });
 }
 
 /** DB-only half. Includes cards whose approval id is still being returned by delivery. */

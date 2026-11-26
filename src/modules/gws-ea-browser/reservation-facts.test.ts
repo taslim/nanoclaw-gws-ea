@@ -387,3 +387,101 @@ it('renders screenshot-reviewed generic cards honestly, omitting unread amounts 
   expect(withoutTotal).not.toContain('Total:');
   expect(withoutTotal).not.toContain('Payment:');
 });
+
+it('keeps reviewed and generic purchase cards within the 2,000-character card limit even with max-length seller inputs', async () => {
+  const { cardQuestionTooLong } = await import('../../channels/ask-question.js');
+  const { ERRAND_ORIGIN_LINE, renderPurchaseCard } = await import('./cards.js');
+  const { purchaseCardTitle } = await import('./purchase-wording.js');
+  const title = purchaseCardTitle();
+  const longText = (label: string, n = 450) => `${label} ${'A\u202EB'.repeat(Math.ceil(n / 3))}`;
+
+  const reviewedHeavy: PurchaseFacts = {
+    ...free,
+    origin: `https://checkout.merchant.example/${'segment/'.repeat(50)}`,
+    account: longText('acct@merchant.example', 300),
+    control: { ...free.control, label: longText('Place order now', 300) },
+    items: Array.from({ length: 12 }, (_, idx) => ({
+      id: `item-${idx}`,
+      title: longText(`Item ${idx + 1}`, 360),
+      quantity: idx + 1,
+    })),
+    totalMinor: 125000,
+    dueNowMinor: 25000,
+    cardEnding: '4242',
+    address: longText('123 Long Delivery Road', 360),
+    delivery: { date: '2026-10-22', text: longText('Express courier', 360) },
+    addOns: Array.from({ length: 6 }, (_, idx) => longText(`Protection plan ${idx + 1}`, 300)),
+    agreements: Array.from({ length: 4 }, (_, idx) => ({
+      origin: 'https://checkout.merchant.example',
+      wording: longText(`Agreement clause ${idx + 1}`, 2000),
+    })),
+    commitments: Array.from({ length: 5 }, (_, idx) => ({
+      kind: 'conditional_fee',
+      terms: longText(`Commitment terms ${idx + 1}`, 700),
+      amountMinor: 5000,
+      perPerson: true,
+      trigger: longText('No-show or late cancellation', 300),
+      cancellationDeadline: '2026-10-19T10:00:00.000Z',
+      cancellationTerms: longText('Cancel 48 hours prior', 700),
+      frequency: longText('One-time penalty', 200),
+    })),
+    noCommitmentTerms: longText('No extra commitment details', 1200),
+  };
+
+  const reviewedCard = renderPurchaseCard(
+    reviewedHeavy,
+    {
+      deliveryWindow: { start: '2026-10-21', end: '2026-10-25' },
+      neededBy: '2026-10-25T18:00:00.000Z',
+    },
+    {
+      unresolved: 2,
+      recordedNotPlaced: Array.from({ length: 5 }, (_, idx) => ({
+        attemptedAt: `2026-10-1${idx}T12:00:00.000Z`,
+        source: 'email' as const,
+      })),
+    },
+    () => 'America/Los_Angeles',
+    'The checkout total changed since the previous card.',
+  );
+
+  expect(cardQuestionTooLong(title, `${reviewedCard}\n\n${ERRAND_ORIGIN_LINE}`)).toBeUndefined();
+  expect(reviewedCard).toContain('Possible duplicate: 2 earlier purchases on this site have no recorded outcome.');
+  expect(reviewedCard).toContain('Total: $1,250.00 (USD)');
+  expect(reviewedCard).toContain('Due now: $250.00');
+  expect(reviewedCard).toContain('Card ending: 4242');
+  expect(reviewedCard).toContain('More items:');
+
+  const genericHeavy: PurchaseFacts = {
+    ...reviewedHeavy,
+    generic: {
+      platform: 'stripe.com',
+      guest: false,
+      items: Array.from({ length: 12 }, (_, idx) => longText(`Generic item ${idx + 1}`, 360)),
+      payment: longText('Visa ending 4242', 300),
+      note: longText('Special dietary instructions', 700),
+      booking: {
+        venue: longText('Grand Dining Hall', 300),
+        partySize: 6,
+        timeText: longText('Friday evening seating', 300),
+      },
+      review: {
+        missing: ['the tax breakdown', 'the cancellation cutoff'],
+        snapshot: ['Total $1,250.00'],
+        contactEmails: Array.from({ length: 6 }, (_, idx) => `guest${idx}@example.test`),
+      },
+    },
+  };
+
+  const genericCard = renderPurchaseCard(
+    genericHeavy,
+    {},
+    { unresolved: 1, recordedNotPlaced: [] },
+    () => 'America/Los_Angeles',
+  );
+  expect(cardQuestionTooLong(title, `${genericCard}\n\n${ERRAND_ORIGIN_LINE}`)).toBeUndefined();
+  expect(genericCard).toContain(`Site: ${genericHeavy.site}`);
+  expect(genericCard).toContain('Total: $1,250.00 (USD)');
+  expect(genericCard).toContain('Due now: $250.00');
+  expect(genericCard).toContain('Could not verify automatically: the tax breakdown, the cancellation cutoff.');
+});

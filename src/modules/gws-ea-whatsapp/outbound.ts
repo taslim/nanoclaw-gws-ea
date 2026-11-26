@@ -6,8 +6,10 @@ import { ChannelNotConnectedError, type OutboundMessage } from '../../channels/a
 import { escapeInvisibles } from '../../card-text.js';
 import { approveRejectRequest, normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { indexPostedRequest } from '../../channels/answers.js';
+import { cardProblems, isCardPart, type CardPart } from '../../channels/card-parts.js';
 import { OutboundRefusedError } from '../../delivery.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { log } from '../../log.js';
 import { whatsappStatusCode, type WhatsAppContacts, type WhatsAppOutreachRequest } from './contacts.js';
 import type { WhatsAppPerson } from './paths.js';
 import type { SqliteStateAdapter } from '../../state-sqlite.js';
@@ -40,6 +42,117 @@ function visibleText(text: string): string {
     .split(/([\t\r\n`])/u)
     .map((part) => (/^[\t\r\n`]$/u.test(part) ? part : escapeInvisibles(part)))
     .join('');
+}
+
+function renderCardPart(part: CardPart): string {
+  const props = isRecord(part.props) ? part.props : {};
+  switch (part.type) {
+    case 'Text': {
+      const content = typeof props.content === 'string' ? props.content : '';
+      if (!content) return '';
+      if (props.style === 'bold') return `**${content}**`;
+      if (props.style === 'muted') return `*${content}*`;
+      return content;
+    }
+    case 'Fields': {
+      const fields = Array.isArray(part.children) ? part.children : [];
+      const lines: string[] = [];
+      for (const field of fields) {
+        if (!isRecord(field) || field.type !== 'Field') continue;
+        const fieldProps = isRecord(field.props) ? field.props : {};
+        const label = typeof fieldProps.label === 'string' ? fieldProps.label : '';
+        const value =
+          typeof fieldProps.value === 'string'
+            ? fieldProps.value
+            : Number.isFinite(fieldProps.value)
+              ? String(fieldProps.value)
+              : '';
+        if (label && value) lines.push(`**${label}:** ${value}`);
+      }
+      return lines.join('\n');
+    }
+    case 'Table': {
+      const headers = Array.isArray(props.headers) ? props.headers.map(String) : [];
+      const rows = Array.isArray(props.rows)
+        ? props.rows.filter(Array.isArray).map((row) => row.map(String).join(' | '))
+        : [];
+      const caption = typeof props.caption === 'string' && props.caption.trim() ? `*${props.caption.trim()}*` : '';
+      const headerLine = headers.length > 0 ? `**${headers.join(' | ')}**` : '';
+      return [caption, headerLine, ...rows].filter(Boolean).join('\n');
+    }
+    case 'Chart': {
+      const title = typeof props.title === 'string' ? `**${props.title}**` : '';
+      const chart = isRecord(props.chart) ? props.chart : {};
+      const lines: string[] = title ? [title] : [];
+      if (chart.type === 'pie' && Array.isArray(chart.segments)) {
+        for (const segment of chart.segments) {
+          if (!isRecord(segment)) continue;
+          lines.push(`- ${String(segment.label)}: ${String(segment.value)}`);
+        }
+      } else if (
+        (chart.type === 'bar' || chart.type === 'line' || chart.type === 'area') &&
+        Array.isArray(chart.categories) &&
+        Array.isArray(chart.series)
+      ) {
+        const categories = chart.categories.map(String);
+        const axes = [
+          typeof chart.xLabel === 'string' ? chart.xLabel : '',
+          typeof chart.yLabel === 'string' ? chart.yLabel : '',
+        ].filter(Boolean);
+        if (axes.length > 0) lines.push(`*${axes.join(' / ')}*`);
+        for (const entry of chart.series) {
+          if (!isRecord(entry) || !Array.isArray(entry.values)) continue;
+          const values: unknown[] = entry.values;
+          const points = categories.map((cat, index) => `${cat}: ${String(values[index])}`).join(', ');
+          lines.push(`- ${String(entry.name)}: ${points}`);
+        }
+      }
+      return lines.join('\n');
+    }
+    case 'Divider':
+      return '';
+    default:
+      return '';
+  }
+}
+
+function renderCardContent(content: Record<string, unknown>): string | null {
+  if (!isRecord(content.card)) {
+    throw new OutboundRefusedError('gws-ea-whatsapp:invalid-card', 'WhatsApp card refused: card must be an object');
+  }
+  const card = content.card;
+  const problems = cardProblems(card);
+  if (problems.length > 0) {
+    throw new OutboundRefusedError('gws-ea-whatsapp:invalid-card', `WhatsApp card refused: ${problems.join('; ')}`);
+  }
+  const blocks: string[] = [];
+  if (typeof card.title === 'string' && card.title.trim()) blocks.push(`**${card.title.trim()}**`);
+  if (typeof card.description === 'string' && card.description.trim()) blocks.push(card.description);
+  if (Array.isArray(card.children)) {
+    for (const child of card.children) {
+      if (isCardPart(child)) {
+        const rendered = renderCardPart(child);
+        if (rendered) blocks.push(rendered);
+      } else if (typeof child === 'string' && child) {
+        blocks.push(child);
+      } else if (isRecord(child) && typeof child.text === 'string' && child.text) {
+        blocks.push(child.text);
+      }
+    }
+  }
+  if (Array.isArray(card.actions)) {
+    const links: string[] = [];
+    for (const action of card.actions) {
+      if (!isRecord(action)) continue;
+      if (typeof action.url === 'string' && action.url && typeof action.label === 'string' && action.label) {
+        links.push(`[${action.label}](${action.url})`);
+      }
+    }
+    if (links.length > 0) blocks.push(links.join('\n'));
+  }
+  if (blocks.length > 0) return blocks.join('\n\n');
+  if (typeof content.fallbackText === 'string' && content.fallbackText.trim()) return content.fallbackText.trim();
+  return null;
 }
 
 function words(content: Record<string, unknown>): string {
@@ -114,7 +227,24 @@ export function createWhatsAppOutbound(options: WhatsAppOutboundOptions) {
     const isHostRequest =
       (content.type === 'ask_question' && content.fromAgent !== true) ||
       (content.operation === 'edit' && typeof content.questionId === 'string');
-    const rawText = words(content);
+    let rawText: string;
+    if (content.type === 'card') {
+      let renderedCard: string | null;
+      try {
+        renderedCard = renderCardContent(content);
+      } catch (error) {
+        if (error instanceof OutboundRefusedError) options.index.complete(key);
+        throw error;
+      }
+      if (renderedCard === null) {
+        log.warn('send_card payload empty, skipping delivery');
+        options.index.complete(key);
+        return '';
+      }
+      rawText = renderedCard;
+    } else {
+      rawText = words(content);
+    }
     const text = isHostRequest ? visibleText(rawText) : rawText;
     const formatted = formatWhatsApp(text, { mentions: !isHostRequest });
     const parts: AnyMessageContent[] = [];

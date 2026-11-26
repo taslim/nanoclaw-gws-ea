@@ -201,6 +201,26 @@ it('uses one stable Google create request ID for a repeated durable text row', a
   expect(ids[2]).not.toBe(ids[0]);
 });
 
+it('uses one stable Google create request ID when posting messages with files', async () => {
+  await start();
+  const file = { filename: 'report.pdf', mimeType: 'application/pdf', data: Buffer.from('%PDF-1.7') };
+  const message = { kind: 'chat', content: { text: 'Attached report' }, files: [file] };
+  await channel!.deliver(`gchat:${DM}`, null, { ...message, deliveryId: 'file-row' });
+  await channel!.deliver(`gchat:${DM}`, null, { ...message, deliveryId: 'file-row' });
+  await channel!.deliver(`gchat:${DM}`, null, { ...message, deliveryId: 'other-file-row' });
+  await channel!.deliver(`gchat:${DM}`, null, { kind: 'chat', content: {}, files: [file], deliveryId: 'files-only' });
+
+  const calls = api.calls(`${DM}/messages`);
+  const ids = calls.map(({ url }) => url.searchParams.get('requestId'));
+  expect(ids).toHaveLength(4);
+  expect(ids[0]).toMatch(/^[0-9a-f]{64}$/u);
+  expect(ids[1]).toBe(ids[0]);
+  expect(ids[2]).not.toBe(ids[0]);
+  expect(ids[3]).toMatch(/^[0-9a-f]{64}$/u);
+  expect(ids[3]).not.toBe(ids[2]);
+  expect(api.posted().every((posted) => posted.attachment?.length === 1)).toBe(true);
+});
+
 function messageEvent(name: string): WorkspaceEvent {
   return {
     messageId: `pubsub-${name}`,
@@ -1553,6 +1573,7 @@ describe('a picture on an approval request', () => {
     expect(card!.attachment).toEqual([
       expect.objectContaining({ contentName: 'checkout.png', contentType: 'image/png', source: 'UPLOADED_CONTENT' }),
     ]);
+    expect(api.calls(`${DM}/messages`)[0]?.url.searchParams.get('requestId')).toMatch(/^[0-9a-f]{64}$/u);
     expect((await getPendingApproval(id!))?.platform_message_id).toBe(card!.name);
 
     reacted(`${card!.name}/reactions/r1`);

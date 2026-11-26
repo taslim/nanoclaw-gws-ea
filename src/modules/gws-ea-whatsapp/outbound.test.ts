@@ -466,3 +466,138 @@ describe('WhatsApp questions use native text answers', () => {
     });
   });
 });
+
+describe('WhatsApp send_card rendering', () => {
+  it('renders title, description, card parts, and URL actions as formatted WhatsApp text while dropping non-URL actions', async () => {
+    const adapter = await h.start();
+    const id = await adapter.deliver('team@g.us', null, {
+      kind: 'chat-sdk',
+      deliveryId: 'wa-card-full',
+      content: {
+        type: 'card',
+        card: {
+          title: 'Weekly Summary',
+          description: 'Key metrics for this week.',
+          children: [
+            { type: 'Text', props: { content: 'Highlights', style: 'bold' } },
+            { type: 'Text', props: { content: 'All systems healthy.', style: 'muted' } },
+            { type: 'Divider' },
+            {
+              type: 'Fields',
+              children: [
+                { type: 'Field', props: { label: 'Owner', value: 'Morgan' } },
+                { type: 'Field', props: { label: 'Tasks', value: 7 } },
+              ],
+            },
+            {
+              type: 'Table',
+              props: {
+                caption: 'Open items',
+                headers: ['Item', 'Count'],
+                rows: [
+                  ['Reviews', 3],
+                  ['Follow-ups', 4],
+                ],
+              },
+            },
+            {
+              type: 'Chart',
+              props: {
+                title: 'Time Split',
+                chart: {
+                  type: 'pie',
+                  segments: [
+                    { label: 'Deep work', value: 60 },
+                    { label: 'Meetings', value: 40 },
+                  ],
+                },
+              },
+            },
+            {
+              type: 'Chart',
+              props: {
+                title: 'Daily Volume',
+                chart: {
+                  type: 'bar',
+                  categories: ['Mon', 'Tue'],
+                  series: [{ name: 'Emails', values: [12, 9] }],
+                  xLabel: 'Day',
+                  yLabel: 'Count',
+                },
+              },
+            },
+          ],
+          actions: [
+            { label: 'Open dashboard', url: 'https://example.test/dash' },
+            { label: 'Ignored callback', actionId: 'approve' },
+          ],
+        },
+      },
+    });
+    expect(id).toMatch(/^3EB0[0-9A-F]{28}$/u);
+    expect(h.socket().sends).toHaveLength(1);
+    const text = String((h.socket().sends[0].content as { text: string }).text);
+    expect(text).toContain('*Weekly Summary*');
+    expect(text).toContain('Key metrics for this week.');
+    expect(text).toContain('*Highlights*');
+    expect(text).toContain('_All systems healthy._');
+    expect(text).toContain('*Owner:* Morgan');
+    expect(text).toContain('*Tasks:* 7');
+    expect(text).toContain('_Open items_');
+    expect(text).toContain('*Item | Count*');
+    expect(text).toContain('Reviews | 3');
+    expect(text).toContain('*Time Split*');
+    expect(text).toContain('- Deep work: 60');
+    expect(text).toContain('*Daily Volume*');
+    expect(text).toContain('- Emails: Mon: 12, Tue: 9');
+    expect(text).toContain('Open dashboard (https://example.test/dash)');
+    expect(text).not.toContain('Ignored callback');
+  });
+
+  it('refuses invalid cards through OutboundRefusedError without sending or leaving a pending row', async () => {
+    const adapter = await h.start();
+    await expect(
+      adapter.deliver('team@g.us', null, {
+        kind: 'chat-sdk',
+        deliveryId: 'wa-card-invalid',
+        content: {
+          type: 'card',
+          card: {
+            title: 'Bad card',
+            children: [{ type: 'Button', props: { label: 'Click' } }],
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: 'OutboundRefusedError',
+      guardId: 'gws-ea-whatsapp:invalid-card',
+      reason: expect.stringContaining('unknown part "Button"'),
+    });
+    expect(h.socket().sends).toEqual([]);
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    expect(disk.pending('wa-card-invalid')).toBeUndefined();
+    disk.close();
+  });
+
+  it('falls back to fallbackText for an empty card and skips completely empty cards cleanly', async () => {
+    const adapter = await h.start();
+    await adapter.deliver('team@g.us', null, {
+      kind: 'chat-sdk',
+      deliveryId: 'wa-card-fallback',
+      content: { type: 'card', card: {}, fallbackText: 'Fallback notice' },
+    });
+    expect(h.socket().sends).toHaveLength(1);
+    expect(h.socket().sends[0].content).toMatchObject({ text: 'Fallback notice' });
+
+    const skippedId = await adapter.deliver('team@g.us', null, {
+      kind: 'chat-sdk',
+      deliveryId: 'wa-card-empty',
+      content: { type: 'card', card: {} },
+    });
+    expect(skippedId).toBe('');
+    expect(h.socket().sends).toHaveLength(1);
+    const disk = new WhatsAppIndex(h.directory, () => '15550000000@s.whatsapp.net');
+    expect(disk.pending('wa-card-empty')).toBeUndefined();
+    disk.close();
+  });
+});
