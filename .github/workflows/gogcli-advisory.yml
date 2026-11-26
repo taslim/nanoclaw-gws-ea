@@ -42,10 +42,19 @@ jobs:
             echo "gogcli pin verified with 0 advisories."
             exit 0
           fi
+          if [ ! -s "$report" ] || ! jq -e '(.pin.version | type == "string" and length > 0) and (.digestErrors | type == "array") and (.advisories | type == "array")' "$report" > /dev/null; then
+            echo "::error::gogcli-check failed without producing a valid JSON report" >&2
+            exit 1
+          fi
           version=$(jq -r '.pin.version' "$report")
           digest_count=$(jq '.digestErrors | length' "$report")
           if [ "$digest_count" -gt 0 ]; then
             jq -r '.digestErrors[]' "$report" >&2
+            exit 1
+          fi
+          advisory_count=$(jq '.advisories | length' "$report")
+          if [ "$advisory_count" -eq 0 ]; then
+            echo "::error::gogcli-check exited non-zero without digest errors or advisories" >&2
             exit 1
           fi
           jq -c '.advisories[]' "$report" | while read -r hit; do

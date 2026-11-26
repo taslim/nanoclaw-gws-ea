@@ -32,6 +32,7 @@ export interface GitHubRelease {
 
 export interface GitHubAdvisoryVulnerability {
   readonly vulnerable_version_range?: string | null;
+  readonly patched_versions?: string | null;
   readonly first_patched_version?: string | null;
 }
 
@@ -54,6 +55,13 @@ export interface OsvVulnerability {
 
 export interface OsvQueryResponse {
   readonly vulns?: readonly OsvVulnerability[];
+  readonly next_page_token?: string;
+}
+
+export interface OsvQueryPayload {
+  readonly version: string;
+  readonly package: { readonly name: string; readonly ecosystem: 'Go' };
+  readonly page_token?: string;
 }
 
 export interface AdvisoryHit {
@@ -160,6 +168,7 @@ export function findMatchingGitHubAdvisories(version: string, advisories: readon
       const range = vuln.vulnerable_version_range?.trim();
       if (!range) continue;
       if (versionMatchesRange(version, range)) {
+        const patched = vuln.patched_versions || vuln.first_patched_version || undefined;
         hits.push({
           source: 'github',
           id: advisory.cve_id || advisory.ghsa_id,
@@ -167,7 +176,7 @@ export function findMatchingGitHubAdvisories(version: string, advisories: readon
           summary: advisory.summary,
           url: advisory.html_url ?? `https://github.com/${GOGCLI_REPO}/security/advisories/${advisory.ghsa_id}`,
           range,
-          ...(vuln.first_patched_version ? { patched: vuln.first_patched_version } : {}),
+          ...(patched ? { patched } : {}),
         });
         break;
       }
@@ -221,6 +230,52 @@ export interface CheckReport {
   readonly warnings: readonly string[];
 }
 
+const MAX_OSV_PAGES = 50;
+
+export async function queryOsvModule(
+  moduleName: string,
+  version: string,
+  fetchPage: (payload: OsvQueryPayload) => Promise<OsvQueryResponse>,
+): Promise<OsvQueryResponse[]> {
+  const pages: OsvQueryResponse[] = [];
+  let pageToken: string | undefined;
+  for (let page = 0; page < MAX_OSV_PAGES; page++) {
+    const response = await fetchPage({
+      version,
+      package: { name: moduleName, ecosystem: 'Go' },
+      ...(pageToken ? { page_token: pageToken } : {}),
+    });
+    pages.push(response);
+    if (!response.next_page_token) return pages;
+    pageToken = response.next_page_token;
+  }
+  throw new Error(`OSV query for ${moduleName}@${version} exceeded ${MAX_OSV_PAGES} pages`);
+}
+
+export async function queryOsvAdvisories(
+  version: string,
+  modules: readonly string[],
+  strictOsv: boolean,
+  fetchPage: (payload: OsvQueryPayload) => Promise<OsvQueryResponse>,
+): Promise<{ readonly advisories: AdvisoryHit[]; readonly warnings: string[] }> {
+  const results = await Promise.allSettled(modules.map((moduleName) => queryOsvModule(moduleName, version, fetchPage)));
+  const pages: OsvQueryResponse[] = [];
+  const errors: string[] = [];
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      pages.push(...result.value);
+    } else {
+      const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      errors.push(`${modules[index]}: ${message}`);
+    }
+  });
+  if (errors.length > 0 && strictOsv) {
+    throw new Error(`OSV query failed for gogcli ${version}: ${errors.join('; ')}`);
+  }
+  const warnings = errors.map((detail) => `Could not reach OSV API for gogcli ${version} (${detail})`);
+  return { advisories: findMatchingOsvAdvisories(pages), warnings };
+}
+
 export async function checkGogcliPin(dockerfilePath: string, strictOsv = false): Promise<CheckReport> {
   const pin = parseDockerfileGogcliPin(readFileSync(dockerfilePath, 'utf8'));
   const headers = githubHeaders();
@@ -233,29 +288,20 @@ export async function checkGogcliPin(dockerfilePath: string, strictOsv = false):
   ]);
   const digestErrors = verifyReleaseDigests(pin, release);
   const advisories = [...findMatchingGitHubAdvisories(pin.version, ghAdvisories)];
-  const warnings: string[] = [];
 
-  try {
-    const osvResponses = await Promise.all(
-      GOGCLI_GO_MODULES.map((moduleName) =>
-        fetchJson<OsvQueryResponse>('https://api.osv.dev/v1/query', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'User-Agent': 'nanoclaw-gws-ea-gogcli-check' },
-          body: JSON.stringify({ version: pin.version, package: { name: moduleName, ecosystem: 'Go' } }),
-        }),
-      ),
-    );
-    const knownIds = new Set(advisories.map((hit) => hit.id));
-    for (const hit of findMatchingOsvAdvisories(osvResponses)) {
-      if (!knownIds.has(hit.id)) advisories.push(hit);
-    }
-  } catch (error) {
-    if (strictOsv) throw error;
-    const message = error instanceof Error ? error.message : String(error);
-    warnings.push(`Could not reach OSV API for gogcli ${pin.version}: ${message}`);
+  const osv = await queryOsvAdvisories(pin.version, GOGCLI_GO_MODULES, strictOsv, (payload) =>
+    fetchJson<OsvQueryResponse>('https://api.osv.dev/v1/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'nanoclaw-gws-ea-gogcli-check' },
+      body: JSON.stringify(payload),
+    }),
+  );
+  const knownIds = new Set(advisories.map((hit) => hit.id));
+  for (const hit of osv.advisories) {
+    if (!knownIds.has(hit.id)) advisories.push(hit);
   }
 
-  return { pin, digestErrors, advisories, warnings };
+  return { pin, digestErrors, advisories, warnings: osv.warnings };
 }
 
 async function main(): Promise<void> {

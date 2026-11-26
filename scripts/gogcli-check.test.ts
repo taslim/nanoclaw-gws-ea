@@ -5,6 +5,7 @@ import {
   findMatchingGitHubAdvisories,
   findMatchingOsvAdvisories,
   parseDockerfileGogcliPin,
+  queryOsvAdvisories,
   verifyReleaseDigests,
   versionMatchesRange,
   type GitHubRelease,
@@ -89,7 +90,7 @@ describe('semver and advisory matching', () => {
         ghsa_id: 'GHSA-old-1',
         state: 'published',
         summary: 'Already patched',
-        vulnerabilities: [{ vulnerable_version_range: '< 0.43.0', first_patched_version: '0.43.0' }],
+        vulnerabilities: [{ vulnerable_version_range: '< 0.43.0', patched_versions: '0.43.0' }],
       },
       {
         ghsa_id: 'GHSA-hit-1',
@@ -98,7 +99,7 @@ describe('semver and advisory matching', () => {
         state: 'published',
         summary: 'Token leak in redirect',
         html_url: 'https://github.com/openclaw/gogcli/security/advisories/GHSA-hit-1',
-        vulnerabilities: [{ vulnerable_version_range: '>= 0.40.0, < 0.44.0', first_patched_version: '0.44.0' }],
+        vulnerabilities: [{ vulnerable_version_range: '>= 0.40.0, < 0.44.0', patched_versions: '0.44.0' }],
       },
     ]);
     expect(hits).toEqual([
@@ -134,5 +135,41 @@ describe('semver and advisory matching', () => {
         url: 'https://osv.dev/vulnerability/GO-2026-0002',
       },
     ]);
+  });
+
+  it('follows OSV next_page_token even across pages without vulns and retains fulfilled hits on partial failure', async () => {
+    const seenTokens: Array<string | undefined> = [];
+    const partial = await queryOsvAdvisories(
+      '0.43.0',
+      ['github.com/openclaw/gogcli', 'github.com/steipete/gogcli'],
+      false,
+      async (payload) => {
+        if (payload.package.name === 'github.com/steipete/gogcli') {
+          throw new Error('HTTP 503 from https://api.osv.dev/v1/query');
+        }
+        seenTokens.push(payload.page_token);
+        if (!payload.page_token) return { next_page_token: 'page-2' };
+        return { vulns: [{ id: 'GO-2026-0099', summary: 'Late page finding' }] };
+      },
+    );
+    expect(seenTokens).toEqual([undefined, 'page-2']);
+    expect(partial.advisories).toEqual([
+      {
+        source: 'osv',
+        id: 'GO-2026-0099',
+        severity: 'unknown',
+        summary: 'Late page finding',
+        url: 'https://osv.dev/vulnerability/GO-2026-0099',
+      },
+    ]);
+    expect(partial.warnings).toHaveLength(1);
+    expect(partial.warnings[0]).toContain('github.com/steipete/gogcli');
+
+    await expect(
+      queryOsvAdvisories('0.43.0', ['github.com/openclaw/gogcli', 'github.com/steipete/gogcli'], true, async (p) => {
+        if (p.package.name === 'github.com/steipete/gogcli') throw new Error('HTTP 503');
+        return {};
+      }),
+    ).rejects.toThrow(/OSV query failed for gogcli 0.43.0/);
   });
 });

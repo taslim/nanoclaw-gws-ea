@@ -14,6 +14,7 @@ import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.
 import { observeLiveCheckout } from './checkout.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
+import { readKeptRelease } from './kept-release.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
 import { observeOnecliRuntime, reconcileOnecliRuntime } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
@@ -46,6 +47,7 @@ import { applyReleaseFiles } from './release-stage.js';
 import {
   loadInstanceRuntimeConfig,
   reloadInstanceService,
+  restoreInstanceServiceDefinition,
   stampUpgradeState,
   updateInstanceRuntimeNodePath,
   type HostStatusHelpers,
@@ -672,9 +674,10 @@ export async function startRelease(host: CutoverHost, definitionChanged: boolean
 
 /**
  * Serve `move.from` again after an operation stopped short of `move.to` serving. While the live link still names
- * `move.from`, nothing of its own was touched, so only its host is started. Otherwise the assistant is fenced again,
- * `beforeSwitch` runs (a rollback puts its state back), and the switch puts `move.from`'s kept files back over what
- * the operation applied.
+ * `move.from`, nothing of its own was touched except any recorded Node.js path change written before `pointCurrent`,
+ * so `move.node_path.from` (in `runtime.json` and `move.from`'s kept service definition) is restored when present and
+ * its host is started. Otherwise the assistant is fenced again, `beforeSwitch` runs (a rollback puts its state back),
+ * and the switch puts `move.from`'s kept files back over what the operation applied.
  */
 export async function serveLeftRelease(
   host: CutoverHost,
@@ -686,8 +689,16 @@ export async function serveLeftRelease(
   beforeSwitch?: () => Promise<void>,
 ): Promise<void> {
   if ((await readCurrent(host.layout)) === releaseName(move.from.deployed_commit)) {
+    let definitionChanged = false;
+    if (move.node_path) {
+      const restored = await updateInstanceRuntimeNodePath(host.runtime, move.node_path.from);
+      const service = cutoverServiceDependencies({ ...host, runtime: restored });
+      const kept = await readKeptRelease(host.layout.kept(releaseName(move.from.deployed_commit)));
+      definitionChanged = await restoreInstanceServiceDefinition(restored, kept.serviceDefinition, service);
+      if (!definitionChanged) await reloadInstanceService(restored, service);
+    }
     await runStep(host.reporter, { id: 'start_release', label: 'Starting the assistant again…' }, async () => {
-      await host.service.start();
+      await host.service.start(definitionChanged ? { definitionChanged } : undefined);
     });
     return;
   }
