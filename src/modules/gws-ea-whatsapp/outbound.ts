@@ -118,12 +118,12 @@ function renderCardPart(part: CardPart): string {
 
 function renderCardContent(content: Record<string, unknown>): string | null {
   if (!isRecord(content.card)) {
-    throw new OutboundRefusedError('gws-ea-whatsapp:invalid-card', 'send_card card refused: card must be an object');
+    throw new OutboundRefusedError('gws-ea-whatsapp:invalid-card', 'WhatsApp card refused: card must be an object');
   }
   const card = content.card;
   const problems = cardProblems(card);
   if (problems.length > 0) {
-    throw new OutboundRefusedError('gws-ea-whatsapp:invalid-card', `send_card card refused: ${problems.join('; ')}`);
+    throw new OutboundRefusedError('gws-ea-whatsapp:invalid-card', `WhatsApp card refused: ${problems.join('; ')}`);
   }
   const blocks: string[] = [];
   if (typeof card.title === 'string' && card.title.trim()) blocks.push(`**${card.title.trim()}**`);
