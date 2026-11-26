@@ -155,20 +155,34 @@ beforeEach(async () => {
         const agent = body as { name: string; identifier: string };
         // Only the new job agent's creation fails; browser's own identity is reconciled on the same path.
         if (gatewayFails && (await host.jobs.getJobAgent(agent.identifier))) throw new Error('Gateway unavailable');
-        agents.set(agent.identifier, { ...agent, id: `oc-${agents.size + 1}`, secretMode: 'all', secrets: [] });
+        agents.set(agent.identifier, { ...agent, id: `oc-${agents.size + 1}`, secretMode: 'selective', secrets: [] });
         return Response.json({}, { status: 201 });
       }
       if (url.pathname === '/v1/agents') {
         if (retirementFails) throw new Error('Retirement interrupted at the gateway');
         return Response.json([...agents.values()]);
       }
-      const match = /^\/v1\/agents\/([^/]+)\/(secret-mode|secrets)$/u.exec(url.pathname);
-      const agent = [...agents.values()].find((entry) => entry.id === match?.[1]);
-      if (!agent) throw new Error(`Unexpected gateway request ${url.pathname}`);
-      if (match?.[2] === 'secret-mode') agent.secretMode = (body as { mode: string }).mode;
-      else if (init?.method === 'PUT') agent.secrets = (body as { secretIds: string[] }).secretIds;
-      else return Response.json(agent.secrets);
-      return Response.json({ success: true });
+      const grantsMatch = /^\/v1\/agents\/([^/]+)\/grants$/u.exec(url.pathname);
+      if (grantsMatch && (init?.method ?? 'GET') === 'GET') {
+        const agent = [...agents.values()].find((entry) => entry.id === decodeURIComponent(grantsMatch[1]!));
+        if (!agent) throw new Error(`Unexpected gateway request ${url.pathname}`);
+        return Response.json({ secrets: agent.secrets.map((secretId) => ({ secretId })) });
+      }
+      const secretGrantMatch = /^\/v1\/agents\/([^/]+)\/grants\/secrets\/([^/]+)$/u.exec(url.pathname);
+      if (secretGrantMatch) {
+        const agent = [...agents.values()].find((entry) => entry.id === decodeURIComponent(secretGrantMatch[1]!));
+        const secretId = decodeURIComponent(secretGrantMatch[2]!);
+        if (!agent) throw new Error(`Unexpected gateway request ${url.pathname}`);
+        if (init?.method === 'PUT') {
+          if (!agent.secrets.includes(secretId)) agent.secrets.push(secretId);
+          return Response.json({ success: true });
+        }
+        if (init?.method === 'DELETE') {
+          agent.secrets = agent.secrets.filter((id) => id !== secretId);
+          return Response.json({ success: true });
+        }
+      }
+      throw new Error(`Unexpected gateway request ${url.pathname}`);
     }),
   );
   await host.migrations.runMigrations(await host.db.initDb(`${ROOT}/central.db`, { role: 'test' }));

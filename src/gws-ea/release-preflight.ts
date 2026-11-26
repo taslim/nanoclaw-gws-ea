@@ -6,7 +6,7 @@ import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { GwsEaError } from './types.js';
 import { isRecord, parseJson, requireRecord } from './validation.js';
 import { sameCredentialMetadata, type ProviderCredentialMetadata } from '../provider-credential.js';
-import { exactVersion, parsePins, PIN_NAMES } from './pins.js';
+import { exactVersion, isSupportedOnecliGatewayUpgrade, parsePins, PIN_NAMES } from './pins.js';
 
 const INCOMPLETE = 'incomplete_release';
 const RELEASE_PINS_FILE = 'src/gws-ea/versions.json';
@@ -155,23 +155,25 @@ export interface ReleaseSetup {
 }
 
 /**
- * An update keeps the assistant's OneCLI and Postgres versions and its
- * provider setup: it neither migrates the OneCLI vault nor runs provider setup
- * again.
+ * An update keeps the assistant's Postgres version and provider setup, and
+ * moves its OneCLI gateway only along a verified upgrade path (never downgrades
+ * or unverified major jumps, and never changes OneCLI SDK unexpectedly).
  */
 export function assertUpdateKeepsSetup(deployed: DeployedSetup, release: ReleaseSetup): void {
   const retry = 'so run the update from a GWS-EA release that';
-  for (const [key, name] of [
-    ['gateway', PIN_NAMES.onecliGateway],
-    ['sdk', 'OneCLI SDK'],
-  ] as const) {
-    if (release.onecli[key] !== deployed.onecli[key]) {
-      throw new GwsEaError(
-        'onecli_version_changed',
-        `This release pins ${name} ${release.onecli[key]}, but the assistant runs ${deployed.onecli[key]}; an update cannot change OneCLI versions, ${retry} pins ${name} ${deployed.onecli[key]}`,
-        { details: { pin: name, release: release.onecli[key], deployed: deployed.onecli[key] } },
-      );
-    }
+  if (!isSupportedOnecliGatewayUpgrade(deployed.onecli.gateway, release.onecli.gateway)) {
+    throw new GwsEaError(
+      'onecli_version_changed',
+      `This release pins ${PIN_NAMES.onecliGateway} ${release.onecli.gateway}, but the assistant runs ${deployed.onecli.gateway}; an update cannot move OneCLI gateway from ${deployed.onecli.gateway} to ${release.onecli.gateway}, ${retry} pins ${PIN_NAMES.onecliGateway} ${deployed.onecli.gateway}`,
+      { details: { pin: PIN_NAMES.onecliGateway, release: release.onecli.gateway, deployed: deployed.onecli.gateway } },
+    );
+  }
+  if (release.onecli.sdk !== deployed.onecli.sdk) {
+    throw new GwsEaError(
+      'onecli_version_changed',
+      `This release pins OneCLI SDK ${release.onecli.sdk}, but the assistant runs ${deployed.onecli.sdk}; an update cannot change OneCLI versions, ${retry} pins OneCLI SDK ${deployed.onecli.sdk}`,
+      { details: { pin: 'OneCLI SDK', release: release.onecli.sdk, deployed: deployed.onecli.sdk } },
+    );
   }
   if (release.postgresImage !== deployed.postgresImage) {
     throw new GwsEaError(

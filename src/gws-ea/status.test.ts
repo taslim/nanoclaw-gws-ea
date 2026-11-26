@@ -89,7 +89,7 @@ afterEach(async () => {
 });
 
 const DOCKER = 'unix:///var/run/docker.sock';
-const PINS = { gateway: '1.41.3' } as const;
+const PINS = { gateway: '1.45.0' } as const;
 const CREDENTIAL = { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com', headerName: 'x-api-key' };
 const MAIN = 'ag-main';
 const EXTERNAL_EMAIL = 'ag-external-email';
@@ -511,11 +511,22 @@ const RECEIVING_CHAT = {
   signInNeeded: false,
 } as const;
 
-/** OneCLI's agents: main granted every secret, external-email in selective mode. */
+/** OneCLI's agents: main and external-email under OneCLI 1.45 grants. */
 const onecliAgents: StatusObservers['onecliAgents'] = async () => [
-  { id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' },
+  { id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'selective' },
   { id: 'agent-ee', identifier: EXTERNAL_EMAIL, name: 'external-email', secretMode: 'selective' },
 ];
+const onecliSecrets: StatusObservers['onecliSecrets'] = async () => [
+  {
+    id: 'secret-model',
+    name: CREDENTIAL.name,
+    type: CREDENTIAL.type,
+    hostPattern: CREDENTIAL.hostPattern,
+    injectionConfig: { headerName: CREDENTIAL.headerName, valueFormat: '{value}' },
+  },
+];
+const onecliAgentSecretGrants: StatusObservers['onecliAgentSecretGrants'] = async (_runtime, agentId) =>
+  agentId === 'agent-main' ? ['secret-model'] : ['secret-model'];
 
 /** OneCLI as observing finds it once its containers are stopped. */
 const STOPPED_VAULT = { status: 'absent', reason: 'its containers are not running' } as const;
@@ -552,6 +563,8 @@ function healthyObservers(state: World): StatusObservers {
     runCommand: recordingRunner(state),
     ncl: ncl(state),
     onecliAgents,
+    onecliSecrets,
+    onecliAgentSecretGrants,
     onecli: async () => PRESENT,
     principalBinding: () => ({
       status: 'matched',
@@ -982,6 +995,94 @@ describe('status', () => {
 
     expect(exitCode).toBe(0);
     expect(status.probes.main_identity).toMatchObject({ status: 'unknown', reason: refusal });
+  });
+
+  it("verifies main's explicit model and published Google grants on 1.45+ while keeping extra operator grants", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const state = world(reservation);
+    const base = healthyObservers(state);
+    const secretsWithGoogleAndExtra = [
+      ...(await onecliSecrets(null as never)),
+      { id: 'secret-cal', name: 'google-calendar', type: 'generic', hostPattern: 'www.googleapis.com' },
+      { id: 'secret-extra', name: 'operator-custom', type: 'generic', hostPattern: 'api.custom.example' },
+    ];
+
+    // Missing model grant -> degraded.
+    const missingModel = await statusJson(host, state, reservation.instance_id, {
+      ...base,
+      onecliSecrets: async () => secretsWithGoogleAndExtra,
+      onecliAgentSecretGrants: async () => ['secret-cal'],
+    });
+    expect(missingModel.status.probes.main_identity).toMatchObject({
+      status: 'degraded',
+      reason: expect.stringContaining('model credential grant'),
+    });
+
+    // Missing published Google grant -> degraded.
+    const missingGoogle = await statusJson(host, state, reservation.instance_id, {
+      ...base,
+      onecliSecrets: async () => secretsWithGoogleAndExtra,
+      onecliAgentSecretGrants: async () => ['secret-model'],
+    });
+    expect(missingGoogle.status.probes.main_identity).toMatchObject({
+      status: 'degraded',
+      reason: expect.stringContaining('google-calendar'),
+    });
+
+    // Legacy secretMode: 'all' on 1.45+ -> degraded.
+    const legacyAll = await statusJson(host, state, reservation.instance_id, {
+      ...base,
+      onecliAgents: async () => [{ id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' }],
+    });
+    expect(legacyAll.status.probes.main_identity).toMatchObject({
+      status: 'degraded',
+      reason: expect.stringContaining('legacy all-secrets mode'),
+    });
+
+    // Model + published Google grants + preserved operator grant -> ok (without mirroring unattached custom secrets).
+    const healthyWithExtra = await statusJson(host, state, reservation.instance_id, {
+      ...base,
+      onecliSecrets: async () => [
+        ...secretsWithGoogleAndExtra,
+        { id: 'secret-ungranted', name: 'other-vault-secret', type: 'generic', hostPattern: 'api.other.example' },
+      ],
+      onecliAgentSecretGrants: async () => ['secret-model', 'secret-cal', 'secret-extra'],
+    });
+    expect(healthyWithExtra.status.probes.main_identity).toMatchObject({ status: 'ok', reason: null });
+  });
+
+  it("still checks legacy secretMode 'all' for an un-updated 1.42 sibling assistant", async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const receiptPath = host.paths.releasePreflightFile(reservation.instance_id, reservation.deployed_commit);
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8')) as Record<string, unknown>;
+    await writeFile(receiptPath, `${JSON.stringify({ ...receipt, onecli: { gateway: '1.42.0', sdk: '2.2.1' } })}\n`, {
+      mode: 0o600,
+    });
+    const state = world(reservation);
+    const base = healthyObservers(state);
+
+    const okLegacy = await statusJson(host, state, reservation.instance_id, {
+      ...base,
+      onecliAgents: async () => [{ id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'all' }],
+      onecliSecrets: async () => {
+        throw new Error('legacy 1.42 probe should not query secrets');
+      },
+      onecliAgentSecretGrants: async () => {
+        throw new Error('legacy 1.42 probe should not query grants');
+      },
+    });
+    expect(okLegacy.status.probes.main_identity).toMatchObject({ status: 'ok', reason: null });
+
+    const selectiveLegacy = await statusJson(host, state, reservation.instance_id, {
+      ...base,
+      onecliAgents: async () => [{ id: 'agent-main', identifier: MAIN, name: 'main', secretMode: 'selective' }],
+    });
+    expect(selectiveLegacy.status.probes.main_identity).toMatchObject({
+      status: 'degraded',
+      reason: expect.stringContaining('granted selective secrets, not all'),
+    });
   });
 
   it("reports a OneCLI unsafe-image refusal as that probe's failure without aborting the others", async () => {

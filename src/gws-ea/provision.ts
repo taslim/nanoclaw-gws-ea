@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
@@ -62,9 +63,15 @@ import {
 } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
-import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
+import { recordProviderCredentials } from '../gateway-providers/onecli-provider-credentials.js';
+import { publishedGoogleSecretIds } from '../modules/gws-ea-google/gateway-grants.js';
+import {
+  reconcileMainIdentity,
+  resolveModelSecretId,
+  type MainIdentityDependencies,
+  type MainIdentityInput,
+} from './identity.js';
 import { displayPersonName, normalizePersonName, type PersonName, type NameOwner } from './person-name.js';
-import type { OnecliAgent } from './onecli-admin.js';
 import {
   bindPrincipal,
   type PrincipalBinding,
@@ -87,7 +94,8 @@ import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTe
 import { assertInstanceId, getInstanceReservation, writeInstanceMarker } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { createState, pointCurrent, readCurrent, releaseName } from './release-layout.js';
+import { LAUNCHER_PINS, onecliUsesAgentGrants } from './pins.js';
+import { createState, exists, pointCurrent, readCurrent, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
 import { GwsEaError, type InstanceReservation, type ProvisionStepId } from './types.js';
 import {
@@ -402,14 +410,15 @@ function processAlive(pid: number): boolean {
   }
 }
 
-async function listOnecliAgents(context: ProductionProvisionContext): Promise<readonly OnecliAgent[]> {
+async function onecliAdminFor(context: ProductionProvisionContext) {
   const admin = context.input.identityDependencies?.onecliAdmin ?? instanceOnecliAdmin;
-  return (await admin(context.input.runtime)).listAgents();
+  return admin(context.input.runtime);
 }
 
 /**
  * Main exists as published, runs in the principal's timezone as the profile
- * holds it, and its OneCLI agent injects every matching secret (all mode).
+ * holds it, and its OneCLI agent has verified access (all mode on legacy 1.42
+ * gateways; explicit model + published Google grants on 1.44+ gateways).
  * The principal's name and timezone are theirs to change through main, so
  * only the profile's own values count.
  */
@@ -440,9 +449,32 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
     ) {
       return ABSENT;
     }
-    const matching = (await listOnecliAgents(context)).filter((agent) => agent.identifier === mainAgentGroupId);
+    const [admin, pins] = await Promise.all([
+      onecliAdminFor(context),
+      instanceOnecliPins(context).catch((error: unknown) => {
+        if (isErrno(error, 'ENOENT')) return { gateway: LAUNCHER_PINS.onecliGateway };
+        throw error;
+      }),
+    ]);
+    const matching = (await admin.listAgents()).filter((agent) => agent.identifier === mainAgentGroupId);
     const agent = matching[0];
-    if (matching.length !== 1 || agent?.name !== 'main' || agent.secretMode !== 'all') return ABSENT;
+    if (matching.length !== 1 || agent?.name !== 'main') return ABSENT;
+    if (!onecliUsesAgentGrants(pins.gateway)) {
+      if (agent.secretMode !== 'all') return ABSENT;
+    } else {
+      if (agent.secretMode === 'all') return ABSENT;
+      const [secrets, granted] = await Promise.all([admin.listSecrets(), admin.listAgentSecretGrants(agent.id)]);
+      const grantedSet = new Set(granted);
+      const modelId = resolveModelSecretId(
+        secrets,
+        context.input.runtime.selected_provider,
+        context.input.providerCredentialMetadata,
+      );
+      if (modelId === undefined || !grantedSet.has(modelId)) return ABSENT;
+      for (const googleId of publishedGoogleSecretIds(secrets).values()) {
+        if (!grantedSet.has(googleId)) return ABSENT;
+      }
+    }
     context.state.mainAgentGroupId = mainAgentGroupId;
     return PRESENT;
   } catch (error) {
@@ -812,6 +844,13 @@ export function createProductionProvisionSteps(
               value.input.onecliDependencies,
             );
             value.state.providerSecretId = imported.id;
+            if (await exists(value.input.runtime.state_root)) {
+              await recordProviderCredentials(
+                path.join(value.input.runtime.state_root, 'data'),
+                value.input.runtime.selected_provider,
+                [imported.id],
+              );
+            }
             return undefined;
           },
         },
@@ -856,11 +895,12 @@ export function createProductionProvisionSteps(
             return (await bootstrapManifestRemoved(value.input.bootstrapManifestFile)) ? observed : ABSENT;
           },
           apply: async (value) => {
-            const main = await dependencies.reconcileMainIdentity(
-              value.input.runtime,
-              value.input.identity,
-              value.input.identityDependencies,
-            );
+            const main = await dependencies.reconcileMainIdentity(value.input.runtime, value.input.identity, {
+              ...value.input.identityDependencies,
+              ...(value.input.providerCredentialMetadata
+                ? { providerCredential: value.input.providerCredentialMetadata }
+                : {}),
+            });
             value.state.mainAgentGroupId = main.agentGroupId;
             if (value.input.bootstrapManifestFile) await removePrivateFile(value.input.bootstrapManifestFile);
             return undefined;

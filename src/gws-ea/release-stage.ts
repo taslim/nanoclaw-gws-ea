@@ -171,7 +171,9 @@ export interface ReleaseFilesTarget {
 export async function applyReleaseFiles(
   target: ReleaseFilesTarget,
   dependencies: InstanceRuntimeDependencies,
-  onecliDependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+  onecliDependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'fetch'> & {
+    readonly sleep?: (milliseconds: number) => Promise<void>;
+  } = {},
 ): Promise<{ readonly definitionChanged: boolean }> {
   const { runtime, onecli, commit } = target;
   const layout = instanceLayout(runtime.instance_root);

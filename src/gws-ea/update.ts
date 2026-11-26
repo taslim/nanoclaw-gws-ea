@@ -18,6 +18,7 @@ import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
 import { writePrivate } from '../community-portal/private-file.js';
+import { recordProviderCredentials } from '../gateway-providers/onecli-provider-credentials.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { readInstallCjkFonts, releaseImageKey, releaseImageTag } from './agent-image-release.js';
 import { findSharedAgentImage } from './agent-image.js';
@@ -46,6 +47,7 @@ import {
   type CutoverSeams,
 } from './cutover.js';
 import { runStep } from './events.js';
+import { resolveModelSecretId } from './identity.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import { prepareReleaseGatewayImage, type GatewayImageChange } from './onecli.js';
 import {
@@ -67,7 +69,7 @@ import {
   type SnapshotManifest,
 } from './operation.js';
 import { CONTROL_PLANE_ROOT, type ControlPlanePaths } from './paths.js';
-import { LAUNCHER_PINS } from './pins.js';
+import { LAUNCHER_PINS, onecliUsesAgentGrants } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 import { instanceOnecliLayout, readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
@@ -88,7 +90,7 @@ import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget 
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
 import { readOwnerOnlyJson } from './secrets.js';
-import { bindInstanceHostPolicies, type InstanceRuntimeConfig } from './service.js';
+import { bindInstanceHostPolicies, instanceOnecliAdmin, type InstanceRuntimeConfig } from './service.js';
 import { isTurnedOff } from './assistant-power.js';
 import { createServiceControl, runtimeServiceTarget } from './service-control.js';
 import { instanceServicePlatform } from './service-coordinates.js';
@@ -650,10 +652,11 @@ async function stageUpdate(
     },
   );
 
+  const fromSetup = await readDeployedSetup(paths, reservation);
   const gateway = await runStep(reporter, { id: 'prepare_gateway_image', label: 'Preparing the gateway image…' }, () =>
     prepareReleaseGatewayImage(
       onecli,
-      { gateway: LAUNCHER_PINS.onecliGateway },
+      { from: { gateway: fromSetup.onecli.gateway }, to: { gateway: LAUNCHER_PINS.onecliGateway } },
       {
         dockerCommandRunner: run,
         recordEffect: (changed) => reporter.emit?.({ type: 'domain-effect', step: 'prepare_gateway_image', changed }),
@@ -728,6 +731,9 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
     `To: ${releaseLine(to)}`,
     ...(from.source_remote === to.source_remote ? [] : [`Source: ${from.source_remote} → ${to.source_remote}`]),
     `Database migrations to add: ${preview.migrations.length > 0 ? preview.migrations.join(', ') : 'none'}`,
+    ...(gateway.currentVersion === gateway.releaseVersion
+      ? []
+      : [`Gateway version: ${gateway.currentVersion} → ${gateway.releaseVersion}`]),
     gateway.release === gateway.current
       ? `Gateway image: unchanged (${gateway.current})`
       : `Gateway image: ${gateway.current} → ${gateway.release}`,
@@ -735,6 +741,11 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
     ...(preview.agentRunnerLockChanged && groupImages.length > 0
       ? [
           `Until rebuilt, ${groups} run the previous agent-runner dependencies, so their first turns may fail and retry.`,
+        ]
+      : []),
+    ...(gateway.currentVersion !== gateway.releaseVersion
+      ? [
+          `This release upgrades OneCLI (${gateway.currentVersion} → ${gateway.releaseVersion}), migrating its database and converting agents to explicit grants; rolling back restores the pre-upgrade OneCLI database backup.`,
         ]
       : []),
     ...(preview.migrations.length > 0 || preview.sessionSchemaChanged
@@ -815,7 +826,14 @@ async function recoverUpdate(
     );
   }
   try {
-    await serveLeftRelease(await openCutoverHost(operation, dependencies), record);
+    const host = await openCutoverHost(operation, dependencies);
+    const [fromPins, toPins] = await Promise.all([releasePins(host, record.from), releasePins(host, record.to)]);
+    const backup = host.layout.onecliSnapshotBackup(operationName(record.started_at));
+    const restoreOnecli =
+      !onecliUsesAgentGrants(fromPins.gateway) && onecliUsesAgentGrants(toPins.gateway) && (await exists(backup))
+        ? () => cutoverOnecli(host).restoreDatabase(host.onecli, backup)
+        : undefined;
+    await serveLeftRelease(host, record, restoreOnecli);
     await discardOperation(operation);
   } catch (error) {
     throw new GwsEaError(
@@ -867,6 +885,35 @@ const RESUMED_FENCED: ReadonlySet<OperationRecord['phase']> = new Set(['fenced',
  * this fence already took is kept. A fence that ended the update's own
  * release leaves the snapshot as the release it left wrote it.
  */
+async function snapshotGatewayIfChanging(host: CutoverHost, record: OperationRecord): Promise<void> {
+  const [fromPins, toPins] = await Promise.all([releasePins(host, record.from), releasePins(host, record.to)]);
+  if (fromPins.gateway === toPins.gateway) return;
+  const backup = host.layout.onecliSnapshotBackup(operationName(record.started_at));
+  await runStep(host.reporter, { id: 'snapshot_gateway', label: "Backing up OneCLI's database…" }, () =>
+    cutoverOnecli(host).backupDatabase(host.onecli, backup),
+  );
+}
+
+async function recordUpgradedProviderCredentials(host: CutoverHost, record: OperationRecord): Promise<void> {
+  const [fromSetup, toPins] = await Promise.all([
+    readDeployedSetup(host.operation.paths, reservationAt(host.reservation, record.from)),
+    releasePins(host, record.to),
+  ]);
+  if (onecliUsesAgentGrants(fromSetup.onecli.gateway) || !onecliUsesAgentGrants(toPins.gateway)) return;
+  const admin = await instanceOnecliAdmin(
+    host.runtime,
+    host.dependencies.fetch ? { fetch: host.dependencies.fetch } : {},
+  );
+  const modelId = resolveModelSecretId(
+    await admin.listSecrets(),
+    host.runtime.selected_provider,
+    fromSetup.providerCredential,
+  );
+  if (modelId !== undefined) {
+    await recordProviderCredentials(path.join(host.layout.state, 'data'), host.runtime.selected_provider, [modelId]);
+  }
+}
+
 async function refence(host: CutoverHost, record: OperationRecord): Promise<OperationRecord> {
   const stop = await fenceInstance(host, 'Making sure the assistant is still stopped…');
   const left = releaseName(record.from.deployed_commit);
@@ -874,6 +921,7 @@ async function refence(host: CutoverHost, record: OperationRecord): Promise<Oper
     await runStep(host.reporter, { id: 'snapshot_state', label: 'Taking a snapshot of its state…' }, () =>
       takeSnapshot(host.layout, operationName(record.started_at), left),
     );
+    await snapshotGatewayIfChanging(host, record);
   }
   return recordOperationFacts(host.operation, { stop });
 }
@@ -911,6 +959,7 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
         await runStep(reporter, { id: 'snapshot_state', label: 'Taking a snapshot of its state…' }, () =>
           takeSnapshot(layout, operationName(record.started_at), releaseName(record.from.deployed_commit)),
         );
+        await snapshotGatewayIfChanging(host, record);
         record = await advanceOperation(operation, 'snapshotted');
         break;
       case 'snapshotted':
@@ -921,6 +970,7 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
         if ((await readCurrent(layout)) !== name) {
           definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
         }
+        await recordUpgradedProviderCredentials(host, record);
         await bindInstanceHostPolicies(host.runtime, host.operation.paths.configRoot, host.dependencies.upsertEnvVars);
         await startRelease(host, definitionChanged, 'Starting the new release…');
         record = await advanceOperation(operation, 'started');

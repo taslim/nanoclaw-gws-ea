@@ -22,6 +22,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
 import { writeWhatsAppLink } from '../modules/gws-ea-whatsapp/paths.js';
 
+import { LAUNCHER_PINS } from './pins.js';
 import {
   ADDED_MIGRATION,
   applying,
@@ -237,7 +238,12 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
       from: release(host, host.first),
       to: release(host, next.commit),
       migrations: [ADDED_MIGRATION],
-      gateway: { current: DEPLOYED_GATEWAY, release: RELEASE_GATEWAY },
+      gateway: {
+        current: DEPLOYED_GATEWAY,
+        release: RELEASE_GATEWAY,
+        currentVersion: LAUNCHER_PINS.onecliGateway,
+        releaseVersion: LAUNCHER_PINS.onecliGateway,
+      },
       groupImages: [{ id: 'ag-research', name: 'research' }],
       agentRunnerLockChanged: false,
       sessionSchemaChanged: false,
@@ -1422,7 +1428,12 @@ describe('the update preview', () => {
       from: coordinates('a'),
       to: coordinates('b'),
       migrations: [],
-      gateway: { current: DEPLOYED_GATEWAY, release: DEPLOYED_GATEWAY },
+      gateway: {
+        current: DEPLOYED_GATEWAY,
+        release: DEPLOYED_GATEWAY,
+        currentVersion: LAUNCHER_PINS.onecliGateway,
+        releaseVersion: LAUNCHER_PINS.onecliGateway,
+      },
       groupImages: [{ id: 'ag-research', name: group }],
       agentRunnerLockChanged: true,
       sessionSchemaChanged: false,
@@ -1624,5 +1635,56 @@ describe('the switch', GIT_HEAVY, () => {
     } finally {
       operation.release();
     }
+  });
+});
+
+describe('OneCLI 1.42.0 -> 1.45.0 gateway upgrade', GIT_HEAVY, () => {
+  it('previews the version bump, snapshots Postgres under the fence, converts grants, and backfills provider-credentials.json', async () => {
+    const host = await machine();
+    const runtime = await assistant(host, { onecliGatewayVersion: '1.42.0' });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+
+    const staged = await stage(host, runtime, dependencies(state, next, runtime));
+    expect(staged.preview.gateway).toMatchObject({
+      currentVersion: '1.42.0',
+      releaseVersion: LAUNCHER_PINS.onecliGateway,
+    });
+    const preview = updatePreviewLines(staged.preview).join('\n');
+    expect(preview).toContain(`Gateway version: 1.42.0 → ${LAUNCHER_PINS.onecliGateway}`);
+    expect(preview).toContain('converting agents to explicit grants');
+
+    const { run } = cli(host, state, next, runtime);
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+
+    await expectUpdated(host, runtime, next, state);
+    const point = await readRollbackPoint(host.paths, runtime.instance_id);
+    const backupFile = layoutOf(host, runtime).onecliSnapshotBackup(point!.snapshot);
+    expect(state.onecliBackups).toEqual([backupFile]);
+    expect(await readFile(backupFile, 'utf8')).toContain('1.42-initial');
+    expect(state.onecliDbState).toBe('migrated-1.45');
+    const recorded = JSON.parse(
+      await readFile(path.join(runtime.state_root, 'data', 'onecli', 'provider-credentials.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(recorded).toMatchObject({ providers: { claude: ['sec-anthropic'] } });
+  });
+
+  it('restores the 1.42.0 Postgres backup before serving 1.42.0 again when 1.45.0 grant conversion fails', async () => {
+    const host = await machine();
+    const runtime = await assistant(host, { onecliGatewayVersion: '1.42.0' });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    state.failGrantConversion = true;
+
+    const { run, err } = cli(host, state, next, runtime);
+    expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(1);
+
+    expect(err.join('\n')).toContain('grant conversion did not succeed cleanly');
+    expect(state.onecliBackups).toHaveLength(1);
+    expect(state.onecliRestores).toEqual(state.onecliBackups);
+    expect(state.onecliDbState).toBe('1.42-initial');
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
   });
 });

@@ -28,22 +28,27 @@ import {
   removeOneCliCredentialsById,
 } from '../gateway-providers/onecli-credentials.js';
 import {
+  backupOnecliDatabase,
   findCredentialSecret,
   importProviderCredential,
   persistOnecliApiKeyFiles,
+  prepareReleaseGatewayImage,
   reconcileOnecliRuntime,
   removeOnecliRuntime,
+  restoreOnecliDatabase,
+  restoreReleaseGateway,
+  verifyOnecliGrantConversion,
   type OnecliRuntimeReceipt,
 } from './onecli.js';
 import { createOnecliAdmin, fetchOnecliApiKey, type OnecliAdmin } from './onecli-admin.js';
-import { createOnecliRuntimeLayout, type OnecliRuntimeLayout } from './onecli-compose.js';
+import { createOnecliRuntimeLayout, renderOnecliCompose, type OnecliRuntimeLayout } from './onecli-compose.js';
 import { resolveWrapperGatewayImage } from './onecli-gateway-image.js';
 import { ONECLI_GATEWAY_VERSION } from './pins.js';
 import { resolveDockerEndpoint } from './prerequisites.js';
 import { buildToolEnvironment, runSanitizedCommand, type SanitizedCommandResult } from './process.js';
 
 /** The OneCLI gateway version this contract last passed against. */
-const VERIFIED_ONECLI_GATEWAY = '1.42.0';
+const VERIFIED_ONECLI_GATEWAY = '1.45.0';
 
 const CONTRACT = process.env.GWS_EA_ONECLI_CONTRACT === '1';
 /** Pulling, building, and starting a cold OneCLI, as an assistant's create does. */
@@ -190,7 +195,7 @@ describe.runIf(CONTRACT)(`the OneCLI admin client against OneCLI ${ONECLI_GATEWA
   );
 
   it(
-    "creates an agent in all secret mode, answers 409 to a second create, and sets the agent's secret mode",
+    'creates an agent with zero grants, answers 409 on duplicate, attaches/detaches grants, and returns 410 on legacy endpoints',
     async () => {
       const identifier = `ag-${randomUUID()}`;
       await admin.createAgent({ name: 'main', identifier });
@@ -204,12 +209,34 @@ describe.runIf(CONTRACT)(`the OneCLI admin client against OneCLI ${ONECLI_GATEWA
       await expect(admin.createAgent({ name: 'main', identifier })).resolves.toBeUndefined();
 
       const agents = (await admin.listAgents()).filter((agent) => agent.identifier === identifier);
-      expect(agents).toEqual([{ id: expect.any(String), identifier, name: 'main', secretMode: 'all' }]);
+      expect(agents).toHaveLength(1);
       const [agent] = agents;
-      await admin.setSecretMode(agent!.id, 'selective');
-      expect((await admin.listAgents()).find((listed) => listed.id === agent!.id)?.secretMode).toBe('selective');
-      await admin.setSecretMode(agent!.id, 'all');
-      expect((await admin.listAgents()).find((listed) => listed.id === agent!.id)?.secretMode).toBe('all');
+      expect(agent).toMatchObject({ id: expect.any(String), identifier, name: 'main' });
+      expect(agent!.secretMode).not.toBe('all');
+
+      expect(await admin.listAgentSecretGrants(agent!.id)).toEqual([]);
+
+      const secrets = await admin.listSecrets();
+      const [firstSecret, secondSecret] = secrets.map((s) => s.id as string);
+      expect(firstSecret).toBeTruthy();
+      expect(secondSecret).toBeTruthy();
+
+      await admin.attachAgentSecretGrant(agent!.id, firstSecret!);
+      await admin.attachAgentSecretGrant(agent!.id, secondSecret!);
+      expect((await admin.listAgentSecretGrants(agent!.id)).slice().sort()).toEqual(
+        [firstSecret!, secondSecret!].sort(),
+      );
+
+      await admin.detachAgentSecretGrant(agent!.id, secondSecret!);
+      expect(await admin.listAgentSecretGrants(agent!.id)).toEqual([firstSecret!]);
+
+      const legacy = await fetch(new URL(`/v1/agents/${encodeURIComponent(agent!.id)}/secret-mode`, layout!.appUrl), {
+        method: 'PATCH',
+        headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'all' }),
+        redirect: 'error',
+      });
+      expect(legacy.status).toBe(410);
     },
     CALL_TIMEOUT_MS,
   );
@@ -266,5 +293,153 @@ describe.runIf(CONTRACT)(`the OneCLI admin client against OneCLI ${ONECLI_GATEWA
       expect((await admin.listSecrets()).some((secret) => secret.id === elsewhere)).toBe(true);
     },
     CALL_TIMEOUT_MS,
+  );
+});
+
+describe.runIf(CONTRACT)('OneCLI 1.42.0 -> 1.45.0 -> 1.42.0 upgrade and rollback contract', () => {
+  it(
+    'backs up 1.42.0 Postgres, upgrades to 1.45.0 with verified grant conversion, and rolls back cleanly to 1.42.0',
+    async () => {
+      const fromPins = { gateway: '1.42.0' } as const;
+      const toPins = { gateway: ONECLI_GATEWAY_VERSION } as const;
+      const upgradeRoot = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-onecli-upgrade-contract-'));
+      const dockerEndpoint = await resolveDockerEndpoint();
+      const [appPort, gatewayPort] = await freePorts();
+      const upgradeLayout = createOnecliRuntimeLayout({
+        instanceId: randomUUID(),
+        instanceRoot: upgradeRoot,
+        project: `gws-ea-upg-${randomBytes(4).toString('hex')}`,
+        appPort,
+        gatewayPort,
+        dockerEndpoint,
+      });
+      const docker = (args: readonly string[]) =>
+        runSanitizedCommand({
+          command: 'docker',
+          args,
+          cwd: upgradeRoot,
+          env: buildToolEnvironment(process.env, { DOCKER_HOST: dockerEndpoint }),
+          timeoutMs: CALL_TIMEOUT_MS,
+        });
+      const wrapper142 = await resolveWrapperGatewayImage(fromPins);
+      const wrapper145 = await resolveWrapperGatewayImage(toPins);
+      const built142 = (await docker(['image', 'ls', '--quiet', wrapper142.image])).stdout.trim() === '';
+      const built145 = (await docker(['image', 'ls', '--quiet', wrapper145.image])).stdout.trim() === '';
+
+      try {
+        // 1. Bring up a real 1.42.0 OneCLI stack with main (all) and browser (selective, model-only).
+        const receipt142 = await reconcileOnecliRuntime(upgradeLayout, fromPins);
+        const key142 = await fetchOnecliApiKey(upgradeLayout.appUrl);
+        const admin142 = createOnecliAdmin(upgradeLayout.appUrl, key142);
+
+        const model = await importProviderCredential(receipt142, {
+          name: 'Anthropic',
+          type: 'anthropic',
+          value: `sk-ant-api03-upgrade-${'0'.repeat(80)}`,
+          hostPattern: 'api.anthropic.com',
+        });
+        const gcal = await admin142.createSecret({
+          name: 'google-calendar',
+          type: 'generic',
+          value: 'ya29-upgrade-calendar-token',
+          hostPattern: 'www.googleapis.com',
+          headerName: 'Authorization',
+          valueFormat: 'Bearer {value}',
+        });
+        const opMcp = await admin142.createSecret({
+          name: 'Operator MCP',
+          type: 'generic',
+          value: 'op-mcp-secret-value',
+          hostPattern: 'mcp.operator.example.test',
+          headerName: 'Authorization',
+          valueFormat: 'Bearer {value}',
+        });
+
+        const mainGroup = `ag-main-${randomUUID().slice(0, 8)}`;
+        const browserGroup = `ag-browser-${randomUUID().slice(0, 8)}`;
+        await admin142.createAgent({ name: 'main', identifier: mainGroup });
+        await admin142.createAgent({ name: 'browser', identifier: browserGroup });
+        const agents142 = await admin142.listAgents();
+        const mainAgent = agents142.find((agent) => agent.identifier === mainGroup)!;
+        const browserAgent = agents142.find((agent) => agent.identifier === browserGroup)!;
+        expect(mainAgent.secretMode).toBe('all');
+
+        // Configure browser as selective + model-only using legacy 1.42 routes.
+        const setMode = await fetch(
+          new URL(`/v1/agents/${encodeURIComponent(browserAgent.id)}/secret-mode`, upgradeLayout.appUrl),
+          {
+            method: 'PATCH',
+            headers: { authorization: `Bearer ${key142}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ mode: 'selective' }),
+          },
+        );
+        expect(setMode.ok).toBe(true);
+        const setSecrets = await fetch(
+          new URL(`/v1/agents/${encodeURIComponent(browserAgent.id)}/secrets`, upgradeLayout.appUrl),
+          {
+            method: 'PUT',
+            headers: { authorization: `Bearer ${key142}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ secretIds: [model.id] }),
+          },
+        );
+        expect(setSecrets.ok).toBe(true);
+
+        // 2. Stage the 1.45.0 image while 1.42.0 serves, then take a fenced Postgres backup.
+        const change = await prepareReleaseGatewayImage(upgradeLayout, { from: fromPins, to: toPins });
+        expect(change).toEqual({
+          current: wrapper142.image,
+          release: wrapper145.image,
+          currentVersion: fromPins.gateway,
+          releaseVersion: toPins.gateway,
+        });
+        const backupFile = path.join(upgradeRoot, 'onecli-db-142.sql');
+        await backupOnecliDatabase(upgradeLayout, backupFile);
+
+        // 3. Upgrade to 1.45.0 via restoreReleaseGateway (isolation + [grant-conversion] gate).
+        const compose142 = renderOnecliCompose(upgradeLayout, fromPins, wrapper142.image);
+        const compose145 = renderOnecliCompose(upgradeLayout, toPins, wrapper145.image);
+        await restoreReleaseGateway(upgradeLayout, toPins, { compose: compose145, left: compose142 });
+        await verifyOnecliGrantConversion(upgradeLayout);
+
+        const admin145 = createOnecliAdmin(upgradeLayout.appUrl, key142);
+        const agents145 = await admin145.listAgents();
+        expect(agents145.every((agent) => agent.secretMode !== 'all')).toBe(true);
+        expect((await admin145.listAgentSecretGrants(mainAgent.id)).slice().sort()).toEqual(
+          [model.id, gcal, opMcp].sort(),
+        );
+        expect(await admin145.listAgentSecretGrants(browserAgent.id)).toEqual([model.id]);
+
+        // Mutate 1.45.0 so rollback visibly restores pre-upgrade state.
+        const postUpgradeSecret = await admin145.createSecret({
+          name: 'Post-upgrade secret',
+          type: 'generic',
+          value: 'post-upgrade-value',
+          hostPattern: 'post.upgrade.example.test',
+          headerName: 'x-api-key',
+        });
+        await admin145.attachAgentSecretGrant(mainAgent.id, postUpgradeSecret);
+
+        // 4. Roll back Postgres from the 1.42.0 backup and restore 1.42.0 Compose.
+        await restoreOnecliDatabase(upgradeLayout, backupFile);
+        await restoreReleaseGateway(upgradeLayout, fromPins, { compose: compose142, left: compose145 });
+
+        const secretsBack = await admin142.listSecrets();
+        expect(secretsBack.map((secret) => secret.id)).toEqual(expect.arrayContaining([model.id, gcal, opMcp]));
+        expect(secretsBack.some((secret) => secret.id === postUpgradeSecret)).toBe(false);
+        const agentsBack = await admin142.listAgents();
+        expect(agentsBack.find((agent) => agent.id === mainAgent.id)?.secretMode).toBe('all');
+        expect(agentsBack.find((agent) => agent.id === browserAgent.id)?.secretMode).toBe('selective');
+      } finally {
+        await removeOnecliRuntime(upgradeLayout);
+        if (built142 && (await docker(['image', 'ls', '--quiet', wrapper142.image])).stdout.trim() !== '') {
+          await docker(['image', 'rm', wrapper142.image]);
+        }
+        if (built145 && (await docker(['image', 'ls', '--quiet', wrapper145.image])).stdout.trim() !== '') {
+          await docker(['image', 'rm', wrapper145.image]);
+        }
+        await rm(upgradeRoot, { recursive: true, force: true });
+      }
+    },
+    START_TIMEOUT_MS,
   );
 });

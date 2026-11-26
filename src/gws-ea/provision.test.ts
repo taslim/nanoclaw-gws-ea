@@ -1143,8 +1143,12 @@ async function writeReleaseReceipt(
 }
 
 interface ProbeIdentityState {
-  /** The agents OneCLI lists; one without a secret mode is as a OneCLI from 1.43 on lists it. */
+  /** The agents OneCLI lists. */
   agents: Array<{ id: string; identifier: string; name: string; secretMode?: 'all' | 'selective' }>;
+  /** Secrets OneCLI lists; defaults to the provider's Anthropic model secret. */
+  secrets?: Array<Record<string, unknown>>;
+  /** Secret IDs granted to each OneCLI agent ID; defaults to `['sec-anthropic']` for `oc-main`. */
+  grants?: Record<string, string[]>;
   /** Every OneCLI request, as `<method> <path>`. */
   readonly onecliCalls: string[];
   /** The principal as the profile holds them; as create declared them by default. */
@@ -1186,6 +1190,24 @@ function probeIdentityDependencies(
           const call = `${init?.method ?? 'GET'} ${url.pathname}`;
           state.onecliCalls.push(call);
           if (call === 'GET /v1/agents') return new Response(JSON.stringify(state.agents));
+          if (call === 'GET /v1/secrets') {
+            const secrets = state.secrets ?? [
+              {
+                id: 'sec-anthropic',
+                name: 'Claude provider',
+                type: 'api_key',
+                hostPattern: 'api.anthropic.com',
+                injectionConfig: { headerName: 'x-api-key', valueFormat: '{value}' },
+              },
+            ];
+            return new Response(JSON.stringify(secrets));
+          }
+          const grantsMatch = /^GET \/v1\/agents\/([^/]+)\/grants$/u.exec(call);
+          if (grantsMatch) {
+            const agentId = decodeURIComponent(grantsMatch[1]!);
+            const ids = state.grants?.[agentId] ?? (agentId === 'oc-main' ? ['sec-anthropic'] : []);
+            return new Response(JSON.stringify({ secrets: ids.map((secretId) => ({ secretId })) }));
+          }
           throw new Error(`Unexpected OneCLI probe call: ${call}`);
         },
       }),
@@ -1366,14 +1388,15 @@ describe('production provision step composition', () => {
     });
   });
 
-  it('accepts only an all-mode canonical main without enumerating its grants', async () => {
+  it('verifies canonical main grants on 1.45+ gateways and keeps legacy all-mode verification for 1.42 receipts', async () => {
     const paths = await testPaths();
     const reserved = await reserveInstance(paths, reservation());
 
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
       const state: ProbeIdentityState = {
-        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
+        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }],
+        grants: { 'oc-main': ['sec-anthropic'] },
         onecliCalls: [],
       };
       const context: ProductionProvisionContext = {
@@ -1383,15 +1406,24 @@ describe('production provision step composition', () => {
       const phase = createProductionProvisionSteps(context).start_nanoclaw.resources[1]!;
 
       await expect(phase.observe(context)).resolves.toEqual(PRESENT);
-      expect(state.onecliCalls).toEqual(['GET /v1/agents']);
+      expect(state.onecliCalls).toEqual(['GET /v1/agents', 'GET /v1/secrets', 'GET /v1/agents/oc-main/grants']);
 
-      // A OneCLI that no longer lists secret modes leaves main on its default, all.
+      // Omitted secretMode with required grants is accepted on 1.45+.
       state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main' }];
       await expect(phase.observe(context)).resolves.toEqual(PRESENT);
 
-      state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }];
-      state.onecliCalls.length = 0;
+      // Missing model grant or legacy all-mode on 1.45+ is absent (reconciled).
+      state.grants = { 'oc-main': [] };
       await expect(phase.observe(context)).resolves.toEqual(ABSENT);
+
+      state.grants = { 'oc-main': ['sec-anthropic'] };
+      state.agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }];
+      await expect(phase.observe(context)).resolves.toEqual(ABSENT);
+
+      // An un-updated 1.42 receipt still checks secretMode === 'all'.
+      await writeReleaseReceipt(paths, reserved, { gateway: '1.42.0', sdk: '2.2.1' });
+      state.onecliCalls.length = 0;
+      await expect(phase.observe(context)).resolves.toEqual(PRESENT);
       expect(state.onecliCalls).toEqual(['GET /v1/agents']);
     });
   });
@@ -1404,7 +1436,8 @@ describe('production provision step composition', () => {
       const base = productionContext(operation, reserved);
       // The principal changed their name and timezone through main after create.
       const state: ProbeIdentityState = {
-        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
+        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }],
+        grants: { 'oc-main': ['sec-anthropic'] },
         onecliCalls: [],
         principal: { name: 'Juno Hale', timezone: 'Europe/London' },
       };
@@ -1899,7 +1932,8 @@ describe('production provision step composition', () => {
     await withInstanceOperation(paths, reserved.instance_id, async (operation) => {
       const base = productionContext(operation, reserved);
       const identityState: ProbeIdentityState = {
-        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }],
+        agents: [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }],
+        grants: { 'oc-main': ['sec-anthropic'] },
         onecliCalls: [],
       };
       const context: ProductionProvisionContext = {

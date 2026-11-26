@@ -62,18 +62,33 @@ beforeEach(async () => {
         ]);
       if (url.pathname === '/v1/agents' && init?.method === 'POST') {
         const value = body as { name: string; identifier: string };
-        agents.set(value.identifier, { ...value, id: `gateway-${agents.size}`, secretMode: 'all', secrets: [] });
+        agents.set(value.identifier, { ...value, id: `gateway-${agents.size}`, secretMode: 'selective', secrets: [] });
         return Response.json({}, { status: 201 });
       }
       if (url.pathname === '/v1/agents') return Response.json([...agents.values()]);
-      const match = /^\/v1\/agents\/([^/]+)\/(secret-mode|secrets)$/u.exec(url.pathname);
-      const agent = [...agents.values()].find((value) => value.id === match?.[1]);
-      if (!agent) throw new Error(`Unexpected gateway request ${url.pathname}`);
-      if (agent.identifier === unavailable) throw new Error('Gateway observation unavailable');
-      if (match?.[2] === 'secret-mode') agent.secretMode = (body as { mode: string }).mode;
-      else if (init?.method === 'PUT') agent.secrets = (body as { secretIds: string[] }).secretIds;
-      else return Response.json(agent.secrets);
-      return Response.json({ success: true });
+      const grantsMatch = /^\/v1\/agents\/([^/]+)\/grants$/u.exec(url.pathname);
+      if (grantsMatch && (init?.method ?? 'GET') === 'GET') {
+        const agent = [...agents.values()].find((value) => value.id === decodeURIComponent(grantsMatch[1]!));
+        if (!agent) throw new Error(`Unexpected gateway request ${url.pathname}`);
+        if (agent.identifier === unavailable) throw new Error('Gateway observation unavailable');
+        return Response.json({ secrets: agent.secrets.map((secretId) => ({ secretId })) });
+      }
+      const secretGrantMatch = /^\/v1\/agents\/([^/]+)\/grants\/secrets\/([^/]+)$/u.exec(url.pathname);
+      if (secretGrantMatch) {
+        const agent = [...agents.values()].find((value) => value.id === decodeURIComponent(secretGrantMatch[1]!));
+        const secretId = decodeURIComponent(secretGrantMatch[2]!);
+        if (!agent) throw new Error(`Unexpected gateway request ${url.pathname}`);
+        if (agent.identifier === unavailable) throw new Error('Gateway observation unavailable');
+        if (init?.method === 'PUT') {
+          if (!agent.secrets.includes(secretId)) agent.secrets.push(secretId);
+          return Response.json({ success: true });
+        }
+        if (init?.method === 'DELETE') {
+          agent.secrets = agent.secrets.filter((id) => id !== secretId);
+          return Response.json({ success: true });
+        }
+      }
+      throw new Error(`Unexpected gateway request ${url.pathname}`);
     }),
   );
   await runMigrations(await initTestDb());
@@ -165,7 +180,7 @@ it('reconciles the release shape at update startup while preserving an explicitl
   const active = await job('active');
   await updateContainerConfigJson(external, 'capabilities', ['shell']);
   await updateContainerConfigJson(active, 'capabilities', ['shell', 'browser-delegate']);
-  agents.get(active)!.secretMode = 'all';
+  agents.get(active)!.secrets.push('google');
   await reconcileChatAgents();
   expect(await hasBrowserAccess(active)).toBe(true);
   expect(await hasBrowserAccess(external)).toBe(false);
@@ -182,7 +197,7 @@ it('reports a retired job healthy only while its gateway has no usable credentia
   expect(await health()).toMatchObject({ jobs: [{ state: 'retired', health: { status: 'ok', reason: null } }] });
   agents.get(retired)!.secrets = ['google'];
   expect(await health()).toMatchObject({
-    jobs: [{ state: 'retired', health: { status: 'degraded', reason: expect.stringContaining('secret assignments') } }],
+    jobs: [{ state: 'retired', health: { status: 'degraded', reason: expect.stringContaining('secret grants') } }],
   });
   agents.delete(retired);
   expect(await health()).toMatchObject({ jobs: [{ state: 'retired', health: { status: 'ok', reason: null } }] });

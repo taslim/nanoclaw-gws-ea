@@ -54,9 +54,17 @@ interface FakeState {
   principalTimezone: string | null;
   /** The principal's addresses as the profile holds them. */
   principalEmails: readonly string[];
-  /** The agents OneCLI holds; one without a secret mode is as a OneCLI from 1.43 on lists it. */
-  agents: Array<{ id: string; identifier: string; name: string; secretMode?: 'all' | 'selective' }>;
-  secretModeWrites: number;
+  /** The agents OneCLI holds; 1.45 agents start with zero grants and selective/omitted secretMode. */
+  agents: Array<{
+    id: string;
+    identifier: string;
+    name: string;
+    secretMode?: 'all' | 'selective';
+    grants: string[];
+  }>;
+  secrets: Array<{ id: string; name: string; type: string; hostPattern: string }>;
+  grantWrites: number;
+  grantDetaches: number;
   /** Main's shared skills as its container config holds them. */
   skills: readonly string[] | 'all';
   /** Every ncl call, in order, by its first two words. */
@@ -70,14 +78,16 @@ function flagValue(args: readonly string[], flag: string): string | undefined {
 
 function harness(
   options: {
-    failAfterSecretModeOnce?: boolean;
-    neverApplySecretMode?: boolean;
+    failAfterGrantOnce?: boolean;
+    neverApplyGrant?: boolean;
     /** A NanoClaw whose config update leaves the provider as it was. */
     ignoreProvider?: boolean;
     /** A release whose main reconcile leaves main on every shared skill. */
     ignoreSkills?: boolean;
     /** OneCLI's list does not yet show main's agent, which a create then finds there (409). */
     listLagsCreate?: boolean;
+    /** Omit model secret from OneCLI vault. */
+    noModelSecret?: boolean;
   } = {},
 ): {
   state: FakeState;
@@ -96,7 +106,11 @@ function harness(
     principalTimezone: null,
     principalEmails: [],
     agents: [],
-    secretModeWrites: 0,
+    secrets: options.noModelSecret
+      ? []
+      : [{ id: 'sec-anthropic', name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' }],
+    grantWrites: 0,
+    grantDetaches: 0,
     skills: 'all',
     calls: [],
   };
@@ -154,30 +168,62 @@ function harness(
     const method = init?.method ?? 'GET';
     const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : {};
     const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+    if (url.pathname === '/v1/secrets' && method === 'GET') {
+      return json(state.secrets);
+    }
     if (url.pathname === '/v1/agents' && method === 'GET') {
-      return json(listed ? state.agents : state.agents.filter((agent) => agent.identifier !== GROUP_ID));
+      const visible = listed ? state.agents : state.agents.filter((agent) => agent.identifier !== GROUP_ID);
+      return json(
+        visible.map(({ id, identifier, name, secretMode }) => ({
+          id,
+          identifier,
+          name,
+          ...(secretMode === undefined ? {} : { secretMode }),
+        })),
+      );
     }
     if (url.pathname === '/v1/agents' && method === 'POST') {
       listed = true;
       if (state.agents.some((agent) => agent.identifier === body.identifier)) {
         return json({ error: 'An agent with this identifier already exists' }, 409);
       }
-      const agent = { id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' as const };
+      const agent = {
+        id: 'oc-main',
+        identifier: GROUP_ID,
+        name: 'main',
+        secretMode: 'selective' as const,
+        grants: [] as string[],
+      };
       state.agents.push(agent);
-      return json(agent, 201);
+      return json({ id: agent.id, identifier: agent.identifier, name: agent.name, secretMode: agent.secretMode }, 201);
     }
-    if (url.pathname === '/v1/agents/oc-main/secret-mode' && method === 'PATCH' && body.mode === 'all') {
-      state.secretModeWrites += 1;
-      if (!options.neverApplySecretMode) {
-        state.agents = state.agents.map((agent) =>
-          agent.id === 'oc-main' ? { ...agent, secretMode: 'all' as const } : agent,
-        );
+    const grantsMatch = /^\/v1\/agents\/([^/]+)\/grants$/u.exec(url.pathname);
+    if (grantsMatch && method === 'GET') {
+      const agent = state.agents.find((entry) => entry.id === decodeURIComponent(grantsMatch[1]!));
+      if (!agent) return json({ error: 'not found' }, 404);
+      return json({ secrets: agent.grants.map((secretId) => ({ secretId })) });
+    }
+    const secretGrantMatch = /^\/v1\/agents\/([^/]+)\/grants\/secrets\/([^/]+)$/u.exec(url.pathname);
+    if (secretGrantMatch) {
+      const agent = state.agents.find((entry) => entry.id === decodeURIComponent(secretGrantMatch[1]!));
+      const secretId = decodeURIComponent(secretGrantMatch[2]!);
+      if (!agent) return json({ error: 'not found' }, 404);
+      if (method === 'PUT') {
+        state.grantWrites += 1;
+        if (!options.neverApplyGrant && !agent.grants.includes(secretId)) {
+          agent.grants.push(secretId);
+        }
+        if (options.failAfterGrantOnce && !failed) {
+          failed = true;
+          throw new TypeError('fetch failed: connection reset after the grant side effect');
+        }
+        return json({ success: true });
       }
-      if (options.failAfterSecretModeOnce && !failed) {
-        failed = true;
-        throw new TypeError('fetch failed: connection reset after the secret-mode side effect');
+      if (method === 'DELETE') {
+        state.grantDetaches += 1;
+        agent.grants = agent.grants.filter((id) => id !== secretId);
+        return json({ success: true });
       }
-      return json({ success: true });
     }
     throw new Error(`Unexpected OneCLI call: ${method} ${url.pathname} ${JSON.stringify(body)}`);
   });
@@ -217,8 +263,19 @@ describe('main identity reconciliation', () => {
     expect(state).toMatchObject({ groupCreated: 0, provider: null, profileWrites: 0, agents: [] });
   });
 
-  it('stamps one main group, selects its provider, verifies all secret mode, then publishes the profile', async () => {
+  it('stamps one main group, selects its provider, grants its model and Google secrets while preserving operator grants, then publishes the profile', async () => {
     const { state, dependencies } = harness();
+    state.secrets.push(
+      { id: 'sec-gcal', name: 'google-calendar', type: 'generic', hostPattern: 'www.googleapis.com' },
+      { id: 'sec-op', name: 'Operator MCP', type: 'generic', hostPattern: 'mcp.internal.test' },
+    );
+    state.agents.push({
+      id: 'oc-main',
+      identifier: GROUP_ID,
+      name: 'main',
+      secretMode: 'selective',
+      grants: ['sec-op'],
+    });
 
     const result = await reconcileMainIdentity(runtimeConfig(), create, dependencies);
     await reconcileMainIdentity(
@@ -231,7 +288,9 @@ describe('main identity reconciliation', () => {
     expect(state.groupCreated).toBe(1);
     expect(state.agents).toHaveLength(1);
     expect(state.provider).toBe('claude');
-    expect(state.secretModeWrites).toBe(0);
+    expect(state.agents[0]!.grants).toEqual(['sec-op', 'sec-anthropic', 'sec-gcal']);
+    expect(state.grantWrites).toBe(2);
+    expect(state.grantDetaches).toBe(0);
     expect(state.profileWrites).toBe(2);
   });
 
@@ -270,10 +329,10 @@ describe('main identity reconciliation', () => {
     expect(state.profileWrites).toBe(1);
   });
 
-  it('resumes after an ambiguous all-mode side effect without duplicating main or its OneCLI agent', async () => {
-    const { state, dependencies } = harness({ failAfterSecretModeOnce: true });
-    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
-    state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective' });
+  it('resumes after an ambiguous grant side effect without duplicating main or its OneCLI agent', async () => {
+    const { state, dependencies } = harness({ failAfterGrantOnce: true });
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective', grants: [] });
+    state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'selective', grants: [] });
 
     await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toMatchObject({
       code: 'onecli_request_failed',
@@ -286,19 +345,32 @@ describe('main identity reconciliation', () => {
     expect(state.groupCreated).toBe(1);
     expect(state.agents).toHaveLength(2);
     expect(state.profileWrites).toBe(1);
-    expect(state.agents).toContainEqual({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' });
+    expect(state.agents).toContainEqual({
+      id: 'oc-main',
+      identifier: GROUP_ID,
+      name: 'main',
+      secretMode: 'selective',
+      grants: ['sec-anthropic'],
+    });
     expect(state.agents).toContainEqual({
       id: 'oc-other',
       identifier: 'ag-other',
       name: 'other',
       secretMode: 'selective',
+      grants: [],
     });
-    expect(state.secretModeWrites).toBe(1);
+    expect(state.grantWrites).toBe(1);
   });
 
   it("creates main's agent when OneCLI's list does not show it, reading it from the list when the create answers 409", async () => {
     const { state, dependencies } = harness({ listLagsCreate: true });
-    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all' });
+    state.agents.push({
+      id: 'oc-main',
+      identifier: GROUP_ID,
+      name: 'main',
+      secretMode: 'selective',
+      grants: ['sec-anthropic'],
+    });
 
     await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).resolves.toEqual({
       agentGroupId: GROUP_ID,
@@ -308,28 +380,40 @@ describe('main identity reconciliation', () => {
     expect(state.profileWrites).toBe(1);
   });
 
-  it("reads main's agent without a secret mode as all, OneCLI's default, and leaves it", async () => {
+  it("accepts main's agent with omitted secretMode when its required grants are present", async () => {
     const { state, dependencies } = harness();
-    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main' });
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', grants: ['sec-anthropic'] });
 
     await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).resolves.toMatchObject({
       onecliAgentId: 'oc-main',
     });
-    expect(state.secretModeWrites).toBe(0);
+    expect(state.grantWrites).toBe(0);
     expect(state.profileWrites).toBe(1);
   });
 
-  it('fails closed before publishing canonical main when all secret mode cannot be verified', async () => {
-    const { state, dependencies } = harness({ neverApplySecretMode: true });
-    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective' });
+  it('fails closed before publishing canonical main when required grants cannot be verified', async () => {
+    const { state, dependencies } = harness({ neverApplyGrant: true });
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'selective', grants: [] });
 
-    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toThrow(/all secret mode/i);
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toMatchObject({
+      code: 'onecli_grants_mismatch',
+    });
+    expect(state.profileWrites).toBe(0);
+  });
+
+  it('fails closed when main is still in legacy all-secrets mode', async () => {
+    const { state, dependencies } = harness();
+    state.agents.push({ id: 'oc-main', identifier: GROUP_ID, name: 'main', secretMode: 'all', grants: [] });
+
+    await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toMatchObject({
+      code: 'onecli_secret_mode_mismatch',
+    });
     expect(state.profileWrites).toBe(0);
   });
 
   it('rejects a pre-existing OneCLI identity collision instead of adopting it', async () => {
     const { state, dependencies } = harness();
-    state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'main', secretMode: 'selective' });
+    state.agents.push({ id: 'oc-other', identifier: 'ag-other', name: 'main', secretMode: 'selective', grants: [] });
 
     await expect(reconcileMainIdentity(runtimeConfig(), create, dependencies)).rejects.toThrow(/collision/i);
     expect(state.profileWrites).toBe(0);

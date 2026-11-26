@@ -128,6 +128,7 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
 }
 
 interface VaultSecret {
+  readonly id: string;
   readonly name: string;
   readonly hostPattern: string;
 }
@@ -142,10 +143,15 @@ async function listVaultSecrets(
 ): Promise<VaultSecret[]> {
   const admin = await instanceOnecliAdmin(runtime, fetchImpl ? { fetch: fetchImpl } : {});
   return (await admin.listSecrets()).map((entry) => {
-    if (typeof entry.name !== 'string' || typeof entry.hostPattern !== 'string') {
+    if (
+      typeof entry.id !== 'string' ||
+      entry.id.length === 0 ||
+      typeof entry.name !== 'string' ||
+      typeof entry.hostPattern !== 'string'
+    ) {
       throw new Error('OneCLI returned an unreadable secret');
     }
-    return { name: entry.name, hostPattern: entry.hostPattern };
+    return { id: entry.id, name: entry.name, hostPattern: entry.hostPattern };
   });
 }
 
@@ -327,9 +333,37 @@ export function googleAccessResources(
   const sleep = dependencies.sleep ?? ((ms: number) => delay(ms));
   const tokenOptions = tokenOptionsOf(dependencies);
   const accessProblem = async (context: GoogleConnectionContext): Promise<string | undefined> => {
-    const secrets = await listVaultSecrets(context.input.google.runtime, fetchImpl);
+    const runtime = context.input.google.runtime;
+    const admin = await instanceOnecliAdmin(runtime, fetchImpl ? { fetch: fetchImpl } : {});
+    const rawSecrets = await admin.listSecrets();
+    const secrets: VaultSecret[] = rawSecrets.map((entry) => {
+      if (
+        typeof entry.id !== 'string' ||
+        entry.id.length === 0 ||
+        typeof entry.name !== 'string' ||
+        typeof entry.hostPattern !== 'string'
+      ) {
+        throw new Error('OneCLI returned an unreadable secret');
+      }
+      return { id: entry.id, name: entry.name, hostPattern: entry.hostPattern };
+    });
     await requireGrant(context);
-    return publishedAccessProblem(secrets)?.reason;
+    const published = publishedAccessProblem(secrets)?.reason;
+    if (published) return published;
+    const mainAgents = (await admin.listAgents()).filter((agent) => agent.name === 'main');
+    if (mainAgents.length === 1 && mainAgents[0]!.secretMode !== 'all') {
+      const granted = new Set(await admin.listAgentSecretGrants(mainAgents[0]!.id));
+      const missingGrants = AGENT_GOOGLE_CREDENTIALS.filter((credential) => {
+        const secret = secrets.find(
+          (candidate) => candidate.name === credential.secretName && candidate.hostPattern === credential.host,
+        );
+        return secret !== undefined && !granted.has(secret.id);
+      }).map((credential) => credential.secretName);
+      if (missingGrants.length > 0) {
+        return `main has not been granted ${listed(missingGrants)} yet`;
+      }
+    }
+    return undefined;
   };
   return [
     {

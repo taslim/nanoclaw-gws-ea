@@ -37,7 +37,9 @@ import { releaseImageTag } from './agent-image-release.js';
 import { aliasHost } from './alias.js';
 import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.js';
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
-import { MAIN_GROUP_NAME } from './identity.js';
+import { MAIN_GROUP_NAME, resolveModelSecretId } from './identity.js';
+import { publishedGoogleSecretIds } from '../modules/gws-ea-google/gateway-grants.js';
+import { onecliUsesAgentGrants } from './pins.js';
 import { readProvisionJournal } from './journal.js';
 import { observeLocalVoice, type VoiceObservation } from './local-voice.js';
 import { runInstanceNclJson } from './ncl.js';
@@ -478,6 +480,8 @@ export interface StatusObservers {
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
   readonly onecliAgents: (runtime: InstanceRuntimeConfig) => Promise<readonly OnecliAgent[]>;
+  readonly onecliSecrets: (runtime: InstanceRuntimeConfig) => Promise<readonly Record<string, unknown>[]>;
+  readonly onecliAgentSecretGrants: (runtime: InstanceRuntimeConfig, agentId: string) => Promise<readonly string[]>;
   readonly onecli: (layout: OnecliRuntimeLayout, pins: OnecliPins) => Promise<Observation>;
   readonly principalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly schema: (stateRoot: string) => SnapshotManifest;
@@ -554,6 +558,10 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
     ...(overrides.fetch ? { fetch: overrides.fetch } : {}),
     ncl: overrides.ncl ?? runInstanceNclJson,
     onecliAgents: overrides.onecliAgents ?? (async (runtime) => (await instanceOnecliAdmin(runtime)).listAgents()),
+    onecliSecrets: overrides.onecliSecrets ?? (async (runtime) => (await instanceOnecliAdmin(runtime)).listSecrets()),
+    onecliAgentSecretGrants:
+      overrides.onecliAgentSecretGrants ??
+      (async (runtime, agentId) => (await instanceOnecliAdmin(runtime)).listAgentSecretGrants(agentId)),
     onecli:
       overrides.onecli ?? ((layout, pins) => observeOnecliRuntime(layout, pins, { dockerCommandRunner: runCommand })),
     principalBinding: overrides.principalBinding ?? verifyPrincipalBinding,
@@ -869,9 +877,10 @@ async function mainIdentityProbe(
     reason,
     agent_group_id: agentGroupId,
   });
-  const [group, config] = await Promise.all([
+  const [group, config, setup] = await Promise.all([
     ncl(runtime, ['groups', 'get', '--id', agentGroupId]).then(unwrapData),
     ncl(runtime, ['groups', 'config', 'get', '--id', agentGroupId]).then(unwrapData),
+    readDeployedSetup(subject.context.paths, subject.reservation),
   ]);
   if (!isRecord(group) || group.name !== MAIN_GROUP_NAME) {
     return degraded(`Agent group ${agentGroupId}, which the profile names as main, is not the main group.`);
@@ -885,8 +894,32 @@ async function mainIdentityProbe(
   if (!agent) return degraded('Main has no OneCLI agent.');
   if (matching.length > 1) return degraded('Several OneCLI agents claim main.');
   if (agent.name !== MAIN_GROUP_NAME) return degraded("Main's OneCLI agent is not named main.");
-  if (agent.secretMode !== 'all') {
-    return degraded(`Main's OneCLI agent is granted ${agent.secretMode} secrets, not all.`);
+  if (!onecliUsesAgentGrants(setup.onecli.gateway)) {
+    if (agent.secretMode !== 'all') {
+      return degraded(`Main's OneCLI agent is granted ${agent.secretMode ?? 'unknown'} secrets, not all.`);
+    }
+    return { ...OK, agent_group_id: agentGroupId };
+  }
+  if (agent.secretMode === 'all') {
+    return degraded("Main's OneCLI agent is still in legacy all-secrets mode.");
+  }
+  const [secrets, granted] = await Promise.all([
+    subject.observers.onecliSecrets(runtime),
+    subject.observers.onecliAgentSecretGrants(runtime, agent.id),
+  ]);
+  const grantedSet = new Set(granted);
+  const modelId = resolveModelSecretId(secrets, runtime.selected_provider, setup.providerCredential);
+  if (modelId === undefined) {
+    return degraded(`OneCLI holds no ${runtime.selected_provider} model credential for main.`);
+  }
+  if (!grantedSet.has(modelId)) {
+    return degraded(`Main's OneCLI agent is missing its ${runtime.selected_provider} model credential grant.`);
+  }
+  const missingGoogle = [...publishedGoogleSecretIds(secrets)]
+    .filter(([, id]) => !grantedSet.has(id))
+    .map(([name]) => name);
+  if (missingGoogle.length > 0) {
+    return degraded(`Main's OneCLI agent is missing Google credential grants (${missingGoogle.join(', ')}).`);
   }
   return { ...OK, agent_group_id: agentGroupId };
 }

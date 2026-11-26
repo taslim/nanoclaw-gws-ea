@@ -80,30 +80,37 @@ describe('the OneCLI API key', () => {
 });
 
 describe('OneCLI administration', () => {
-  it('reads and replaces only the named agent secret assignments using the pinned OneCLI API', async () => {
+  it('reads, attaches, and detaches only the named agent secret grants using the OneCLI 1.44+ grants API', async () => {
     const { fetch, requests } = oneCli((request) =>
-      request.method === 'GET' ? json(['model-secret']) : json({ success: true }),
+      request.method === 'GET' ? json({ secrets: [{ secretId: 'model-secret' }] }) : json({ success: true }),
     );
     const admin = createOnecliAdmin(APP_URL, API_KEY, { fetch });
 
-    expect(await admin.listAgentSecretIds('agent/chat')).toEqual(['model-secret']);
-    await admin.setAgentSecretIds('agent/chat', ['model-secret']);
+    expect(await admin.listAgentSecretGrants('agent/chat')).toEqual(['model-secret']);
+    await admin.attachAgentSecretGrant('agent/chat', 'model/secret');
+    await admin.detachAgentSecretGrant('agent/chat', 'extra/secret');
 
     expect(requests.map(({ method, route, body }) => ({ method, route, body }))).toEqual([
-      { method: 'GET', route: `${APP_URL}/v1/agents/agent%2Fchat/secrets`, body: undefined },
-      { method: 'PUT', route: `${APP_URL}/v1/agents/agent%2Fchat/secrets`, body: { secretIds: ['model-secret'] } },
+      { method: 'GET', route: `${APP_URL}/v1/agents/agent%2Fchat/grants`, body: undefined },
+      { method: 'PUT', route: `${APP_URL}/v1/agents/agent%2Fchat/grants/secrets/model%2Fsecret`, body: undefined },
+      { method: 'DELETE', route: `${APP_URL}/v1/agents/agent%2Fchat/grants/secrets/extra%2Fsecret`, body: undefined },
     ]);
   });
 
-  it.each([{}, ['model-secret', 'model-secret'], [12], ['']].map((answer) => ({ answer })))(
-    'refuses malformed agent secret assignments $answer',
-    async ({ answer }) => {
-      const { fetch } = oneCli(() => json(answer));
-      await expect(createOnecliAdmin(APP_URL, API_KEY, { fetch }).listAgentSecretIds('agent')).rejects.toMatchObject({
-        code: 'invalid_onecli_output',
-      });
-    },
-  );
+  it.each(
+    [
+      {},
+      { secrets: 'bad' },
+      { secrets: [{ secretId: 'model-secret' }, { secretId: 'model-secret' }] },
+      { secrets: [{ secretId: 12 }] },
+      { secrets: [{ secretId: '' }] },
+    ].map((answer) => ({ answer })),
+  )('refuses malformed agent secret grants $answer', async ({ answer }) => {
+    const { fetch } = oneCli(() => json(answer));
+    await expect(createOnecliAdmin(APP_URL, API_KEY, { fetch }).listAgentSecretGrants('agent')).rejects.toMatchObject({
+      code: 'invalid_onecli_output',
+    });
+  });
 
   it('sends every call to the given app URL with the given key, and registers the key for redaction', async () => {
     const { fetch, requests } = oneCli(() => json([]));
@@ -182,7 +189,7 @@ describe('OneCLI administration', () => {
     expect(onecliInjection({ name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' })).toBeNull();
   });
 
-  it("lists agents without their access tokens, reading a missing secret mode as OneCLI's default, all", async () => {
+  it('lists agents without their access tokens, preserving omitted secretMode as undefined', async () => {
     const { fetch } = oneCli(() =>
       json([
         { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective', accessToken: ACCESS_TOKEN },
@@ -192,7 +199,7 @@ describe('OneCLI administration', () => {
 
     await expect(createOnecliAdmin(APP_URL, API_KEY, { fetch }).listAgents()).resolves.toEqual([
       { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' },
-      { id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: 'all' },
+      { id: 'oc-other', identifier: 'ag-other', name: 'other', secretMode: undefined },
     ]);
   });
 
@@ -208,7 +215,7 @@ describe('OneCLI administration', () => {
 
     await expect(admin.createAgent({ name: 'main', identifier: 'ag-main' })).resolves.toBeUndefined();
     await expect(admin.listAgents()).resolves.toEqual([
-      { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' },
+      { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: undefined },
     ]);
     expect(requests[0]).toMatchObject({
       method: 'POST',
@@ -223,20 +230,6 @@ describe('OneCLI administration', () => {
     await expect(
       createOnecliAdmin(APP_URL, API_KEY, { fetch }).createAgent({ name: 'main', identifier: 'ag-main' }),
     ).rejects.toMatchObject({ code: 'onecli_request_failed', message: expect.stringContaining('HTTP 400') });
-  });
-
-  it("sets an agent's secret mode on that agent alone", async () => {
-    const { fetch, requests } = oneCli(() => json({ success: true }));
-
-    await createOnecliAdmin(APP_URL, API_KEY, { fetch }).setSecretMode('oc/main', 'all');
-
-    expect(requests).toEqual([
-      expect.objectContaining({
-        method: 'PATCH',
-        route: `${APP_URL}/v1/agents/oc%2Fmain/secret-mode`,
-        body: { mode: 'all' },
-      }),
-    ]);
   });
 });
 

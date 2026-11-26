@@ -1,5 +1,6 @@
 import { instanceOnecliAdmin, validateRuntimeConfig, type InstanceRuntimeConfig } from './service.js';
 import { runInstanceNclJson } from './ncl.js';
+import { findCredentialSecret } from './onecli.js';
 import type { OnecliAdmin, OnecliAgent } from './onecli-admin.js';
 import { GwsEaError } from './types.js';
 import {
@@ -11,6 +12,9 @@ import {
   unwrapData,
 } from './validation.js';
 import { normalizePersonName, type PersonName, type NameOwner } from './person-name.js';
+import { publishedGoogleSecretIds } from '../modules/gws-ea-google/gateway-grants.js';
+import type { ProviderCredentialMetadata } from '../provider-credential.js';
+import { getProviderHostContract } from '../provider-contracts/index.js';
 import { ianaTimezone } from '../timezone.js';
 
 export const MAIN_TEMPLATE = 'gws-ea/main';
@@ -45,6 +49,7 @@ export interface MainIdentityResult {
 export interface MainIdentityDependencies {
   readonly runNcl?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
   readonly onecliAdmin?: (config: InstanceRuntimeConfig) => Promise<OnecliAdmin>;
+  readonly providerCredential?: ProviderCredentialMetadata;
 }
 
 function safeString(value: unknown, label: string, maxLength = 256): string {
@@ -153,19 +158,89 @@ function sameAddresses(held: unknown, declared: readonly string[]): boolean {
   return holding.size === held.length && held.length === declared.length && declared.every((e) => holding.has(e));
 }
 
-async function reconcileAllSecretMode(admin: OnecliAdmin, agentGroupId: string): Promise<string> {
+/**
+ * Resolve the one unambiguous model secret ID in OneCLI for `provider`. Uses
+ * exact credential metadata when supplied, otherwise falls back to the
+ * provider's declared model endpoint hostnames.
+ */
+export function resolveModelSecretId(
+  secrets: readonly Record<string, unknown>[],
+  provider: string,
+  providerCredential?: ProviderCredentialMetadata,
+): string | undefined {
+  if (providerCredential !== undefined) {
+    const found = findCredentialSecret(secrets, providerCredential, {
+      ambiguous: `More than one OneCLI secret matches ${providerCredential.name}`,
+      conflict: `An existing OneCLI secret named ${providerCredential.name} has incompatible metadata`,
+    });
+    return typeof found?.id === 'string' && found.id.length > 0 ? found.id : undefined;
+  }
+  const endpoints = getProviderHostContract(provider)?.modelEndpoints;
+  const hosts = new Set(
+    [endpoints?.api, endpoints?.subscription]
+      .filter((value): value is string => value !== undefined)
+      .map((value) => new URL(value).hostname),
+  );
+  if (hosts.size === 0) return undefined;
+  const candidates = secrets.filter(
+    (secret) =>
+      typeof secret.id === 'string' &&
+      secret.id.length > 0 &&
+      typeof secret.hostPattern === 'string' &&
+      hosts.has(secret.hostPattern),
+  );
+  if (candidates.length > 1) {
+    throw new GwsEaError('ambiguous_onecli_secret', `More than one OneCLI secret matches provider ${provider}`);
+  }
+  return candidates.length === 1 ? (candidates[0]!.id as string) : undefined;
+}
+
+/**
+ * Reconcile canonical main's OneCLI identity under OneCLI 1.44+ explicit
+ * grants: ensure the agent exists, attach its model credential and any
+ * already-published Google credentials, and preserve every other grant
+ * (such as operator-attached MCP server credentials).
+ */
+async function reconcileMainGatewayGrants(
+  admin: OnecliAdmin,
+  agentGroupId: string,
+  provider: string,
+  providerCredential?: ProviderCredentialMetadata,
+): Promise<string> {
   let agent = exactAgent(await admin.listAgents(), agentGroupId);
   if (!agent) {
     await admin.createAgent({ name: MAIN_GROUP_NAME, identifier: agentGroupId });
     agent = exactAgent(await admin.listAgents(), agentGroupId);
     if (!agent) throw new GwsEaError('onecli_agent_missing', 'OneCLI did not create canonical main');
   }
+  if (agent.secretMode === 'all') {
+    throw new GwsEaError(
+      'onecli_secret_mode_mismatch',
+      'Canonical main is still in legacy all-secrets mode; upgrade or reconvert OneCLI',
+    );
+  }
 
-  if (agent.secretMode !== 'all') await admin.setSecretMode(agent.id, 'all');
+  const secrets = await admin.listSecrets();
+  const modelId = resolveModelSecretId(secrets, provider, providerCredential);
+  if (modelId === undefined) {
+    throw new GwsEaError(
+      'onecli_model_credential_missing',
+      `OneCLI holds no model credential for provider ${provider}`,
+    );
+  }
+  const required = [...new Set([modelId, ...publishedGoogleSecretIds(secrets).values()])];
+  const granted = new Set(await admin.listAgentSecretGrants(agent.id));
+  for (const secretId of required) {
+    if (!granted.has(secretId)) await admin.attachAgentSecretGrant(agent.id, secretId);
+  }
 
   const verified = exactAgent(await admin.listAgents(), agentGroupId);
-  if (!verified || verified.id !== agent.id || verified.secretMode !== 'all') {
-    throw new GwsEaError('onecli_secret_mode_mismatch', 'Canonical main does not have verified all secret mode');
+  if (!verified || verified.id !== agent.id || verified.secretMode === 'all') {
+    throw new GwsEaError('onecli_secret_mode_mismatch', 'Canonical main does not have verified OneCLI grants');
+  }
+  const verifiedGrants = new Set(await admin.listAgentSecretGrants(verified.id));
+  if (required.some((secretId) => !verifiedGrants.has(secretId))) {
+    throw new GwsEaError('onecli_grants_mismatch', 'Canonical main did not retain its required OneCLI secret grants');
   }
   return verified.id;
 }
@@ -218,7 +293,12 @@ export async function reconcileMainIdentity(
     throw new GwsEaError('main_group_mismatch', "Canonical main's skills did not reconcile to the release's list");
   }
 
-  const onecliAgentId = await reconcileAllSecretMode(await onecliAdmin(config), group.id);
+  const onecliAgentId = await reconcileMainGatewayGrants(
+    await onecliAdmin(config),
+    group.id,
+    config.selected_provider,
+    dependencies.providerCredential,
+  );
   const { principal } = input;
   const profile = unwrapData(
     await runNcl(config, [

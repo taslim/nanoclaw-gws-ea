@@ -1,7 +1,6 @@
 /**
- * The gateway identity of a host-owned sealed group: selective secret mode, holding exactly its provider's model
- * credential. Every other secret in the gateway, the principal's app credentials included, stays with main, whose
- * identity keeps all secrets.
+ * The gateway identity of a host-owned sealed group: fail-closed agent grants holding strictly and only its
+ * provider's model credential. Every other secret in the gateway stays off sealed groups.
  */
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -49,8 +48,9 @@ async function modelSecret(client: OnecliAdmin, group: string, label: string): P
 }
 
 /**
- * Admission refuses a group without an identity, so the gateway never creates one in its default all-secrets mode;
- * this creates it, repairs it, and reads back both restrictions. Only this group's identity is written.
+ * Admission refuses a group without a verified model-only gateway identity; this creates it if absent, attaches its
+ * model credential, detaches any other secret grant, and reads back the grants to verify. Only this group's identity
+ * is written.
  */
 export async function reconcileSealedGateway(group: string, label: string): Promise<void> {
   if ((await sealedGatewayDrift(group, label)).length === 0) return;
@@ -64,9 +64,14 @@ export async function reconcileSealedGateway(group: string, label: string): Prom
     current = await sealedGatewayIdentity(client, group, label);
   }
   if (!current) throw new Error(`${label} gateway identity was not created`);
-  if (current.secretMode !== 'selective') await client.setSecretMode(current.id, 'selective');
-  const assigned = await client.listAgentSecretIds(current.id);
-  if (assigned.length !== 1 || assigned[0] !== secret) await client.setAgentSecretIds(current.id, [secret]);
+  if (current.secretMode === 'all') {
+    throw new Error(`${label} gateway identity is in legacy all-secrets mode; upgrade or reconvert OneCLI`);
+  }
+  const granted = await client.listAgentSecretGrants(current.id);
+  if (!granted.includes(secret)) await client.attachAgentSecretGrant(current.id, secret);
+  for (const extra of granted) {
+    if (extra !== secret) await client.detachAgentSecretGrant(current.id, extra);
+  }
   const problems = await sealedGatewayDrift(group, label);
   if (problems.length > 0) throw new Error(`${label} gateway reconciliation failed: ${problems.join('; ')}`);
 }
@@ -79,7 +84,7 @@ export async function sealedGatewayDrift(group: string, label: string): Promise<
   void model.catch(() => undefined);
   const current = await sealedGatewayIdentity(client, group, label);
   if (!current) return ['its gateway identity is missing'];
-  if (current.secretMode !== 'selective') return ['its gateway secret mode is not selective'];
-  const [secret, assigned] = await Promise.all([model, client.listAgentSecretIds(current.id)]);
-  return assigned.length === 1 && assigned[0] === secret ? [] : ['its gateway secret assignments are not model-only'];
+  if (current.secretMode === 'all') return ['its gateway secret mode is all'];
+  const [secret, granted] = await Promise.all([model, client.listAgentSecretGrants(current.id)]);
+  return granted.length === 1 && granted[0] === secret ? [] : ['its gateway secret grants are not model-only'];
 }

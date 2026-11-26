@@ -37,6 +37,28 @@ export function parsePins(value: unknown, label = 'gws-ea versions.json'): GwsEa
 export const LAUNCHER_PINS = parsePins(launcherPins);
 export const ONECLI_GATEWAY_VERSION = LAUNCHER_PINS.onecliGateway;
 
+/** Supported in-place OneCLI gateway upgrades, each backed by a verified conversion and rollback path. */
+const SUPPORTED_ONECLI_GATEWAY_UPGRADES: ReadonlySet<string> = new Set(['1.42.0->1.45.0']);
+
+function parseReleaseTriple(version: string): readonly [number, number, number] | undefined {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/u.exec(version);
+  if (!match) return undefined;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** OneCLI 1.44+ replaces per-agent secret modes with explicit per-agent secret grants. */
+export function onecliUsesAgentGrants(version: string): boolean {
+  const parsed = parseReleaseTriple(version);
+  if (!parsed) return false;
+  const [major, minor] = parsed;
+  return major > 1 || (major === 1 && minor >= 44);
+}
+
+/** Whether `gws-ea update` may move an assistant's OneCLI gateway from `deployed` to `release`. */
+export function isSupportedOnecliGatewayUpgrade(deployed: string, release: string): boolean {
+  return deployed === release || SUPPORTED_ONECLI_GATEWAY_UPGRADES.has(`${deployed}->${release}`);
+}
+
 const packageManifest: unknown = createRequire(import.meta.url)('../../package.json');
 export const ONECLI_SDK_VERSION = exactVersion(
   requireRecord(

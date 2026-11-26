@@ -15,7 +15,7 @@ import { observeLiveCheckout } from './checkout.js';
 import { runStep, type StepReporter } from './events.js';
 import { loadCreatedRuntime, type InstanceOperation } from './journal.js';
 import { runInstanceNclJson, type InstanceNclOptions } from './ncl.js';
-import { observeOnecliRuntime, reconcileOnecliRuntime } from './onecli.js';
+import { backupOnecliDatabase, observeOnecliRuntime, reconcileOnecliRuntime, restoreOnecliDatabase } from './onecli.js';
 import type { OnecliPins, OnecliRuntimeLayout } from './onecli-compose.js';
 import {
   addFollowUps,
@@ -455,6 +455,10 @@ export interface CutoverOnecli {
   reverify(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
   /** Health only, never repairing, once a release serves. */
   observe(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<Observation>;
+  /** Stop app/gateway and dump OneCLI Postgres atomically to `backupFile`. */
+  backupDatabase(layout: OnecliRuntimeLayout, backupFile: string): Promise<void>;
+  /** Stop app/gateway and restore OneCLI Postgres from `backupFile`. */
+  restoreDatabase(layout: OnecliRuntimeLayout, backupFile: string): Promise<void>;
 }
 
 export interface CutoverSeams {
@@ -564,15 +568,14 @@ function onecliBoundaries({ run, dependencies }: CutoverHost) {
   return {
     dockerCommandRunner: run,
     ...(dependencies.ambientEnv ? { ambientEnv: dependencies.ambientEnv } : {}),
+    ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
+    ...(dependencies.service?.sleep ? { sleep: dependencies.service.sleep } : {}),
   };
 }
 
 export function cutoverOnecli(host: CutoverHost): CutoverOnecli {
   const { dependencies } = host;
-  const boundaries = {
-    ...onecliBoundaries(host),
-    ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
-  };
+  const boundaries = onecliBoundaries(host);
   return {
     reverify:
       dependencies.onecli?.reverify ??
@@ -581,6 +584,12 @@ export function cutoverOnecli(host: CutoverHost): CutoverOnecli {
         await reconcileOnecliRuntime(layout, pins, boundaries);
       }),
     observe: dependencies.onecli?.observe ?? ((layout, pins) => observeOnecliRuntime(layout, pins, boundaries)),
+    backupDatabase:
+      dependencies.onecli?.backupDatabase ??
+      ((layout, backupFile) => backupOnecliDatabase(layout, backupFile, boundaries)),
+    restoreDatabase:
+      dependencies.onecli?.restoreDatabase ??
+      ((layout, backupFile) => restoreOnecliDatabase(layout, backupFile, boundaries)),
   };
 }
 

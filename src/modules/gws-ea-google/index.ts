@@ -7,12 +7,21 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { registerCapability } from '../../capabilities.js';
+import { getGroupCapabilities, registerCapability } from '../../capabilities.js';
+import { protectedGroupReason } from '../../cli/guard.js';
 import { registerContainerEnv } from '../../container-env.js';
+import { registerSessionAdmissionPolicy } from '../../container-runner.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
 import { getGatewayProvider, withholdGatewayAgentSkills } from '../../gateway-providers/index.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { knownMainAgentGroupId } from '../gws-ea-profile/db.js';
+import {
+  hostOnecliAdmin,
+  MAIN_ONLY_KEYS,
+  reconcileAllGoogleGrants,
+  reconcileGroupGoogleGrants,
+} from './gateway-grants.js';
 import {
   AGENT_GOOGLE_SERVICES,
   EXPOSED_GOOGLE_SERVICES,
@@ -53,13 +62,6 @@ export const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>>
 const GOOGLE_KEYS: ReadonlyMap<GoogleCapability, string> = new Map(
   EXPOSED_GOOGLE_SERVICES.map((id) => [AGENT_GOOGLE_SERVICES[id].capability, AGENT_GOOGLE_SERVICES[id].skill]),
 );
-
-/**
- * Keys whose gog commands only the profile's `main` is given, since a new
- * group stores `all` and so holds every key. The skill still follows the key,
- * as every Google skill does.
- */
-const MAIN_ONLY_KEYS: ReadonlySet<GoogleCapability> = new Set(['google-workspace']);
 
 for (const [capability, skill] of GOOGLE_KEYS) {
   registerCapability(capability, {
@@ -103,6 +105,25 @@ registerContainerEnv('gws-ea-google:gog', ({ agentGroupId, capabilities }): Reco
 
 const grantFile = googleGrantFilePath();
 
+registerSessionAdmissionPolicy('gws-ea-google:gateway-grants', async ({ disposition, key }) => {
+  if (disposition !== 'create' || grantFile === undefined) return;
+  if (getGatewayProvider().kind !== 'onecli') return;
+  if ((await protectedGroupReason(key.agentGroupId)) !== undefined) return;
+  const admin = hostOnecliAdmin();
+  if (!admin) return;
+  const [group, capabilities] = await Promise.all([
+    getAgentGroup(key.agentGroupId),
+    getGroupCapabilities(key.agentGroupId),
+  ]);
+  await reconcileGroupGoogleGrants(key.agentGroupId, {
+    admin,
+    capabilities,
+    isMain: key.agentGroupId === knownMainAgentGroupId(),
+    ...(group ? { groupName: group.name } : {}),
+    createMissingAgent: true,
+  });
+});
+
 /**
  * Built as the module loads from the grant alone: channels start before the
  * host's modules, so Chat has its token before any module's start runs,
@@ -121,9 +142,17 @@ onHostStart(async ({ signal }) => {
     });
     return;
   }
+  const onPublished =
+    gateway.kind === 'onecli'
+      ? async () => {
+          const admin = hostOnecliAdmin();
+          if (admin) await reconcileAllGoogleGrants(admin);
+        }
+      : undefined;
   const refresher = createGoogleTokenRefresher({
     readGrant: () => readGoogleGrantFile(grantFile),
     connection: (target) => credentials.connection(target),
+    ...(onPublished ? { onPublished } : {}),
     log,
   });
   // Started, not awaited: host startup never waits on Google.
