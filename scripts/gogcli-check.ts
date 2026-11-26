@@ -232,24 +232,33 @@ export interface CheckReport {
 
 const MAX_OSV_PAGES = 50;
 
+export interface OsvModuleResult {
+  readonly pages: readonly OsvQueryResponse[];
+  readonly error?: string;
+}
+
 export async function queryOsvModule(
   moduleName: string,
   version: string,
   fetchPage: (payload: OsvQueryPayload) => Promise<OsvQueryResponse>,
-): Promise<OsvQueryResponse[]> {
+): Promise<OsvModuleResult> {
   const pages: OsvQueryResponse[] = [];
   let pageToken: string | undefined;
-  for (let page = 0; page < MAX_OSV_PAGES; page++) {
-    const response = await fetchPage({
-      version,
-      package: { name: moduleName, ecosystem: 'Go' },
-      ...(pageToken ? { page_token: pageToken } : {}),
-    });
-    pages.push(response);
-    if (!response.next_page_token) return pages;
-    pageToken = response.next_page_token;
+  try {
+    for (let page = 0; page < MAX_OSV_PAGES; page++) {
+      const response = await fetchPage({
+        version,
+        package: { name: moduleName, ecosystem: 'Go' },
+        ...(pageToken ? { page_token: pageToken } : {}),
+      });
+      pages.push(response);
+      if (!response.next_page_token) return { pages };
+      pageToken = response.next_page_token;
+    }
+    return { pages, error: `OSV query for ${moduleName}@${version} exceeded ${MAX_OSV_PAGES} pages` };
+  } catch (error) {
+    return { pages, error: error instanceof Error ? error.message : String(error) };
   }
-  throw new Error(`OSV query for ${moduleName}@${version} exceeded ${MAX_OSV_PAGES} pages`);
 }
 
 export async function queryOsvAdvisories(
@@ -258,15 +267,13 @@ export async function queryOsvAdvisories(
   strictOsv: boolean,
   fetchPage: (payload: OsvQueryPayload) => Promise<OsvQueryResponse>,
 ): Promise<{ readonly advisories: AdvisoryHit[]; readonly warnings: string[] }> {
-  const results = await Promise.allSettled(modules.map((moduleName) => queryOsvModule(moduleName, version, fetchPage)));
+  const results = await Promise.all(modules.map((moduleName) => queryOsvModule(moduleName, version, fetchPage)));
   const pages: OsvQueryResponse[] = [];
   const errors: string[] = [];
   results.forEach((result, index) => {
-    if (result.status === 'fulfilled') {
-      pages.push(...result.value);
-    } else {
-      const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
-      errors.push(`${modules[index]}: ${message}`);
+    pages.push(...result.pages);
+    if (result.error !== undefined) {
+      errors.push(`${modules[index]}: ${result.error}`);
     }
   });
   if (errors.length > 0 && strictOsv) {

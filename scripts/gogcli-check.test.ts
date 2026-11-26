@@ -172,4 +172,36 @@ describe('semver and advisory matching', () => {
       }),
     ).rejects.toThrow(/OSV query failed for gogcli 0.43.0/);
   });
+
+  it('retains advisories fetched on earlier OSV pages when a subsequent page fails', async () => {
+    const partial = await queryOsvAdvisories('0.43.0', ['github.com/openclaw/gogcli'], false, async (payload) => {
+      if (!payload.page_token) {
+        return {
+          vulns: [{ id: 'GO-2026-0100', summary: 'Page 1 finding' }],
+          next_page_token: 'page-2',
+        };
+      }
+      throw new Error('HTTP 503 on page 2');
+    });
+    expect(partial.advisories).toEqual([
+      {
+        source: 'osv',
+        id: 'GO-2026-0100',
+        severity: 'unknown',
+        summary: 'Page 1 finding',
+        url: 'https://osv.dev/vulnerability/GO-2026-0100',
+      },
+    ]);
+    expect(partial.warnings).toHaveLength(1);
+    expect(partial.warnings[0]).toContain('HTTP 503 on page 2');
+
+    await expect(
+      queryOsvAdvisories('0.43.0', ['github.com/openclaw/gogcli'], true, async (payload) => {
+        if (!payload.page_token) {
+          return { vulns: [{ id: 'GO-2026-0100', summary: 'Page 1 finding' }], next_page_token: 'page-2' };
+        }
+        throw new Error('HTTP 503 on page 2');
+      }),
+    ).rejects.toThrow(/HTTP 503 on page 2/);
+  });
 });
