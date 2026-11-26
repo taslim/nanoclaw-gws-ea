@@ -19,15 +19,13 @@ const API_KEY_PATTERN = /^oc_[A-Za-z0-9_-]{20,}$/u;
 /** What OneCLI stores as the format of a header or parameter given none: the bare value. */
 const DEFAULT_INJECTION_FORMAT = '{value}';
 
-export type OnecliSecretMode = 'all' | 'selective';
-
 /** The agent's access token is never read. */
 export interface OnecliAgent {
   readonly id: string;
   readonly identifier: string;
   readonly name: string;
-  /** `all`, OneCLI's default, when OneCLI omits it, as releases from 1.43 on may. */
-  readonly secretMode: string;
+  /** Present when OneCLI reports it; absent when omitted on newer releases. */
+  readonly secretMode: string | undefined;
 }
 
 export type OnecliInjection =
@@ -42,11 +40,12 @@ export interface OnecliAdmin {
   listAgents(): Promise<readonly OnecliAgent[]>;
   /** One whose identifier exists already (409) is no failure: the list then names it. */
   createAgent(agent: { readonly name: string; readonly identifier: string }): Promise<void>;
-  setSecretMode(agentId: string, mode: OnecliSecretMode): Promise<void>;
-  /** Explicit secret assignments, as the pinned OneCLI exposes them; values are never read. */
-  listAgentSecretIds(agentId: string): Promise<readonly string[]>;
-  /** Replaces every assignment; retiring a host-owned agent sends an empty list. */
-  setAgentSecretIds(agentId: string, secretIds: readonly string[]): Promise<void>;
+  /** Explicit secret grant IDs from `/v1/agents/{id}/grants` (OneCLI 1.44+); values are never read. */
+  listAgentSecretGrants(agentId: string): Promise<readonly string[]>;
+  /** Grants one secret to an agent via `PUT /v1/agents/{id}/grants/secrets/{secretId}`. */
+  attachAgentSecretGrant(agentId: string, secretId: string): Promise<void>;
+  /** Revokes one secret grant from an agent via `DELETE /v1/agents/{id}/grants/secrets/{secretId}`. */
+  detachAgentSecretGrant(agentId: string, secretId: string): Promise<void>;
 }
 
 export interface OnecliAdminDependencies {
@@ -60,7 +59,7 @@ interface OnecliEndpoint {
 }
 
 interface OnecliCall {
-  readonly method: 'GET' | 'POST' | 'PATCH' | 'PUT';
+  readonly method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
   readonly route: string;
   readonly label: string;
   readonly body?: unknown;
@@ -116,7 +115,10 @@ function parseAgent(agent: Record<string, unknown>): OnecliAgent {
     id: requireString(agent.id, 'OneCLI agent ID', INVALID_OUTPUT, 256),
     identifier: requireString(agent.identifier, 'OneCLI agent identifier', INVALID_OUTPUT, 256),
     name: requireString(agent.name, 'OneCLI agent name', INVALID_OUTPUT, 256),
-    secretMode: requireString(agent.secretMode ?? 'all', 'OneCLI agent secret mode', INVALID_OUTPUT, 32),
+    secretMode:
+      agent.secretMode === undefined
+        ? undefined
+        : requireString(agent.secretMode, 'OneCLI agent secret mode', INVALID_OUTPUT, 32),
   };
 }
 
@@ -199,34 +201,44 @@ export function createOnecliAdmin(
         accepted: 409,
       });
     },
-    async setSecretMode(agentId, mode) {
-      await send(endpoint, {
-        method: 'PATCH',
-        route: `/v1/agents/${encodeURIComponent(agentId)}/secret-mode`,
-        label: `agent ${agentId}'s secret mode`,
-        body: { mode },
-      });
-    },
-    async listAgentSecretIds(agentId) {
-      const ids = await read(endpoint, {
+    async listAgentSecretGrants(agentId) {
+      const grants = await read(endpoint, {
         method: 'GET',
-        route: `/v1/agents/${encodeURIComponent(agentId)}/secrets`,
-        label: `agent ${agentId}'s secret assignments`,
+        route: `/v1/agents/${encodeURIComponent(agentId)}/grants`,
+        label: `agent ${agentId}'s secret grants`,
       });
-      if (
-        !Array.isArray(ids) ||
-        !ids.every((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 256) ||
-        new Set(ids).size !== ids.length
-      )
-        throw new GwsEaError(INVALID_OUTPUT, 'OneCLI returned invalid agent secret assignments');
+      if (!isRecord(grants) || !Array.isArray(grants.secrets)) {
+        throw new GwsEaError(INVALID_OUTPUT, 'OneCLI returned invalid agent secret grants');
+      }
+      const ids: string[] = [];
+      for (const entry of grants.secrets) {
+        if (
+          !isRecord(entry) ||
+          typeof entry.secretId !== 'string' ||
+          entry.secretId.length === 0 ||
+          entry.secretId.length > 256
+        ) {
+          throw new GwsEaError(INVALID_OUTPUT, 'OneCLI returned invalid agent secret grants');
+        }
+        ids.push(entry.secretId);
+      }
+      if (new Set(ids).size !== ids.length) {
+        throw new GwsEaError(INVALID_OUTPUT, 'OneCLI returned duplicate agent secret grants');
+      }
       return ids;
     },
-    async setAgentSecretIds(agentId, secretIds) {
+    async attachAgentSecretGrant(agentId, secretId) {
       await send(endpoint, {
         method: 'PUT',
-        route: `/v1/agents/${encodeURIComponent(agentId)}/secrets`,
-        label: `agent ${agentId}'s secret assignments`,
-        body: { secretIds },
+        route: `/v1/agents/${encodeURIComponent(agentId)}/grants/secrets/${encodeURIComponent(secretId)}`,
+        label: `attaching secret ${secretId} to agent ${agentId}`,
+      });
+    },
+    async detachAgentSecretGrant(agentId, secretId) {
+      await send(endpoint, {
+        method: 'DELETE',
+        route: `/v1/agents/${encodeURIComponent(agentId)}/grants/secrets/${encodeURIComponent(secretId)}`,
+        label: `detaching secret ${secretId} from agent ${agentId}`,
       });
     },
   };

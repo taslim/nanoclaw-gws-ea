@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 import {
+  backupOnecliDatabase,
+  restoreOnecliDatabase,
   restoreReleaseGateway,
   importProviderCredential,
   observeOnecliRuntime,
@@ -16,6 +18,7 @@ import {
   reconcileOnecliRuntime,
   removeOnecliRuntime,
   stopOnecliRuntime,
+  verifyOnecliGrantConversion,
   verifyOnecliRuntime,
   type OnecliCommand,
   type OnecliCommandRunner,
@@ -1108,8 +1111,17 @@ describe("an update's gateway image", () => {
     world.wrapperImageMissing = true;
 
     await expect(
-      prepareReleaseGatewayImage(layout, PINS, { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT }),
-    ).resolves.toEqual({ current: RELEASE_GATEWAY_IMAGE, release: GATEWAY_IMAGE });
+      prepareReleaseGatewayImage(
+        layout,
+        { from: PINS, to: PINS },
+        { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT },
+      ),
+    ).resolves.toEqual({
+      current: RELEASE_GATEWAY_IMAGE,
+      release: GATEWAY_IMAGE,
+      currentVersion: PINS.gateway,
+      releaseVersion: PINS.gateway,
+    });
 
     const build = world.calls.find((call) => call.args[0] === 'build')!;
     expect(build.args).toContain(GATEWAY_IMAGE);
@@ -1124,9 +1136,13 @@ describe("an update's gateway image", () => {
     await writeInstanceCompose(layout, RELEASE_GATEWAY_IMAGE);
     const { world, runner } = dockerWorld(layout);
 
-    await expect(prepareReleaseGatewayImage(layout, PINS, { dockerCommandRunner: runner })).resolves.toEqual({
+    await expect(
+      prepareReleaseGatewayImage(layout, { from: PINS, to: PINS }, { dockerCommandRunner: runner }),
+    ).resolves.toEqual({
       current: RELEASE_GATEWAY_IMAGE,
       release: GATEWAY_IMAGE,
+      currentVersion: PINS.gateway,
+      releaseVersion: PINS.gateway,
     });
 
     expect(world.calls.some((call) => call.args[0] === 'build')).toBe(false);
@@ -1328,9 +1344,13 @@ describe("an update's gateway image", () => {
     await writeInstanceCompose(layout, GATEWAY_IMAGE);
     const { world, runner } = dockerWorld(layout);
 
-    await expect(prepareReleaseGatewayImage(layout, PINS, { dockerCommandRunner: runner })).resolves.toEqual({
+    await expect(
+      prepareReleaseGatewayImage(layout, { from: PINS, to: PINS }, { dockerCommandRunner: runner }),
+    ).resolves.toEqual({
       current: GATEWAY_IMAGE,
       release: GATEWAY_IMAGE,
+      currentVersion: PINS.gateway,
+      releaseVersion: PINS.gateway,
     });
 
     expect(world.calls).toEqual([]);
@@ -1494,5 +1514,250 @@ describe('OneCLI health check and provider credential', () => {
         hostPattern: 'api.anthropic.com',
       }),
     ).rejects.toMatchObject({ code: 'onecli_unverified' });
+  });
+});
+
+describe('OneCLI 1.42 -> 1.45 upgrade, backup, restore, and grant conversion', () => {
+  const FROM_PINS: OnecliPins = { gateway: '1.42.0' };
+  const TO_PINS: OnecliPins = { gateway: '1.45.0' };
+  const VALID_DUMP = `-- PostgreSQL database dump\nCREATE TABLE agents (id text);\n-- PostgreSQL database dump complete\n`;
+
+  it('pulls the target base image and builds the target wrapper when upgrading 1.42.0 -> 1.45.0', async () => {
+    const layout = await layoutFixture();
+    const fromHash = await computeWrapperImageHash(FROM_PINS);
+    const toHash = await computeWrapperImageHash(TO_PINS);
+    const fromImage = wrapperImageTag(fromHash);
+    const toImage = wrapperImageTag(toHash);
+    const written = renderOnecliCompose(layout, FROM_PINS, fromImage);
+    await mkdir(layout.rootDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(layout.composeFile, written, { mode: 0o600 });
+
+    const calls: OnecliCommand[] = [];
+    const present = new Set<string>([fromImage]);
+    const runner: OnecliCommandRunner = async (command) => {
+      calls.push(command);
+      if (command.args[0] === 'image' && command.args[1] === 'ls') {
+        const ref = command.args.at(-1)!;
+        return { stdout: present.has(ref) ? 'sha256:present\n' : '', stderr: '' };
+      }
+      if (command.args[0] === 'image' && command.args[1] === 'pull') {
+        present.add(command.args[2]!);
+        return { stdout: '', stderr: '' };
+      }
+      if (command.args[0] === 'build') {
+        present.add(toImage);
+        return { stdout: '', stderr: '' };
+      }
+      throw new Error(`unexpected docker command: ${command.args.join(' ')}`);
+    };
+
+    const change = await prepareReleaseGatewayImage(
+      layout,
+      { from: FROM_PINS, to: TO_PINS },
+      { dockerCommandRunner: runner, ambientEnv: HOSTILE_AMBIENT },
+    );
+
+    expect(change).toEqual({
+      current: fromImage,
+      release: toImage,
+      currentVersion: '1.42.0',
+      releaseVersion: '1.45.0',
+    });
+    expect(calls.map((c) => c.args.slice(0, 3).join(' '))).toEqual([
+      'image ls --quiet',
+      'image pull ghcr.io/onecli/onecli:1.45.0',
+      'image ls --quiet',
+      'build --build-arg ONECLI_BASE=ghcr.io/onecli/onecli:1.45.0',
+    ]);
+    // Compose file stays untouched until cutover.
+    expect(await readFile(layout.composeFile, 'utf8')).toBe(written);
+  });
+
+  it('backs up Postgres atomically after stopping app and gateway, using privateOutput and refusing truncated dumps', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout);
+    const { world, runner: baseRunner } = dockerWorld(layout, {
+      postgres: 'healthy',
+      app: 'healthy',
+      gateway: 'healthy',
+    });
+    let dumpOutput = VALID_DUMP;
+    const execCalls: OnecliCommand[] = [];
+    const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'compose' && command.args.includes('exec')) {
+        execCalls.push(command);
+        return { stdout: dumpOutput, stderr: '' };
+      }
+      return baseRunner(command);
+    };
+
+    const backupFile = path.join(layout.rootDirectory, 'backups', 'onecli-db.sql');
+    await backupOnecliDatabase(layout, backupFile, { dockerCommandRunner: runner });
+
+    // App and gateway were stopped before pg_dump; postgres stayed running.
+    expect(world.services.get('app')?.running).toBe(false);
+    expect(world.services.get('gateway')?.running).toBe(false);
+    expect(world.services.get('postgres')?.running).toBe(true);
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0]?.privateOutput).toBe(true);
+    expect(execCalls[0]?.args.join(' ')).toContain('pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"');
+    expect(await readFile(backupFile, 'utf8')).toBe(VALID_DUMP);
+    expect((await stat(backupFile)).mode & 0o777).toBe(0o600);
+
+    // Truncated dump without completion marker is refused without writing the target file.
+    dumpOutput = '-- PostgreSQL database dump\nCREATE TABLE partial (id text);\n';
+    const badFile = path.join(layout.rootDirectory, 'backups', 'bad.sql');
+    await expect(backupOnecliDatabase(layout, badFile, { dockerCommandRunner: runner })).rejects.toMatchObject({
+      code: 'onecli_backup_failed',
+    });
+    await expect(stat(badFile)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('validates the backup file before touching Postgres, then drops, recreates, and restores via private stdin', async () => {
+    const layout = await layoutFixture();
+    await writeInstanceCompose(layout);
+    const { world, runner: baseRunner } = dockerWorld(layout, {
+      postgres: 'healthy',
+      app: 'healthy',
+      gateway: 'healthy',
+    });
+    const execCalls: OnecliCommand[] = [];
+    const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'compose' && command.args.includes('exec')) {
+        execCalls.push(command);
+        return { stdout: '', stderr: '' };
+      }
+      return baseRunner(command);
+    };
+
+    // Incomplete backup must fail BEFORE stopping services or running dropdb.
+    const truncated = path.join(layout.rootDirectory, 'truncated.sql');
+    await writeFile(truncated, '-- incomplete dump\n', { mode: 0o600 });
+    await expect(restoreOnecliDatabase(layout, truncated, { dockerCommandRunner: runner })).rejects.toMatchObject({
+      code: 'onecli_restore_failed',
+    });
+    expect(world.calls).toEqual([]);
+    expect(execCalls).toEqual([]);
+
+    // Complete backup stops app+gateway, drops & recreates DB, and pipes SQL to psql.
+    const backup = path.join(layout.rootDirectory, 'valid.sql');
+    await writeFile(backup, VALID_DUMP, { mode: 0o600 });
+    await restoreOnecliDatabase(layout, backup, { dockerCommandRunner: runner });
+
+    expect(world.services.get('app')?.running).toBe(false);
+    expect(world.services.get('gateway')?.running).toBe(false);
+    expect(world.services.get('postgres')?.running).toBe(true);
+    expect(execCalls).toHaveLength(2);
+    expect(execCalls[0]?.args.join(' ')).toContain('dropdb --if-exists --force');
+    expect(execCalls[0]?.args.join(' ')).toContain('createdb');
+    expect(execCalls[1]?.args.join(' ')).toContain('psql -q -v ON_ERROR_STOP=1');
+    expect(execCalls[1]?.input).toBe(VALID_DUMP);
+    expect(execCalls[1]?.privateOutput).toBe(true);
+  });
+
+  it('verifies [grant-conversion] logs and API state, rejecting non-zero failures or lingering all-mode agents', async () => {
+    const layout = await layoutFixture();
+    const { world, runner: baseRunner } = dockerWorld(layout, {
+      postgres: 'healthy',
+      app: 'healthy',
+      gateway: 'healthy',
+    });
+    const appId = world.services.get('app')!.id;
+    let logOutput =
+      '[grant-conversion] Converted 2 agent(s), 0 failed, 0 skipped, 0 preempted, 0 verify-failed in 12ms\n';
+    let agents: Array<{ id: string; identifier: string; name: string; secretMode?: string }> = [
+      { id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' },
+    ];
+
+    const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'container' && command.args[1] === 'inspect' && command.args[2] === '--format') {
+        return { stdout: '2026-11-26T12:00:00.000000000Z\n', stderr: '' };
+      }
+      if (command.args[0] === 'container' && command.args[1] === 'logs') {
+        expect(command.args).toEqual(['container', 'logs', '--since', '2026-11-26T12:00:00.000000000Z', appId]);
+        return { stdout: logOutput, stderr: '' };
+      }
+      return baseRunner(command);
+    };
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/v1/user/api-key') return Response.json({ apiKey: ONECLI_API_KEY });
+      if (url.pathname === '/v1/agents') return Response.json(agents);
+      if (url.pathname === '/v1/agents/oc-main/grants') return Response.json({ secrets: [{ secretId: 'sec-1' }] });
+      throw new Error(`unexpected fetch ${url.pathname}`);
+    });
+    const sleep = async () => undefined;
+
+    await expect(
+      verifyOnecliGrantConversion(layout, { dockerCommandRunner: runner, fetch, sleep }),
+    ).resolves.toBeUndefined();
+
+    // Non-zero failed count -> fails closed.
+    logOutput = '[grant-conversion] Converted 1 agent(s), 1 failed, 0 skipped, 0 preempted, 0 verify-failed\n';
+    await expect(
+      verifyOnecliGrantConversion(layout, { dockerCommandRunner: runner, fetch, sleep }),
+    ).rejects.toMatchObject({ code: 'onecli_grant_conversion_failed' });
+
+    // Non-zero preempted count -> fails closed.
+    logOutput = '[grant-conversion] Converted 1 agent(s), 0 failed, 0 skipped, 1 preempted, 0 verify-failed\n';
+    await expect(
+      verifyOnecliGrantConversion(layout, { dockerCommandRunner: runner, fetch, sleep }),
+    ).rejects.toMatchObject({ code: 'onecli_grant_conversion_failed' });
+
+    // Clean log, but an agent still in 'all' mode -> fails closed.
+    logOutput = '[grant-conversion] Converted 1 agent(s), 0 failed, 0 skipped, 0 preempted, 0 verify-failed\n';
+    agents = [{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'all' }];
+    await expect(
+      verifyOnecliGrantConversion(layout, { dockerCommandRunner: runner, fetch, sleep }),
+    ).rejects.toMatchObject({ code: 'onecli_grant_conversion_failed' });
+  });
+
+  it('runs verifyOnecliGrantConversion during restoreReleaseGateway when crossing 1.42.0 -> 1.45.0', async () => {
+    const layout = await layoutFixture();
+    const fromImage = wrapperImageTag(await computeWrapperImageHash(FROM_PINS));
+    const toImage = wrapperImageTag(await computeWrapperImageHash(TO_PINS));
+    const compose142 = renderOnecliCompose(layout, FROM_PINS, fromImage);
+    const compose145 = renderOnecliCompose(layout, TO_PINS, toImage);
+    await mkdir(layout.rootDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(layout.composeFile, compose142, { mode: 0o600 });
+
+    const { runner: baseRunner } = dockerWorld(
+      layout,
+      { postgres: 'healthy', app: 'healthy', gateway: 'healthy' },
+      compose142,
+    );
+    let logsChecked = false;
+    const runner: OnecliCommandRunner = async (command) => {
+      if (command.args[0] === 'container' && command.args[1] === 'inspect' && command.args[2] === '--format') {
+        return { stdout: '2026-11-26T12:00:00Z\n', stderr: '' };
+      }
+      if (command.args[0] === 'container' && command.args[1] === 'logs') {
+        logsChecked = true;
+        return {
+          stdout: '[grant-conversion] Converted 1 agent(s), 0 failed, 0 skipped, 0 preempted, 0 verify-failed\n',
+          stderr: '',
+        };
+      }
+      return baseRunner(command);
+    };
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/v1/user/api-key') return Response.json({ apiKey: ONECLI_API_KEY });
+      if (url.pathname === '/v1/agents') return Response.json([{ id: 'oc-main', identifier: 'ag-main', name: 'main' }]);
+      if (url.pathname === '/v1/agents/oc-main/grants') return Response.json({ secrets: [] });
+      throw new Error(`unexpected fetch ${url.pathname}`);
+    });
+
+    await restoreReleaseGateway(
+      layout,
+      TO_PINS,
+      { compose: compose145, left: compose142 },
+      { dockerCommandRunner: runner, fetch, sleep: async () => undefined },
+    );
+
+    expect(logsChecked).toBe(true);
+    expect(fetch.mock.calls.map(([input]) => String(input))).toContainEqual(
+      expect.stringContaining('/v1/agents/oc-main/grants'),
+    );
   });
 });

@@ -17,7 +17,7 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, readlink, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, readlink, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -31,6 +31,7 @@ import { provideReleaseImage, readInstallCjkFonts } from './agent-image-release.
 import { committedTree } from './checkout.js';
 import {
   assistantImageDocker,
+  cutoverOnecli,
   fenceInstance,
   finishFollowUps,
   openCutoverHost,
@@ -65,6 +66,7 @@ import {
   type RollbackMode,
   type SnapshotManifest,
 } from './operation.js';
+import { onecliUsesAgentGrants } from './pins.js';
 import { readDeployedSetup } from './provision.js';
 import { safeErrorMessage } from './redact.js';
 import {
@@ -653,21 +655,56 @@ async function writeRollbackReceipt(rollback: Rollback, record: OperationRecord)
   });
 }
 
-async function pinsOf(rollback: Rollback, release: ReleaseCoordinates): Promise<{ readonly gateway: string }> {
-  const { onecli } = await readDeployedSetup(rollback.operation.paths, reservationAt(rollback.reservation, release));
+async function pinsOf(host: CutoverHost, release: ReleaseCoordinates): Promise<{ readonly gateway: string }> {
+  const { onecli } = await readDeployedSetup(host.operation.paths, reservationAt(host.reservation, release));
   return { gateway: onecli.gateway };
+}
+
+/** Rolling back from a 1.44+ grants gateway to a pre-1.44 gateway requires restoring the pre-upgrade Postgres dump. */
+async function rollbackRestoresOnecliDb(
+  host: CutoverHost,
+  from: ReleaseCoordinates,
+  to: ReleaseCoordinates,
+): Promise<boolean> {
+  const [fromPins, toPins] = await Promise.all([pinsOf(host, from), pinsOf(host, to)]);
+  return onecliUsesAgentGrants(fromPins.gateway) && !onecliUsesAgentGrants(toPins.gateway);
+}
+
+async function restoreOnecliForRollback(rollback: Rollback): Promise<void> {
+  if (!(await rollbackRestoresOnecliDb(rollback, rollback.from, rollback.to))) return;
+  const { layout, reporter } = rollback;
+  const quarantineBackup = layout.onecliQuarantineBackup(rollback.op);
+  const snapshotBackup = layout.onecliSnapshotBackup(rollback.snapshot);
+  await runStep(
+    reporter,
+    { id: 'restore_gateway_database', label: "Restoring OneCLI's pre-upgrade database…" },
+    async () => {
+      if (!(await exists(quarantineBackup))) {
+        await cutoverOnecli(rollback).backupDatabase(rollback.onecli, quarantineBackup);
+      }
+      await cutoverOnecli(rollback).restoreDatabase(rollback.onecli, snapshotBackup);
+    },
+  );
 }
 
 /**
  * Go back to the release a rollback left, recorded first so a return cut short
  * is finished by the next `rollback --id`. The state the rollback's target
- * produced is kept in `quarantine/<op>-returned/`. A record that carried a
- * committed update's follow-ups gives them back.
+ * produced is kept in `quarantine/<op>-returned/`, and any quarantined OneCLI
+ * Postgres dump is restored back before bringing the left release up. A record
+ * that carried a committed update's follow-ups gives them back.
  */
 async function goBack(rollback: Rollback): Promise<void> {
   const { operation, layout } = rollback;
   await beginOperationReturn(operation);
-  await serveLeftRelease(rollback, rollback, () => returnQuarantinedState(layout, rollback.op));
+  await serveLeftRelease(rollback, rollback, async () => {
+    await returnQuarantinedState(layout, rollback.op);
+    const quarantineBackup = layout.onecliQuarantineBackup(rollback.op);
+    if (await exists(quarantineBackup)) {
+      await cutoverOnecli(rollback).restoreDatabase(rollback.onecli, quarantineBackup);
+      await rename(quarantineBackup, layout.onecliReturnedBackup(rollback.op));
+    }
+  });
   await runStep(rollback.reporter, { id: 'verify_release', label: 'Checking the release it left serves…' }, async () =>
     verifyServingRelease(rollback, {
       view: reservationAt(rollback.reservation, rollback.from),
@@ -712,7 +749,12 @@ async function closedForFixForward(rollback: Rollback, cause: unknown, why: stri
  * quarantine.
  */
 async function returnFailed(rollback: Rollback, cause: unknown, why: string): Promise<GwsEaError> {
-  if (!(await exists(rollback.layout.quarantine(rollback.op)))) return closedForFixForward(rollback, cause, why);
+  if (
+    !(await exists(rollback.layout.quarantine(rollback.op))) &&
+    !(await exists(rollback.layout.onecliQuarantineBackup(rollback.op)))
+  ) {
+    return closedForFixForward(rollback, cause, why);
+  }
   const id = rollback.operation.instanceId;
   return new GwsEaError(
     'rollback_return_unfinished',
@@ -795,6 +837,7 @@ async function runRollback(rollback: Rollback, start: OperationRecord): Promise<
           break;
         }
         case 'snapshotted':
+          await restoreOnecliForRollback(rollback);
           definitionChanged = await switchTo(rollback, record.to, record.from, 'Switching to the previous release…');
           record = await advanceOperation(operation, 'switched');
           break;
@@ -901,11 +944,25 @@ async function revertOpenUpdate(
   }
   const host = await openCutoverHost(operation, dependencies);
   if (!targetMayHaveStarted(update)) {
-    await serveLeftRelease(host, update);
+    const backup = host.layout.onecliSnapshotBackup(operationName(update.started_at));
+    const restoreOnecli =
+      (await rollbackRestoresOnecliDb(host, update.to, update.from)) && (await exists(backup))
+        ? () => cutoverOnecli(host).restoreDatabase(host.onecli, backup)
+        : undefined;
+    await serveLeftRelease(host, update, restoreOnecli);
     await discardOperation(operation);
     return { kind: 'update_discarded', release: update.from, discarded: update.to };
   }
   const plan = { from: update.to, to: update.from, snapshot: operationName(update.started_at), request };
+  if (
+    (await rollbackRestoresOnecliDb(host, plan.from, plan.to)) &&
+    !(await exists(host.layout.onecliSnapshotBackup(plan.snapshot)))
+  ) {
+    throw new GwsEaError(
+      'rollback_unavailable',
+      `Assistant ${id} has no pre-upgrade OneCLI database backup, so there is nothing to roll back to.`,
+    );
+  }
   await assertConfirmable(host, plan);
   const record = await beginOperation(operation, { kind: 'rollback', from: plan.from, to: plan.to });
   const rollback = await rollbackOf(host, record, request);
@@ -936,6 +993,12 @@ async function rollBackCommitted(
   }
   const name = releaseName(to.deployed_commit);
   if (!(await isReleaseComplete(layout, name))) throw unavailable(`no longer keeps ${releaseLine(to)} whole`);
+  if (
+    (await rollbackRestoresOnecliDb(host, from, to)) &&
+    !(await exists(layout.onecliSnapshotBackup(point.snapshot)))
+  ) {
+    throw unavailable('has no pre-upgrade OneCLI database backup');
+  }
   await runStep(
     host.reporter,
     { id: 'prepare_agent_image', label: "Preparing the previous release's agent image…" },

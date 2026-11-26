@@ -239,7 +239,7 @@ it('admits the errands of every explicitly granted group and always main', async
   await expect(admit('system:a2a:main:errand')).resolves.toBeUndefined();
 });
 
-it('gives browser a gateway identity holding only the model credential, refusing any other until repaired, and leaves main all', async () => {
+it('gives browser a gateway identity holding only the model credential, refusing any other until repaired, and leaves main grants untouched', async () => {
   await createAgentGroup({
     id: 'main',
     name: 'main',
@@ -252,7 +252,8 @@ it('gives browser a gateway identity holding only the model credential, refusing
     'main',
   );
   await configureBrowserAccess(`${ROOT}/browser`);
-  gateway.createDefault('main', 'main');
+  const main = gateway.createDefault('main', 'main');
+  main.secrets.push(MODEL_SECRET.id, APP_SECRET.id);
 
   await reconcileBrowserGroup();
   const id = (await getBrowserAgentGroupId())!;
@@ -268,14 +269,18 @@ it('gives browser a gateway identity holding only the model credential, refusing
   await expect(admit()).resolves.toBeUndefined();
 
   gateway.agents.get(id)!.secrets.push(APP_SECRET.id);
-  expect(await browserGroupDrift(id)).toEqual(['its gateway secret assignments are not model-only']);
-  await expect(admit()).rejects.toThrow('browser may not start: its gateway secret assignments are not model-only');
+  expect(await browserGroupDrift(id)).toEqual(['its gateway secret grants are not model-only']);
+  await expect(admit()).rejects.toThrow('browser may not start: its gateway secret grants are not model-only');
   gateway.agents.get(id)!.secretMode = 'all';
-  await expect(admit()).rejects.toThrow('its gateway secret mode is not selective');
+  await expect(admit()).rejects.toThrow('its gateway secret mode is all');
+  gateway.agents.get(id)!.secretMode = 'selective';
 
   await reconcileBrowserGroup();
   expect(gateway.agents.get(id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
   await expect(admit()).resolves.toBeUndefined();
-  expect(gateway.agents.get('main')).toMatchObject({ secretMode: 'all', secrets: [] });
+  expect(gateway.agents.get('main')).toMatchObject({
+    secretMode: 'selective',
+    secrets: [MODEL_SECRET.id, APP_SECRET.id],
+  });
   expect(gateway.injected('main', APP_SECRET.hostPattern)).toEqual([APP_SECRET.id]);
 });

@@ -1,9 +1,12 @@
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
 import { createOnecliAdmin, fetchOnecliApiKey, onecliInjection } from './onecli-admin.js';
 import { isRegularFile, preparePrivateDirectory } from './paths.js';
 import { PRESENT, type Observation } from './phases.js';
+import { onecliUsesAgentGrants } from './pins.js';
+import { pollUntil } from './poll.js';
 import { findPortHolder, portInUseError, type PortHolder } from './ports.js';
 import {
   buildToolEnvironment,
@@ -54,6 +57,11 @@ const ONECLI_BUILD_TIMEOUT_MS = 10 * 60_000;
 /** `up --wait` itself waits `ONECLI_WAIT_TIMEOUT_SECONDS`; the margin covers creating the containers. */
 const UP_TIMEOUT_MS = (ONECLI_WAIT_TIMEOUT_SECONDS + 120) * 1_000;
 const INSPECT_TIMEOUT_MS = 30_000;
+const POSTGRES_DUMP_TIMEOUT_MS = 120_000;
+const POSTGRES_DUMP_MAX_BYTES = 128 * 1024 * 1024;
+const POSTGRES_DUMP_COMPLETE_MARKER = '-- PostgreSQL database dump complete';
+const CONVERSION_POLL_MS = 1_000;
+const CONVERSION_LIMIT_MS = 30_000;
 
 export type OnecliCommand = SanitizedCommand;
 export type OnecliCommandRunner = SanitizedCommandRunner;
@@ -278,24 +286,296 @@ async function ensureWrapperGatewayImage(
 export interface GatewayImageChange {
   readonly current: string;
   readonly release: string;
+  readonly currentVersion: string;
+  readonly releaseVersion: string;
+}
+
+export interface GatewayImagePins {
+  readonly from: OnecliPins;
+  readonly to: OnecliPins;
+}
+
+/** Extract the OneCLI tag from `ghcr.io/onecli/onecli:<tag>`; undefined for any other reference. */
+export function parseOnecliGatewayVersionFromImage(image: string): string | undefined {
+  const match = /^ghcr\.io\/onecli\/onecli:([^\s:@]+)$/u.exec(image);
+  return match?.[1];
+}
+
+async function ensureOnecliBaseImage(
+  docker: OnecliDocker,
+  pins: OnecliPins,
+  recordEffect?: OnecliRuntimeDependencies['recordEffect'],
+): Promise<void> {
+  const baseImage = onecliGatewayImage(pins);
+  const present = await docker.runner({
+    command: 'docker',
+    args: ['image', 'ls', '--quiet', baseImage],
+    cwd: docker.layout.rootDirectory,
+    env: docker.environment,
+    timeoutMs: INSPECT_TIMEOUT_MS,
+  });
+  if (present.stdout.trim().length > 0) return;
+  recordEffect?.(null);
+  await docker.runner({
+    command: 'docker',
+    args: ['image', 'pull', baseImage],
+    cwd: docker.layout.rootDirectory,
+    env: docker.environment,
+    timeoutMs: ONECLI_PULL_TIMEOUT_MS,
+    stream: true,
+  });
+  recordEffect?.(true);
 }
 
 /**
  * Runs before an update's stop, from this tool's tree, which is the release it
- * deploys. Content-addressed tags never collide, so a build never replaces what
- * another assistant runs. The Compose file and the running runtime are left for
- * the switch.
+ * deploys. Validates the live Compose file against the currently deployed pins,
+ * pulls the new OneCLI base image when the version changes, and builds the
+ * content-addressed wrapper tag. The Compose file and running runtime are left
+ * for the switch.
  */
 export async function prepareReleaseGatewayImage(
   layout: OnecliRuntimeLayout,
-  pins: OnecliPins,
+  pins: GatewayImagePins,
   dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect'> = {},
 ): Promise<GatewayImageChange> {
-  const { gateway: current } = await instanceOnecliImages(layout, pins);
-  const { image: release } = await resolveWrapperGatewayImage(pins);
-  if (release !== current)
-    await ensureWrapperGatewayImage(dockerContext(layout, dependencies), pins, release, dependencies.recordEffect);
-  return { current, release };
+  const { gateway: current } = await instanceOnecliImages(layout, pins.from);
+  const { image: release } = await resolveWrapperGatewayImage(pins.to);
+  const docker = dockerContext(layout, dependencies);
+  if (pins.to.gateway !== pins.from.gateway) {
+    await ensureOnecliBaseImage(docker, pins.to, dependencies.recordEffect);
+  }
+  if (release !== current) {
+    await ensureWrapperGatewayImage(docker, pins.to, release, dependencies.recordEffect);
+  }
+  return { current, release, currentVersion: pins.from.gateway, releaseVersion: pins.to.gateway };
+}
+
+/** Stop named OneCLI services (e.g., `app` and `gateway`) while keeping others (such as `postgres`) up. */
+async function stopOnecliServices(
+  docker: OnecliDocker,
+  services: readonly ('postgres' | 'app' | 'gateway')[],
+): Promise<void> {
+  const containers = await inspectProjectContainers(docker);
+  assertOwnedContainers(docker.layout, containers);
+  const target = new Set<string>(services);
+  const runningIds = containers
+    .filter((container) => container.running && target.has(container.service))
+    .map((container) => container.id);
+  if (runningIds.length === 0) return;
+  await docker.runner({
+    command: 'docker',
+    args: ['container', 'stop', ...runningIds],
+    cwd: path.dirname(docker.layout.rootDirectory),
+    env: docker.environment,
+    timeoutMs: 120_000,
+    stream: true,
+  });
+  const remaining = (await inspectProjectContainers(docker)).filter(
+    (container) => container.running && target.has(container.service),
+  );
+  if (remaining.length > 0) {
+    throw new GwsEaError(
+      'onecli_stop_incomplete',
+      `OneCLI services still running after stop: ${remaining.map((container) => container.service).join(', ')}`,
+    );
+  }
+}
+
+async function ensureOnecliPostgresRunning(docker: OnecliDocker): Promise<void> {
+  const containers = await inspectProjectContainers(docker);
+  assertOwnedContainers(docker.layout, containers);
+  const postgres = containers.find((container) => container.service === 'postgres');
+  if (postgres?.running && postgres.health === 'healthy') return;
+  await docker.runner({
+    ...buildComposeInvocation(docker.layout, [
+      'up',
+      '--detach',
+      '--wait',
+      '--wait-timeout',
+      String(ONECLI_WAIT_TIMEOUT_SECONDS),
+      '--pull',
+      'never',
+      'postgres',
+    ]),
+    env: docker.environment,
+    timeoutMs: UP_TIMEOUT_MS,
+    stream: true,
+  });
+}
+
+/**
+ * Stop `app` and `gateway` so no client writes to Postgres, then dump the
+ * OneCLI database atomically to `backupFile` (owner-only, private stdout).
+ */
+export async function backupOnecliDatabase(
+  layout: OnecliRuntimeLayout,
+  backupFile: string,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+): Promise<void> {
+  const docker = dockerContext(layout, dependencies);
+  await stopOnecliServices(docker, ['app', 'gateway']);
+  await ensureOnecliPostgresRunning(docker);
+  const dump = await docker.runner({
+    ...buildComposeInvocation(layout, [
+      'exec',
+      '-T',
+      'postgres',
+      'sh',
+      '-ceu',
+      'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"',
+    ]),
+    env: docker.environment,
+    timeoutMs: POSTGRES_DUMP_TIMEOUT_MS,
+    outputLimitBytes: POSTGRES_DUMP_MAX_BYTES,
+    privateOutput: true,
+  });
+  if (!dump.stdout.includes(POSTGRES_DUMP_COMPLETE_MARKER)) {
+    throw new GwsEaError(
+      'onecli_backup_failed',
+      'OneCLI PostgreSQL backup did not finish cleanly (missing completion marker).',
+    );
+  }
+  await preparePrivateDirectory(path.dirname(backupFile));
+  await writePrivateTextFile(backupFile, dump.stdout);
+}
+
+/**
+ * Stop `app` and `gateway`, drop and recreate the OneCLI Postgres database,
+ * and restore `backupFile` with `ON_ERROR_STOP=1`. Never drops the database
+ * before validating the backup file is complete.
+ */
+export async function restoreOnecliDatabase(
+  layout: OnecliRuntimeLayout,
+  backupFile: string,
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv'> = {},
+): Promise<void> {
+  const sql = await readOwnerOnlyFile(backupFile);
+  if (sql.length === 0 || !sql.includes(POSTGRES_DUMP_COMPLETE_MARKER)) {
+    throw new GwsEaError(
+      'onecli_restore_failed',
+      `OneCLI PostgreSQL backup ${backupFile} is empty or incomplete, so the database was not touched.`,
+    );
+  }
+  const docker = dockerContext(layout, dependencies);
+  await stopOnecliServices(docker, ['app', 'gateway']);
+  await ensureOnecliPostgresRunning(docker);
+  await docker.runner({
+    ...buildComposeInvocation(layout, [
+      'exec',
+      '-T',
+      'postgres',
+      'sh',
+      '-ceu',
+      'dropdb --if-exists --force -U "$POSTGRES_USER" "$POSTGRES_DB" && createdb -U "$POSTGRES_USER" "$POSTGRES_DB"',
+    ]),
+    env: docker.environment,
+    timeoutMs: 60_000,
+  });
+  await docker.runner({
+    ...buildComposeInvocation(layout, [
+      'exec',
+      '-T',
+      'postgres',
+      'sh',
+      '-ceu',
+      'psql -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" "$POSTGRES_DB"',
+    ]),
+    env: docker.environment,
+    timeoutMs: POSTGRES_DUMP_TIMEOUT_MS,
+    input: sql,
+    privateOutput: true,
+  });
+}
+
+export interface GrantConversionDependencies extends Pick<
+  OnecliRuntimeDependencies,
+  'dockerCommandRunner' | 'ambientEnv' | 'fetch'
+> {
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+}
+
+/**
+ * Prove OneCLI 1.44+'s one-time `[grant-conversion]` completed cleanly on this
+ * boot of the `app` container (`0 failed`, `0 verify-failed`, `0 preempted`),
+ * no agent remains in `all` mode, and the `/v1/agents/{id}/grants` route answers.
+ */
+export async function verifyOnecliGrantConversion(
+  layout: OnecliRuntimeLayout,
+  dependencies: GrantConversionDependencies = {},
+): Promise<void> {
+  const docker = dockerContext(layout, dependencies);
+  const containers = await inspectProjectContainers(docker);
+  assertOwnedContainers(layout, containers);
+  const app = containers.find((container) => container.service === 'app');
+  if (!app || !app.running) {
+    throw new GwsEaError('onecli_grant_conversion_failed', 'OneCLI app container is not running after upgrade.');
+  }
+  const startedAt = (
+    await docker.runner({
+      command: 'docker',
+      args: ['container', 'inspect', '--format', '{{.State.StartedAt}}', app.id],
+      cwd: layout.rootDirectory,
+      env: docker.environment,
+      timeoutMs: INSPECT_TIMEOUT_MS,
+    })
+  ).stdout.trim();
+  if (!startedAt) {
+    throw new GwsEaError('onecli_grant_conversion_failed', 'Could not read OneCLI app container start timestamp.');
+  }
+
+  const conversionLine = await pollUntil(
+    async (): Promise<string | undefined> => {
+      const logs = await docker.runner({
+        command: 'docker',
+        args: ['container', 'logs', '--since', startedAt, app.id],
+        cwd: layout.rootDirectory,
+        env: docker.environment,
+        timeoutMs: INSPECT_TIMEOUT_MS,
+      });
+      const lines = `${logs.stdout}\n${logs.stderr}`
+        .split(/\r?\n/u)
+        .filter((line) => line.includes('[grant-conversion]'));
+      return lines.at(-1);
+    },
+    (line) => line !== undefined,
+    {
+      intervalMs: CONVERSION_POLL_MS,
+      limitMs: CONVERSION_LIMIT_MS,
+      sleep: dependencies.sleep ?? ((milliseconds) => delay(milliseconds)),
+    },
+  );
+  if (!conversionLine) {
+    throw new GwsEaError(
+      'onecli_grant_conversion_failed',
+      'OneCLI did not log a [grant-conversion] result on this boot.',
+    );
+  }
+  if (
+    !conversionLine.includes(', 0 failed,') ||
+    !conversionLine.includes(', 0 verify-failed') ||
+    !conversionLine.includes(', 0 preempted,')
+  ) {
+    throw new GwsEaError(
+      'onecli_grant_conversion_failed',
+      `OneCLI grant conversion did not succeed cleanly: ${conversionLine}`,
+    );
+  }
+
+  const fetchImpl = dependencies.fetch ?? globalThis.fetch;
+  const apiKey = await fetchOnecliApiKey(layout.appUrl, { fetch: fetchImpl });
+  const admin = createOnecliAdmin(layout.appUrl, apiKey, { fetch: fetchImpl });
+  const agents = await admin.listAgents();
+  const stillAll = agents.filter((agent) => agent.secretMode === 'all');
+  if (stillAll.length > 0) {
+    throw new GwsEaError(
+      'onecli_grant_conversion_failed',
+      `${stillAll.length} OneCLI agent(s) remain in legacy all-secrets mode after conversion.`,
+    );
+  }
+  if (agents.length > 0) {
+    await admin.listAgentSecretGrants(agents[0]!.id);
+  }
 }
 
 /** The Compose file a switch applies, and the one the release it leaves ran with. */
@@ -317,16 +597,21 @@ interface GatewaySwitch {
  * The isolation probe then runs before returning when a container was
  * recreated, or when the file differs from `left`: a switch cut short after
  * its `up` recreated a service and before the probe passed recreates nothing
- * when it is resumed, so only the file shows what is still unproven.
+ * when it is resumed, so only the file shows what is still unproven. When
+ * crossing from a pre-1.44 gateway to a 1.44+ grants gateway, the conversion
+ * gate also verifies `[grant-conversion]` succeeded before NanoClaw starts.
  */
 export async function restoreReleaseGateway(
   layout: OnecliRuntimeLayout,
   pins: OnecliPins,
   { compose, left }: GatewaySwitch,
-  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect'> = {},
+  dependencies: Pick<OnecliRuntimeDependencies, 'dockerCommandRunner' | 'ambientEnv' | 'recordEffect' | 'fetch'> & {
+    readonly sleep?: (milliseconds: number) => Promise<void>;
+  } = {},
 ): Promise<void> {
   const docker = dockerContext(layout, dependencies);
   const { gateway } = parseOnecliComposeImages(compose);
+  const leftVersion = parseOnecliGatewayVersionFromImage(parseOnecliComposeImages(left).app);
   if (wrapperImageHash(gateway) === undefined) {
     throw new GwsEaError('unsafe_onecli_image', `OneCLI gateway image ${gateway} is not a gws-ea wrapper image`);
   }
@@ -351,6 +636,9 @@ export async function restoreReleaseGateway(
   // A recreated container is a new one, with a new ID, whose egress no probe has seen.
   const recreated = (await projectContainerIds(docker)).some((id) => !before.has(id));
   if (recreated || compose !== left) await verifyAgentNetworkIsolation(docker, pins);
+  if (leftVersion !== undefined && !onecliUsesAgentGrants(leftVersion) && onecliUsesAgentGrants(pins.gateway)) {
+    await verifyOnecliGrantConversion(layout, dependencies);
+  }
 }
 
 /**

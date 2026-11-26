@@ -386,4 +386,47 @@ describe('the Google token refresher', () => {
     for (const consent of GRANT.consents) expect(logged).not.toContain(consent.refresh_token);
     expect(logged).not.toContain(GRANT.client_secret);
   });
+
+  it('invokes onPublished after publishing secrets and retries on the next tick when grant sync fails', async () => {
+    const w = world();
+    let grant = OLD_GRANT;
+    const clock = { now: Date.parse('2026-09-30T12:00:00.000Z') };
+    let failSync = true;
+    const onPublished = vi.fn(async () => {
+      if (failSync) throw new Error('temporary gateway error');
+    });
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const r = createGoogleTokenRefresher({
+      readGrant: async () => grant,
+      connection: w.connection,
+      fetch: w.fetch,
+      now: () => clock.now,
+      log,
+      onPublished,
+    });
+
+    // First tick publishes OLD_GRANT secrets; onPublished fails and logs a warning without failing the tick.
+    await r.tick();
+    expect(onPublished).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledWith('Could not sync Google access grants for agents; retrying', {
+      error: 'temporary gateway error',
+    });
+
+    // Second tick (tokens still fresh) retries onPublished because the previous sync failed.
+    failSync = false;
+    clock.now += 60_000;
+    await r.tick();
+    expect(onPublished).toHaveBeenCalledTimes(2);
+
+    // Third tick (tokens fresh, sync succeeded, same grant) does not re-sync unnecessarily.
+    clock.now += 60_000;
+    await r.tick();
+    expect(onPublished).toHaveBeenCalledTimes(2);
+
+    // Grant updated with Workspace scopes: new secrets published -> onPublished runs again.
+    grant = { ...GRANT, granted_at: '2026-10-09T18:00:00.000Z' };
+    clock.now += 60_000;
+    await r.tick();
+    expect(onPublished).toHaveBeenCalledTimes(3);
+  });
 });

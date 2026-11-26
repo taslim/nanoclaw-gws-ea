@@ -137,6 +137,7 @@ const GCP: GcpProjectInput = {
 class World {
   enabledApis = new Set<string>(['chat.googleapis.com']);
   secrets: { id: string; name: string; hostPattern: string }[] = [];
+  mainGrants = new Set<string>();
   calendarStatus = 200;
   calendarId = ACCOUNT;
   driveStatus = 200;
@@ -147,17 +148,21 @@ class World {
   /** The scopes of each access token Google minted. */
   readonly tokenScopes = new Map<string, readonly string[]>();
   readonly gcloudCalls: string[] = [];
-  /** Every request to OneCLI other than a read of its secret metadata. */
+  /** Every request to OneCLI other than a read of its secret or grant metadata. */
   readonly vaultWrites: string[] = [];
 
   revoked = false;
 
-  /** What the host's refresher does once it sees a sign-in: one secret per credential the grant holds scopes for. */
-  publish(granted: readonly string[] = GOOGLE_SIGN_IN_SCOPES): void {
+  /** What the host's refresher does once it sees a sign-in: one secret per credential the grant holds scopes for, granted to main. */
+  publish(granted: readonly string[] = GOOGLE_SIGN_IN_SCOPES, options: { grantMain?: boolean } = {}): void {
+    const grantMain = options.grantMain ?? true;
     for (const credential of AGENT_GOOGLE_CREDENTIALS) {
       if (credentialScopes(credential, granted).length === 0) continue;
-      if (this.secrets.some((secret) => secret.name === credential.secretName)) continue;
-      this.secrets.push({ id: `sec-${credential.host}`, name: credential.secretName, hostPattern: credential.host });
+      const id = `sec-${credential.host}`;
+      if (!this.secrets.some((secret) => secret.name === credential.secretName)) {
+        this.secrets.push({ id, name: credential.secretName, hostPattern: credential.host });
+      }
+      if (grantMain) this.mainGrants.add(id);
     }
   }
 
@@ -205,6 +210,14 @@ class World {
     if (route === '/v1/secrets' && (init?.method ?? 'GET') === 'GET') {
       expect(init?.redirect).toBe('error');
       return json(this.secrets);
+    }
+    if (route === '/v1/agents' && (init?.method ?? 'GET') === 'GET') {
+      expect(init?.redirect).toBe('error');
+      return json([{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }]);
+    }
+    if (route === '/v1/agents/oc-main/grants' && (init?.method ?? 'GET') === 'GET') {
+      expect(init?.redirect).toBe('error');
+      return json({ secrets: [...this.mainGrants].map((secretId) => ({ secretId })) });
     }
     this.vaultWrites.push(`${init?.method ?? 'GET'} ${route}`);
     return json({}, 404);

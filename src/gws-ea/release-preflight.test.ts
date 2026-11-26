@@ -118,7 +118,7 @@ describe('release preflight', () => {
       provider: 'claude',
       providerCredential: { name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' },
       packageManager: 'pnpm@10.34.5',
-      onecli: { gateway: '1.42.0', sdk: '2.2.1' },
+      onecli: { gateway: '1.45.0', sdk: '2.2.1' },
     });
     expect(commands).toHaveLength(2);
     expect(commands[0]).toMatchObject({ command: 'pnpm', args: ['install', '--frozen-lockfile'], cwd: root });
@@ -253,6 +253,21 @@ describe('update compatibility', () => {
 
   it("accepts a release that keeps the assistant's OneCLI, Postgres, and provider setup", () => {
     expect(() => assertUpdateKeepsSetup(deployed, { ...same, providerCredential: { ...credential } })).not.toThrow();
+  });
+
+  it('accepts the verified 1.42.0 -> 1.45.0 OneCLI gateway upgrade and refuses downgrades or unverified jumps', () => {
+    expect(() =>
+      assertUpdateKeepsSetup(deployed, { ...same, onecli: { ...deployed.onecli, gateway: '1.45.0' } }),
+    ).not.toThrow();
+    expect(() =>
+      assertUpdateKeepsSetup(
+        { ...deployed, onecli: { ...deployed.onecli, gateway: '1.45.0' } },
+        { ...same, onecli: { ...deployed.onecli, gateway: '1.42.0' } },
+      ),
+    ).toThrow(expect.objectContaining({ code: 'onecli_version_changed' }));
+    expect(() =>
+      assertUpdateKeepsSetup(deployed, { ...same, onecli: { ...deployed.onecli, gateway: '2.0.0' } }),
+    ).toThrow(expect.objectContaining({ code: 'onecli_version_changed' }));
   });
 
   it.each([

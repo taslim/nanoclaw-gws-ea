@@ -999,3 +999,90 @@ it('keeps the current saved password through update and a snapshot rollback', GI
   expect(await run(['rollback', '--id', runtime.instance_id, '--snapshot', '--yes'])).toBe(0);
   expect(await store.secret(saved.id, 'password', 'https://cedar.example')).toBe('Cedar!after-snapshot');
 });
+
+describe('OneCLI 1.45.0 -> 1.42.0 gateway rollback', GIT_HEAVY, () => {
+  async function upgradedAssistant() {
+    const host = await machine();
+    const runtime = await assistant(host, { onecliGatewayVersion: '1.42.0' });
+    await converse(runtime, 'm1');
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    expect(await cli(host, state, next, runtime).run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+    expect(state.onecliDbState).toBe('migrated-1.45');
+    return { host, runtime, next, state };
+  }
+
+  it('restores the 1.42.0 OneCLI Postgres backup during a code-only rollback while keeping post-update conversations', async () => {
+    const { host, runtime, next, state } = await upgradedAssistant();
+    await converse(runtime, 'm2');
+    const inode = await centralInode(runtime);
+    const point = await readRollbackPoint(host.paths, runtime.instance_id);
+    const snapshotBackup = layoutOf(host, runtime).onecliSnapshotBackup(point!.snapshot);
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id])).toBe(0);
+
+    await expectRolledBack(host, runtime, next, state);
+    expect(await centralInode(runtime)).toBe(inode);
+    expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
+    expect(state.onecliDbState).toBe('1.42-initial');
+    expect(state.onecliRestores).toEqual([snapshotBackup]);
+    // Quarantined 1.45.0 dump was captured before overwriting Postgres.
+    expect(state.onecliBackups).toHaveLength(2);
+    expect(state.onecliBackups[1]).toContain('quarantine');
+  });
+
+  it('refuses to roll back across 1.45.0 -> 1.42.0 before fencing when the pre-upgrade OneCLI backup is missing', async () => {
+    const { host, runtime, next, state } = await upgradedAssistant();
+    const point = await readRollbackPoint(host.paths, runtime.instance_id);
+    await rm(layoutOf(host, runtime).onecliSnapshotBackup(point!.snapshot));
+    state.events.length = 0;
+
+    const { run, err } = cli(host, state, next, runtime);
+    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(1);
+
+    expect(err.join('\n')).toContain('has no pre-upgrade OneCLI database backup');
+    expect(state.events).toEqual([]);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
+  });
+
+  it('symmetrically restores the quarantined 1.45.0 OneCLI backup when returning to 1.45.0 after a failed rollback', async () => {
+    const { host, runtime, next, state } = await upgradedAssistant();
+    state.onecliDbState = 'migrated-1.45-with-new-grants';
+    state.onStart = (root) => {
+      // Fail verification only when 1.42.0 starts, forcing rollback to goBack() to 1.45.0.
+      state.chatDown = readlinkSync(root) === releaseName(host.first);
+    };
+
+    const { run, err } = cli(host, state, next, runtime);
+    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(1);
+
+    expect(err.join('\n')).toContain(`went back: the assistant runs dogfood ${next.commit.slice(0, 12)} again`);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
+    expect(state.running).toBe(true);
+    expect(state.onecliDbState).toBe('migrated-1.45-with-new-grants');
+    // Quarantined 1.45.0 dump was restored and renamed to *-returned.sql.
+    const quarantine = await readdir(path.join(layoutOf(host, runtime).root, 'quarantine'));
+    expect(quarantine.some((name) => name.endsWith('-onecli-db-returned.sql'))).toBe(true);
+    expect(quarantine.some((name) => name.endsWith('-onecli-db.sql'))).toBe(false);
+  });
+
+  it('restores the 1.42.0 Postgres backup when reverting a snapshotted update killed after OneCLI migrated', async () => {
+    const host = await machine();
+    const runtime = await assistant(host, { onecliGatewayVersion: '1.42.0' });
+    const next = await nextRelease(host);
+    const state = world(runtime);
+    records.killAfter = 'snapshotted';
+    records.reached = () => state.reached?.();
+    await killDuringUpdate(host, runtime, state, next);
+    // Simulate crash mid-switch after 1.45.0 migrated Postgres before advancing to `switched`.
+    state.onecliDbState = 'migrated-1.45';
+
+    expect(await cli(host, state, next, runtime).run(['rollback', '--id', runtime.instance_id])).toBe(0);
+
+    expect(state.onecliDbState).toBe('1.42-initial');
+    expect(state.onecliRestores).toEqual(state.onecliBackups);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
+    expect(state.running).toBe(true);
+    expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
+  });
+});

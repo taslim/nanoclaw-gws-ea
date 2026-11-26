@@ -175,14 +175,14 @@ const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<voi
     async (g) => {
       gateway.createDefault(g.id, g.name).secretMode = 'all';
     },
-    /gateway secret mode is not selective/,
+    /gateway secret mode is all/,
   ],
   [
     'an app credential assigned beside the model credential',
     async (g) => {
       gateway.createDefault(g.id, g.name).secrets.push(APP_SECRET.id);
     },
-    /gateway secret assignments are not model-only/,
+    /gateway secret grants are not model-only/,
   ],
   [
     'a template skill',
@@ -227,22 +227,23 @@ describe('the session admission external-email registers', () => {
     expect((await externalEmailHealth()).problems).toEqual([]);
   });
 
-  it('gives it a gateway identity holding only the model credential at each start, and leaves main all', async () => {
+  it('gives it a gateway identity holding only the model credential at each start, and leaves main grants untouched', async () => {
     const ee = await externalEmail();
     expect(gateway.agents.get(ee.id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
     expect(gateway.injected(ee.id, APP_SECRET.hostPattern)).toEqual([]);
     expect(gateway.injected(ee.id, MODEL_SECRET.hostPattern)).toEqual([MODEL_SECRET.id]);
 
     const main = gateway.createDefault('ag-main', 'main');
-    Object.assign(gateway.agents.get(ee.id)!, { secretMode: 'all', secrets: [MODEL_SECRET.id, APP_SECRET.id] });
+    main.secrets.push(MODEL_SECRET.id, APP_SECRET.id);
+    gateway.agents.get(ee.id)!.secrets.push(APP_SECRET.id);
     await expect(admit(ee.id)).rejects.toThrow(
-      'external-email may not start: its gateway secret mode is not selective',
+      'external-email may not start: its gateway secret grants are not model-only',
     );
     await startHost();
 
     expect(gateway.agents.get(ee.id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
     await expect(admit(ee.id)).resolves.toBeUndefined();
-    expect(main).toMatchObject({ secretMode: 'all', secrets: [] });
+    expect(main).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id, APP_SECRET.id] });
     expect(gateway.injected('ag-main', APP_SECRET.hostPattern)).toEqual([APP_SECRET.id]);
   });
 

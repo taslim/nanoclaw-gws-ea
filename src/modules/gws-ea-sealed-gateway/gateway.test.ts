@@ -32,28 +32,30 @@ it('assigns nothing while the model credential is ambiguous, naming the group', 
   expect(gateway.agents.size).toBe(0);
 });
 
-it('writes only its own identity, and reports one the gateway created with all secrets', async () => {
+it('writes only its own identity, and refuses one in legacy all-secrets mode', async () => {
   const gateway = useFakeGateway([MODEL_SECRET, APP_SECRET]);
   const other = gateway.createDefault('ag-other', 'other');
-  gateway.createDefault('ag-sealed', 'sealed');
+  other.secrets.push(MODEL_SECRET.id, APP_SECRET.id);
+  const sealed = gateway.createDefault('ag-sealed', 'sealed');
+  sealed.secretMode = 'all';
 
-  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual(['its gateway secret mode is not selective']);
-  await reconcileSealedGateway('ag-sealed', 'browser');
-
-  expect(gateway.agents.get('ag-sealed')).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
-  expect(other).toMatchObject({ secretMode: 'all', secrets: [] });
-  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual([]);
+  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual(['its gateway secret mode is all']);
+  await expect(reconcileSealedGateway('ag-sealed', 'browser')).rejects.toThrow('legacy all-secrets mode');
+  expect(other).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id, APP_SECRET.id] });
 });
 
-it('replaces a single assignment that is not the model credential', async () => {
+it('replaces a non-model grant with strictly the model credential while leaving other agents untouched', async () => {
   const gateway = useFakeGateway([MODEL_SECRET, APP_SECRET]);
-  Object.assign(gateway.createDefault('ag-sealed', 'sealed'), { secretMode: 'selective', secrets: [APP_SECRET.id] });
+  const other = gateway.createDefault('ag-other', 'other');
+  other.secrets.push(MODEL_SECRET.id, APP_SECRET.id);
+  gateway.createDefault('ag-sealed', 'sealed').secrets.push(APP_SECRET.id);
 
-  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual([
-    'its gateway secret assignments are not model-only',
-  ]);
+  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual(['its gateway secret grants are not model-only']);
   await reconcileSealedGateway('ag-sealed', 'browser');
 
   expect(gateway.agents.get('ag-sealed')).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
   expect(gateway.injected('ag-sealed', APP_SECRET.hostPattern)).toEqual([]);
+  expect(gateway.injected('ag-sealed', MODEL_SECRET.hostPattern)).toEqual([MODEL_SECRET.id]);
+  expect(other.secrets).toEqual([MODEL_SECRET.id, APP_SECRET.id]);
+  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual([]);
 });

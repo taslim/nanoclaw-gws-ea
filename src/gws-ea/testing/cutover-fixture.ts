@@ -326,6 +326,8 @@ export interface AssistantOptions {
   readonly port?: number;
   /** The gateway its release's Compose file names, as an older tool rendered it. */
   readonly gateway?: string;
+  /** The OneCLI gateway version its release pinned (defaults to LAUNCHER_PINS.onecliGateway). */
+  readonly onecliGatewayVersion?: string;
   /** Its release's service definition, as an older tool rendered it. */
   readonly serviceDefinition?: string;
 }
@@ -404,10 +406,24 @@ export async function assistant(host: Machine, options: AssistantOptions = {}): 
   );
   const name = releaseName(host.first);
   const keptFiles = path.join(layout.kept(name));
-  if (options.gateway) {
-    await writeFile(path.join(keptFiles, 'onecli-compose.yaml'), renderOnecliCompose(onecli, PINS, options.gateway), {
-      mode: 0o600,
-    });
+  const gatewayPins = { gateway: options.onecliGatewayVersion ?? PINS.gateway };
+  if (options.gateway || options.onecliGatewayVersion) {
+    const gatewayImage = options.gateway ?? (await resolveWrapperGatewayImage(gatewayPins)).image;
+    await writeFile(
+      path.join(keptFiles, 'onecli-compose.yaml'),
+      renderOnecliCompose(onecli, gatewayPins, gatewayImage),
+      {
+        mode: 0o600,
+      },
+    );
+  }
+  if (options.onecliGatewayVersion) {
+    const receiptPath = path.join(keptFiles, 'release-preflight.json');
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8')) as { onecli: Record<string, string> };
+    receipt.onecli.gateway = options.onecliGatewayVersion;
+    await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+    await mkdir(path.dirname(runtime.secret_files.onecli_admin_api_key), { recursive: true, mode: 0o700 });
+    await writeFile(runtime.secret_files.onecli_admin_api_key, `oc_${'a'.repeat(64)}`, { mode: 0o600 });
   }
   if (options.serviceDefinition) {
     await writeFile(path.join(keptFiles, 'service-definition'), options.serviceDefinition, { mode: 0o600 });
@@ -516,6 +532,12 @@ export interface World {
   readonly probes: string[];
   /** The isolation probe fails while the gateway runs this image. */
   failingGateway?: string;
+  /** Simulated OneCLI Postgres database content; updated on 1.45+ up and restored on rollback. */
+  onecliDbState: string;
+  readonly onecliBackups: string[];
+  readonly onecliRestores: string[];
+  /** Force verifyOnecliGrantConversion to see a failed conversion line. */
+  failGrantConversion?: boolean;
   /** The serving runtime's re-verification before the fence fails. */
   reverifyFails?: boolean;
   readonly reverified: string[];
@@ -593,6 +615,9 @@ export function world(runtime: Pick<InstanceRuntimeConfig, 'install_id' | 'insta
     serviceCalls: [],
     gateways: new Map(),
     probes: [],
+    onecliDbState: '1.42-initial',
+    onecliBackups: [],
+    onecliRestores: [],
     reverified: [],
     rebuilds: [],
     skills: [],
@@ -717,7 +742,14 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
   if (first === 'compose') {
     const project = flagValues(spec.args, '--project-name')[0]!;
     if (spec.args.includes('up')) {
-      state.gateways.set(project, await readFile(flagValues(spec.args, '--file')[0]!, 'utf8'));
+      const compose = await readFile(flagValues(spec.args, '--file')[0]!, 'utf8');
+      state.gateways.set(project, compose);
+      if (
+        compose.includes(`ghcr.io/onecli/onecli:${LAUNCHER_PINS.onecliGateway}`) &&
+        state.onecliDbState === '1.42-initial'
+      ) {
+        state.onecliDbState = 'migrated-1.45';
+      }
       return { stdout: '', stderr: '' };
     }
     throw new Error(`unexpected compose command: ${joined}`);
@@ -725,6 +757,47 @@ async function docker(state: World, spec: SanitizedCommand): Promise<{ stdout: s
   if (first === 'container' && second === 'ls') {
     const project = flagValues(spec.args, '--filter')[0]!.replace('label=com.docker.compose.project=', '');
     return { stdout: projectContainers(state, project), stderr: '' };
+  }
+  if (
+    first === 'container' &&
+    second === 'inspect' &&
+    spec.args[2] === '--format' &&
+    spec.args[3] === '{{.State.StartedAt}}'
+  ) {
+    return { stdout: '2026-11-26T12:00:00Z\n', stderr: '' };
+  }
+  if (first === 'container' && second === 'inspect' && spec.args.some((arg) => arg.startsWith('postgres-'))) {
+    const project = spec.args.find((arg) => arg.startsWith('postgres-'))!.slice('postgres-'.length);
+    const instanceId = `${project.slice(7, 15)}-${project.slice(15, 19)}-${project.slice(19, 23)}-${project.slice(23, 27)}-${project.slice(27)}`;
+    const entries = spec.args.slice(2).map((id) => {
+      const service = id.startsWith('postgres-') ? 'postgres' : id.startsWith('app-') ? 'app' : 'gateway';
+      return {
+        Id: id,
+        Config: {
+          Labels: {
+            'com.docker.compose.project': project,
+            'com.docker.compose.service': service,
+            'com.docker.compose.config-hash': `hash-${service}`,
+            'dev.gws-ea.instance-id': instanceId,
+          },
+        },
+        State: { Running: true, Status: 'running', Health: { Status: 'healthy' } },
+        NetworkSettings: { Ports: {} },
+      };
+    });
+    return { stdout: JSON.stringify(entries), stderr: '' };
+  }
+  if (first === 'container' && second === 'logs') {
+    const line = state.failGrantConversion
+      ? '[grant-conversion] Converted 1 agent(s), 1 failed, 0 skipped, 0 preempted, 0 verify-failed\n'
+      : '[grant-conversion] Converted 1 agent(s), 0 failed, 0 skipped, 0 preempted, 0 verify-failed\n';
+    return { stdout: line, stderr: '' };
+  }
+  if (first === 'image' && second === 'pull') {
+    const id = imageId();
+    state.ids.add(id);
+    state.tags.set(last, id);
+    return { stdout: '', stderr: '' };
   }
   if (first === 'info') return { stdout: 'Docker Desktop\n', stderr: '' };
   if (first === 'run') {
@@ -1061,7 +1134,39 @@ export function dependencies(state: World, release: Release, runtime: InstanceRu
         if (state.reverifyFails) throw new GwsEaError('unhealthy_onecli', 'The OneCLI runtime is not serving.');
       },
       observe: async () => state.onecliObservation ?? { status: 'present' },
+      backupDatabase: async (_layout: OnecliRuntimeLayout, backupFile: string) => {
+        state.onecliBackups.push(backupFile);
+        await mkdir(path.dirname(backupFile), { recursive: true, mode: 0o700 });
+        await writeFile(backupFile, `${state.onecliDbState}\n-- PostgreSQL database dump complete\n`, { mode: 0o600 });
+      },
+      restoreDatabase: async (_layout: OnecliRuntimeLayout, backupFile: string) => {
+        const dump = await readFile(backupFile, 'utf8');
+        state.onecliDbState = dump.split('\n')[0] ?? '';
+        state.onecliRestores.push(backupFile);
+      },
     },
+    fetch: (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/v1/user/api-key') return Response.json({ apiKey: `oc_${'a'.repeat(64)}` });
+      if (url.pathname === '/v1/agents') {
+        return Response.json([{ id: 'oc-main', identifier: 'ag-main', name: 'main', secretMode: 'selective' }]);
+      }
+      if (url.pathname === '/v1/agents/oc-main/grants') {
+        return Response.json({ secrets: [{ secretId: 'sec-anthropic' }] });
+      }
+      if (url.pathname === '/v1/secrets') {
+        return Response.json([
+          {
+            id: 'sec-anthropic',
+            name: CREDENTIAL.name,
+            type: CREDENTIAL.type,
+            hostPattern: CREDENTIAL.hostPattern,
+            injectionConfig: { headerName: CREDENTIAL.headerName, valueFormat: '{value}' },
+          },
+        ]);
+      }
+      throw new Error(`unexpected OneCLI fetch: ${url.pathname}`);
+    }) as typeof globalThis.fetch,
     ncl: ncl(state),
   };
 }

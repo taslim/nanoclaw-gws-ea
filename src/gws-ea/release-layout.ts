@@ -87,6 +87,12 @@ export interface InstanceLayout {
   receipt(name: string): string;
   snapshot(op: string): string;
   quarantine(op: string): string;
+  /** Pre-upgrade OneCLI PostgreSQL dump kept inside `snapshots/<op>/`. */
+  onecliSnapshotBackup(op: string): string;
+  /** Current OneCLI PostgreSQL dump quarantined beside `quarantine/<op>/` before restoring a snapshot DB. */
+  onecliQuarantineBackup(op: string): string;
+  /** Where the rollback target's OneCLI dump is moved aside when a failed rollback returns. */
+  onecliReturnedBackup(op: string): string;
 }
 
 export function instanceLayout(root: string): InstanceLayout {
@@ -101,6 +107,10 @@ export function instanceLayout(root: string): InstanceLayout {
     receipt: (name) => path.join(keptRoot(resolved), requireReleaseName(name), RECEIPT),
     snapshot: (op) => path.join(snapshotsRoot(resolved), requireOperationName(op)),
     quarantine: (op) => path.join(quarantineRoot(resolved), requireOperationName(op)),
+    onecliSnapshotBackup: (op) => path.join(snapshotsRoot(resolved), requireOperationName(op), 'onecli-db.sql'),
+    onecliQuarantineBackup: (op) => path.join(quarantineRoot(resolved), `${requireOperationName(op)}-onecli-db.sql`),
+    onecliReturnedBackup: (op) =>
+      path.join(quarantineRoot(resolved), `${requireOperationName(op)}-onecli-db-returned.sql`),
   };
 }
 

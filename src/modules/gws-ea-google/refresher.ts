@@ -38,6 +38,8 @@ export interface RefresherOptions {
   readonly readGrant: () => Promise<GoogleGrant | undefined>;
   /** The selected gateway's connection for one credential: the only way a token is stored. */
   readonly connection: (target: GatewayCredentialTarget) => GatewayRuntimeCredentialConnection;
+  /** Optional hook called once published Google secrets need their per-agent gateway grants synced. */
+  readonly onPublished?: () => Promise<void>;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
   readonly log: RefresherLog;
@@ -63,6 +65,7 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
   const published = new Map<string, Published>();
   let revoked: string | undefined;
   let current: string | undefined;
+  let grantsSynced = false;
 
   return {
     async tick() {
@@ -80,6 +83,7 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
         // A new sign-in: every token is minted from it afresh.
         current = identity;
         published.clear();
+        grantsSynced = false;
       }
       if (revoked === identity) return;
 
@@ -93,8 +97,9 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
           const token = await mintCredentialToken(grant, credential, { ...tokenOptions, fallBack: !retrying });
           if (!token) continue;
           const connection = options.connection(bearerTarget(credential.secretName, credential.host));
-          await connection.find();
+          const existing = await connection.find();
           await connection.save(token.accessToken);
+          if (existing === null || held === undefined) grantsSynced = false;
           published.set(credential.host, { expiresAt: token.expiresAt, partial: token.fallback !== undefined });
           const fields = { host: credential.host, expiresAt: new Date(token.expiresAt).toISOString() };
           if (token.fallback) {
@@ -116,6 +121,18 @@ export function createGoogleTokenRefresher(options: RefresherOptions): GoogleTok
           if (retrying) continue;
           options.log.warn('Could not renew Google access for agents; retrying', {
             host: credential.host,
+            error: message(error),
+          });
+        }
+      }
+
+      if (published.size > 0 && !grantsSynced && options.onPublished) {
+        try {
+          await options.onPublished();
+          grantsSynced = true;
+          /* eslint-disable-next-line no-catch-all/no-catch-all -- A background loop: any failure is logged and the next tick retries. */
+        } catch (error) {
+          options.log.warn('Could not sync Google access grants for agents; retrying', {
             error: message(error),
           });
         }
