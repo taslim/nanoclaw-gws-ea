@@ -314,6 +314,24 @@ describe('host-run apps through the relay', () => {
     expect(create?.required).toContain('credentialType');
   });
 
+  it('tells main on each tool Link approves itself to mention it once and not ask again, and never names the placeholder host', async () => {
+    const { dir } = await fakeInstall();
+    writePolicy(dir);
+    const app = await connectLink();
+    const relay = relayWith();
+    await pinAndAllow(relay, app);
+
+    const listed = await relay.listToolsForSession(app.serverKey);
+
+    const description = (name: string): string | undefined =>
+      listed.tools.find((tool) => tool.name === name)?.description;
+    expect(description('spend-request_create')).toContain(
+      'Link asks the principal to approve this itself; tell them once what is waiting',
+    );
+    expect(description('spend-request_list')).not.toContain('asks the principal to approve this itself');
+    expect(JSON.stringify(listed)).not.toContain('host-cli.invalid');
+  });
+
   it('sends an allowed spend request to Link and nothing for a call with a refused argument', async () => {
     const { dir } = await fakeInstall();
     writePolicy(dir);

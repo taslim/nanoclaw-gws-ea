@@ -55,6 +55,11 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       'the response frame keeps its transport error code; the error message tells main what was refused and what to do',
   },
+  'gws-ea-connections/device-sign-in.ts parseLine: type': {
+    kind: 'host-only',
+    reason:
+      "a parsed line of link-cli's sign-in output for the host's own sign-in loop; no agent reads it, and the page shows its own wording",
+  },
   'gws-ea-connections/held-card.ts unwrapEnvelope: ...envVal': {
     kind: 'read-whole',
     reason:

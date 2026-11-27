@@ -301,13 +301,23 @@ function computeToolsVersion(listHash: string, tools: readonly PinnedAppTool[]):
   return sha256Hex(canonicalJson({ listHash, tools: summary })).slice(0, 16);
 }
 
-function formatToolForMain(pinned: PinnedAppTool): RelayedTool {
+/**
+ * Said where main calls the tool rather than in its standing guidance: the app's own approval is the decision, so a
+ * second ask in chat would add a step and protect nothing.
+ */
+export function confirmedByAppDescriptionSuffix(appName: string): string {
+  return `${appName} asks the principal to approve this itself; tell them once what is waiting, then check the outcome when they say they approved or its window passes, without asking again or adding your own approval.`;
+}
+
+function formatToolForMain(pinned: PinnedAppTool, entry: CatalogEntry | undefined): RelayedTool {
   const description =
     pinned.label === 'ask_first'
       ? appendDescriptionSuffix(pinned.definition.description, ASK_FIRST_DESCRIPTION_SUFFIX)
       : pinned.label === null
         ? appendDescriptionSuffix(pinned.definition.description, UNSORTED_DESCRIPTION_SUFFIX)
-        : pinned.definition.description;
+        : entry?.confirmedByApp.includes(pinned.definition.name)
+          ? appendDescriptionSuffix(pinned.definition.description, confirmedByAppDescriptionSuffix(entry.name))
+          : pinned.definition.description;
   return {
     name: pinned.definition.name,
     ...(pinned.definition.title === undefined ? {} : { title: pinned.definition.title }),
@@ -1033,19 +1043,23 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       if (stopping) throw new ConnectionsStoreError('store_unavailable');
       return trackOp(async () => {
         const { app, grant } = await requireConnectedApp(serverKey);
+        const entry = catalogEntryFor(app);
+        // A host-run app's address is a placeholder, so its instructions are attributed to the app by name.
+        const source = app.transport === 'host_cli' && entry ? entry.name : app.host;
+        const format = (tool: PinnedAppTool): RelayedTool => formatToolForMain(tool, entry);
         const loaded = await store.readAppTools(app.id);
         if (loaded?.pin) {
           triggerBackgroundRefresh(app.id);
           return {
-            instructions: formatRelayedInstructions(loaded.pin.instructions, app.host),
-            tools: loaded.tools.map(formatToolForMain),
+            instructions: formatRelayedInstructions(loaded.pin.instructions, source),
+            tools: loaded.tools.map(format),
             toolsVersion: computeToolsVersion(loaded.pin.listHash, loaded.tools),
           };
         }
         const pinned = await pinConnectedApp(app, grant);
         return {
-          instructions: formatRelayedInstructions(pinned.pin.instructions, app.host),
-          tools: pinned.tools.map(formatToolForMain),
+          instructions: formatRelayedInstructions(pinned.pin.instructions, source),
+          tools: pinned.tools.map(format),
           toolsVersion: computeToolsVersion(pinned.pin.listHash, pinned.tools),
         };
       });

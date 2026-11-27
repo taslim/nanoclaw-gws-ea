@@ -62,9 +62,9 @@ it('replaces the logins-only link tool in every tool module', () => {
     expect(fs.readFileSync(`${modules}/${file}`, 'utf8'), file).not.toContain('logins_page');
 });
 
-it('offers an available app once, through the Connections link, only when an errand the principal asked for needs it', () => {
+it('offers an available app once, only when an errand needs it', () => {
   const instructions = fs.readFileSync(new URL('./gws-ea-principal-pages.instructions.md', import.meta.url), 'utf8');
-  for (const rule of ['errand they asked for needs', 'list as available', 'offer it once', 'Connections link'])
+  for (const rule of ['errand needs its page or an app', 'list as available', 'offer that app once'])
     expect(instructions).toContain(rule);
   expect(instructions).not.toContain('never invite them to connect more');
 });
