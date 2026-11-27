@@ -1605,6 +1605,8 @@ describe('home status and link facts', () => {
     hasClient: false,
     clientEntered: false,
     status,
+    transport: 'remote',
+    catalogId: null,
     version: 1,
     createdAt: '2026-11-14T00:00:00.000Z',
     updatedAt: '2026-11-14T00:00:00.000Z',

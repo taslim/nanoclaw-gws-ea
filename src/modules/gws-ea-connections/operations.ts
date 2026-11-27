@@ -7,6 +7,13 @@ import {
   type AdmissionRefusal,
 } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
+import {
+  placeCatalogApps,
+  readCatalogPolicy,
+  type AvailableCatalogEntry,
+  type CatalogEntry,
+  type CatalogPolicyState,
+} from './catalog.js';
 import { checkRestartSoon } from './idle-restart.js';
 import { withAppLock } from './locks.js';
 import {
@@ -124,8 +131,13 @@ export interface ConnectionsListing {
   readonly listed: boolean;
   /** Apps can be added and connected: the store's secrets and main's servers are readable. */
   readonly canChange: boolean;
+  /** The principal's apps, less the not-connected catalog apps listed under `available`. */
   readonly apps: readonly ConnectionApp[];
   readonly operators: readonly OperatorServer[];
+  /** Each listed app's catalog entry, by app id; present when the apps were listed. */
+  readonly catalogEntries?: Readonly<Record<string, CatalogEntry>>;
+  /** Catalog entries this assistant can connect and has not; present when the apps were listed. */
+  readonly available?: readonly AvailableCatalogEntry[];
   /** Pinned tool metadata per principal app id, read without Keychain. */
   readonly pins?: Readonly<Record<string, AppPin>>;
   /** Pinned tools per principal app id, read without Keychain. */
@@ -136,10 +148,12 @@ export interface ConnectionsListing {
 
 export interface ListingSources {
   readonly operatorServers: () => Promise<readonly OperatorServer[]>;
+  readonly catalogPolicy: () => Promise<CatalogPolicyState>;
 }
 
 export const defaultListingSources: ListingSources = {
   operatorServers: mainOperatorServers,
+  catalogPolicy: () => readCatalogPolicy(),
 };
 
 /**
@@ -175,18 +189,25 @@ export async function readListing(
 
   const storePromise = (async () => {
     try {
-      const [apps, pinList, allTools, availability] = await Promise.all([
+      const [apps, pinList, allTools, availability, policy] = await Promise.all([
         store.apps(),
         store.listPins(),
         store.listAllTools(),
         options.includeAvailability === false ? Promise.resolve({ available: false }) : store.availability(),
+        sources.catalogPolicy(),
       ]);
       const pins = Object.fromEntries(pinList.map((pin) => [pin.appId, pin]));
       const toolsByApp: Record<string, PinnedAppTool[]> = {};
       for (const tool of allTools) {
         (toolsByApp[tool.appId] ??= []).push(tool);
       }
-      return { listed: true as const, apps, pins, toolsByApp, available: availability.available };
+      return {
+        listed: true as const,
+        catalog: placeCatalogApps(apps, policy),
+        pins,
+        toolsByApp,
+        available: availability.available,
+      };
     } catch (error) {
       if (!(error instanceof ConnectionsStoreError)) throw error;
       return { listed: false as const };
@@ -209,8 +230,10 @@ export async function readListing(
   return {
     listed: true,
     canChange: opResult.ok && storeResult.available,
-    apps: storeResult.apps,
+    apps: storeResult.catalog.apps,
     operators: opResult.operators,
+    catalogEntries: storeResult.catalog.entries,
+    available: storeResult.catalog.available,
     pins: storeResult.pins,
     toolsByApp: storeResult.toolsByApp,
     ...(pendingApprovals.length > 0 ? { pendingApprovals } : {}),
@@ -311,9 +334,7 @@ export class ConnectionOperations {
   }
 
   listing(): Promise<ConnectionsListing> {
-    return readListing(this.store, {
-      operatorServers: this.operators,
-    });
+    return readListing(this.store, { ...defaultListingSources, operatorServers: this.operators });
   }
 
   /**

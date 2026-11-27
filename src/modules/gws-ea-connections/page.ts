@@ -200,6 +200,7 @@ function storeFailure(error: ConnectionsStoreError): { readonly status: number; 
     case 'duplicate_name':
       return { status: 400, message: addMessage('duplicate_name') };
     case 'duplicate_host':
+    case 'duplicate_catalog_entry':
       return { status: 400, message: HOST_IN_USE };
     case 'invalid_details':
       return { status: 400, message: addMessage('invalid_name') };
