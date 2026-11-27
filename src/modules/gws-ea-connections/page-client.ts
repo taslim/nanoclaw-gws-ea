@@ -52,7 +52,10 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
             location.assign('/connections?outcome=connected');
             return;
           }
-          if (data.status !== 'waiting') {
+          // A sign-in started again from another tab has its own address and phrase.
+          const shownPhrase = root.querySelector('#device-phrase')?.textContent;
+          const shownAddress = root.querySelector('#device-address')?.getAttribute('href');
+          if (data.status !== 'waiting' || data.phrase !== shownPhrase || data.verificationUrl !== shownAddress) {
             location.assign(location.pathname);
             return;
           }

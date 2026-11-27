@@ -182,7 +182,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   }
 
   async function endRefused(app: ConnectionApp, generation: number, code: TerminalCode): Promise<void> {
-    unstored.delete(app.id);
+    // A refusal for another generation leaves a held rotation for renew to store.
+    if (unstored.get(app.id)?.generation === generation) unstored.delete(app.id);
     if (!(await store.markRefused(app.id, generation))) return;
     log.warn('App needs reconnecting', { appId: app.id, code });
     await attempt(app.id, 'Could not clean up refused app state', 'failed', async () => {

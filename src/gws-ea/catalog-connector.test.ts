@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { catalogEntry, operatorEnabled, readCatalogPolicy } from '../modules/gws-ea-connections/catalog.js';
 import { verifyHostCliReceipt, type HostCliTransport } from '../modules/gws-ea-connections/host-cli-receipt.js';
-import { installLink, provisionLink } from './catalog-connector.js';
+import { installLink, provisionLink, type CatalogRetirement } from './catalog-connector.js';
 import { provisionInstalledConnectors } from './connector-provisioning.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
@@ -20,27 +20,36 @@ import { persistTestRuntime } from './testing/runtime-fixture.js';
 import { GwsEaError } from './types.js';
 
 const pnpm = vi.hoisted(() => ({
-  version: '1.6.0',
   calls: [] as { args: readonly string[]; files: string[]; manifest: string; home: string | undefined }[],
 }));
 vi.mock('./process.js', async (original) => {
   const actual = await original<typeof import('./process.js')>();
-  // Lays out what a frozen install of the pinned package produces, at the version the test pins.
+  // Lays out what a frozen install of the staged package files produces: the lockfile decides the version, and a
+  // manifest it does not match is refused as frozen pnpm refuses it.
   const install = async (command: SanitizedCommand) => {
     if (command.command !== 'pnpm') return actual.runSanitizedCommand(command);
+    const manifest = await readFile(path.join(command.cwd, 'package.json'), 'utf8');
     pnpm.calls.push({
       args: command.args,
       files: (await readdir(command.cwd)).sort(),
-      manifest: await readFile(path.join(command.cwd, 'package.json'), 'utf8'),
+      manifest,
       home: command.env?.HOME,
     });
+    const locked = /'@stripe\/link-cli':\n\s+specifier: (\S+)\n\s+version: (\S+)/u.exec(
+      await readFile(path.join(command.cwd, 'pnpm-lock.yaml'), 'utf8'),
+    );
+    const requested = (JSON.parse(manifest) as { dependencies: Record<string, string> }).dependencies[
+      '@stripe/link-cli'
+    ];
+    if (!locked || locked[1] !== requested) throw new Error('ERR_PNPM_OUTDATED_LOCKFILE');
+    const version = locked[2];
     const cli = path.join(command.cwd, 'node_modules/@stripe/link-cli');
     await mkdir(path.join(cli, 'dist'), { recursive: true });
     await writeFile(
       path.join(cli, 'package.json'),
-      JSON.stringify({ name: '@stripe/link-cli', version: pnpm.version, bin: { 'link-cli': 'dist/cli.js' } }),
+      JSON.stringify({ name: '@stripe/link-cli', version, bin: { 'link-cli': 'dist/cli.js' } }),
     );
-    await writeFile(path.join(cli, 'dist/cli.js'), `// link-cli ${pnpm.version}\n`);
+    await writeFile(path.join(cli, 'dist/cli.js'), `// link-cli ${version}\n`);
     const undici = path.join(command.cwd, 'node_modules/undici');
     await mkdir(undici, { recursive: true });
     await writeFile(path.join(undici, 'package.json'), JSON.stringify({ name: 'undici', main: 'index.js' }));
@@ -48,6 +57,33 @@ vi.mock('./process.js', async (original) => {
     return { stdout: '', stderr: '' };
   };
   return { ...actual, runSanitizedCommand: install };
+});
+// Another release ships its own committed Link package files; a test stands in for that release by pointing the
+// installer's copy at a fixture directory.
+const releasePackage = vi.hoisted(() => ({ directory: undefined as string | undefined }));
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>();
+  const copyFile: typeof actual.copyFile = (source, destination, mode) => {
+    const file = String(source);
+    const committed = path.dirname(file).endsWith(path.join('connector-packages', 'link'));
+    return actual.copyFile(
+      committed && releasePackage.directory ? path.join(releasePackage.directory, path.basename(file)) : source,
+      destination,
+      mode,
+    );
+  };
+  return { ...actual, default: { ...actual, copyFile }, copyFile };
+});
+const policyWrites = vi.hoisted(() => ({ fail: false }));
+vi.mock('../community-portal/private-file.js', async (original) => {
+  const actual = await original<typeof import('../community-portal/private-file.js')>();
+  return {
+    ...actual,
+    writePrivate: async (file: string, value: unknown) => {
+      if (policyWrites.fail && path.basename(file) === 'catalog.json') throw new Error('The policy write failed.');
+      return actual.writePrivate(file, value);
+    },
+  };
 });
 const hostNcl = vi.hoisted(() =>
   vi.fn<(runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>>(),
@@ -77,8 +113,9 @@ beforeEach(async () => {
   root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'catalog-connector-')));
   paths = resolveControlPlanePaths({ configRoot: path.join(root, 'config'), stateRoot: path.join(root, 'state') });
   policyFile = path.join(paths.configRoot, 'catalog.json');
-  pnpm.version = PINNED.version;
   pnpm.calls = [];
+  releasePackage.directory = undefined;
+  policyWrites.fail = false;
   hostNcl.mockReset();
 });
 afterEach(async () => {
@@ -199,12 +236,36 @@ describe('Link connector', () => {
   it('installs a newly pinned version beside the one a rolled-back assistant still runs', async () => {
     await installLink(paths);
     const next = { ...PINNED, version: '1.7.0' };
-    pnpm.version = '1.7.0';
+    const committed = path.join(CONTROL_PLANE_ROOT, 'src/gws-ea/connector-packages/link');
+    const nextRelease = path.join(root, 'next-release-link-package');
+    await mkdir(nextRelease);
+    // The next release's committed files pin Link 1.7.0 and leave every other package as it was.
+    const pin = (text: string, pattern: RegExp) =>
+      text.replace(pattern, (match) => match.replaceAll(PINNED.version, next.version));
+    await writeFile(
+      path.join(nextRelease, 'package.json'),
+      pin(await readFile(path.join(committed, 'package.json'), 'utf8'), /"@stripe\/link-cli": "[^"]+"/u),
+    );
+    await writeFile(
+      path.join(nextRelease, 'pnpm-lock.yaml'),
+      pin(
+        await readFile(path.join(committed, 'pnpm-lock.yaml'), 'utf8'),
+        /'@stripe\/link-cli':\n\s+specifier: \S+\n\s+version: \S+/u,
+      ),
+    );
 
+    await expect(provisionLink(paths, next)).rejects.toMatchObject({ code: 'link_install_unverified' });
+    expect(await exists(path.join(paths.configRoot, 'connectors', 'link', '1.7.0'))).toBe(false);
+    releasePackage.directory = nextRelease;
     await provisionLink(paths, next);
+    releasePackage.directory = undefined;
     await provisionLink(paths, PINNED);
 
-    expect(pnpm.calls).toHaveLength(2);
+    const staged = pnpm.calls.map(
+      (call) =>
+        (JSON.parse(call.manifest) as { dependencies: Record<string, string> }).dependencies['@stripe/link-cli'],
+    );
+    expect(staged).toEqual(['1.6.0', '1.6.0', '1.7.0']);
     const older = path.join(paths.configRoot, 'connectors', 'link', '1.6.0');
     const newer = path.join(paths.configRoot, 'connectors', 'link', '1.7.0');
     await expect(verifyHostCliReceipt(older, PINNED)).resolves.toBeDefined();
@@ -335,11 +396,61 @@ describe('Link connector', () => {
     expect((await cli(['connectors', 'uninstall', 'link', '--json'], { serviceHelpers: services() })).code).toBe(0);
     expect(await exists(path.join(paths.configRoot, 'connectors', 'link'))).toBe(false);
   });
+
+  it('reports a retry as a change only when an assistant confirms it disconnected Link', async () => {
+    const answering = await assistant();
+    const silent = await assistant();
+    await installLink(paths, { upsertEnvVars });
+    let retired: number | undefined;
+    hostNcl.mockImplementation(async (runtime) => {
+      if (runtime.instance_id === silent.instance_id || retired === undefined)
+        throw new GwsEaError('ncl_failed', 'The assistant did not answer.');
+      return confirmed('link', retired);
+    });
+    const uninstall = () => cli(['connectors', 'uninstall', 'link', '--json'], { serviceHelpers: services() });
+    expect((await uninstall()).result).toMatchObject({ outcome: 'paused', changed: true });
+
+    retired = 1;
+    const disconnected = await uninstall();
+    expect(disconnected.result).toMatchObject({ outcome: 'paused', changed: true });
+    expect((disconnected.result?.data as { assistants: CatalogRetirement[] }).assistants).toContainEqual(
+      expect.objectContaining({ instance_id: answering.instance_id, outcome: 'retired', retired: 1 }),
+    );
+
+    retired = 0;
+    expect((await uninstall()).result).toMatchObject({ outcome: 'paused', changed: false });
+  });
 });
 
 describe('Shop connector', () => {
   const REDIRECT = 'https://aya.example.test/connections/callback/mcp.shop.com';
   const ALLOW = `Allow ${REDIRECT} as a redirect URL of your Shopify client in the Shopify Dev Dashboard.`;
+  const shopRoot = () => path.join(paths.configRoot, 'connectors', 'shop');
+
+  async function recordedShop() {
+    const state = await readCatalogPolicy(policyFile);
+    if (state.status !== 'read' || !state.policy.shop) throw new Error('Shop is not recorded');
+    return state.policy.shop;
+  }
+
+  async function secretSource(secret: string): Promise<string> {
+    const source = path.join(paths.configRoot, `shop-secret-${randomUUID()}`);
+    await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
+    await writeFile(source, `${secret}\n`, { mode: 0o600 });
+    return source;
+  }
+
+  function installShop(clientId: string, source?: string) {
+    return cli([
+      'connectors',
+      'install',
+      'shop',
+      '--client-id',
+      clientId,
+      ...(source ? ['--client-secret-file', source] : []),
+      '--json',
+    ]);
+  }
 
   it('refuses to register without a client ID', async () => {
     const { code, result } = await cli(['connectors', 'install', 'shop', '--json']);
@@ -374,11 +485,12 @@ describe('Shop connector', () => {
       data: { client_id: 'gws-ea-shop-client', client_secret: true, operator_actions: [ALLOW] },
       next_actions: expect.arrayContaining([{ kind: 'external', instruction: ALLOW }]),
     });
-    const stored = path.join(paths.configRoot, 'connectors', 'shop', 'client-secret');
+    const stored = (await recordedShop()).clientSecretFile!;
     expect(await readCatalogPolicy(policyFile)).toEqual({
       status: 'read',
       policy: { schemaVersion: 1, link: null, shop: { clientId: 'gws-ea-shop-client', clientSecretFile: stored } },
     });
+    expect(path.dirname(stored)).toBe(shopRoot());
     expect(await readFile(stored, 'utf8')).toBe(secret);
     expect((await stat(stored)).mode & 0o777).toBe(0o600);
     for (const runtime of [served, unserved])
@@ -454,15 +566,67 @@ describe('Shop connector', () => {
     expect(code).not.toBe(0);
     expect(result).toMatchObject({ error: { code: 'shop_client_secret_invalid' } });
     expect(await readFile(policyFile, 'utf8')).toBe(before);
-    expect(await exists(path.join(paths.configRoot, 'connectors', 'shop', 'client-secret'))).toBe(false);
+    expect(await readdir(shopRoot())).toEqual([]);
   });
+
+  it('publishes a replacement client and its secret together, keeping the old pair when publishing fails', async () => {
+    expect((await installShop('gws-ea-shop-client', await secretSource('first-secret-sentinel'))).code).toBe(0);
+    const first = await recordedShop();
+    const before = await readFile(policyFile, 'utf8');
+    const replacement = await secretSource('second-secret-sentinel');
+
+    policyWrites.fail = true;
+    expect((await installShop('gws-ea-shop-client-next', replacement)).code).not.toBe(0);
+    expect(await readFile(policyFile, 'utf8')).toBe(before);
+    expect(await readFile(first.clientSecretFile!, 'utf8')).toBe('first-secret-sentinel');
+    expect(await readdir(shopRoot())).toEqual([path.basename(first.clientSecretFile!)]);
+
+    policyWrites.fail = false;
+    expect((await installShop('gws-ea-shop-client-next', replacement)).code).toBe(0);
+    const second = await recordedShop();
+    expect(second.clientId).toBe('gws-ea-shop-client-next');
+    expect(second.clientSecretFile).not.toBe(first.clientSecretFile);
+    expect(await readFile(second.clientSecretFile!, 'utf8')).toBe('second-secret-sentinel');
+    expect((await stat(second.clientSecretFile!)).mode & 0o777).toBe(0o600);
+    expect(await readdir(shopRoot())).toEqual([path.basename(second.clientSecretFile!)]);
+  });
+
+  it.each([
+    ['missing', null],
+    ['empty', ''],
+    ['holding whitespace inside the secret', 'shop-client secret-sentinel'],
+  ])(
+    'treats a stored secret that is %s as unusable on check and names the reinstall to run',
+    async (_case, contents) => {
+      expect((await installShop('gws-ea-shop-client', await secretSource('shop-client-secret-sentinel'))).code).toBe(0);
+      const stored = (await recordedShop()).clientSecretFile!;
+      if (contents === null) await rm(stored);
+      else await writeFile(stored, contents, { mode: 0o600 });
+
+      const checked = await cli(['connectors', 'check', 'shop', '--json']);
+
+      expect(checked.code).toBe(1);
+      expectResultContract('connectors check shop', checked.result);
+      const data = checked.result?.data as { readiness: { status: string }; reasons: string[] };
+      expect(data.readiness.status).toBe('not_ready');
+      expect(data.reasons.join('\n')).toContain('stored Shop client secret');
+      const actions = checked.result?.next_actions as { kind: string; instruction?: string }[];
+      expect(actions).toContainEqual({
+        kind: 'external',
+        instruction: expect.stringContaining(
+          'gws-ea connectors install shop --client-id gws-ea-shop-client --client-secret-file ',
+        ),
+      });
+      expect(checked.output.join('\n')).not.toContain('secret-sentinel');
+    },
+  );
 
   it('removes the stored secret when Shop is installed again with a client ID only', async () => {
     const source = path.join(paths.configRoot, 'shop-secret');
     await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
     await writeFile(source, 'shop-client-secret-sentinel', { mode: 0o600 });
     await cli(['connectors', 'install', 'shop', '--client-id', 'gws-ea-shop-client', '--client-secret-file', source]);
-    const stored = path.join(paths.configRoot, 'connectors', 'shop', 'client-secret');
+    const stored = (await recordedShop()).clientSecretFile!;
     expect(await exists(stored)).toBe(true);
 
     const { code, result } = await cli([
@@ -480,7 +644,7 @@ describe('Shop connector', () => {
       status: 'read',
       policy: { schemaVersion: 1, link: null, shop: { clientId: 'gws-ea-public-client', clientSecretFile: null } },
     });
-    expect(await exists(stored)).toBe(false);
+    expect(await readdir(shopRoot())).toEqual([]);
   });
 
   it('disconnects Shop on running assistants before removing the stored secret', async () => {

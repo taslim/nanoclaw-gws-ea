@@ -89,6 +89,7 @@ import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { createState, pointCurrent, readCurrent, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
+import type { NextAction } from './result.js';
 import { GwsEaError, type InstanceReservation, type ProvisionStepId } from './types.js';
 import {
   isRecord,
@@ -1444,6 +1445,10 @@ export async function runProductionProvision(
     : result;
 }
 
+function connectorActionLines(actions: readonly NextAction[]): string[] {
+  return actions.map((action) => (action.kind === 'command' ? `Then: ${action.argv.join(' ')}` : action.instruction));
+}
+
 /** Optional connector setup and identity run only after the assistant is talkable. */
 export async function provisionAssistantResources(
   operation: InstanceOperation,
@@ -1469,9 +1474,7 @@ export async function provisionAssistantResources(
         code: `${actionable.name}_${actionable.reason}`,
         message: `The assistant is ready; ${actionable.name} setup waits. ${actionable.message}`,
         details: [
-          ...connectors.next_actions.map((action) =>
-            action.kind === 'command' ? `Then: ${action.argv.join(' ')}` : action.instruction,
-          ),
+          ...connectorActionLines(connectors.next_actions),
           `Continue with gws-ea resume --id ${operation.instanceId}.`,
         ],
       },
@@ -1493,7 +1496,19 @@ export async function provisionAssistantResources(
   }
   const runtime = await loadInstanceRuntimeConfig(operation.paths.runtimeFile(operation.instanceId));
   const result = await runAliasStep(operation.paths, operation.instanceId, runtime, reporter, alias);
-  return result.status === 'ready'
-    ? { ...result, nextActions: connectors.next_actions, pendingConnectors: connectors.pending }
-    : { ...result, pause: { ...result.pause, optional: true } };
+  if (result.status === 'ready')
+    return { ...result, nextActions: connectors.next_actions, pendingConnectors: connectors.pending };
+  // A pause carries no structured actions, so the host-wide setup the ready result would report travels in its details.
+  return {
+    ...result,
+    pause: {
+      ...result.pause,
+      optional: true,
+      details: [
+        ...(result.pause.details ?? []),
+        ...connectors.pending.map((connector) => `${connector.name}: ${connector.message}`),
+        ...connectorActionLines(connectors.next_actions),
+      ],
+    },
+  };
 }

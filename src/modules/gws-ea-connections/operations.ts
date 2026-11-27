@@ -432,6 +432,7 @@ export class ConnectionOperations {
       const appId = app.id;
       await startDeviceSignIn({
         appId,
+        entry,
         launch,
         clientName: await this.clientName(),
         complete: (pendingFile, current) => this.completeDeviceSignIn(entry, appId, launch, pendingFile, current),
@@ -768,7 +769,11 @@ export class ConnectionOperations {
     let retired = 0;
     if (entry && operatorDisabled(entry, await readCatalogPolicy())) {
       // Under each app's lock, so a sign-in finishing now has either connected, and is disconnected below, or never will.
-      for (const app of await own()) await withAppLock(app.id, async () => cancelDeviceSignIn(app.id));
+      for (const app of await own())
+        await withAppLock(app.id, async () => {
+          cancelDeviceSignIn(app.id);
+          await this.store.discardSignIns(app.id);
+        });
       for (const app of await own()) {
         if (app.status === 'not_connected') continue;
         try {

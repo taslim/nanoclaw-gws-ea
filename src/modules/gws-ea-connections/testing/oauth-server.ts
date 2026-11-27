@@ -472,6 +472,17 @@ export class FakeMcpApp {
     };
   }
 
+  /** Each string argument the tool's current definition mirrors into an `Mcp-Param-*` header must arrive there. */
+  private paramHeadersMatch(request: FakeRequest, call: RecordedToolCall): boolean {
+    const properties = this.tools.find((tool) => tool.name === call.name)?.inputSchema.properties ?? {};
+    return Object.entries(properties).every(([key, schema]) => {
+      const header = schema['x-mcp-header'];
+      const value = call.arguments[key];
+      if (typeof header !== 'string' || typeof value !== 'string') return true;
+      return request.headers[`mcp-param-${header.toLowerCase()}`] === value;
+    });
+  }
+
   /** Discovery and listings are open; a tool call without a live token is refused with where to sign in. */
   private modernMcp(request: FakeRequest, bearer: string | undefined): FakeReply {
     const message = JSON.parse(request.body) as McpMessage;
@@ -509,7 +520,8 @@ export class FakeMcpApp {
         return result({ tools: this.tools, ttlMs: 0, cacheScope: 'private' });
       case 'tools/call': {
         const call = toolCallOf(params, bearer);
-        if (request.headers['mcp-name'] !== call.name) return rpcError(id, -32020, 'Header mismatch');
+        if (request.headers['mcp-name'] !== call.name || !this.paramHeadersMatch(request, call))
+          return rpcError(id, -32020, 'Header mismatch');
         if (bearer === undefined || !this.accessTokens.has(bearer)) {
           const scopes = this.resourceMetadata.scopes_supported;
           const scope = Array.isArray(scopes) ? `, scope="${scopes.join(' ')}"` : '';

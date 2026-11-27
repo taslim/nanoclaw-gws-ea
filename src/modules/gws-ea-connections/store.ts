@@ -1457,6 +1457,13 @@ export class ConnectionsStore {
     });
   }
 
+  /** Every pending sign-in for the app, claimed or not; a claimed one then completes as expired. */
+  async discardSignIns(appId: string): Promise<void> {
+    await this.use((db) => {
+      db.prepare('DELETE FROM sign_ins WHERE app_id = ?').run(appId);
+    });
+  }
+
   async sweepExpiredSignIns(): Promise<number> {
     return this.use(
       (db) => db.prepare('DELETE FROM sign_ins WHERE expires_at <= ?').run(new Date().toISOString()).changes,

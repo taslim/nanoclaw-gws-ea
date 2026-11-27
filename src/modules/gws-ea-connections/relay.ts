@@ -1,7 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { Client, SdkHttpError, StreamableHTTPClientTransport, type FetchLike } from '@modelcontextprotocol/client';
+import {
+  Client,
+  isSpecType,
+  SdkHttpError,
+  StreamableHTTPClientTransport,
+  type CallToolRequestOptions,
+  type FetchLike,
+} from '@modelcontextprotocol/client';
 
 import { getDb } from '../../db/connection.js';
 import { getPendingApproval } from '../../db/sessions.js';
@@ -343,6 +350,11 @@ function offeredTools(entry: CatalogEntry | undefined, listing: readonly ToolDef
   return listing.filter((tool) => !entry.withheld.includes(tool.name)).map((tool) => offeredDefinition(entry, tool));
 }
 
+/** A command pinned before the app was known as the entry's, or before the entry withheld it, is not offered either. */
+function withheldBy(entry: CatalogEntry | undefined, toolName: string): boolean {
+  return entry?.withheld.includes(toolName) === true;
+}
+
 function refusalText(entry: CatalogEntry, toolName: string, rule: RefusedArgument): string {
   switch (rule.match.kind) {
     case 'any':
@@ -463,6 +475,18 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
   function requestOptions(managed: ManagedClient): { readonly timeout: number } | undefined {
     return managed.kind === 'host_process' ? { timeout: timeoutMs } : undefined;
+  }
+
+  /**
+   * A remote call carries the approved definition, so the client mirrors its parameter headers from it and, when the
+   * server's definition has changed since, fails with a header mismatch instead of refetching the listing and resending
+   * under a definition nobody approved.
+   */
+  function callOptions(managed: ManagedClient, tool: PinnedAppTool): CallToolRequestOptions | undefined {
+    if (managed.kind === 'host_process') return requestOptions(managed);
+    const definition: unknown = tool.definition;
+    if (!isSpecType.Tool(definition)) throw new TypeError('The approved tool definition is not a valid MCP tool');
+    return { toolDefinition: definition };
   }
 
   function trackOp<T>(operation: () => Promise<T>): Promise<T> {
@@ -907,7 +931,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             (await verifyLiveGrant(app.id, grant.generation)) ? { ok: true } : { ok: false, reason: 'grant_changed' });
         try {
           const result = await traceStore.run(callTrace, () =>
-            managed.client.callTool(upstreamCall(managed, tool, args), requestOptions(managed)),
+            managed.client.callTool(upstreamCall(managed, tool, args), callOptions(managed, tool)),
           );
           // A child's pipe is read far past the relay's cap, so the cap applies to the answer main would receive.
           if (managed.kind === 'host_process' && Buffer.byteLength(JSON.stringify(result)) > maxBodyBytes) {
@@ -1074,20 +1098,21 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         const entry = catalogEntryFor(app);
         // A host-run app's address is a placeholder, so its instructions are attributed to the app by name.
         const source = app.transport === 'host_cli' && entry ? entry.name : app.host;
-        const format = (tool: PinnedAppTool): RelayedTool => formatToolForMain(tool, entry);
+        const format = (tools: readonly PinnedAppTool[]): RelayedTool[] =>
+          tools.filter((tool) => !withheldBy(entry, tool.name)).map((tool) => formatToolForMain(tool, entry));
         const loaded = await store.readAppTools(app.id);
         if (loaded?.pin) {
           triggerBackgroundRefresh(app.id);
           return {
             instructions: formatRelayedInstructions(loaded.pin.instructions, source),
-            tools: loaded.tools.map(format),
+            tools: format(loaded.tools),
             toolsVersion: computeToolsVersion(loaded.pin.listHash, loaded.tools),
           };
         }
         const pinned = await pinConnectedApp(app, grant);
         return {
           instructions: formatRelayedInstructions(pinned.pin.instructions, source),
-          tools: pinned.tools.map(format),
+          tools: format(pinned.tools),
           toolsVersion: computeToolsVersion(pinned.pin.listHash, pinned.tools),
         };
       });
@@ -1108,6 +1133,9 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         const refused = entry && refusedArgumentIn(entry, input.toolName, input.args);
         if (entry && refused) {
           return { status: 'unsent', reason: 'refused_argument', text: refusalText(entry, input.toolName, refused) };
+        }
+        if (withheldBy(entry, input.toolName)) {
+          return { status: 'unsent', reason: 'unknown_tool', text: `Unknown tool "${input.toolName}".` };
         }
         const loaded = await store.readAppTools(app.id);
         let pin = loaded?.pin;

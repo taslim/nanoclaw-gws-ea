@@ -119,6 +119,8 @@ if (args.includes('--mcp')) {
         break;
       case 'garbled':
         process.stdout.write('Polling…\n');
+        // A referenced timer keeps the process alive so only the host's kill can end it.
+        setInterval(() => undefined, 60_000);
         await new Promise(() => undefined);
         break;
       case 'no_phrase':

@@ -21,6 +21,7 @@ import {
   hostCliEnvironment,
   hostCliPaths,
   HostCliUnavailableError,
+  resolveHostCliLaunch,
   resolveInstalledHostCli,
   type HostCliEntry,
   type HostCliLaunch,
@@ -50,6 +51,7 @@ const IDLE: DeviceSignInView = { status: 'idle' };
 
 export interface DeviceSignInStart {
   readonly appId: string;
+  readonly entry: HostCliEntry;
   readonly launch: HostCliLaunch;
   /** Shown in the app where the principal approves, so they can tell which assistant asks. */
   readonly clientName: string;
@@ -257,8 +259,18 @@ class DeviceSignIn {
       return;
     }
     if (!shown || unreadable) return this.#end(unreadable ? 'failed' : (failure ?? 'failed'));
-    // A login that ended without saying so may still have saved an approval before it stopped.
-    if (!authenticated) authenticated = await statusAuthenticated(launch, this.#pendingFile);
+    // A login that ended without saying so may still have saved an approval before it stopped. The install may have
+    // changed while approval was pending, so the status check runs only from a freshly verified launch.
+    if (!authenticated) {
+      let statusLaunch: HostCliLaunch;
+      try {
+        statusLaunch = await resolveHostCliLaunch(this.#start.entry);
+      } catch (error) {
+        if (!(error instanceof HostCliUnavailableError)) throw error;
+        return this.#end(error.reason === 'not_enabled' ? 'not_offered' : 'failed');
+      }
+      authenticated = await statusAuthenticated(statusLaunch, this.#pendingFile);
+    }
     if (!authenticated) return this.#end(failure ?? 'expired');
     const completion = await complete(this.#pendingFile, () => this.#current());
     if (completion === 'connected') {

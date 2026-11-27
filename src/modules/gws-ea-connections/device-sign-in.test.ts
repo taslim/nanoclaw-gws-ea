@@ -4,6 +4,7 @@ import { createServer, request as httpRequest, type Server } from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { chromium } from 'playwright-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { ROOT } = vi.hoisted(() => ({ ROOT: `/tmp/connections-device-sign-in-${process.pid}` }));
@@ -22,7 +23,7 @@ import type { NoteForMain } from '../gws-ea-profile/main-note.js';
 import '../gws-ea-profile/index.js';
 import { catalogEntry } from './catalog.js';
 import { CATALOG_POLICY_FILE_ENV, CONNECTIONS_ROOT_ENV } from './config.js';
-import { cancelAllDeviceSignIns } from './device-sign-in.js';
+import { cancelAllDeviceSignIns, cancelDeviceSignIn } from './device-sign-in.js';
 import { recordHostCliReceipt } from './host-cli-receipt.js';
 import { isHostCliEntry, type HostCliEntry } from './host-process.js';
 import { ConnectionOperations } from './operations.js';
@@ -40,6 +41,7 @@ const PRINCIPAL = 'morgan@example.test';
 const ADDRESS = 'https://app.link.com/device?code=juno-sentinel';
 const PHRASE = 'maple-river-lantern';
 const SENTINEL_TOKEN = 'sentinel-link-token-W4z8-long-enough';
+const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 const savedEnv = { ...process.env };
 
 let base: string;
@@ -283,6 +285,45 @@ describe('connecting Link from the page', () => {
     expect(fs.existsSync(pendingFile())).toBe(false);
   });
 
+  it.skipIf(!chromePath)(
+    'shows the new address and phrase in an open page once another tab has started a new sign-in',
+    async () => {
+      control({ login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE });
+      await connectLink();
+      const app = await linkApp();
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext();
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const url = new URL(route.request().url());
+          const reply = await request(`${url.pathname}${url.search}`);
+          await route.fulfill({
+            status: reply.status,
+            contentType: url.pathname.endsWith('/sign-in-status') ? 'application/json' : 'text/html',
+            body: reply.body,
+          });
+        });
+        const page = await context.newPage();
+        page.setDefaultTimeout(10_000);
+        await page.goto(`https://${HOST}/connections/app/${app.id}/connect`);
+        await expect.poll(() => page.locator('#device-phrase').textContent()).toBe(PHRASE);
+
+        const nextAddress = 'https://app.link.com/device?code=remy-sentinel';
+        const nextPhrase = 'cedar-harbor-violet';
+        cancelDeviceSignIn(app.id);
+        control({ login: 'wait', verificationUrl: nextAddress, phrase: nextPhrase });
+        await connectLink();
+
+        await expect.poll(() => page.locator('#device-phrase').textContent(), { timeout: 10_000 }).toBe(nextPhrase);
+        expect(await page.locator('#device-address').getAttribute('href')).toBe(nextAddress);
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
   it('names the assistant, polls every five seconds, reads JSON lines and signs in against the pending file', async () => {
     await connectedLink();
 
@@ -354,6 +395,25 @@ describe('connecting Link from the page', () => {
     );
 
     expect(ran('status')).toEqual([expect.objectContaining({ authFile: pendingFile() })]);
+    expect(await store.currentGrant(app.id)).toBeUndefined();
+  });
+
+  it('ends without a status check when the installed CLI changed while the login waited', async () => {
+    control({ login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE });
+    await connectLink();
+    const app = await linkApp();
+    const cliFile = path.join(installDir, 'node_modules', '@stripe', 'link-cli', 'dist', 'cli.js');
+    fs.appendFileSync(cliFile, '// changed after the receipt\n');
+
+    answer('deny');
+    const status = await eventually(
+      () => signInStatus(app),
+      (value) => value.status === 'ended',
+    );
+
+    expect(status).toEqual({ status: 'ended', reason: 'failed' });
+    expect(ran('status')).toEqual([]);
+    expect(fs.existsSync(pendingFile())).toBe(false);
     expect(await store.currentGrant(app.id)).toBeUndefined();
   });
 

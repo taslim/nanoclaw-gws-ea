@@ -1589,6 +1589,25 @@ describe('the catalog on the page', () => {
     expect((await onlyApp()).status).toBe('connected');
   });
 
+  it('keeps Rename and Delete beside Connect for an Available entry with a stored app, and only Connect otherwise', async () => {
+    serve(catalogServer(NOTION).handle);
+    expect((await catalogConnect('notion')).status).toBe(200);
+    const abandoned = await onlyApp();
+
+    const rows = listSection((await request('/connections')).body, 'Available')
+      .split('<li ')
+      .filter((row) => row.includes('name="entry"'));
+    const notionRow = rows.find((row) => row.includes('value="notion"')) ?? '';
+    expect(notionRow).toContain('aria-label="Connect Notion"');
+    expect(notionRow).toContain(`href="/connections/app/${abandoned.id}/rename"`);
+    expect(notionRow).toContain('action="/connections/delete"');
+    expect(notionRow).toContain(`value="${abandoned.id}"`);
+    for (const row of rows.filter((candidate) => !candidate.includes('value="notion"'))) {
+      expect(row).not.toContain('data-menu-button');
+      expect(row).not.toContain('/rename');
+    }
+  });
+
   it('stores nothing and shows the probe’s message when the entry’s server does not answer', async () => {
     serve((incoming) => (incoming.host === 'api.chowdeck.com' ? { status: 503 } : undefined));
     const reply = await catalogConnect('chowdeck');

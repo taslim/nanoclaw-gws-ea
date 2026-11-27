@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -18,16 +19,37 @@ vi.mock('../../config.js', async (original) => ({
 }));
 const logged = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() }));
 vi.mock('../../log.js', () => ({ log: logged }));
+/** Lets a test wrap each proxy the host starts; every other test gets the proxy unchanged. */
+const proxyFront = vi.hoisted(() => ({
+  wrap: undefined as undefined | ((proxy: PublicBrowserProxy) => Promise<PublicBrowserProxy>),
+}));
+vi.mock('../gws-ea-browser/proxy.js', async (original) => {
+  const actual = await original<typeof import('../gws-ea-browser/proxy.js')>();
+  return {
+    ...actual,
+    startPublicBrowserProxy: async (): Promise<PublicBrowserProxy> => {
+      const proxy = await actual.startPublicBrowserProxy();
+      return proxyFront.wrap ? proxyFront.wrap(proxy) : proxy;
+    },
+  };
+});
 
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import type { Session } from '../../types.js';
-import { startPublicBrowserProxy } from '../gws-ea-browser/proxy.js';
+import { startPublicBrowserProxy, type PublicBrowserProxy } from '../gws-ea-browser/proxy.js';
 import { mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
 import { catalogEntry } from './catalog.js';
 import { CATALOG_POLICY_FILE_ENV, CONNECTIONS_ROOT_ENV } from './config.js';
 import { HOST_CLI_RECEIPT_FILE, recordHostCliReceipt, verifyHostCliReceipt } from './host-cli-receipt.js';
-import { hostCliEnvironment, HostCliUnavailableError, isHostCliEntry, type HostCliEntry } from './host-process.js';
+import {
+  hostCliEnvironment,
+  HostCliUnavailableError,
+  HostProcessTransport,
+  isHostCliEntry,
+  resolveHostCliLaunch,
+  type HostCliEntry,
+} from './host-process.js';
 import { createAppRelay, RELAY_MAX_BODY_BYTES, type AppRelay, type RelayCallOutcome } from './relay.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
 import type { FakeAppControl, FakeAppRecord } from './testing/fake-stdio-app.js';
@@ -244,6 +266,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  proxyFront.wrap = undefined;
   await Promise.all(relays.splice(0).map((relay) => relay.drain(500)));
   await closeDb();
   for (const key of [CONNECTIONS_ROOT_ENV, CATALOG_POLICY_FILE_ENV, 'ONECLI_URL', 'ANTHROPIC_API_KEY']) {
@@ -493,6 +516,37 @@ describe('host-run apps through the relay', () => {
     expect(await accepts(Number(new URL(start.env.LINK_HTTP_PROXY ?? '').port))).toBe(false);
   });
 
+  it('finishes an explicit close only after the proxy is closed and the close is reported', async () => {
+    const { dir } = await fakeInstall();
+    writePolicy(dir);
+    control({});
+    // A proxy that takes a moment to close, so the child's exit is still cleaning up when the explicit close arrives.
+    proxyFront.wrap = (proxy) =>
+      Promise.resolve({
+        ...proxy,
+        close: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          await proxy.close();
+        },
+      });
+    const transport = new HostProcessTransport(await resolveHostCliLaunch(linkEntry()));
+    let reported = 0;
+    transport.onclose = () => {
+      reported += 1;
+    };
+    await transport.start();
+    await eventually(() => starts().length === 1);
+    const [start] = starts();
+    if (!start) throw new Error('The app never started');
+    const proxyPort = Number(new URL(start.env.LINK_HTTP_PROXY ?? '').port);
+
+    await transport.close();
+
+    expect(reported).toBe(1);
+    expect(alive(start.pid)).toBe(false);
+    expect(await accepts(proxyPort)).toBe(false);
+  });
+
   it.each([
     [
       'a changed entry file',
@@ -528,9 +582,20 @@ const linkInstall = process.env.GWS_EA_LINK_CLI_TEST_INSTALL;
 describe.skipIf(!linkInstall)('the real pinned Link CLI', { timeout: 60_000 }, () => {
   const run = promisify(execFile);
 
-  async function listener(): Promise<{ readonly url: string; readonly hits: string[]; close(): Promise<void> }> {
+  interface Listener {
+    readonly url: string;
+    readonly authority: string;
+    readonly hits: string[];
+    /** TCP connections accepted, whether or not any bytes arrived. */
+    connections(): number;
+    close(): Promise<void>;
+  }
+
+  async function listener(): Promise<Listener> {
     const hits: string[] = [];
+    let accepted = 0;
     const server = net.createServer((socket) => {
+      accepted += 1;
       socket.once('data', (data) => hits.push(data.toString('utf8').split('\r\n')[0] ?? ''));
       socket.end(
         'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}',
@@ -540,9 +605,87 @@ describe.skipIf(!linkInstall)('the real pinned Link CLI', { timeout: 60_000 }, (
     const { port } = server.address() as net.AddressInfo;
     return {
       url: `http://127.0.0.1:${port}`,
+      authority: `127.0.0.1:${port}`,
       hits,
+      connections: () => accepted,
       close: () => new Promise<void>((resolve) => server.close(() => resolve())),
     };
+  }
+
+  interface ProxyExchange {
+    readonly method: string;
+    readonly target: string;
+    readonly status: number;
+  }
+
+  /**
+   * Sits in front of a real public-only proxy and records each request it forwards with the proxy's answer, so a test
+   * can tell the proxy's refusal from a failure that never reached the network.
+   */
+  async function recordingFront(proxy: PublicBrowserProxy, exchanges: ProxyExchange[]): Promise<PublicBrowserProxy> {
+    const sockets = new Set<net.Socket>();
+    const track = (socket: net.Socket): void => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+    };
+    const server = http.createServer((request, response) => {
+      const forwarded = http.request({
+        host: '127.0.0.1',
+        port: proxy.port,
+        method: request.method,
+        path: request.url,
+        headers: request.headers,
+      });
+      forwarded.on('response', (reply) => {
+        exchanges.push({ method: request.method ?? '', target: request.url ?? '', status: reply.statusCode ?? 0 });
+        response.writeHead(reply.statusCode ?? 502, reply.headers);
+        reply.pipe(response);
+      });
+      forwarded.on('error', () => response.destroy());
+      request.pipe(forwarded);
+    });
+    server.on('connection', track);
+    server.on('connect', (request: http.IncomingMessage, client: net.Socket, head: Buffer) => {
+      const target = request.url ?? '';
+      const forwarded = http.request({ host: '127.0.0.1', port: proxy.port, method: 'CONNECT', path: target });
+      forwarded.on('connect', (reply: http.IncomingMessage, upstream: net.Socket, upstreamHead: Buffer) => {
+        track(upstream);
+        exchanges.push({ method: 'CONNECT', target, status: reply.statusCode ?? 0 });
+        if (reply.statusCode !== 200) {
+          client.end(`HTTP/1.1 ${reply.statusCode ?? 502} ${reply.statusMessage ?? ''}\r\nConnection: close\r\n\r\n`);
+          upstream.destroy();
+          return;
+        }
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (upstreamHead.length) client.write(upstreamHead);
+        if (head.length) upstream.write(head);
+        client.pipe(upstream);
+        upstream.pipe(client);
+        client.on('close', () => upstream.destroy());
+        upstream.on('close', () => client.destroy());
+      });
+      forwarded.on('error', () => client.destroy());
+      forwarded.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as net.AddressInfo;
+    return {
+      port,
+      url: `http://127.0.0.1:${port}`,
+      async close() {
+        await new Promise<void>((resolve) => {
+          server.close(() => resolve());
+          for (const socket of sockets) socket.destroy();
+        });
+        await proxy.close();
+      },
+    };
+  }
+
+  function recordProxies(): ProxyExchange[] {
+    const exchanges: ProxyExchange[] = [];
+    proxyFront.wrap = (proxy) => recordingFront(proxy, exchanges);
+    return exchanges;
   }
 
   function authFile(home: string, expiresAt: number): string {
@@ -569,6 +712,7 @@ describe.skipIf(!linkInstall)('the real pinned Link CLI', { timeout: 60_000 }, (
     await verifiedEntry();
     writePolicy(linkInstall ?? '');
     authFile(WORK_DIR, Date.now() + 3_600_000);
+    const exchanges = recordProxies();
     const target = await listener();
     try {
       const app = await connectLink();
@@ -590,14 +734,16 @@ describe.skipIf(!linkInstall)('the real pinned Link CLI', { timeout: 60_000 }, (
       });
 
       expect(outcome).toMatchObject({ status: 'completed', result: { isError: true } });
-      expect(target.hits).toEqual([]);
+      expect(exchanges).toContainEqual({ method: 'CONNECT', target: target.authority, status: 403 });
+      expect(target.connections()).toBe(0);
     } finally {
       await target.close();
     }
   });
 
-  it('sends an expired-token refresh through the proxy rather than straight to the sign-in server', async () => {
+  it('sends an expired-token refresh through the proxy, which refuses it before the sign-in server', async () => {
     const entryFile = await verifiedEntry();
+    const exchanges = recordProxies();
     const proxy = await startPublicBrowserProxy();
     const signIn = await listener();
     try {
@@ -615,15 +761,24 @@ describe.skipIf(!linkInstall)('the real pinned Link CLI', { timeout: 60_000 }, (
         stderr: 'ignore',
       });
       const client = new Client({ name: 'egress-check', version: '1.0.0' });
-      await client.connect(transport);
-      const result = await client.callTool({
-        name: 'call_write_tool',
-        arguments: { name: 'user-info_retrieve', arguments: {} },
-      });
-      await client.close();
+      let result: Awaited<ReturnType<Client['callTool']>>;
+      try {
+        await client.connect(transport);
+        result = await client.callTool({
+          name: 'call_write_tool',
+          arguments: { name: 'user-info_retrieve', arguments: {} },
+        });
+      } finally {
+        await client.close();
+      }
 
-      expect(result.isError).toBe(true);
-      expect(signIn.hits).toEqual([]);
+      // Node's env proxy tunnels plain-http requests too, so the refresh reaches the proxy as a CONNECT.
+      expect(result).toMatchObject({
+        isError: true,
+        content: [{ type: 'text', text: `Request failed: POST ${signIn.url}/device/token` }],
+      });
+      expect(exchanges).toContainEqual({ method: 'CONNECT', target: signIn.authority, status: 403 });
+      expect(signIn.connections()).toBe(0);
     } finally {
       await signIn.close();
       await proxy.close();

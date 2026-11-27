@@ -437,6 +437,44 @@ describe('retiring catalog apps the operator turned off', () => {
       );
     });
 
+    it('cannot finish a sign-in, claimed or not, that was pending when the operator turned Shop off', async () => {
+      const issuer = 'https://mcp.shop.com/';
+      const created = await store.create({ name: 'My Shop', url: SHOP_URL, auth: 'oauth', issuer });
+      const app = await store.setClient(created.id, created.version, {
+        issuer,
+        client: OPERATOR_CLIENT,
+        entered: false,
+      });
+      const signIn = () =>
+        store.startSignIn(app.id, app.version, {
+          principalId: PRINCIPAL,
+          verifier: 'verifier-'.padEnd(48, 'x'),
+          issuer,
+          redirectUri: 'https://juno.example.test/connections/callback/mcp.shop.com',
+          resource: SHOP_URL,
+        });
+      const match = { host: app.host, principalId: PRINCIPAL };
+      await writeShopPolicy(false);
+      await start();
+
+      const unclaimed = await signIn();
+      expect(await retireShop()).toEqual({ schemaVersion: 1, entry: 'shop', retired: 0, remaining: 0 });
+      expect(await store.claimSignIn(unclaimed.state, match)).toBeUndefined();
+
+      const claim = await store.claimSignIn((await signIn()).state, match);
+      if (!claim) throw new Error('The sign-in was not claimed');
+      await retireShop();
+      const completion = await store.completeSignIn(claim, {
+        kind: 'oauth',
+        accessToken: SENTINEL_TOKEN,
+        accessIssuedAt: new Date().toISOString(),
+        accessExpiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+
+      expect(completion).toEqual({ status: 'expired' });
+      expect(await shopStatus()).toBe('not_connected');
+    });
+
     it('stays connected, and does not hold up the uninstall, when it signed in with a client the principal entered', async () => {
       await connectedShop('entered');
       await writeShopPolicy(false);

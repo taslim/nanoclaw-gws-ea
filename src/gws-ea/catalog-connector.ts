@@ -3,7 +3,8 @@
  * committed lockfile, and the operator's registered Shop client. One owner-only policy records both; every
  * assistant reads it on use, so the operator never touches an assistant to enable or retire an entry.
  */
-import { copyFile, mkdtemp, rename, rm } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { copyFile, mkdtemp, readdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -147,8 +148,14 @@ export function linkInstallationDirectory(paths: Pick<ControlPlanePaths, 'config
   return path.join(connectorRoot(paths, 'link'), version);
 }
 
-function shopSecretFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
-  return path.join(connectorRoot(paths, 'shop'), 'client-secret');
+const SHOP_SECRET_PREFIX = 'client-secret';
+
+/**
+ * Each stored secret gets a name of its own, so the policy publishes a client ID with the secret file it pairs with
+ * and a reader never sees one client's ID beside another's secret.
+ */
+function newShopSecretFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
+  return path.join(connectorRoot(paths, 'shop'), `${SHOP_SECRET_PREFIX}-${randomBytes(16).toString('hex')}`);
 }
 
 /** Assistants on this release spawn exactly this version. */
@@ -423,6 +430,8 @@ async function retireOn(
   }
   const reply = parseCatalogRetireReply(answer, entry);
   if (!reply) return unconfirmedRetirement(id, `It gave no readable answer about disconnecting ${name}. ${recovery}`);
+  // A retry after the policy is already disabled writes nothing, so a confirmed disconnection is its only effect.
+  if (reply.retired > 0) dependencies.recordEffect?.(true);
   if (reply.remaining > 0)
     return unconfirmedRetirement(
       id,
@@ -556,21 +565,31 @@ export async function installShop(
         )
       ).trim();
       registerSecret(secret);
-      if (!secret || /\s/u.test(secret))
+      // The rule the host applies to the stored secret at sign-in.
+      if (!isClientCredential(secret))
         throw new GwsEaError('shop_client_secret_invalid', 'The Shop client secret file must hold only the secret.');
     }
     const root = connectorRoot(paths, 'shop');
     await preparePrivateDirectory(path.dirname(root));
     // The directory marks Shop as installed until an uninstall confirms every running assistant disconnected it.
     await preparePrivateDirectory(root);
-    const secretFile = shopSecretFile(paths);
+    let secretFile: string | null = null;
     dependencies.recordEffect?.(null);
-    if (secret !== undefined) await writePrivateTextFile(secretFile, secret);
-    await writePolicy(paths, {
-      ...policy,
-      shop: { clientId, clientSecretFile: secret === undefined ? null : secretFile },
-    });
-    if (secret === undefined) await rm(secretFile, { force: true });
+    if (secret !== undefined) {
+      secretFile = newShopSecretFile(paths);
+      await writePrivateTextFile(secretFile, secret);
+    }
+    try {
+      await writePolicy(paths, { ...policy, shop: { clientId, clientSecretFile: secretFile } });
+    } catch (error) {
+      // The recorded client keeps its own secret file; the unpublished one goes.
+      if (secretFile !== null) await rm(secretFile, { force: true });
+      throw error;
+    }
+    // Earlier secrets, and any a failed install left behind, are retired once the new pair is published.
+    for (const entry of await readdir(root))
+      if (entry.startsWith(SHOP_SECRET_PREFIX) && path.join(root, entry) !== secretFile)
+        await rm(path.join(root, entry), { force: true });
     dependencies.recordEffect?.(true);
     await bindAssistants(paths, dependencies);
     const redirects = await shopRedirects(paths);
@@ -651,6 +670,9 @@ export async function provisionCatalogConnectors(
   }
   return results;
 }
+
+const shellArgument = (value: string): string =>
+  /^[\w.@%+=:,/-]+$/u.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 
 const readiness = (checked: boolean, ready: boolean): ConnectorReadiness => ({
   status: checked ? (ready ? 'ready' : 'not_ready') : 'not_checked',
@@ -779,17 +801,22 @@ async function inspectShop(
     let secretReadable = true;
     if (checked && shop.clientSecretFile)
       try {
-        await readOperatorFile(
+        const stored = await readOperatorFile(
           shop.clientSecretFile,
           paths.configRoot,
           'Shop client secret',
           'shop_client_secret_invalid',
         );
-        // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable secret is the observed fact; its contents never reach output.
+        if (!isClientCredential(stored))
+          throw new GwsEaError('shop_client_secret_invalid', 'The stored Shop client secret is not usable.');
+        // eslint-disable-next-line no-catch-all/no-catch-all -- An unusable secret is the observed fact; its contents never reach output.
       } catch (_error) {
         secretReadable = false;
-        reasons.push('The stored Shop client secret is missing or not owner-only.');
-        actions.push(command('install', 'shop'));
+        reasons.push('The stored Shop client secret is missing, not owner-only, or not a usable secret.');
+        actions.push({
+          kind: 'external',
+          instruction: `Write the Shop client secret alone to an owner-only (0600) file under ${paths.configRoot}, then run gws-ea connectors install shop --client-id ${shellArgument(shop.clientId)} --client-secret-file <that file>.`,
+        });
       }
     assistants = redirects.map((redirect) => ({
       instance_id: redirect.instance_id,

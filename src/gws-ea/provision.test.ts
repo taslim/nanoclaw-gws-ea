@@ -2855,4 +2855,32 @@ describe('the web alias an assistant with the browser enabled gets', () => {
       (await getInstanceReservation(harness.paths, harness.instanceId)).exclusive_resource_claims.alias_email,
     ).toBe('yaa@example.com');
   });
+
+  it('keeps pending host-wide connector setup in an optional alias pause', async () => {
+    const harness = await readyAssistant();
+    const host = aliasHostNcl();
+    const allow = 'Allow https://aya.example.test/connections/callback/mcp.shop.com in your Shopify client.';
+    const provisioning = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
+      pending: [{ name: 'shop', reason: 'shop_redirect_to_allow', message: 'Shop needs its redirect URL allowed.' }],
+      next_actions: [
+        { kind: 'external', instruction: allow },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'link'] },
+      ],
+    });
+    try {
+      const paused = await finish(harness, { ncl: host.ncl });
+
+      expect(paused).toMatchObject({ status: 'paused', pause: { phase: 'provision_alias', optional: true } });
+      const details = (paused as Extract<ProvisionResult, { status: 'paused' }>).pause.details ?? [];
+      expect(details).toEqual(
+        expect.arrayContaining([
+          'shop: Shop needs its redirect URL allowed.',
+          allow,
+          'Then: gws-ea connectors install link',
+        ]),
+      );
+    } finally {
+      provisioning.mockRestore();
+    }
+  });
 });

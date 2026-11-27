@@ -253,6 +253,54 @@ describe('host relay core', () => {
     expect(await store.recentCompletedResults(app.id, 1)).toHaveLength(1);
   });
 
+  it('sends a call only under the approved definition, so a changed header mirroring is refused, not resent', async () => {
+    const lookup = (header: string): FakeToolDefinition => ({
+      name: 'lookup_order',
+      description: 'Look up an order in a delivery region.',
+      inputSchema: {
+        type: 'object',
+        properties: { region: { type: 'string', 'x-mcp-header': header } },
+        required: ['region'],
+      },
+      annotations: { readOnlyHint: true },
+    });
+    const fake = new FakeMcpApp({
+      appUrl: FOOD_URL,
+      issuer: 'https://mcp.bistro.example.test',
+      protocol: '2026-07-28',
+      tools: [lookup('Region')],
+    });
+    fake.accessTokens.add(SENTINEL_PASTED);
+    endpoints.use(fake.handle);
+    const app = await connectPastedApp();
+    const { tools } = await relay.pinApp(app.id);
+    await store.applyToolLabels(
+      app.id,
+      tools.map((tool) => ({
+        name: tool.name,
+        definitionHash: tool.definitionHash,
+        label: 'just_do' as const,
+        source: 'principal' as const,
+        reason: 'Allowed for this test',
+      })),
+    );
+    const call = (region: string) =>
+      relay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'lookup_order',
+        args: { region },
+        session,
+        requestId: `req-${randomUUID()}`,
+      });
+    expect(await call('north')).toMatchObject({ status: 'completed' });
+
+    fake.tools = [lookup('Area')];
+    const outcome = await call('south');
+
+    expect(outcome.status).not.toBe('completed');
+    expect(fake.toolCalls.map((recorded) => recorded.arguments)).toEqual([{ region: 'north' }]);
+  });
+
   it('refuses calls from any non-main agent group before touching the app', async () => {
     const fake = new FakeMcpApp({
       appUrl: FOOD_URL,
@@ -1912,6 +1960,58 @@ describe('catalog rules at the relay', () => {
     });
     expect(outcome).toMatchObject({ status: 'unsent', reason: 'unknown_tool' });
     expect(fake.toolCalls).toEqual([]);
+  });
+
+  it('keeps a withheld command pinned before the app was known as Shop out of the listing, and never sends it', async () => {
+    const tool = (name: string): FakeToolDefinition => ({
+      name,
+      description: `Shop ${name.replaceAll('_', ' ')}.`,
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    });
+    const listing = ['search_catalog', 'complete_checkout', 'create_spend_request', 'get_spend_request'].map(tool);
+    const fake = new FakeMcpApp({
+      appUrl: SHOP_URL,
+      issuer: 'https://mcp.shop.com',
+      allowUnauthenticated: true,
+      tools: listing,
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'My Shop', url: SHOP_URL, auth: 'none' });
+    expect(created.catalogId).toBeNull();
+    const { app, generation } = await store.connect(created.id, created.version, { kind: 'none' });
+    const pinned = await store.pinTools(app.id, {
+      instructions: null,
+      tools: listing,
+      expectedGrantGeneration: generation,
+      at: new Date(clock).toISOString(),
+    });
+    await store.applyToolLabels(
+      app.id,
+      pinned.tools.map((entry) => ({
+        name: entry.name,
+        definitionHash: entry.definitionHash,
+        label: 'just_do' as const,
+        source: 'principal' as const,
+        reason: 'Allowed for this test',
+      })),
+    );
+    const call = (toolName: string) =>
+      relay.callTool({
+        serverKey: app.serverKey,
+        toolName,
+        args: { id: 'sr-1' },
+        session,
+        requestId: `req-${randomUUID()}`,
+      });
+
+    const withheld = await call('get_spend_request');
+    const offered = await call('search_catalog');
+    const listed = await relay.listToolsForSession(app.serverKey);
+
+    expect(withheld).toMatchObject({ status: 'unsent', reason: 'unknown_tool' });
+    expect(offered).toMatchObject({ status: 'completed' });
+    expect(fake.toolCalls.map((recorded) => recorded.name)).toEqual(['search_catalog']);
+    expect(listed.tools.map((entry) => entry.name).sort()).toEqual(['complete_checkout', 'search_catalog']);
   });
 
   function mainNoteTexts(prefix: string): string[] {

@@ -206,7 +206,7 @@ function deleteConfirmation(app: ConnectionApp): string {
   return `data-confirm-title="${escapeHtml(`Delete ${app.name}?`)}" data-confirm-action="Delete" data-confirm-message="Your assistant will lose access, and saved sign-in and client details will be removed. You can add it again anytime."`;
 }
 
-function appMenu(app: ConnectionApp, index: number, hasPin: boolean): string {
+function appMenu(app: ConnectionApp, menuId: string, hasPin: boolean): string {
   const items = [
     ...(app.status === 'connected' || hasPin
       ? [
@@ -219,7 +219,7 @@ function appMenu(app: ConnectionApp, index: number, hasPin: boolean): string {
       : [menuForm('/connections/disconnect', app, 'Disconnect', 'Disconnecting…')]),
     menuForm('/connections/delete', app, 'Delete', 'Deleting…', deleteConfirmation(app)),
   ];
-  return renderMenu(`app-menu-${index}`, `More for ${app.name}`, items, app.name);
+  return renderMenu(menuId, `More for ${app.name}`, items, app.name);
 }
 
 function appRow(
@@ -258,7 +258,7 @@ function appRow(
   const mainSlot = primaryHref
     ? `<a class="app-link" href="${escapeHtml(primaryHref)}" data-navigation>${inner}</a>`
     : `<div class="app-link app-link-static">${inner}</div>`;
-  return `<li class="row app-row">${mainSlot}${desktopAction}${appMenu(app, index, pin !== undefined)}</li>`;
+  return `<li class="row app-row">${mainSlot}${desktopAction}${appMenu(app, `app-menu-${index}`, pin !== undefined)}</li>`;
 }
 
 /** The page names the host it showed, and the host disconnects only if main's entry still points there. */
@@ -295,15 +295,24 @@ function operatorRow(server: OperatorServer, index: number, state: ConnectionsPa
   return `<li class="row app-row operator-row"><div class="app-link app-link-static"><span class="row-main"><span class="row-title">${escapeHtml(server.key)}</span><span class="row-sub">${host ? `<span class="app-host">${escapeHtml(host)}</span>` : ''}<span class="app-origin">Added by your operator</span></span></span><span class="app-status">${statusBadge('connected')}</span></div>${operatorAction(server, index, state)}</li>`;
 }
 
-/** Connecting starts the entry's sign-in at once, so its Connect posts like a sign-in rather than opening a view. */
-function availableRow({ entry }: AvailableCatalogEntry, canChange: boolean): string {
+/**
+ * Connecting starts the entry's sign-in at once, so its Connect posts like a sign-in rather than opening a view. An
+ * entry whose app is still stored, after a disconnect or an abandoned sign-in, keeps that app's menu.
+ */
+function availableRow(
+  { entry, app }: AvailableCatalogEntry,
+  index: number,
+  canChange: boolean,
+  pins: ConnectionsPageState['listing']['pins'],
+): string {
   const needs = entry.requirements
     ? `<span class="row-sub catalog-needs">${escapeHtml(entry.requirements)}</span>`
     : '';
   const connect = canChange
     ? `<form method="post" action="/connections/catalog-connect" data-sign-in><input type="hidden" name="entry" value="${escapeHtml(entry.id)}"><button class="button button-secondary row-button" type="submit" aria-label="${escapeHtml(`Connect ${entry.name}`)}" data-pending-label="Opening…">Connect</button></form>`
     : '';
-  return `<li class="row catalog-row"><span class="row-main"><span class="row-title">${escapeHtml(entry.name)}</span><span class="row-sub">${escapeHtml(entry.goodFor)}</span>${needs}</span>${connect}</li>`;
+  const menu = app ? appMenu(app, `available-menu-${index}`, pins?.[app.id] !== undefined) : '';
+  return `<li class="row catalog-row"><span class="row-main"><span class="row-title">${escapeHtml(entry.name)}</span><span class="row-sub">${escapeHtml(entry.goodFor)}</span>${needs}</span>${connect}${menu}</li>`;
 }
 
 function addOwnRow(): string {
@@ -354,7 +363,11 @@ function appList(state: ConnectionsPageState): string {
         ...operators.map((server, index) => operatorRow(server, index, state)),
       ],
     },
-    { id: 'available-heading', title: 'Available', rows: available.map((entry) => availableRow(entry, canChange)) },
+    {
+      id: 'available-heading',
+      title: 'Available',
+      rows: available.map((entry, index) => availableRow(entry, index, canChange, state.listing.pins)),
+    },
     { id: 'add-own-heading', title: 'Add your own', rows: canChange ? [addOwnRow()] : [] },
   ].filter((candidate) => candidate.rows.length > 0);
   const showSectionTitles = sections.length > 1;

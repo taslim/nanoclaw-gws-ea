@@ -149,7 +149,7 @@ export class HostProcessTransport implements Transport {
   #proxy: PublicBrowserProxy | undefined;
   #child: StdioClientTransport | undefined;
   #running = false;
-  #finished = false;
+  #finished: Promise<void> | undefined;
 
   constructor(launch: HostCliLaunch) {
     this.#launch = launch;
@@ -193,10 +193,12 @@ export class HostProcessTransport implements Transport {
     await this.#finish();
   }
 
-  async #finish(): Promise<void> {
-    if (this.#finished) return;
-    this.#finished = true;
-    await this.#proxy?.close();
-    this.onclose?.();
+  /** One cleanup whichever path gets there first, so an explicit close also waits for one the child's exit began. */
+  #finish(): Promise<void> {
+    this.#finished ??= (async () => {
+      await this.#proxy?.close();
+      this.onclose?.();
+    })();
+    return this.#finished;
   }
 }
