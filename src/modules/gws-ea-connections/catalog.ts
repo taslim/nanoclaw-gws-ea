@@ -150,6 +150,14 @@ export function catalogEntry(id: string): CatalogEntry | undefined {
   return CATALOG.find((entry) => entry.id === id);
 }
 
+export type RemoteCatalogEntry = CatalogEntry & {
+  readonly transport: Extract<CatalogTransport, { readonly kind: 'remote' }>;
+};
+
+export function isRemoteEntry(entry: CatalogEntry): entry is RemoteCatalogEntry {
+  return entry.transport.kind === 'remote';
+}
+
 /**
  * An app made from the catalog names its entry; one added earlier by address is its entry when it is on that entry's
  * host, so it carries its connection, tools and labels without being converted. A host-run app's placeholder host

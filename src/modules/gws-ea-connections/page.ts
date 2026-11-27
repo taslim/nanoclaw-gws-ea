@@ -14,11 +14,13 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
+import { catalogEntry, isRemoteEntry } from './catalog.js';
 import { getPendingHeldCallApproval, resolveHeldCallFromWeb, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
   readListing,
   type AddRefusal,
+  type CatalogConnectOutcome,
   type ConnectRefusal,
   type ConnectionsListing,
   type SignInReturn,
@@ -32,6 +34,7 @@ import {
 } from './operator.js';
 import {
   humanizeToolName,
+  listedApp,
   renderConnectionsPage,
   sortToolsForDisplay,
   toolDescription,
@@ -64,6 +67,7 @@ const WRITES = [
   'add',
   'connect',
   'sign-in',
+  'catalog-connect',
   'change-client',
   'disconnect',
   'delete',
@@ -110,10 +114,12 @@ function isListOutcome(code: string | null): code is ListOutcome {
 const CHANGED = 'This app changed in another tab. Reload and try again.';
 const STORE_UNAVAILABLE = 'Apps can’t be loaded right now. Ask your operator.';
 const UNREACHABLE = 'The app didn’t respond. Check the address and try again.';
+const CATALOG_UNREACHABLE = 'The app didn’t respond. Try again in a little while.';
 const UNSUPPORTED = 'This app’s sign-in method isn’t supported.';
 const HOST_IN_USE = 'Another app already uses this address. Remove it first.';
 const OPERATOR_NEEDED = 'Apps can’t be added or connected right now. Ask your operator.';
 const CLIENT_UNAVAILABLE = 'Can’t sign in to this app right now. Try again in a few minutes.';
+const NOT_OFFERED = 'This app isn’t available right now. Reload the page.';
 
 function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnected'>): {
   readonly status: number;
@@ -319,7 +325,7 @@ interface WriteResult {
 }
 
 async function write(
-  action: Exclude<WriteAction, 'sign-in' | 'held-decision'>,
+  action: Exclude<WriteAction, 'sign-in' | 'catalog-connect' | 'held-decision'>,
   data: Record<string, unknown>,
   operations: ConnectionOperations,
   operatorDependencies: OperatorDisconnectDependencies,
@@ -476,6 +482,49 @@ async function startSignIn(
   }
 }
 
+function catalogConnectReply(outcome: CatalogConnectOutcome): {
+  readonly status: number;
+  readonly body: Readonly<Record<string, string>>;
+} {
+  switch (outcome.status) {
+    case 'started':
+      return { status: 200, body: { authorizationUrl: outcome.authorizationUrl } };
+    case 'connect_view':
+      return { status: 200, body: { location: viewLocation({ kind: 'connect', id: outcome.app.id }) } };
+    case 'refused':
+      return { status: connectRefusalStatus(outcome.reason), body: { error: connectMessage(outcome.reason) } };
+    case 'add_refused':
+      // A catalog entry has no address the principal could check, so an unreachable server is only a retry.
+      return {
+        status: 400,
+        body: { error: outcome.reason === 'unreachable' ? CATALOG_UNREACHABLE : addMessage(outcome.reason) },
+      };
+    case 'not_offered':
+      return { status: 409, body: { error: NOT_OFFERED } };
+  }
+}
+
+/** Like a sign-in start, it answers JSON: where the page goes next, the server's sign-in or the app's Connect view. */
+async function connectCatalogEntry(
+  response: ServerResponse,
+  data: Record<string, unknown>,
+  principal: string,
+  operations: ConnectionOperations | undefined,
+): Promise<void> {
+  only(data, ['entry']);
+  const entry = catalogEntry(text(data, 'entry'));
+  if (!entry || !isRemoteEntry(entry)) throw new InvalidSubmission();
+  if (!operations) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+  try {
+    const { status, body } = catalogConnectReply(await operations.connectCatalogEntry(entry, principal));
+    sendJson(response, status, body);
+  } catch (error) {
+    if (!(error instanceof ConnectionsStoreError)) throw error;
+    const failure = storeFailure(error);
+    sendJson(response, failure.status, { error: failure.message });
+  }
+}
+
 /**
  * The Access-verified principal is checked afresh before every read or write, the sign-in return included. A
  * client secret or pasted token arrives once in a POST body and is never written back to any response.
@@ -600,6 +649,8 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       }
       if (route.kind === 'write' && route.action === 'sign-in')
         return startSignIn(response, data ?? {}, principal, operations);
+      if (route.kind === 'write' && route.action === 'catalog-connect')
+        return connectCatalogEntry(response, data ?? {}, principal, operations);
       if (route.kind === 'write' && route.action === 'tool-label' && wantsJson(request.headers.accept)) {
         const body = data ?? {};
         only(body, ['id', 'tool', 'label', 'definitionHash']);
@@ -629,7 +680,13 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         status: 200,
         saved: false,
       };
-      if (route.kind === 'write' && route.action !== 'sign-in' && route.action !== 'held-decision' && data) {
+      if (
+        route.kind === 'write' &&
+        route.action !== 'sign-in' &&
+        route.action !== 'catalog-connect' &&
+        route.action !== 'held-decision' &&
+        data
+      ) {
         if (!operations) result = { ...result, outcome: STORE_UNAVAILABLE, status: 503 };
         else {
           try {
@@ -675,7 +732,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       let status = result.status;
       if (route.kind === 'view' && (view.kind === 'connect' || view.kind === 'rename' || view.kind === 'tools')) {
         if (!listing.listed) status = 503;
-        else if (!listing.apps.some((app) => app.id === view.id)) status = 404;
+        else if (!listedApp(listing, view.id)) status = 404;
       }
       const outcome = route.kind === 'view' && !listing.listed && !result.outcome ? STORE_UNAVAILABLE : result.outcome;
       const nonce = pageNonce();

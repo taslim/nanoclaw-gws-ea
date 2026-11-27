@@ -1,6 +1,7 @@
 /**
  * Runs inside the page kit's script.
- * - Sign-in starts with a same-origin POST that answers the server's authorization URL.
+ * - Sign-in starts with a same-origin POST that answers the server's authorization URL, or, for a catalog app whose
+ *   sign-in needs the principal first, its Connect view.
  * - Tool approval toggles update optimistically in place via same-origin JSON (no full-page lock or re-sort jump).
  * - While a connected app's tools are still being sorted, lightweight same-origin polling updates rows live in place
  *   and stops automatically once settled.
@@ -46,6 +47,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (response.ok && typeof data.authorizationUrl === 'string' && data.authorizationUrl.startsWith('https://')) {
         leaving = true;
         location.assign(data.authorizationUrl);
+        return;
+      }
+      if (response.ok && typeof data.location === 'string' && data.location.startsWith('/connections/')) {
+        leaving = true;
+        location.assign(data.location);
         return;
       }
       kit.message(typeof data.error === 'string' ? data.error : 'Couldn’t open sign-in. Try again.', response.status === 409);

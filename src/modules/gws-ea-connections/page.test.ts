@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { inspect } from 'node:util';
-import { chromium } from 'playwright-core';
+import { chromium, type BrowserContext } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -27,7 +27,9 @@ import { createWebHandler } from '../gws-ea-web/server.js';
 import { upsertUser } from '../permissions/db/users.js';
 import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
+import { catalogEntry } from './catalog.js';
 import { createClientDocumentHandler } from './client-document.js';
+import { CATALOG_POLICY_FILE_ENV } from './config.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
 import { canonicalArgsHash } from './canonical.js';
 import {
@@ -145,6 +147,11 @@ beforeAll(async () => {
     'recipes.example.test',
     'down.example.test',
     'mcp.larder.example.test',
+    'api.chowdeck.com',
+    'mcp.notion.com',
+    'mcp.granola.ai',
+    'ai.todoist.net',
+    'mcp.shop.com',
   ]);
 });
 afterAll(async () => {
@@ -186,6 +193,8 @@ beforeEach(async () => {
   gateway = new FakeGateway();
   operatorCredentialsAvailable = true;
   documentsServed = true;
+  // No operator policy unless a test writes one.
+  vi.stubEnv(CATALOG_POLICY_FILE_ENV, path.join(directory, 'catalog.json'));
   replies = [];
   logged = [];
   for (const level of ['debug', 'info', 'warn', 'error'] as const)
@@ -251,6 +260,7 @@ afterEach(async () => {
   await closeDb();
   await rm(directory, { recursive: true, force: true });
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 function request(
@@ -515,6 +525,32 @@ const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 /** Hop-by-hop and length headers the test server sent for its own connection, not for the page. */
 const CONNECTION_HEADERS = new Set(['connection', 'content-length', 'keep-alive', 'transfer-encoding']);
 
+/** Serves the assistant's hostname in Chrome from the page handler, recording what each write sent. */
+async function routeAssistant(context: BrowserContext, sent: { path: string; body: unknown }[]): Promise<void> {
+  await context.route(`https://${HOST}/**`, async (route) => {
+    const outgoing = route.request();
+    const url = new URL(outgoing.url());
+    const body = outgoing.postData() ?? undefined;
+    if (outgoing.method() === 'POST') sent.push({ path: url.pathname, body: JSON.parse(body ?? 'null') });
+    const headers = await outgoing.allHeaders();
+    const forwarded = Object.fromEntries(
+      ['content-type', 'origin', 'sec-fetch-site'].flatMap((name) => (headers[name] ? [[name, headers[name]]] : [])),
+    );
+    const reply = await request(`${url.pathname}${url.search}`, outgoing.method(), forwarded, body);
+    await route.fulfill({
+      status: reply.status,
+      headers: Object.fromEntries(
+        Object.entries(reply.headers).flatMap(([name, value]) =>
+          CONNECTION_HEADERS.has(name) || value === undefined
+            ? []
+            : [[name, Array.isArray(value) ? value.join(', ') : value]],
+        ),
+      ),
+      body: reply.body,
+    });
+  });
+}
+
 describe('sign-in in Chrome', () => {
   it.skipIf(!chromePath)(
     'sends the app and the client details entered with it, then opens the server’s sign-in',
@@ -526,31 +562,8 @@ describe('sign-in in Chrome', () => {
       const browser = await chromium.launch({ executablePath: chromePath, headless: true });
       try {
         const context = await browser.newContext();
-        const started: unknown[] = [];
-        await context.route(`https://${HOST}/**`, async (route) => {
-          const sent = route.request();
-          const url = new URL(sent.url());
-          const body = sent.postData() ?? undefined;
-          if (url.pathname === '/connections/sign-in') started.push(JSON.parse(body ?? 'null'));
-          const headers = await sent.allHeaders();
-          const forwarded = Object.fromEntries(
-            ['content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
-              headers[name] ? [[name, headers[name]]] : [],
-            ),
-          );
-          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
-          await route.fulfill({
-            status: reply.status,
-            headers: Object.fromEntries(
-              Object.entries(reply.headers).flatMap(([name, value]) =>
-                CONNECTION_HEADERS.has(name) || value === undefined
-                  ? []
-                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
-              ),
-            ),
-            body: reply.body,
-          });
-        });
+        const sent: { path: string; body: unknown }[] = [];
+        await routeAssistant(context, sent);
         await context.route('https://app.ledgerly.example.test/**', (route) =>
           route.fulfill({ status: 200, contentType: 'text/html', body: '<title>Sign in</title>' }),
         );
@@ -562,10 +575,53 @@ describe('sign-in in Chrome', () => {
         await page.getByRole('button', { name: 'Continue to app.ledgerly.example.test' }).click();
         await page.waitForURL('https://app.ledgerly.example.test/**');
 
-        expect(started).toEqual([
-          { id: added.id, version: String(added.version), clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET },
+        expect(sent).toEqual([
+          {
+            path: '/connections/sign-in',
+            body: { id: added.id, version: String(added.version), clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET },
+          },
         ]);
         expect(signInRow(added.id)).toEqual({ claimed_at: null });
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!chromePath)(
+    'connects a catalog entry from Available: straight to its sign-in, or to its Connect view when it needs details',
+    async () => {
+      const notion = new FakeMcpApp({
+        appUrl: 'https://mcp.notion.com/mcp',
+        issuer: 'https://mcp.notion.com',
+        registration: true,
+      });
+      const granola = new FakeMcpApp({ appUrl: 'https://mcp.granola.ai/mcp', issuer: 'https://mcp.granola.ai' });
+      serve(notion.handle, granola.handle);
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext();
+        const sent: { path: string; body: unknown }[] = [];
+        await routeAssistant(context, sent);
+        await context.route('https://mcp.notion.com/**', (route) =>
+          route.fulfill({ status: 200, contentType: 'text/html', body: '<title>Sign in</title>' }),
+        );
+        const page = await context.newPage();
+        page.setDefaultTimeout(5000);
+        await page.goto(`https://${HOST}/connections`);
+        await page.getByRole('button', { name: 'Connect Granola' }).click();
+        await page.waitForURL(`https://${HOST}/connections/app/*/connect`);
+        expect(await page.getByLabel('Client ID').count()).toBe(1);
+
+        await page.goto(`https://${HOST}/connections`);
+        await page.getByRole('button', { name: 'Connect Notion' }).click();
+        await page.waitForURL('https://mcp.notion.com/**');
+        expect(sent).toEqual([
+          { path: '/connections/catalog-connect', body: { entry: 'granola' } },
+          { path: '/connections/catalog-connect', body: { entry: 'notion' } },
+        ]);
         await context.close();
       } finally {
         await browser.close();
@@ -1427,24 +1483,164 @@ describe('the add dialog', () => {
   });
 });
 
-describe('page states', () => {
-  it('shows an empty state and Add when there are no apps', async () => {
+/** One titled section of the list, from its heading to its end; empty when the page has no such section. */
+function listSection(body: string, title: string): string {
+  const match = new RegExp(
+    `<section[^>]*><h2 class="section-title" id="[^"]+">${title}</h2>([\\s\\S]*?)</section>`,
+    'u',
+  ).exec(body);
+  return match?.[1] ?? '';
+}
+
+function sectionTitles(body: string): string[] {
+  return [...body.matchAll(/<h2 class="section-title" id="[^"]+">([^<]*)<\/h2>/gu)].map((match) => match[1]);
+}
+
+const catalogConnect = (entry: string): Promise<Reply> => post('/connections/catalog-connect', { entry });
+
+function catalogServer(url: string, options: { readonly registration?: boolean } = {}): FakeMcpApp {
+  return new FakeMcpApp({ appUrl: url, issuer: new URL(url).origin, registration: options.registration ?? true });
+}
+
+async function writeCatalogPolicy(policy: unknown): Promise<void> {
+  await writeFile(path.join(directory, 'catalog.json'), JSON.stringify(policy), { mode: 0o600 });
+}
+
+describe('the catalog on the page', () => {
+  const remoteEntries = [
+    ['Chowdeck', 'chowdeck', 'https://api.chowdeck.com/mcp'],
+    ['Notion', 'notion', 'https://mcp.notion.com/mcp'],
+    ['Granola', 'granola', 'https://mcp.granola.ai/mcp'],
+    ['Todoist', 'todoist', 'https://ai.todoist.net/mcp'],
+  ] as const;
+  const NOTION = 'https://mcp.notion.com/mcp';
+
+  it('lists the reviewed apps under Available with no apps and no operator setup, then adding your own', async () => {
     const reply = await request('/connections');
     expect(reply.status).toBe(200);
-    expect(reply.body).toContain('<h2>No apps yet</h2>');
-    expect(reply.body).toContain('href="/connections/new"');
-    expect(reply.body).not.toContain('Your apps');
+    expect(reply.body).not.toContain('No apps yet');
+    expect(sectionTitles(reply.body)).toEqual(['Available', 'Add your own']);
+    const available = listSection(reply.body, 'Available');
+    for (const [name, id] of remoteEntries) {
+      expect(available).toContain(`<span class="row-title">${name}</span>`);
+      expect(available).toContain(`<input type="hidden" name="entry" value="${id}">`);
+    }
+    expect(available).toContain('Transcripts and edits need a paid Granola plan.');
+    expect(available).not.toContain('value="link"');
+    expect(available).not.toContain('value="shop"');
+    expect(listSection(reply.body, 'Add your own')).toContain('href="/connections/new"');
   });
 
-  it('lists operator servers by host only, without a Your apps section, offering only Disconnect', async () => {
+  it('shows Link with what its account needs, and Shop, once the operator enables them', async () => {
+    const link = catalogEntry('link');
+    if (link?.transport.kind !== 'host_cli') throw new Error('Link is a host-run entry');
+    await writeCatalogPolicy({
+      schemaVersion: 1,
+      link: {
+        enabled: true,
+        versions: { [link.transport.version]: { installationDir: path.join(directory, 'link') } },
+      },
+      shop: { clientId: 'juno-shop-client' },
+    });
+    const available = listSection((await request('/connections')).body, 'Available');
+    expect(available).toContain('value="link"');
+    expect(available).toContain(
+      'Payments work only for US and Canadian Link accounts, and financial insights only for US accounts.',
+    );
+    expect(available).toContain('value="shop"');
+  });
+
+  it.each(remoteEntries)('connects %s in one action, then lists it under Connected', async (name, id, url) => {
+    const server = catalogServer(url);
+    serve(server.handle);
+
+    const started = await catalogConnect(id);
+    expect(started.status).toBe(200);
+    const { authorizationUrl } = JSON.parse(started.body) as { authorizationUrl: string };
+    const app = await onlyApp();
+    expect(app).toMatchObject({ name, catalogId: id, url, status: 'not_connected' });
+    expect(new URL(authorizationUrl).searchParams.get('resource')).toBe(url);
+
+    const returned = await callback(new URL(url).hostname, server.approve(authorizationUrl).query);
+    expect(returned.headers.location).toBe(toolsReturn(app));
+    expect((await onlyApp()).status).toBe('connected');
+    const list = (await request('/connections')).body;
+    expect(listSection(list, 'Connected')).toContain(`<span class="row-title">${name}</span>`);
+    expect(listSection(list, 'Available')).not.toContain(`value="${id}"`);
+  });
+
+  it('keeps an abandoned sign-in’s entry under Available, and connecting again reuses its app', async () => {
+    const notion = catalogServer(NOTION);
+    serve(notion.handle);
+    expect((await catalogConnect('notion')).status).toBe(200);
+    const abandoned = await onlyApp();
+
+    const list = (await request('/connections')).body;
+    expect(sectionTitles(list)).toEqual(['Available', 'Add your own']);
+    expect(listSection(list, 'Available')).toContain('value="notion"');
+
+    const again = await catalogConnect('notion');
+    expect(again.status).toBe(200);
+    expect((await onlyApp()).id).toBe(abandoned.id);
+    const { authorizationUrl } = JSON.parse(again.body) as { authorizationUrl: string };
+    await callback('mcp.notion.com', notion.approve(authorizationUrl).query);
+    expect((await onlyApp()).status).toBe('connected');
+  });
+
+  it('stores nothing and shows the probe’s message when the entry’s server does not answer', async () => {
+    serve((incoming) => (incoming.host === 'api.chowdeck.com' ? { status: 503 } : undefined));
+    const reply = await catalogConnect('chowdeck');
+    expect(reply.status).toBe(400);
+    expect(JSON.parse(reply.body)).toEqual({ error: 'The app didn’t respond. Try again in a little while.' });
+    expect(await store.apps()).toEqual([]);
+  });
+
+  it('opens the Connect view, marked reviewed, when the entry’s server needs client details', async () => {
+    serve(catalogServer('https://mcp.granola.ai/mcp', { registration: false }).handle);
+    const reply = await catalogConnect('granola');
+    expect(reply.status).toBe(200);
+    const app = await onlyApp();
+    expect(JSON.parse(reply.body)).toEqual({ location: `/connections/app/${app.id}/connect` });
+
+    const view = await request(`/connections/app/${app.id}/connect`);
+    expect(view.status).toBe(200);
+    expect(view.body).toContain('name="clientId"');
+    expect(view.body).toContain('Reviewed for GWS-EA.');
+    expect(view.body).not.toContain('hasn’t reviewed');
+  });
+
+  it('lists an app added earlier by address on an entry’s host under Connected, and not again under Available', async () => {
+    const notion = catalogServer(NOTION);
+    serve(notion.handle);
+    expect((await post('/connections/add', { url: NOTION, name: 'Team wiki' })).status).toBe(200);
+    const added = await onlyApp();
+    await callback('mcp.notion.com', notion.approve(await startSignIn(added)).query);
+
+    const list = (await request('/connections')).body;
+    expect(listSection(list, 'Connected')).toContain('<span class="row-title">Team wiki</span>');
+    expect(listSection(list, 'Available')).not.toContain('value="notion"');
+  });
+
+  it('refuses an entry that is not offered, storing nothing', async () => {
+    const shop = await catalogConnect('shop');
+    expect(shop.status).toBe(409);
+    expect(JSON.parse(shop.body)).toEqual({ error: 'This app isn’t available right now. Reload the page.' });
+    expect((await catalogConnect('ledgerly')).status).toBe(404);
+    expect(await store.apps()).toEqual([]);
+  });
+});
+
+describe('page states', () => {
+  it('lists operator servers by host only under Connected, labelled as your operator’s, offering only Disconnect', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
       ledgerly: { type: 'http', url: `https://app.ledgerly.example.test/mcp?key=${SENTINEL_QUERY}` },
       calendar: { command: 'calendar-mcp' },
     });
     const reply = await request('/connections');
-    expect(reply.body).toContain('Added by your operator');
-    expect(reply.body).toContain('app.ledgerly.example.test');
-    expect(reply.body).not.toContain('Your apps');
+    const connected = listSection(reply.body, 'Connected');
+    expect(connected).toContain('app.ledgerly.example.test');
+    expect(connected).toContain('Added by your operator');
+    expect(reply.body).not.toContain('<h2 class="section-title" id="operator-heading">');
     expect(reply.body).not.toContain('calendar');
     expect(reply.body.match(/<(?:a|button)[^>]*role="menuitem"[^>]*>([^<]*)</gu)).toEqual([
       '<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect<',
@@ -1465,6 +1661,7 @@ describe('page states', () => {
     expect(list.body).toContain('Apps can’t be added or connected right now. Ask your operator.');
     expect(list.body).not.toContain('href="/connections/new"');
     expect(list.body).not.toContain('/connect"');
+    expect(list.body).not.toContain('/connections/catalog-connect');
     expect(list.body).toContain('Delete');
     expect((await request(`/connections/app/${app.id}/connect`)).body).not.toContain('action="/connections/connect"');
     expect((await request('/connections/new')).body).not.toContain('action="/connections/add"');

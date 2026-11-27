@@ -8,11 +8,14 @@ import {
 } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
 import {
+  catalogEntryFor,
+  operatorEnabled,
   placeCatalogApps,
   readCatalogPolicy,
   type AvailableCatalogEntry,
   type CatalogEntry,
   type CatalogPolicyState,
+  type RemoteCatalogEntry,
 } from './catalog.js';
 import { checkRestartSoon } from './idle-restart.js';
 import { withAppLock } from './locks.js';
@@ -94,6 +97,14 @@ export type ClientChangeOutcome =
 export type SignInStartOutcome =
   | { readonly status: 'started'; readonly authorizationUrl: string; readonly app: ConnectionApp }
   | { readonly status: 'refused'; readonly reason: ConnectRefusal; readonly app?: ConnectionApp };
+
+export type CatalogConnectOutcome =
+  | SignInStartOutcome
+  /** Its sign-in needs the principal on the app's Connect view: client details, a token, or a confirmation. */
+  | { readonly status: 'connect_view'; readonly app: ConnectionApp }
+  | { readonly status: 'add_refused'; readonly reason: AddRefusal }
+  /** The operator has not set up what the entry needs on this host. */
+  | { readonly status: 'not_offered' };
 
 /**
  * The only facts a sign-in's return reports; anything more could tell a forged return apart from a real one. A
@@ -337,12 +348,42 @@ export class ConnectionOperations {
     return readListing(this.store, { ...defaultListingSources, operatorServers: this.operators });
   }
 
+  add(input: { readonly url: string; readonly name?: string }): Promise<AddOutcome> {
+    const given = input.name?.trim();
+    return this.addApp(input.url, (advertisedName, host) =>
+      given ? [given] : [...new Set([advertisedName ?? host, host])],
+    );
+  }
+
+  /**
+   * Adds the entry's app, or reuses the one an earlier connect left, and starts its sign-in. The entry's lock keeps a
+   * second tab from adding it twice.
+   */
+  async connectCatalogEntry(entry: RemoteCatalogEntry, principalId: string): Promise<CatalogConnectOutcome> {
+    if (!operatorEnabled(entry, await readCatalogPolicy())) return { status: 'not_offered' };
+    return withAppLock(`catalog:${entry.id}`, async (): Promise<CatalogConnectOutcome> => {
+      let app = (await this.store.apps()).find((candidate) => catalogEntryFor(candidate)?.id === entry.id);
+      if (app?.status === 'connected') return refusedConnect('already_connected');
+      if (!app) {
+        const added = await this.addApp(entry.transport.url, (_advertised, host) => [entry.name, host], entry.id);
+        if (added.status === 'refused') return { status: 'add_refused', reason: added.reason };
+        app = added.app;
+      }
+      if (app.auth !== 'oauth' || !app.hasClient) return { status: 'connect_view', app };
+      return this.startSignIn(app.id, app.version, principalId);
+    });
+  }
+
   /**
    * Admits and probes the URL, then stores the app Not connected. The document's address needs the stored app's ID,
    * so a document client is set after the store.
    */
-  async add(input: { readonly url: string; readonly name?: string }): Promise<AddOutcome> {
-    const admission = await admitAppUrl(input.url, this.admission);
+  private async addApp(
+    url: string,
+    names: (advertisedName: string | undefined, host: string) => readonly string[],
+    catalogId?: string,
+  ): Promise<AddOutcome> {
+    const admission = await admitAppUrl(url, this.admission);
     if (!admission.admitted) return { status: 'refused', reason: admission.reason };
     const probe = await probeApp(admission.url, this.oauth);
     if (probe.status !== 'ok') return { status: 'refused', reason: probe.status };
@@ -362,15 +403,14 @@ export class ConnectionOperations {
         log.info('App registration refused; client details needed', { code: error.code });
       }
     }
-    const given = input.name?.trim();
-    const names = given ? [given] : [...new Set([probe.advertisedName ?? admission.host, admission.host])];
+    const catalog = catalogId === undefined ? {} : { catalogId };
     let app: ConnectionApp | undefined;
-    for (const name of names) {
+    for (const name of names(probe.advertisedName, admission.host)) {
       try {
         app = await this.store.create(
           method.kind === 'oauth'
-            ? { name, url: admission.url, auth: 'oauth', issuer: method.issuer }
-            : { name, url: admission.url, auth: method.kind },
+            ? { name, url: admission.url, auth: 'oauth', issuer: method.issuer, ...catalog }
+            : { name, url: admission.url, auth: method.kind, ...catalog },
         );
         break;
       } catch (error) {
