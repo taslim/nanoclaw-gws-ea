@@ -74,14 +74,17 @@ vi.mock('node:fs/promises', async (original) => {
   };
   return { ...actual, default: { ...actual, copyFile }, copyFile };
 });
-const policyWrites = vi.hoisted(() => ({ fail: false }));
+// `before` fails the policy write before its rename; `after` lets the rename land, then fails as a later step would.
+const policyWrites = vi.hoisted(() => ({ fail: false as false | 'before' | 'after' }));
 vi.mock('../community-portal/private-file.js', async (original) => {
   const actual = await original<typeof import('../community-portal/private-file.js')>();
   return {
     ...actual,
     writePrivate: async (file: string, value: unknown) => {
-      if (policyWrites.fail && path.basename(file) === 'catalog.json') throw new Error('The policy write failed.');
-      return actual.writePrivate(file, value);
+      const policy = path.basename(file) === 'catalog.json';
+      if (policy && policyWrites.fail === 'before') throw new Error('The policy write failed.');
+      await actual.writePrivate(file, value);
+      if (policy && policyWrites.fail === 'after') throw new Error('The directory sync failed.');
     },
   };
 });
@@ -575,7 +578,7 @@ describe('Shop connector', () => {
     const before = await readFile(policyFile, 'utf8');
     const replacement = await secretSource('second-secret-sentinel');
 
-    policyWrites.fail = true;
+    policyWrites.fail = 'before';
     expect((await installShop('gws-ea-shop-client-next', replacement)).code).not.toBe(0);
     expect(await readFile(policyFile, 'utf8')).toBe(before);
     expect(await readFile(first.clientSecretFile!, 'utf8')).toBe('first-secret-sentinel');
@@ -589,6 +592,18 @@ describe('Shop connector', () => {
     expect(await readFile(second.clientSecretFile!, 'utf8')).toBe('second-secret-sentinel');
     expect((await stat(second.clientSecretFile!)).mode & 0o777).toBe(0o600);
     expect(await readdir(shopRoot())).toEqual([path.basename(second.clientSecretFile!)]);
+  });
+
+  it('keeps the new secret when its policy landed before the write reported failure', async () => {
+    expect((await installShop('gws-ea-shop-client', await secretSource('first-secret-sentinel'))).code).toBe(0);
+
+    policyWrites.fail = 'after';
+    expect((await installShop('gws-ea-shop-client-next', await secretSource('second-secret-sentinel'))).code).not.toBe(
+      0,
+    );
+    const published = await recordedShop();
+    expect(published.clientId).toBe('gws-ea-shop-client-next');
+    expect(await readFile(published.clientSecretFile!, 'utf8')).toBe('second-secret-sentinel');
   });
 
   it.each([

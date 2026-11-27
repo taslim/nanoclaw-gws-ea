@@ -582,8 +582,14 @@ export async function installShop(
     try {
       await writePolicy(paths, { ...policy, shop: { clientId, clientSecretFile: secretFile } });
     } catch (error) {
-      // The recorded client keeps its own secret file; the unpublished one goes.
-      if (secretFile !== null) await rm(secretFile, { force: true });
+      // A failure after the rename leaves the new pair published, so its secret stays; only an unpublished one
+      // goes. An unreadable policy keeps it too, and the next successful install retires it.
+      if (secretFile !== null) {
+        const state = await readCatalogPolicy(catalogPolicyFile(paths));
+        const published =
+          state.status === 'read' ? state.policy.shop?.clientSecretFile === secretFile : state.status === 'invalid';
+        if (!published) await rm(secretFile, { force: true });
+      }
       throw error;
     }
     // Earlier secrets, and any a failed install left behind, are retired once the new pair is published.

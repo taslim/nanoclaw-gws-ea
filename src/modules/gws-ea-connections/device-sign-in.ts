@@ -1,6 +1,7 @@
 /**
  * A host-run app's sign-in: the CLI's own polling device login, run on the host against a pending auth file beside the
- * real one, so a sign-in that never finishes leaves the earlier credentials as they were. The principal approves a
+ * real one, so a sign-in that never finishes leaves the earlier credentials as they were. Each attempt has a pending
+ * file of its own, so a cancelled attempt that finishes late cleans up only after itself. The principal approves a
  * phrase in the app. Only a record saying `authenticated: true`, from the login or from a status check of the pending
  * file, counts as approval; an exit status never does.
  *
@@ -9,7 +10,8 @@
  * address and phrase: its records carry a token preview and the credentials' path.
  */
 import { spawn } from 'node:child_process';
-import { access, chmod, rename, rm } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { access, chmod, readdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -34,7 +36,8 @@ const FIRST_RECORD_STUCK_MS = 30_000;
 const LOGIN_KILL_AFTER_MS = (LOGIN_TIMEOUT_S + 30) * 1000;
 const COMMAND_DEADLINE_MS = 30_000;
 const KILL_GRACE_MS = 2_000;
-const PENDING_FILE = 'auth.pending.json';
+const PENDING_PREFIX = 'auth.pending';
+const isPendingFile = (name: string): boolean => name.startsWith(PENDING_PREFIX) && name.endsWith('.json');
 
 export type DeviceSignInFailure = 'expired' | 'refused' | 'failed' | 'not_offered';
 
@@ -178,7 +181,7 @@ class DeviceSignIn {
 
   constructor(start: DeviceSignInStart) {
     this.#start = start;
-    this.#pendingFile = path.join(start.launch.workDir, PENDING_FILE);
+    this.#pendingFile = path.join(start.launch.workDir, `${PENDING_PREFIX}-${randomBytes(16).toString('hex')}.json`);
     this.ready = new Promise((resolve) => {
       this.#resolveReady = resolve;
     });
@@ -222,7 +225,6 @@ class DeviceSignIn {
 
   async #login(): Promise<void> {
     const { launch, clientName, complete } = this.#start;
-    await rm(this.#pendingFile, { force: true });
     if (this.#cancelled) return;
     let shown = false;
     let unreadable = false;
@@ -354,7 +356,14 @@ export async function signOutHostCli(entry: HostCliEntry): Promise<void> {
     }
   }
   await rm(paths.authFile, { force: true });
-  await rm(path.join(paths.workDir, PENDING_FILE), { force: true });
+  let names: string[];
+  try {
+    names = await readdir(paths.workDir);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const name of names.filter(isPendingFile)) await rm(path.join(paths.workDir, name), { force: true });
 }
 
 export async function hostCliClientName(): Promise<string> {

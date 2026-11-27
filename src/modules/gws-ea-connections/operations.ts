@@ -762,15 +762,23 @@ export class ConnectionOperations {
   async retireCatalogEntry(entryId: RetirableCatalogEntry): Promise<CatalogRetireReply> {
     const entry = catalogEntry(entryId);
     const signsInWithOperatorClient = entry !== undefined && usesOperatorClient(entry);
+    const operators = (app: ConnectionApp): boolean => !(signsInWithOperatorClient && app.clientEntered);
     const own = async (): Promise<readonly ConnectionApp[]> =>
-      (await this.store.apps()).filter(
-        (app) => catalogEntryFor(app)?.id === entryId && !(signsInWithOperatorClient && app.clientEntered),
-      );
+      (await this.store.apps()).filter((app) => catalogEntryFor(app)?.id === entryId && operators(app));
     let retired = 0;
     if (entry && operatorDisabled(entry, await readCatalogPolicy())) {
       // Under each app's lock, so a sign-in finishing now has either connected, and is disconnected below, or never will.
+      // The principal may have entered their own client since the app was picked; that sign-in is theirs to keep.
       for (const app of await own())
         await withAppLock(app.id, async () => {
+          let current: ConnectionApp;
+          try {
+            current = await this.store.get(app.id);
+          } catch (error) {
+            if (error instanceof ConnectionsStoreError && error.reason === 'app_not_found') return;
+            throw error;
+          }
+          if (!operators(current)) return;
           cancelDeviceSignIn(app.id);
           await this.store.discardSignIns(app.id);
         });

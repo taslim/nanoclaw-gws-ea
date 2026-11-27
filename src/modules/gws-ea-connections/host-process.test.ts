@@ -570,6 +570,29 @@ describe('host-run apps through the relay', () => {
     expect(records()).toHaveLength(before);
     await expect(relay.pinApp(app.id)).rejects.toEqual(new HostCliUnavailableError('invalid_install'));
   });
+
+  it('refuses to spawn on a host Node that ignores NODE_USE_ENV_PROXY, so no request can go direct', async () => {
+    const { dir } = await fakeInstall();
+    writePolicy(dir);
+    control({});
+    const app = await connectLink();
+    const relay = relayWith();
+    await pinAndAllow(relay, app);
+    await relay.closeApp(app.id);
+    const before = records().length;
+    const actual = process.versions.node;
+
+    Object.defineProperty(process.versions, 'node', { value: '23.11.1' });
+    try {
+      const outcome = await call(relay, app, 'user-info_retrieve');
+
+      expect(outcome).toMatchObject({ status: 'unsent', reason: 'app_unavailable' });
+      expect(records()).toHaveLength(before);
+      await expect(relay.pinApp(app.id)).rejects.toEqual(new HostCliUnavailableError('unsupported_runtime'));
+    } finally {
+      Object.defineProperty(process.versions, 'node', { value: actual });
+    }
+  });
 });
 
 /**

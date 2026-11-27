@@ -475,6 +475,36 @@ describe('retiring catalog apps the operator turned off', () => {
       expect(await shopStatus()).toBe('not_connected');
     });
 
+    it('keeps a sign-in the principal started with their own client after the retirement picked the app', async () => {
+      const issuer = 'https://mcp.shop.com/';
+      const created = await store.create({ name: 'My Shop', url: SHOP_URL, auth: 'oauth', issuer });
+      await writeShopPolicy(false);
+      await start();
+      const listApps = store.apps.bind(store);
+      let pending: string | undefined;
+      vi.spyOn(store, 'apps').mockImplementationOnce(async () => {
+        const picked = await listApps();
+        const entered = await store.setClient(created.id, created.version, {
+          issuer,
+          client: { clientId: 'shop-client-juno-hale' },
+          entered: true,
+        });
+        ({ state: pending } = await store.startSignIn(entered.id, entered.version, {
+          principalId: PRINCIPAL,
+          verifier: 'verifier-'.padEnd(48, 'x'),
+          issuer,
+          redirectUri: 'https://juno.example.test/connections/callback/mcp.shop.com',
+          resource: SHOP_URL,
+        }));
+        return picked;
+      });
+
+      expect(await retireShop()).toEqual({ schemaVersion: 1, entry: 'shop', retired: 0, remaining: 0 });
+
+      if (!pending) throw new Error('The principal’s sign-in was not started');
+      expect(await store.claimSignIn(pending, { host: created.host, principalId: PRINCIPAL })).toBeDefined();
+    });
+
     it('stays connected, and does not hold up the uninstall, when it signed in with a client the principal entered', async () => {
       await connectedShop('entered');
       await writeShopPolicy(false);

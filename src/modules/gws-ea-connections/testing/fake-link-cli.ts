@@ -13,6 +13,8 @@ export interface FakeLinkControl {
   readonly phrase?: string;
   readonly token?: string;
   readonly logoutFails?: boolean;
+  /** A login that takes this long to exit once asked to stop, as one finishing its last poll would. */
+  readonly stopDelayMs?: number;
 }
 
 export interface FakeLinkRecord {
@@ -85,6 +87,11 @@ if (args.includes('--mcp')) {
 
   const [group, command] = args;
   if (group === 'auth' && command === 'login') {
+    const { stopDelayMs } = control;
+    if (stopDelayMs !== undefined)
+      process.once('SIGTERM', () => {
+        setTimeout(() => process.exit(143), stopDelayMs);
+      });
     writeState({
       auth: null,
       pendingDeviceAuth: {

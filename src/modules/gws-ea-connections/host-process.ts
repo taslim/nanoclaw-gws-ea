@@ -10,6 +10,7 @@ import type { JSONRPCMessage, Transport, TransportSendOptions } from '@modelcont
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { isRecord } from '../../gws-ea/validation.js';
+import { nodeHonorsEnvProxy } from '../../node-env-proxy.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from '../gws-ea-browser/proxy.js';
 import { operatorEnabled, readCatalogPolicy, type CatalogEntry, type CatalogPolicy } from './catalog.js';
 import { connectionsRoot } from './config.js';
@@ -23,7 +24,8 @@ export function isHostCliEntry(entry: CatalogEntry): entry is HostCliEntry {
   return entry.transport.kind === 'host_cli';
 }
 
-export type HostCliUnavailableReason = 'not_enabled' | 'invalid_install' | 'no_connections_root' | 'unsafe_directory';
+export type HostCliUnavailableReason =
+  'not_enabled' | 'invalid_install' | 'no_connections_root' | 'unsafe_directory' | 'unsupported_runtime';
 
 export class HostCliUnavailableError extends Error {
   constructor(readonly reason: HostCliUnavailableReason) {
@@ -93,6 +95,8 @@ export function hostCliPaths(entry: HostCliEntry): { readonly workDir: string; r
 
 async function launchFrom(entry: HostCliEntry, installationDir: string | undefined): Promise<HostCliLaunch> {
   if (installationDir === undefined) throw new HostCliUnavailableError('not_enabled');
+  // The child runs on this Node; one that ignores NODE_USE_ENV_PROXY would send the CLI's own fetches direct.
+  if (!nodeHonorsEnvProxy(process.versions.node)) throw new HostCliUnavailableError('unsupported_runtime');
   let entryFile: string;
   try {
     ({ entryFile } = await verifyHostCliReceipt(installationDir, entry.transport));

@@ -117,7 +117,7 @@ function commands(): FakeLinkRecord[] {
 
 const ran = (command: string): FakeLinkRecord[] => commands().filter((entry) => entry.args[1] === command);
 const authFile = (): string => path.join(workDir, 'auth.json');
-const pendingFile = (): string => path.join(workDir, 'auth.pending.json');
+const pendingFiles = (): string[] => fs.readdirSync(workDir).filter((name) => name.startsWith('auth.pending'));
 
 function operations(): ConnectionOperations {
   return new ConnectionOperations({
@@ -282,7 +282,7 @@ describe('connecting Link from the page', () => {
     expect(await store.currentGrant(app.id)).toMatchObject({ kind: 'none' });
     expect(fs.statSync(authFile()).mode & 0o777).toBe(0o600);
     expect(fs.readFileSync(authFile(), 'utf8')).toContain(SENTINEL_TOKEN);
-    expect(fs.existsSync(pendingFile())).toBe(false);
+    expect(pendingFiles()).toEqual([]);
   });
 
   it.skipIf(!chromePath)(
@@ -340,7 +340,9 @@ describe('connecting Link from the page', () => {
       '--format',
       'jsonl',
     ]);
-    expect(login?.authFile).toBe(pendingFile());
+    expect(path.dirname(login?.authFile ?? '')).toBe(workDir);
+    expect(path.basename(login?.authFile ?? '')).toMatch(/^auth\.pending.*\.json$/u);
+    expect(login?.authFile).not.toBe(authFile());
     expect(login?.proxy).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/u);
   });
 
@@ -378,7 +380,7 @@ describe('connecting Link from the page', () => {
       expect((await linkApp()).status).toBe('not_connected');
       expect(await store.currentGrant(app.id)).toBeUndefined();
       expect(fs.existsSync(authFile())).toBe(false);
-      expect(fs.existsSync(pendingFile())).toBe(false);
+      expect(pendingFiles()).toEqual([]);
       expect(view.body).toContain(message);
       expect(view.body).toContain('Try again');
       expect(view.body).toContain('<input type="hidden" name="entry" value="link">');
@@ -394,7 +396,7 @@ describe('connecting Link from the page', () => {
       (status) => status.status === 'ended',
     );
 
-    expect(ran('status')).toEqual([expect.objectContaining({ authFile: pendingFile() })]);
+    expect(ran('status')).toEqual([expect.objectContaining({ authFile: ran('login')[0]?.authFile })]);
     expect(await store.currentGrant(app.id)).toBeUndefined();
   });
 
@@ -413,7 +415,7 @@ describe('connecting Link from the page', () => {
 
     expect(status).toEqual({ status: 'ended', reason: 'failed' });
     expect(ran('status')).toEqual([]);
-    expect(fs.existsSync(pendingFile())).toBe(false);
+    expect(pendingFiles()).toEqual([]);
     expect(await store.currentGrant(app.id)).toBeUndefined();
   });
 
@@ -434,7 +436,7 @@ describe('connecting Link from the page', () => {
     expect(status).toEqual({ status: 'ended', reason: 'failed' });
     expect(view.body).toContain('The sign-in couldn’t be read.');
     expect(view.body).toContain('Try again');
-    expect(fs.existsSync(pendingFile())).toBe(false);
+    expect(pendingFiles()).toEqual([]);
     const [login_] = ran('login');
     expect(() => process.kill(login_?.pid ?? 0, 0)).toThrow();
   });
@@ -457,7 +459,42 @@ describe('connecting Link from the page', () => {
     expect((await linkApp()).status).toBe('not_connected');
     expect(await store.currentGrant(app.id)).toBeUndefined();
     expect(fs.existsSync(authFile())).toBe(false);
-    expect(fs.existsSync(pendingFile())).toBe(false);
+    expect(pendingFiles()).toEqual([]);
+  });
+
+  it('keeps a replacement sign-in’s pending file when the cancelled one finishes after it started', async () => {
+    control({ login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE, stopDelayMs: 500 });
+    await connectLink();
+    const app = await linkApp();
+    cancelDeviceSignIn(app.id);
+    control({ login: 'wait', verificationUrl: ADDRESS, phrase: 'cedar-harbor-violet', token: SENTINEL_TOKEN });
+    await connectLink();
+    const [cancelled, replacement] = ran('login');
+    if (!cancelled || !replacement) throw new Error('Both logins should have started');
+    expect(await signInStatus(app)).toMatchObject({ status: 'waiting', phrase: 'cedar-harbor-violet' });
+
+    await eventually(
+      async () => {
+        try {
+          process.kill(cancelled.pid, 0);
+          return false;
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return true;
+          throw error;
+        }
+      },
+      (exited) => exited,
+    );
+    // The cancelled sign-in cleans up once its proxy closes, after its CLI exits.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(fs.existsSync(replacement.authFile ?? '')).toBe(true);
+    answer('approve');
+    await eventually(
+      () => signInStatus(app),
+      (status) => status.status === 'connected',
+    );
+    expect(fs.readFileSync(authFile(), 'utf8')).toContain(SENTINEL_TOKEN);
   });
 
   it('starts a fresh login on Try again once the last one ended', async () => {
