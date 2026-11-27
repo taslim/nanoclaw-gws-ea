@@ -98,6 +98,7 @@ export interface AuthorizationServer {
 }
 
 export interface ProtectedResource {
+  /** As the server published it: it may write the app's address differently, e.g. without a root path's slash. */
   readonly resource: string;
   readonly issuer: string;
   readonly scopes: readonly string[];
@@ -105,7 +106,10 @@ export interface ProtectedResource {
 
 /** Everything a sign-in to one app needs from discovery. */
 export interface SignInServer {
-  /** The app's URL, sent as `resource` on every authorization and token request. */
+  /**
+   * The app's resource identifier, sent as `resource` on every authorization and token request exactly as the server
+   * published it, since an authorization server may compare it as a string.
+   */
   readonly resource: string;
   readonly scope: string | undefined;
   readonly server: AuthorizationServer;
@@ -293,7 +297,7 @@ export async function discoverAuthorizationServer(
 
 /**
  * The app's protected-resource metadata, from the location its 401 named or the well-known one. Undefined when the
- * server publishes none. Its `resource` must be the app's URL.
+ * server publishes none. Its `resource` must name the app's URL.
  */
 export async function readProtectedResource(
   appUrl: string,
@@ -316,7 +320,7 @@ export async function readProtectedResource(
   }
   if (!sameUrl(document.resource, appUrl)) return fail('resource_mismatch');
   return {
-    resource: appUrl,
+    resource: document.resource,
     issuer: issuerOf(document.authorization_servers?.[0], options.assistantHost),
     scopes: strings(document.scopes_supported),
   };
@@ -556,7 +560,7 @@ export async function refreshAccess(
       metadata: sdkMetadata(server),
       clientInformation: information,
       refreshToken: grant.refreshToken,
-      resource: app.url,
+      resource: resource?.resource ?? app.url,
       fetchFn: watch.fetch,
     }),
   );

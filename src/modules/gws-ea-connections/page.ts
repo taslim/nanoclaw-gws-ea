@@ -145,7 +145,7 @@ function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnect
 
 /** A refusal that a reload settles is a conflict; any other is the request's own fault. */
 function connectRefusalStatus(reason: ConnectRefusal): number {
-  return reason === 'wrong_method' || reason === 'already_connected' ? 409 : 400;
+  return reason === 'wrong_method' || reason === 'already_connected' || reason === 'not_offered' ? 409 : 400;
 }
 
 function addMessage(reason: AddRefusal): string {
@@ -195,6 +195,8 @@ function connectMessage(reason: ConnectRefusal): string {
       return 'The sign-in service didn’t accept your assistant’s client. Reload the page to enter client details.';
     case 'client_unavailable':
       return CLIENT_UNAVAILABLE;
+    case 'not_offered':
+      return NOT_OFFERED;
     case 'unreachable':
       return UNREACHABLE;
     case 'unsupported':

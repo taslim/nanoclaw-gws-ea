@@ -152,6 +152,7 @@ beforeAll(async () => {
     'mcp.granola.ai',
     'ai.todoist.net',
     'mcp.shop.com',
+    'accounts.shop.app',
   ]);
 });
 afterAll(async () => {
@@ -1667,6 +1668,109 @@ describe('the catalog on the page', () => {
     expect(switchState((await request(`/connections/app/${app.id}/tools`)).body, 'spend-request_create')).toBe(
       'Ask first',
     );
+  });
+
+  describe('Shop, signed in with the operator’s client', () => {
+    const SHOP = 'https://mcp.shop.com/';
+    const SHOP_RESOURCE = 'https://mcp.shop.com';
+    const SHOP_REDIRECT = `https://${HOST}/connections/callback/mcp.shop.com`;
+    const SHOP_CLIENT = 'juno-shop-client';
+    /** The secret the operator stored after rotating the first one. */
+    const SENTINEL_ROTATED = 'sentinel-rotated-secret-W8p1';
+
+    /**
+     * Shaped like Shop's: no registration endpoint, client documents and public clients taken, `iss` sent back, and
+     * a resource identifier without its root path's slash.
+     */
+    function fakeShop(secret: string): FakeMcpApp {
+      return new FakeMcpApp({
+        appUrl: SHOP,
+        resource: SHOP_RESOURCE,
+        issuer: 'https://accounts.shop.app',
+        tokenAuthMethods: ['client_secret_basic', 'client_secret_post', 'none'],
+        issParameter: true,
+        scopes: ['personal_agent'],
+        fetchClientDocument,
+        client: { id: SHOP_CLIENT, secret, redirectUri: SHOP_REDIRECT },
+      });
+    }
+
+    async function registerShopClient(secret: string): Promise<void> {
+      const secretFile = path.join(directory, 'shop-client-secret');
+      await writeFile(secretFile, secret, { mode: 0o600 });
+      await writeCatalogPolicy({ schemaVersion: 1, shop: { clientId: SHOP_CLIENT, clientSecretFile: secretFile } });
+    }
+
+    async function startShop(): Promise<string> {
+      const started = await catalogConnect('shop');
+      expect(started.status).toBe(200);
+      const { authorizationUrl } = JSON.parse(started.body) as { authorizationUrl: string };
+      return authorizationUrl;
+    }
+
+    it('connects in one action, sending the client’s secret only to the token endpoint', async () => {
+      const shop = fakeShop(SENTINEL_SECRET);
+      serve(shop.handle);
+      await registerShopClient(SENTINEL_SECRET);
+
+      const authorizationUrl = await startShop();
+      expect(Object.fromEntries(new URL(authorizationUrl).searchParams)).toMatchObject({
+        client_id: SHOP_CLIENT,
+        redirect_uri: SHOP_REDIRECT,
+        resource: SHOP_RESOURCE,
+        scope: 'personal_agent',
+      });
+      const app = await onlyApp();
+      expect(app).toMatchObject({ name: 'Shop', catalogId: 'shop', url: SHOP, status: 'not_connected' });
+      const view = (await request(`/connections/app/${app.id}/connect`)).body;
+      expect(view).toContain('>Continue to accounts.shop.app</button>');
+      expect(view).not.toContain('name="clientId"');
+      expect(view).not.toContain('Change client details');
+
+      const returned = await callback('mcp.shop.com', shop.approve(authorizationUrl).query);
+      expect(returned.headers.location).toBe(toolsReturn(app));
+      expect((await onlyApp()).status).toBe('connected');
+      expect(tokenRequests().map((incoming) => incoming.headers.authorization)).toEqual([
+        `Basic ${Buffer.from(`${SHOP_CLIENT}:${SENTINEL_SECRET}`).toString('base64')}`,
+      ]);
+      expect(listSection((await request('/connections')).body, 'Connected')).toContain(
+        '<span class="row-title">Shop</span>',
+      );
+      assertNoSentinels();
+    });
+
+    it('keeps the operator’s client when Shop refuses it, and signs in with the secret the operator stores next', async () => {
+      const shop = fakeShop(SENTINEL_ROTATED);
+      serve(shop.handle);
+      await registerShopClient(SENTINEL_SECRET);
+
+      const refused = await callback('mcp.shop.com', shop.approve(await startShop()).query);
+      expect(refused.headers.location).toBe('/connections?outcome=assistant_client_refused');
+      const app = await onlyApp();
+      expect(app).toMatchObject({ status: 'not_connected', hasClient: true, clientEntered: false });
+      expect((await store.readClient(app.id)).client).toEqual({ clientId: SHOP_CLIENT, clientSecret: SENTINEL_SECRET });
+
+      await registerShopClient(SENTINEL_ROTATED);
+      await callback('mcp.shop.com', shop.approve(await startShop()).query);
+      expect((await onlyApp()).status).toBe('connected');
+      expect(registrationRequests()).toEqual([]);
+      for (const sentinel of [SENTINEL_SECRET, SENTINEL_ROTATED]) {
+        for (const reply of replies) expect(reply.body).not.toContain(sentinel);
+        for (const line of logged) expect(line).not.toContain(sentinel);
+      }
+    });
+
+    it('refuses a sign-in with the operator’s earlier client once the operator removes it', async () => {
+      serve(fakeShop(SENTINEL_SECRET).handle);
+      await registerShopClient(SENTINEL_SECRET);
+      await startShop();
+      const app = await onlyApp();
+
+      await writeCatalogPolicy({ schemaVersion: 1 });
+      const reply = await post('/connections/sign-in', { id: app.id, version: String(app.version) });
+      expect(reply.status).toBe(409);
+      expect(JSON.parse(reply.body)).toEqual({ error: 'This app isn’t available right now. Reload the page.' });
+    });
   });
 
   it('refuses an entry that is not offered, storing nothing', async () => {

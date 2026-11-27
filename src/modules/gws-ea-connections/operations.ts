@@ -12,13 +12,16 @@ import {
   catalogEntry,
   catalogEntryFor,
   isRemoteEntry,
+  operatorClient,
   operatorDisabled,
   operatorEnabled,
   placeCatalogApps,
   readCatalogPolicy,
+  usesOperatorClient,
   type AvailableCatalogEntry,
   type CatalogEntry,
   type CatalogPolicyState,
+  type OperatorClient,
   type RemoteCatalogEntry,
 } from './catalog.js';
 import type { CatalogRetireReply, RetirableCatalogEntry } from './catalog-retire.js';
@@ -102,6 +105,8 @@ export type ConnectRefusal =
   | 'needs_client'
   | 'client_refused'
   | 'client_unavailable'
+  /** The app signs in with the operator's client, and the operator has removed it. */
+  | 'not_offered'
   | 'unreachable'
   | 'unsupported';
 
@@ -403,7 +408,8 @@ export class ConnectionOperations {
         if (added.status === 'refused') return { status: 'add_refused', reason: added.reason };
         app = added.app;
       }
-      if (app.auth !== 'oauth' || !app.hasClient) return { status: 'connect_view', app };
+      if (app.auth !== 'oauth' || (!app.hasClient && !usesOperatorClient(entry)))
+        return { status: 'connect_view', app };
       return this.startSignIn(app.id, app.version, principalId);
     });
   }
@@ -486,7 +492,10 @@ export class ConnectionOperations {
     const { method } = probe;
     let client: ClientRegistration | undefined;
     let usesDocument = false;
-    if (method.kind === 'oauth' && (method.clientDocuments || method.dynamicRegistration)) {
+    // The operator's client is set at each sign-in instead, so none is made for the app.
+    const entry = catalogEntryFor({ catalogId: catalogId ?? null, transport: 'remote', host: admission.host });
+    const operatorSignIn = entry !== undefined && usesOperatorClient(entry);
+    if (method.kind === 'oauth' && !operatorSignIn && (method.clientDocuments || method.dynamicRegistration)) {
       try {
         const kind = newClientKind(method.signIn.server, { served: this.documentsServed(), refused: false });
         if (kind === 'document') usesDocument = true;
@@ -570,6 +579,9 @@ export class ConnectionOperations {
       if (app.auth !== 'oauth') return refusedConnect('wrong_method');
       const own = entered && enteredClient(entered);
       if (entered && !own) return refusedConnect('invalid_client');
+      const operator = own || app.clientEntered ? undefined : await this.operatorClientFor(app);
+      if (operator?.status === 'none') return refusedConnect('not_offered');
+      if (operator?.status === 'unreadable') return refusedConnect('client_unavailable');
       const probe = await probeApp(app.url, this.oauth);
       if (probe.status !== 'ok') return refusedConnect(probe.status);
       if (probe.method.kind !== 'oauth' || probe.method.issuer !== app.issuer) return refusedConnect('method_changed');
@@ -578,12 +590,14 @@ export class ConnectionOperations {
       let prepared: PreparedAuthorization;
       try {
         let client: ClientRegistration;
-        if (own) {
-          client = own;
+        // The operator's client replaces whatever the app held, so the one registered now is always the one used.
+        const given = own ?? (operator?.status === 'registered' ? operator.client : undefined);
+        if (given) {
+          client = given;
           app = await this.store.setClient(app.id, app.version, {
             issuer: signIn.server.issuer,
             client,
-            entered: true,
+            entered: own !== undefined,
           });
         } else {
           const stored = await this.store.readClient(app.id, app.version);
@@ -850,7 +864,7 @@ export class ConnectionOperations {
     try {
       const refused = await this.store.get(appId);
       if (refused.clientEntered) outcome = 'client_refused';
-      if (!refused.hasClient) return outcome;
+      if (!refused.hasClient || this.holdsOperatorClient(refused)) return outcome;
       const app = await this.store.clearClient(refused.id, refused.version);
       const probe = await probeApp(app.url, this.oauth);
       if (
@@ -876,6 +890,22 @@ export class ConnectionOperations {
       else throw error;
     }
     return outcome;
+  }
+
+  /** The operator's client for an app whose catalog entry signs in with one; undefined for any other app. */
+  private async operatorClientFor(app: ConnectionApp): Promise<OperatorClient | undefined> {
+    const entry = catalogEntryFor(app);
+    if (!entry || !usesOperatorClient(entry)) return undefined;
+    return operatorClient(entry, await readCatalogPolicy());
+  }
+
+  /**
+   * Unless the principal entered their own, such an app's client is the operator's: nothing made for the app replaces
+   * it, and each sign-in sets the one the operator holds then.
+   */
+  private holdsOperatorClient(app: ConnectionApp): boolean {
+    const entry = catalogEntryFor(app);
+    return !app.clientEntered && entry !== undefined && usesOperatorClient(entry);
   }
 
   /** A new registration for this app alone, whatever client it held before. */

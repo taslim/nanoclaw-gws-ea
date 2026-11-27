@@ -11,7 +11,7 @@ import { log } from '../../log.js';
 import { hostOf } from './admit.js';
 import type { ToolDefinition } from './canonical.js';
 import { catalogPolicyFile } from './config.js';
-import type { ConnectionApp } from './store.js';
+import type { ClientRegistration, ConnectionApp } from './store.js';
 
 export type CatalogEntryId = 'chowdeck' | 'notion' | 'granola' | 'todoist' | 'shop' | 'link';
 
@@ -292,12 +292,13 @@ export function catalogEntryFor(
 
 export const CATALOG_POLICY_SCHEMA_VERSION = 1;
 const POLICY_MAX_BYTES = 16 * 1024;
+const CLIENT_SECRET_MAX_BYTES = 4 * 1024;
 const EXACT_VERSION = /^\d+\.\d+\.\d+$/u;
-/** RFC 6749 client identifiers are visible ASCII. */
-const CLIENT_ID = /^[\x21-\x7e]{1,2048}$/u;
+/** RFC 6749 client identifiers and secrets are visible ASCII. */
+const CLIENT_CREDENTIAL = /^[\x21-\x7e]{1,2048}$/u;
 
 export function isClientId(value: string): boolean {
-  return CLIENT_ID.test(value);
+  return CLIENT_CREDENTIAL.test(value);
 }
 
 /** What the operator enabled on this host; written by `gws-ea connector`, read by every assistant on use. */
@@ -348,26 +349,31 @@ function parseCatalogPolicy(value: unknown): CatalogPolicy | undefined {
   return { schemaVersion: CATALOG_POLICY_SCHEMA_VERSION, link, shop };
 }
 
+/** A regular file only this user owns and can read, opened without following a link; undefined when it is not one. */
+function readOwnerOnlyText(file: string, maxBytes: number): string | undefined {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (
+      stat.nlink !== 1 ||
+      (stat.mode & 0o077) !== 0 ||
+      (typeof process.getuid === 'function' && stat.uid !== process.getuid())
+    )
+      return undefined;
+    return new TextDecoder('utf-8', { fatal: true }).decode(readRegularFileBounded(fd, maxBytes));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export async function readCatalogPolicy(file = catalogPolicyFile()): Promise<CatalogPolicyState> {
   if (!file) return { status: 'absent' };
   /* eslint-disable no-catch-all/no-catch-all -- bad optional operator state closes the operator's entries, never the page */
   try {
     if (!path.isAbsolute(file)) return invalidPolicy();
-    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    let bytes: Buffer;
-    try {
-      const stat = fs.fstatSync(fd);
-      if (
-        stat.nlink !== 1 ||
-        (stat.mode & 0o077) !== 0 ||
-        (typeof process.getuid === 'function' && stat.uid !== process.getuid())
-      )
-        return invalidPolicy();
-      bytes = readRegularFileBounded(fd, POLICY_MAX_BYTES);
-    } finally {
-      fs.closeSync(fd);
-    }
-    const policy = parseCatalogPolicy(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
+    const text = readOwnerOnlyText(file, POLICY_MAX_BYTES);
+    if (text === undefined) return invalidPolicy();
+    const policy = parseCatalogPolicy(JSON.parse(text));
     return policy ? { status: 'read', policy } : invalidPolicy();
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { status: 'absent' };
@@ -379,6 +385,40 @@ export async function readCatalogPolicy(file = catalogPolicyFile()): Promise<Cat
 function invalidPolicy(): CatalogPolicyState {
   log.warn('Catalog policy is unreadable; operator-enabled catalog apps are unavailable');
   return { status: 'invalid' };
+}
+
+/** Whether the entry signs in with the client the operator registered, rather than one made for the app. */
+export function usesOperatorClient(entry: CatalogEntry): boolean {
+  return entry.prerequisite === 'shop_client';
+}
+
+export type OperatorClient =
+  | { readonly status: 'none' }
+  | { readonly status: 'registered'; readonly client: ClientRegistration }
+  /** Registered, but its secret file is missing, malformed or not owner-only. */
+  | { readonly status: 'unreadable' };
+
+/**
+ * The client the operator registered for the entry. Its secret is read from the owner-only file the policy names at
+ * each sign-in, so one the operator rotates is used from the next sign-in on.
+ */
+export function operatorClient(entry: CatalogEntry, state: CatalogPolicyState): OperatorClient {
+  const shop = state.status === 'read' && usesOperatorClient(entry) ? state.policy.shop : null;
+  if (!shop) return { status: 'none' };
+  if (shop.clientSecretFile === null) return { status: 'registered', client: { clientId: shop.clientId } };
+  let secret: string | undefined;
+  /* eslint-disable no-catch-all/no-catch-all -- an unreadable secret closes this sign-in, never the page */
+  try {
+    secret = readOwnerOnlyText(shop.clientSecretFile, CLIENT_SECRET_MAX_BYTES);
+  } catch {
+    secret = undefined;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  if (secret === undefined || !CLIENT_CREDENTIAL.test(secret)) {
+    log.warn('The operator’s client secret for a catalog app is unreadable', { entry: entry.id });
+    return { status: 'unreadable' };
+  }
+  return { status: 'registered', client: { clientId: shop.clientId, clientSecret: secret } };
 }
 
 /** Link counts only while this release's pinned version is installed, so a host never runs a version it did not pin. */

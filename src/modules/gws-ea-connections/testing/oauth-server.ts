@@ -180,6 +180,8 @@ export interface FakeToolResult {
 
 export interface FakeAppOptions {
   readonly appUrl: string;
+  /** The resource identifier the server publishes and expects back verbatim; the app's URL unless given. */
+  readonly resource?: string;
   /** Root-path issuer, on the app's host or another. */
   readonly issuer: string;
   readonly registration?: boolean;
@@ -216,6 +218,7 @@ interface PendingCode {
  */
 export class FakeMcpApp {
   readonly app: URL;
+  readonly resource: string;
   readonly issuer: URL;
   readonly resourceMetadata: Record<string, unknown>;
   readonly serverMetadata: Record<string, unknown>;
@@ -238,6 +241,7 @@ export class FakeMcpApp {
 
   constructor(options: FakeAppOptions) {
     this.app = new URL(options.appUrl);
+    this.resource = options.resource ?? this.app.href;
     this.issuer = new URL(options.issuer);
     this.issParameter = options.issParameter ?? false;
     this.serverName = options.serverName ?? 'Ledgerly';
@@ -248,7 +252,7 @@ export class FakeMcpApp {
     this.fetchClientDocument = options.fetchClientDocument;
     const at = (route: string): string => new URL(route, this.issuer).href;
     this.resourceMetadata = {
-      resource: this.app.href,
+      resource: this.resource,
       authorization_servers: [options.issuer],
       ...(options.scopes ? { scopes_supported: [...options.scopes] } : {}),
     };
@@ -275,7 +279,12 @@ export class FakeMcpApp {
   }
 
   get resourceMetadataUrl(): string {
-    return new URL(`/.well-known/oauth-protected-resource${this.app.pathname}`, this.app).href;
+    return new URL(this.resourceMetadataPath, this.app).href;
+  }
+
+  /** RFC 9728 inserts the well-known segment before the app's path, which is empty for an app at the root. */
+  private get resourceMetadataPath(): string {
+    return `/.well-known/oauth-protected-resource${this.app.pathname.replace(/\/$/u, '')}`;
   }
 
   /** Plays the principal approving at the server's sign-in page; returns the query sent to the redirect URI. */
@@ -335,7 +344,7 @@ export class FakeMcpApp {
       if (request.method === 'POST' && request.path === this.app.pathname) return this.mcp(request);
       if (request.method === 'GET' && request.path === this.app.pathname) return { status: 405 };
       if (request.method === 'DELETE' && request.path === this.app.pathname) return { status: 204 };
-      if (request.method === 'GET' && request.path === `/.well-known/oauth-protected-resource${this.app.pathname}`)
+      if (request.method === 'GET' && request.path === this.resourceMetadataPath)
         return { status: 200, body: this.resourceMetadata };
     }
     if (request.host !== this.issuer.hostname) return undefined;
@@ -439,7 +448,7 @@ export class FakeMcpApp {
     const form = new URLSearchParams(request.body);
     const clientId = this.authenticated(request, form);
     if (!clientId) return { status: 401, body: { error: 'invalid_client' } };
-    if (form.get('resource') !== this.app.href) return { status: 400, body: { error: 'invalid_target' } };
+    if (form.get('resource') !== this.resource) return { status: 400, body: { error: 'invalid_target' } };
     if (form.get('grant_type') === 'authorization_code') {
       const pending = this.codes.get(form.get('code') ?? '');
       this.codes.delete(form.get('code') ?? '');
@@ -451,7 +460,7 @@ export class FakeMcpApp {
         pending.clientId !== clientId ||
         pending.challenge !== challenge ||
         pending.redirectUri !== form.get('redirect_uri') ||
-        pending.resource !== this.app.href
+        pending.resource !== this.resource
       )
         return { status: 400, body: { error: 'invalid_grant' } };
       return this.issue(clientId);
