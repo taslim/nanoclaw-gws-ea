@@ -563,9 +563,8 @@ describe('disconnecting Link', () => {
     control({ logoutDelayMs: 400, login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE });
 
     const disconnecting = request('/connections/disconnect', 'POST', { id: app.id, version: String(app.version) });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await vi.waitFor(() => expect(ran('logout')).toHaveLength(1));
     const connecting = connectLink();
-    await new Promise((resolve) => setTimeout(resolve, 100));
     answer('approve');
     await disconnecting;
     await connecting;
