@@ -11,6 +11,7 @@ import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../g
 import {
   catalogEntry,
   catalogEntryFor,
+  isClientCredential,
   isRemoteEntry,
   operatorClient,
   operatorDisabled,
@@ -31,6 +32,7 @@ import {
   hostCliClientName,
   signOutHostCli,
   startDeviceSignIn,
+  type DeviceSignInCompletion,
 } from './device-sign-in.js';
 import {
   HostCliUnavailableError,
@@ -272,9 +274,6 @@ export async function readListing(
   };
 }
 
-/** RFC 6749 client credentials are visible ASCII. */
-const CLIENT_VALUE = /^[\x21-\x7e]{1,2048}$/u;
-
 function refusedConnect(reason: ConnectRefusal): { readonly status: 'refused'; readonly reason: ConnectRefusal } {
   return { status: 'refused', reason };
 }
@@ -303,7 +302,7 @@ function oauthRefusal(code: ConnectionOAuthError['code']): ConnectRefusal {
 function enteredClient(entered: EnteredClient): ClientRegistration | undefined {
   const clientId = entered.clientId.trim();
   const clientSecret = entered.clientSecret?.trim();
-  if (!CLIENT_VALUE.test(clientId) || (clientSecret && !CLIENT_VALUE.test(clientSecret))) return undefined;
+  if (!isClientCredential(clientId) || (clientSecret && !isClientCredential(clientSecret))) return undefined;
   return { clientId, ...(clientSecret ? { clientSecret } : {}) };
 }
 
@@ -435,21 +434,26 @@ export class ConnectionOperations {
         appId,
         launch,
         clientName: await this.clientName(),
-        complete: (pendingFile, current) => this.completeDeviceSignIn(appId, launch, pendingFile, current),
+        complete: (pendingFile, current) => this.completeDeviceSignIn(entry, appId, launch, pendingFile, current),
       });
       return { status: 'device_sign_in', app };
     });
   }
 
-  /** Under the app's lock, so a disconnect that cancelled the sign-in meanwhile always wins. */
+  /**
+   * Under the app's lock, so a disconnect that cancelled the sign-in meanwhile always wins. The operator may have turned
+   * the entry off while the principal was approving; its retirement saw no connected app, so nothing connects now.
+   */
   private async completeDeviceSignIn(
+    entry: HostCliEntry,
     appId: string,
     launch: HostCliLaunch,
     pendingFile: string,
     current: () => boolean,
-  ): Promise<boolean> {
-    const connected = await withAppLock(appId, async (): Promise<ConnectionApp | undefined> => {
+  ): Promise<DeviceSignInCompletion> {
+    const connected = await withAppLock(appId, async (): Promise<ConnectionApp | 'not_offered' | undefined> => {
       if (!current()) return undefined;
+      if (!operatorEnabled(entry, await readCatalogPolicy())) return 'not_offered';
       let app: ConnectionApp;
       try {
         app = await this.store.get(appId);
@@ -462,10 +466,11 @@ export class ConnectionOperations {
       await this.notifyDisconnected(result.app.id);
       return result.app;
     });
-    if (!connected) return false;
+    if (connected === undefined) return 'not_connected';
+    if (connected === 'not_offered') return connected;
     await this.pinConnected(connected);
     await this.apply();
-    return true;
+    return 'connected';
   }
 
   /**
@@ -748,13 +753,18 @@ export class ConnectionOperations {
   }
 
   /**
-   * Disconnects every app made from the entry once the operator has turned it off on this host, and notes main for
-   * each. While the entry is still offered, or the policy cannot be read, nothing is retired.
+   * Disconnects every app of the entry once the operator has turned it off on this host, and notes main for each. An
+   * app added earlier by address counts as the entry's, as at placement; one signed in with a client the principal
+   * entered is theirs, not the operator's, so the operator's turn-off leaves it alone. While the entry is still offered,
+   * or the policy cannot be read, nothing is retired.
    */
   async retireCatalogEntry(entryId: RetirableCatalogEntry): Promise<CatalogRetireReply> {
     const entry = catalogEntry(entryId);
+    const signsInWithOperatorClient = entry !== undefined && usesOperatorClient(entry);
     const own = async (): Promise<readonly ConnectionApp[]> =>
-      (await this.store.apps()).filter((app) => app.catalogId === entryId);
+      (await this.store.apps()).filter(
+        (app) => catalogEntryFor(app)?.id === entryId && !(signsInWithOperatorClient && app.clientEntered),
+      );
     let retired = 0;
     if (entry && operatorDisabled(entry, await readCatalogPolicy())) {
       // Under each app's lock, so a sign-in finishing now has either connected, and is disconnected below, or never will.

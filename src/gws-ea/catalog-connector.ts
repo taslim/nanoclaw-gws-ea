@@ -14,7 +14,7 @@ import { hostOf } from '../modules/gws-ea-connections/admit.js';
 import {
   CATALOG_POLICY_SCHEMA_VERSION,
   catalogEntry,
-  isClientId,
+  isClientCredential,
   readCatalogPolicy,
   type CatalogPolicy,
   type CatalogPolicyState,
@@ -538,7 +538,7 @@ export async function installShop(
   dependencies: CatalogConnectorDependencies = {},
 ): Promise<ShopInstallData> {
   const clientId = request.clientId?.trim();
-  if (!clientId || !isClientId(clientId))
+  if (!clientId || !isClientCredential(clientId))
     throw new GwsEaError(
       'invalid_arguments',
       'Shop needs the client ID of your Shopify Dev Dashboard app. Rerun with --client-id CLIENT_ID.',

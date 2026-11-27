@@ -292,7 +292,7 @@ const EXACT_VERSION = /^\d+\.\d+\.\d+$/u;
 /** RFC 6749 client identifiers and secrets are visible ASCII. */
 const CLIENT_CREDENTIAL = /^[\x21-\x7e]{1,2048}$/u;
 
-export function isClientId(value: string): boolean {
+export function isClientCredential(value: string): boolean {
   return CLIENT_CREDENTIAL.test(value);
 }
 
@@ -328,7 +328,7 @@ function parseLink(value: unknown): CatalogPolicy['link'] | undefined {
 
 function parseShop(value: unknown): CatalogPolicy['shop'] | undefined {
   if (value === undefined || value === null) return null;
-  if (!isRecord(value) || typeof value.clientId !== 'string' || !isClientId(value.clientId)) return undefined;
+  if (!isRecord(value) || typeof value.clientId !== 'string' || !isClientCredential(value.clientId)) return undefined;
   const secret = value.clientSecretFile;
   if (secret !== undefined && secret !== null && !absoluteFile(secret)) return undefined;
   return { clientId: value.clientId, clientSecretFile: absoluteFile(secret) ? secret : null };
@@ -405,7 +405,7 @@ export function operatorClient(entry: CatalogEntry, state: CatalogPolicyState): 
     secret = undefined;
   }
   /* eslint-enable no-catch-all/no-catch-all */
-  if (secret === undefined || !CLIENT_CREDENTIAL.test(secret)) {
+  if (secret === undefined || !isClientCredential(secret)) {
     log.warn('The operator’s client secret for a catalog app is unreadable', { entry: entry.id });
     return { status: 'unreadable' };
   }

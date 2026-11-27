@@ -410,6 +410,7 @@ const DEVICE_ENDED = {
   expired: 'The sign-in expired before it was approved.',
   refused: 'The sign-in was declined.',
   failed: 'The sign-in couldn’t be read.',
+  not_offered: 'This app isn’t available right now.',
 } satisfies Record<DeviceSignInFailure, string>;
 
 function deviceStartForm(entry: CatalogEntry, label: string): string {

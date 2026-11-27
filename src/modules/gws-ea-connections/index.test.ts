@@ -72,7 +72,7 @@ import { applyMainServers, MainServersUnreadableError } from './apply.js';
 import { CATALOG_RETIRE_COMMAND } from './catalog-retire.js';
 import { CATALOG_POLICY_FILE_ENV, CONNECTIONS_ROOT_ENV } from './config.js';
 import { connectionsHealth } from './index.js';
-import { ConnectionsStoreError, getConnectionsStore, type ConnectionsStore } from './store.js';
+import { ConnectionsStoreError, getConnectionsStore, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
 
 const MAIN = 'ag-main';
@@ -339,5 +339,114 @@ describe('retiring catalog apps the operator turned off', () => {
     expect(await linkStatus()).toBe('connected');
     expect(existsSync(linkAuth())).toBe(true);
     expect(writeNoteForMain).not.toHaveBeenCalled();
+  });
+
+  describe('a Shop app the principal added by address', () => {
+    const SHOP_URL = 'https://mcp.shop.com/';
+    const PRINCIPAL = 'morgan@example.test';
+    const OPERATOR_CLIENT = { clientId: 'gws-ea-shop-client', clientSecret: 'sentinel-operator-shop-secret' };
+
+    /** Signed in with the operator's client, or with one the principal entered; no refresh token, so nothing is revoked. */
+    async function connectedShop(client: 'operator' | 'entered'): Promise<ConnectionApp> {
+      const issuer = 'https://mcp.shop.com/';
+      const created = await store.create({ name: 'My Shop', url: SHOP_URL, auth: 'oauth', issuer });
+      expect(created.catalogId).toBeNull();
+      const withClient = await store.setClient(created.id, created.version, {
+        issuer,
+        client: client === 'operator' ? OPERATOR_CLIENT : { clientId: 'shop-client-juno-hale' },
+        entered: client === 'entered',
+      });
+      const { state } = await store.startSignIn(withClient.id, withClient.version, {
+        principalId: PRINCIPAL,
+        verifier: 'verifier-'.padEnd(48, 'x'),
+        issuer,
+        redirectUri: 'https://juno.example.test/connections/callback/mcp.shop.com',
+        resource: SHOP_URL,
+      });
+      const claim = await store.claimSignIn(state, { host: withClient.host, principalId: PRINCIPAL });
+      if (!claim) throw new Error('The sign-in was not claimed');
+      const done = await store.completeSignIn(claim, {
+        kind: 'oauth',
+        accessToken: SENTINEL_TOKEN,
+        accessIssuedAt: new Date().toISOString(),
+        accessExpiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+      if (done.status !== 'connected') throw new Error('The sign-in did not connect');
+      return done.app;
+    }
+
+    async function writeShopPolicy(offered: boolean): Promise<void> {
+      const file = path.join(directory, 'catalog.json');
+      await writeFile(
+        file,
+        JSON.stringify({
+          schemaVersion: 1,
+          link: null,
+          shop: offered ? { clientId: OPERATOR_CLIENT.clientId, clientSecretFile: null } : null,
+        }),
+        { mode: 0o600 },
+      );
+      process.env[CATALOG_POLICY_FILE_ENV] = file;
+    }
+
+    const shopStatus = async (): Promise<string | undefined> =>
+      (await store.apps()).find((app) => app.host === 'mcp.shop.com')?.status;
+
+    const retireShop = async (): Promise<unknown> => {
+      const command = lookup(CATALOG_RETIRE_COMMAND);
+      if (!command) throw new Error('the retire command is not registered');
+      return command.handler(command.parseArgs({ entry: 'shop' }), { caller: 'host' });
+    };
+
+    const start = async (): Promise<void> => {
+      if (!host.start) throw new Error('the connections module registered no host-start hook');
+      await host.start({ signal: new AbortController().signal });
+    };
+
+    it('is disconnected, noted and counted when the operator turns Shop off on a running assistant', async () => {
+      const app = await connectedShop('operator');
+      await writeShopPolicy(true);
+      await start();
+      expect(await shopStatus()).toBe('connected');
+      await writeShopPolicy(false);
+
+      const reply = await retireShop();
+
+      expect(reply).toEqual({ schemaVersion: 1, entry: 'shop', retired: 1, remaining: 0 });
+      expect(await shopStatus()).toBe('not_connected');
+      expect(writeNoteForMain).toHaveBeenCalledOnce();
+      expect(writeNoteForMain).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: `connection-retired:${app.id}:${app.version}`,
+          text: expect.stringContaining('turned Shop off'),
+          wake: false,
+        }),
+      );
+    });
+
+    it('is disconnected and noted at the next start of an assistant that was stopped when Shop was turned off', async () => {
+      const app = await connectedShop('operator');
+      await writeShopPolicy(false);
+
+      await start();
+
+      expect(await shopStatus()).toBe('not_connected');
+      expect(writeNoteForMain).toHaveBeenCalledOnce();
+      expect(writeNoteForMain).toHaveBeenCalledWith(
+        expect.objectContaining({ id: `connection-retired:${app.id}:${app.version}`, wake: false }),
+      );
+    });
+
+    it('stays connected, and does not hold up the uninstall, when it signed in with a client the principal entered', async () => {
+      await connectedShop('entered');
+      await writeShopPolicy(false);
+
+      await start();
+      const reply = await retireShop();
+
+      expect(reply).toEqual({ schemaVersion: 1, entry: 'shop', retired: 0, remaining: 0 });
+      expect(await shopStatus()).toBe('connected');
+      expect(writeNoteForMain).not.toHaveBeenCalled();
+    });
   });
 });

@@ -34,7 +34,7 @@ import {
   type AppRelay,
   type HoldCallInput,
 } from './relay.js';
-import type { ConnectionApp, ConnectionsStore } from './store.js';
+import { HOST_CLI_DOMAIN, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeToolDefinition } from './testing/oauth-server.js';
 import { testConnectionsStore } from './testing/store.js';
 
@@ -1912,5 +1912,106 @@ describe('catalog rules at the relay', () => {
     });
     expect(outcome).toMatchObject({ status: 'unsent', reason: 'unknown_tool' });
     expect(fake.toolCalls).toEqual([]);
+  });
+
+  function mainNoteTexts(prefix: string): string[] {
+    const file = inboundDbPath(session.agent_group_id, session.id);
+    if (!fs.existsSync(file)) return [];
+    const db = new Database(file, { readonly: true });
+    try {
+      return db
+        .prepare<[string], { content: string }>('SELECT content FROM messages_in WHERE id LIKE ?')
+        .all(`${prefix}%`)
+        .map((row) => (JSON.parse(row.content) as { text: string }).text);
+    } finally {
+      db.close();
+    }
+  }
+
+  it('tells main once, without an address, that the app’s tools are paused until the operator updates', async () => {
+    const tool = (name: string): FakeToolDefinition => ({
+      name,
+      description: `Shop ${name.replaceAll('_', ' ')}.`,
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    });
+    const fake = new FakeMcpApp({
+      appUrl: SHOP_URL,
+      issuer: 'https://mcp.shop.com',
+      allowUnauthenticated: true,
+      tools: [tool('search_catalog'), tool('create_spend_request')],
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'Shop', url: SHOP_URL, auth: 'none', catalogId: 'shop' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+
+    await expect(relay.pinApp(app.id)).rejects.toThrow();
+    await expect(relay.pinApp(app.id)).rejects.toThrow();
+
+    const notes = mainNoteTexts('connection-rules-unmatched:');
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('"Shop"');
+    expect(notes[0]).toContain('paused');
+    expect(notes[0]).toContain('operator');
+    for (const leaked of ['http', 'mcp.shop.com', HOST_CLI_DOMAIN]) expect(notes[0]).not.toContain(leaked);
+  });
+
+  describe('a recorded Link listing that no longer matches the rules', () => {
+    const recorded = (
+      JSON.parse(fs.readFileSync(path.join(import.meta.dirname, 'testing', 'link-1.6.0-tools.json'), 'utf8')) as {
+        readonly tools: readonly FakeToolDefinition[];
+      }
+    ).tools;
+
+    function withProperty(
+      tools: readonly FakeToolDefinition[],
+      toolName: string,
+      change: (properties: Record<string, Record<string, unknown>>) => void,
+    ): FakeToolDefinition[] {
+      return tools.map((entry) => {
+        if (toolName !== 'all' && entry.name !== toolName) return entry;
+        const properties = structuredClone({ ...entry.inputSchema.properties });
+        change(properties);
+        return { ...entry, inputSchema: { ...entry.inputSchema, properties } };
+      });
+    }
+
+    it.each([
+      [
+        'spend-request_create without credentialType',
+        withProperty(recorded, 'spend-request_create', (properties) => {
+          delete properties.credentialType;
+        }),
+      ],
+      [
+        'a credentialType that no longer offers shared_payment_token',
+        withProperty(recorded, 'spend-request_create', (properties) => {
+          properties.credentialType = { ...properties.credentialType, enum: ['card', 'link_pay_token'] };
+        }),
+      ],
+      [
+        'no tool taking approve',
+        withProperty(recorded, 'all', (properties) => {
+          delete properties.approve;
+        }),
+      ],
+    ])('offers none of its tools when it lists %s, and the app fails to pin', async (_case, drifted) => {
+      // Rules apply by the app's catalog entry, whatever carries its listing, so a served listing stands in for the CLI.
+      const fake = new FakeMcpApp({
+        appUrl: OPEN_URL,
+        issuer: 'https://recipes.example.test',
+        allowUnauthenticated: true,
+        tools: [...recorded],
+      });
+      endpoints.use(fake.handle);
+      const created = await store.create({ name: 'Link', url: OPEN_URL, auth: 'none', catalogId: 'link' });
+      const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+      expect((await relay.pinApp(app.id)).tools.length).toBeGreaterThan(0);
+
+      fake.tools = drifted;
+      await expect(relay.pinApp(app.id)).rejects.toThrow();
+
+      expect(await store.listTools(app.id)).toEqual([]);
+      expect((await relay.listToolsForSession(app.serverKey)).tools).toEqual([]);
+    });
   });
 });

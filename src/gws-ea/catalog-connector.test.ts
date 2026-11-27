@@ -431,6 +431,58 @@ describe('Shop connector', () => {
     expect(pnpm.calls).toEqual([]);
   });
 
+  it.each([
+    ['empty', '\n'],
+    ['holding whitespace inside the secret', 'shop-client secret-sentinel\n'],
+  ])('refuses a secret file that is %s and leaves the recorded client as it was', async (_case, contents) => {
+    expect((await cli(['connectors', 'install', 'shop', '--client-id', 'gws-ea-shop-client', '--json'])).code).toBe(0);
+    const before = await readFile(policyFile, 'utf8');
+    const source = path.join(paths.configRoot, 'shop-secret');
+    await writeFile(source, contents, { mode: 0o600 });
+
+    const { code, result } = await cli([
+      'connectors',
+      'install',
+      'shop',
+      '--client-id',
+      'gws-ea-shop-client-next',
+      '--client-secret-file',
+      source,
+      '--json',
+    ]);
+
+    expect(code).not.toBe(0);
+    expect(result).toMatchObject({ error: { code: 'shop_client_secret_invalid' } });
+    expect(await readFile(policyFile, 'utf8')).toBe(before);
+    expect(await exists(path.join(paths.configRoot, 'connectors', 'shop', 'client-secret'))).toBe(false);
+  });
+
+  it('removes the stored secret when Shop is installed again with a client ID only', async () => {
+    const source = path.join(paths.configRoot, 'shop-secret');
+    await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
+    await writeFile(source, 'shop-client-secret-sentinel', { mode: 0o600 });
+    await cli(['connectors', 'install', 'shop', '--client-id', 'gws-ea-shop-client', '--client-secret-file', source]);
+    const stored = path.join(paths.configRoot, 'connectors', 'shop', 'client-secret');
+    expect(await exists(stored)).toBe(true);
+
+    const { code, result } = await cli([
+      'connectors',
+      'install',
+      'shop',
+      '--client-id',
+      'gws-ea-public-client',
+      '--json',
+    ]);
+
+    expect(code).toBe(0);
+    expect(result?.data).toMatchObject({ client_id: 'gws-ea-public-client', client_secret: false });
+    expect(await readCatalogPolicy(policyFile)).toEqual({
+      status: 'read',
+      policy: { schemaVersion: 1, link: null, shop: { clientId: 'gws-ea-public-client', clientSecretFile: null } },
+    });
+    expect(await exists(stored)).toBe(false);
+  });
+
   it('disconnects Shop on running assistants before removing the stored secret', async () => {
     await assistant('aya.example.test');
     const source = path.join(paths.configRoot, 'shop-secret');

@@ -11,6 +11,7 @@ import type { Session } from '../../types.js';
 import { EgressError, publicFetch, type EgressDependencies } from '../gws-ea-egress/fetch.js';
 import { resolveDestination } from '../gws-ea-egress/resolve.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { notifyMainToolsChanged } from './apply.js';
 import {
   catalogEntryFor,
@@ -27,6 +28,8 @@ import {
   canonicalJson,
   normalizeToolDefinition,
   sha256Hex,
+  toolDefinitionHash,
+  toolListHash,
   type ToolDefinition,
 } from './canonical.js';
 import {
@@ -795,6 +798,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         at: new Date(now()).toISOString(),
       });
       if (cleared.changed) await notifyMainToolsChanged(store);
+      await noteRulesUnmatched(app, listed.tools);
       throw new CatalogRulesUnmatchedError();
     }
     const result = await store.pinTools(app.id, {
@@ -806,6 +810,32 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     if (result.changed) await notifyMainToolsChanged(store);
     if (result.unsortedCount > 0) onToolsNeedSort?.(app.id, result.pin.listHash);
     return result;
+  }
+
+  /**
+   * Main hears once per listing, without waking, why a connected app has no tools, so it neither retries nor tells the
+   * principal the app works. The note's id names the app and the listing: the same listing again writes nothing.
+   */
+  async function noteRulesUnmatched(app: ConnectionApp, listing: readonly ToolDefinition[]): Promise<void> {
+    const listHash = toolListHash(
+      listing.map((tool) => ({ name: tool.name, definitionHash: toolDefinitionHash(tool) })),
+    );
+    try {
+      await writeNoteForMain({
+        id: `connection-rules-unmatched:${app.id}:${listHash}`,
+        timestamp: new Date(now()).toISOString(),
+        text:
+          `The app ${JSON.stringify(app.name)} is still connected, but its tools are paused: its current version no ` +
+          "longer matches what GWS-EA reviewed. They come back once the principal's operator updates GWS-EA.",
+        wake: false,
+      });
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- the tools are already withheld; a lost note must not change that */
+    } catch (error) {
+      hostLog.error('Paused app note not written', {
+        appId: app.id,
+        error: error instanceof Error ? error.name : 'unknown',
+      });
+    }
   }
 
   async function pinApp(appId: string): Promise<PinToolsResult> {

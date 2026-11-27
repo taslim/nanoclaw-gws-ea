@@ -475,14 +475,14 @@ export function resolveFinalToolUpdates(
 } {
   const matched = new Map<string, ParsedSortToolEntry>();
   const conflicted = new Set<string>();
-  for (const entry of entries) {
-    const target = expected.get(entry.name);
-    if (!target || target.definitionHash !== entry.definitionHash) continue;
-    const previous = matched.get(entry.name);
+  for (const sortedTool of entries) {
+    const target = expected.get(sortedTool.name);
+    if (!target || target.definitionHash !== sortedTool.definitionHash) continue;
+    const previous = matched.get(sortedTool.name);
     if (!previous) {
-      matched.set(entry.name, entry);
-    } else if (previous.label !== entry.label) {
-      conflicted.add(entry.name);
+      matched.set(sortedTool.name, sortedTool);
+    } else if (previous.label !== sortedTool.label) {
+      conflicted.add(sortedTool.name);
     }
   }
   const updates: ToolLabelUpdate[] = [];

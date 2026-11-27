@@ -35,7 +35,10 @@ const COMMAND_DEADLINE_MS = 30_000;
 const KILL_GRACE_MS = 2_000;
 const PENDING_FILE = 'auth.pending.json';
 
-export type DeviceSignInFailure = 'expired' | 'refused' | 'failed';
+export type DeviceSignInFailure = 'expired' | 'refused' | 'failed' | 'not_offered';
+
+/** `not_offered` when the operator stopped offering the app while its sign-in waited for approval. */
+export type DeviceSignInCompletion = 'connected' | 'not_offered' | 'not_connected';
 
 export type DeviceSignInView =
   | { readonly status: 'idle' }
@@ -51,10 +54,10 @@ export interface DeviceSignInStart {
   /** Shown in the app where the principal approves, so they can tell which assistant asks. */
   readonly clientName: string;
   /**
-   * Puts the approved pending file in place and connects the app; false when it did not, for instance because the
-   * sign-in stopped being `current` while it waited for the app's lock.
+   * Puts the approved pending file in place and connects the app; `not_connected` when it did not, for instance because
+   * the sign-in stopped being `current` while it waited for the app's lock.
    */
-  readonly complete: (pendingFile: string, current: () => boolean) => Promise<boolean>;
+  readonly complete: (pendingFile: string, current: () => boolean) => Promise<DeviceSignInCompletion>;
 }
 
 type CliLine =
@@ -257,11 +260,12 @@ class DeviceSignIn {
     // A login that ended without saying so may still have saved an approval before it stopped.
     if (!authenticated) authenticated = await statusAuthenticated(launch, this.#pendingFile);
     if (!authenticated) return this.#end(failure ?? 'expired');
-    if (await complete(this.#pendingFile, () => this.#current())) {
+    const completion = await complete(this.#pendingFile, () => this.#current());
+    if (completion === 'connected') {
       if (!this.#cancelled) this.#settle({ status: 'connected' });
       return;
     }
-    await this.#end('failed');
+    await this.#end(completion === 'not_offered' ? 'not_offered' : 'failed');
   }
 }
 

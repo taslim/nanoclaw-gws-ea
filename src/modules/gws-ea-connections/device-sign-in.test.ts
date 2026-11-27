@@ -379,6 +379,27 @@ describe('connecting Link from the page', () => {
     expect(() => process.kill(login_?.pid ?? 0, 0)).toThrow();
   });
 
+  it('connects nothing when the operator stops offering Link before the principal approves', async () => {
+    control({ login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE, token: SENTINEL_TOKEN });
+    await connectLink();
+    const app = await linkApp();
+    writePolicy({ enabled: false });
+
+    answer('approve');
+    const status = await eventually(
+      () => signInStatus(app),
+      (value) => value.status !== 'waiting',
+    );
+    const view = await request(`/connections/app/${app.id}/connect`);
+
+    expect(status).toEqual({ status: 'ended', reason: 'not_offered' });
+    expect(view.body).toContain('This app isn’t available right now.');
+    expect((await linkApp()).status).toBe('not_connected');
+    expect(await store.currentGrant(app.id)).toBeUndefined();
+    expect(fs.existsSync(authFile())).toBe(false);
+    expect(fs.existsSync(pendingFile())).toBe(false);
+  });
+
   it('starts a fresh login on Try again once the last one ended', async () => {
     control({ login: 'deny', verificationUrl: ADDRESS, phrase: PHRASE });
     await connectLink();
