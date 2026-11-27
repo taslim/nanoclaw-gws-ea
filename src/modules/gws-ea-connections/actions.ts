@@ -123,6 +123,7 @@ const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
   needs_client: 'it needs client details',
   client_refused: 'the server refused the client',
   client_unavailable: 'the assistant cannot sign in to it right now',
+  not_offered: 'the operator has not made it available on this host',
   unreachable: 'the server did not answer',
   unsupported: "the server's sign-in cannot be used",
 };

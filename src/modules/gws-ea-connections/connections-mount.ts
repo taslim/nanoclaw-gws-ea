@@ -3,6 +3,7 @@ import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import type { PrincipalPageMount, PrincipalSubpathLinkContext, PublicMount } from '../gws-ea-web/mounts.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
+import { catalogEntryFor, isConfirmedByApp, type AvailableCatalogEntry } from './catalog.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { isLiveHeldCallView } from './held-calls.js';
 import { CLIENT_DOCUMENT_PATH } from './oauth.js';
@@ -55,12 +56,14 @@ export interface ConnectionToolFact {
   readonly label: ToolLabel | 'unsorted';
   readonly summary?: string;
   readonly reason: string | null;
+  readonly confirmedByApp?: true;
 }
 
 export interface ConnectionLinkFact {
   readonly name: string;
   readonly key: string;
-  readonly host: string;
+  /** Absent for an app the host runs itself, whose stored host is a placeholder that names nothing. */
+  readonly host?: string;
   readonly origin: 'principal' | 'operator';
   readonly status: AppStatus;
   /** Present for pinned principal apps: true until the principal confirms review or after definitions change. */
@@ -69,23 +72,45 @@ export interface ConnectionLinkFact {
   readonly tools?: readonly ConnectionToolFact[];
 }
 
+export interface AvailableAppFact {
+  readonly id: string;
+  readonly name: string;
+  readonly goodFor: string;
+  readonly requirements?: string;
+  readonly signIn: 'phrase_approval' | 'sign_in_page';
+  readonly app?: { readonly name: string; readonly key: string };
+}
+
+function availableFact({ entry, app }: AvailableCatalogEntry): AvailableAppFact {
+  return {
+    id: entry.id,
+    name: entry.name,
+    goodFor: entry.goodFor,
+    ...(entry.requirements ? { requirements: entry.requirements } : {}),
+    signIn: entry.transport.kind === 'host_cli' ? 'phrase_approval' : 'sign_in_page',
+    ...(app ? { app: { name: app.name, key: app.serverKey } } : {}),
+  };
+}
+
 /** The host knows nothing of an operator server beyond its entry, so a present entry is connected. */
-export function operatorAsApp(server: OperatorServer): ConnectionLinkFact | undefined {
+export function operatorAsApp(server: OperatorServer): (ConnectionLinkFact & { readonly host: string }) | undefined {
   const host = hostOf(server.url);
   // An entry without a host reaches no server, so there is nothing of it to show.
   return host ? { name: server.key, key: server.key, host, origin: 'operator', status: 'connected' } : undefined;
 }
 
-/** Main learns which apps exist and how they stand, never an address that could carry a credential. */
+/** Never an address that carries a secret. */
 export async function connectionsLinkFacts(
   read: () => Promise<ConnectionsListing> = () => currentListing(false),
-): Promise<{ readonly apps: readonly ConnectionLinkFact[] }> {
-  const { apps, operators, pins, toolsByApp } = await read();
+): Promise<{ readonly apps: readonly ConnectionLinkFact[]; readonly available?: readonly AvailableAppFact[] }> {
+  const { apps, operators, pins, toolsByApp, available } = await read();
   return {
     apps: [
-      ...apps.map(({ id, name, serverKey, host, status }): ConnectionLinkFact => {
+      ...apps.map((app): ConnectionLinkFact => {
+        const { id, name, serverKey, host, status } = app;
         const pin = pins?.[id];
         const pinnedTools = toolsByApp?.[id];
+        const entry = catalogEntryFor(app);
         const tools =
           pin && pinnedTools
             ? pinnedTools.map((tool): ConnectionToolFact => ({
@@ -93,12 +118,13 @@ export async function connectionsLinkFacts(
                 label: tool.label ?? 'unsorted',
                 ...(tool.summary ? { summary: tool.summary } : {}),
                 reason: tool.reason,
+                ...(entry && isConfirmedByApp(entry, tool.name) ? { confirmedByApp: true as const } : {}),
               }))
             : undefined;
         return {
           name,
           key: serverKey,
-          host,
+          ...(app.transport === 'remote' ? { host } : {}),
           origin: 'principal',
           status,
           ...(pin ? { needsReview: pin.needsReview } : {}),
@@ -107,6 +133,7 @@ export async function connectionsLinkFacts(
       }),
       ...operators.flatMap((server) => operatorAsApp(server) ?? []),
     ],
+    ...(available ? { available: available.map(availableFact) } : {}),
   };
 }
 

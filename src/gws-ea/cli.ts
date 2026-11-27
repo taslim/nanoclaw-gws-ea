@@ -350,7 +350,10 @@ function parseBillingAccount(value: string | undefined): string | undefined {
 function isBusy(error: unknown): boolean {
   return (
     error instanceof GwsEaError &&
-    (error.code === 'instance_busy' || error.code === 'voice_busy' || error.code === 'registry_busy')
+    (error.code === 'instance_busy' ||
+      error.code === 'voice_busy' ||
+      error.code === 'catalog_busy' ||
+      error.code === 'registry_busy')
   );
 }
 
@@ -2526,6 +2529,13 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               : undefined,
             recordEffect,
           },
+          catalog: {
+            environment,
+            upsertEnvVars: runtime.upsertEnvVars,
+            serviceHelpers: runtime.serviceHelpers,
+            progress: (line) => presenter.line(line),
+            recordEffect,
+          },
         };
         const lifecycle = handler.command;
         run = await startRunLog({ paths, command: commandPath });
@@ -2534,6 +2544,10 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           return connectorDefinition(name)[lifecycle](lifecycleContext);
         });
         data = result;
+        const external =
+          'operator_actions' in result
+            ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
+            : [];
         if (result.name === 'web') {
           paused =
             'assistants' in result
@@ -2554,13 +2568,18 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                     argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
                   },
                 ]),
-            ...('operator_actions' in result
-              ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
-              : []),
+            ...external,
           ];
-        } else
-          actions =
-            handler.command === 'install' ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', name] }] : [];
+        } else {
+          paused = 'outcome' in result && result.outcome === 'pending';
+          let next: string | undefined;
+          if (paused) next = handler.command;
+          else if (handler.command === 'install') next = 'check';
+          actions = [
+            ...(next === undefined ? [] : [{ kind: 'command' as const, argv: ['gws-ea', 'connectors', next, name] }]),
+            ...external,
+          ];
+        }
         run.complete();
         presenter.report({
           outcome: paused ? 'paused' : 'ready',

@@ -14,11 +14,14 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
+import { catalogEntry, catalogEntryFor } from './catalog.js';
+import { deviceSignInView, type DeviceSignInView } from './device-sign-in.js';
 import { getPendingHeldCallApproval, resolveHeldCallFromWeb, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
   readListing,
   type AddRefusal,
+  type CatalogConnectOutcome,
   type ConnectRefusal,
   type ConnectionsListing,
   type SignInReturn,
@@ -31,7 +34,9 @@ import {
   type OperatorDisconnectOutcome,
 } from './operator.js';
 import {
+  autoStateText,
   humanizeToolName,
+  listedApp,
   renderConnectionsPage,
   sortToolsForDisplay,
   toolDescription,
@@ -64,6 +69,7 @@ const WRITES = [
   'add',
   'connect',
   'sign-in',
+  'catalog-connect',
   'change-client',
   'disconnect',
   'delete',
@@ -77,12 +83,14 @@ type WriteAction = (typeof WRITES)[number];
 type Route =
   | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: ListOutcome }
   | { readonly kind: 'tools-status'; readonly id: string }
+  | { readonly kind: 'sign-in-status'; readonly id: string }
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
 
 const EXACT_APP_ID = new RegExp(`^${APP_ID_PATTERN}$`, 'u');
 const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/(connect|rename|tools)$`, 'u');
 const APP_TOOLS_STATUS = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/tools-status$`, 'u');
+const APP_SIGN_IN_STATUS = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/sign-in-status$`, 'u');
 const HELD_VIEW = /^\/connections\/held\/([A-Za-z0-9_-]{4,128})$/u;
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
@@ -110,10 +118,12 @@ function isListOutcome(code: string | null): code is ListOutcome {
 const CHANGED = 'This app changed in another tab. Reload and try again.';
 const STORE_UNAVAILABLE = 'Apps can’t be loaded right now. Ask your operator.';
 const UNREACHABLE = 'The app didn’t respond. Check the address and try again.';
+const CATALOG_UNREACHABLE = 'The app didn’t respond. Try again in a little while.';
 const UNSUPPORTED = 'This app’s sign-in method isn’t supported.';
 const HOST_IN_USE = 'Another app already uses this address. Remove it first.';
 const OPERATOR_NEEDED = 'Apps can’t be added or connected right now. Ask your operator.';
 const CLIENT_UNAVAILABLE = 'Can’t sign in to this app right now. Try again in a few minutes.';
+const NOT_OFFERED = 'This app isn’t available right now. Reload the page.';
 
 function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnected'>): {
   readonly status: number;
@@ -135,7 +145,7 @@ function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnect
 
 /** A refusal that a reload settles is a conflict; any other is the request's own fault. */
 function connectRefusalStatus(reason: ConnectRefusal): number {
-  return reason === 'wrong_method' || reason === 'already_connected' ? 409 : 400;
+  return reason === 'wrong_method' || reason === 'already_connected' || reason === 'not_offered' ? 409 : 400;
 }
 
 function addMessage(reason: AddRefusal): string {
@@ -185,6 +195,8 @@ function connectMessage(reason: ConnectRefusal): string {
       return 'The sign-in service didn’t accept your assistant’s client. Reload the page to enter client details.';
     case 'client_unavailable':
       return CLIENT_UNAVAILABLE;
+    case 'not_offered':
+      return NOT_OFFERED;
     case 'unreachable':
       return UNREACHABLE;
     case 'unsupported':
@@ -200,6 +212,7 @@ function storeFailure(error: ConnectionsStoreError): { readonly status: number; 
     case 'duplicate_name':
       return { status: 400, message: addMessage('duplicate_name') };
     case 'duplicate_host':
+    case 'duplicate_catalog_entry':
       return { status: 400, message: HOST_IN_USE };
     case 'invalid_details':
       return { status: 400, message: addMessage('invalid_name') };
@@ -226,6 +239,8 @@ function readRoute(method: string | undefined, url: string | undefined): Route |
     if (callback) return { kind: 'callback', host: callback[1], query: new URLSearchParams(search ?? '') };
     const statusMatch = search === undefined ? APP_TOOLS_STATUS.exec(pathname) : null;
     if (statusMatch) return { kind: 'tools-status', id: statusMatch[1] };
+    const signInMatch = search === undefined ? APP_SIGN_IN_STATUS.exec(pathname) : null;
+    if (signInMatch) return { kind: 'sign-in-status', id: signInMatch[1] };
   }
   if (method !== 'GET' && method !== 'HEAD') return undefined;
   if (pathname === '/connections') {
@@ -318,7 +333,7 @@ interface WriteResult {
 }
 
 async function write(
-  action: Exclude<WriteAction, 'sign-in' | 'held-decision'>,
+  action: Exclude<WriteAction, 'sign-in' | 'catalog-connect' | 'held-decision'>,
   data: Record<string, unknown>,
   operations: ConnectionOperations,
   operatorDependencies: OperatorDisconnectDependencies,
@@ -426,6 +441,7 @@ function wantsJson(acceptHeader: string | string[] | undefined): boolean {
 /** Safe display metadata for live polling on the tool-approvals screen; never exposes secrets or raw server prompts. */
 function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]) {
   const sorted = sortToolsForDisplay(tools);
+  const entry = catalogEntryFor(app);
   const hasUnsorted =
     app.status === 'connected' && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
   return {
@@ -443,8 +459,23 @@ function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, to
       label: tool.label,
       unsettled: tool.unsettled,
       description: toolDescription(tool),
+      autoText: autoStateText(entry, tool.name),
     })),
   };
+}
+
+/** Never anything the CLI saved. */
+function signInStatusPayload(app: ConnectionApp, view: DeviceSignInView): Readonly<Record<string, string>> {
+  if (app.status === 'connected') return { status: 'connected' };
+  switch (view.status) {
+    case 'waiting':
+      return { status: 'waiting', verificationUrl: view.verificationUrl, phrase: view.phrase };
+    case 'ended':
+      return { status: 'ended', reason: view.reason };
+    case 'idle':
+    case 'connected':
+      return { status: 'idle' };
+  }
 }
 
 /** A sign-in start answers JSON: the page opens the server's sign-in address itself. */
@@ -468,6 +499,50 @@ async function startSignIn(
     );
     if (started.status === 'started') return sendJson(response, 200, { authorizationUrl: started.authorizationUrl });
     sendJson(response, connectRefusalStatus(started.reason), { error: connectMessage(started.reason) });
+  } catch (error) {
+    if (!(error instanceof ConnectionsStoreError)) throw error;
+    const failure = storeFailure(error);
+    sendJson(response, failure.status, { error: failure.message });
+  }
+}
+
+function catalogConnectReply(outcome: CatalogConnectOutcome): {
+  readonly status: number;
+  readonly body: Readonly<Record<string, string>>;
+} {
+  switch (outcome.status) {
+    case 'started':
+      return { status: 200, body: { authorizationUrl: outcome.authorizationUrl } };
+    case 'connect_view':
+    case 'device_sign_in':
+      return { status: 200, body: { location: viewLocation({ kind: 'connect', id: outcome.app.id }) } };
+    case 'refused':
+      return { status: connectRefusalStatus(outcome.reason), body: { error: connectMessage(outcome.reason) } };
+    case 'add_refused':
+      // A catalog entry has no address the principal could check, so an unreachable server is only a retry.
+      return {
+        status: 400,
+        body: { error: outcome.reason === 'unreachable' ? CATALOG_UNREACHABLE : addMessage(outcome.reason) },
+      };
+    case 'not_offered':
+      return { status: 409, body: { error: NOT_OFFERED } };
+  }
+}
+
+/** Like a sign-in start, it answers JSON: where the page goes next, the server's sign-in or the app's Connect view. */
+async function connectCatalogEntry(
+  response: ServerResponse,
+  data: Record<string, unknown>,
+  principal: string,
+  operations: ConnectionOperations | undefined,
+): Promise<void> {
+  only(data, ['entry']);
+  const entry = catalogEntry(text(data, 'entry'));
+  if (!entry) throw new InvalidSubmission();
+  if (!operations) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+  try {
+    const { status, body } = catalogConnectReply(await operations.connectCatalogEntry(entry, principal));
+    sendJson(response, status, body);
   } catch (error) {
     if (!(error instanceof ConnectionsStoreError)) throw error;
     const failure = storeFailure(error);
@@ -588,6 +663,18 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
           throw error;
         }
       }
+      if (route.kind === 'sign-in-status') {
+        if (!operations) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+        try {
+          const app = await operations.store.get(route.id);
+          if (app.transport !== 'host_cli') return refuse(response);
+          return sendJson(response, 200, signInStatusPayload(app, deviceSignInView(app.id)));
+        } catch (error) {
+          if (!(error instanceof ConnectionsStoreError)) throw error;
+          if (error.reason === 'app_not_found') return refuse(response);
+          return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+        }
+      }
       if (route.kind === 'callback') {
         if (!operations) return sendReturn(response, 'failed');
         const outcome = await operations.finishSignIn(route.host, principal, route.query);
@@ -599,6 +686,8 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       }
       if (route.kind === 'write' && route.action === 'sign-in')
         return startSignIn(response, data ?? {}, principal, operations);
+      if (route.kind === 'write' && route.action === 'catalog-connect')
+        return connectCatalogEntry(response, data ?? {}, principal, operations);
       if (route.kind === 'write' && route.action === 'tool-label' && wantsJson(request.headers.accept)) {
         const body = data ?? {};
         only(body, ['id', 'tool', 'label', 'definitionHash']);
@@ -628,7 +717,13 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         status: 200,
         saved: false,
       };
-      if (route.kind === 'write' && route.action !== 'sign-in' && route.action !== 'held-decision' && data) {
+      if (
+        route.kind === 'write' &&
+        route.action !== 'sign-in' &&
+        route.action !== 'catalog-connect' &&
+        route.action !== 'held-decision' &&
+        data
+      ) {
         if (!operations) result = { ...result, outcome: STORE_UNAVAILABLE, status: 503 };
         else {
           try {
@@ -674,7 +769,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
       let status = result.status;
       if (route.kind === 'view' && (view.kind === 'connect' || view.kind === 'rename' || view.kind === 'tools')) {
         if (!listing.listed) status = 503;
-        else if (!listing.apps.some((app) => app.id === view.id)) status = 404;
+        else if (!listedApp(listing, view.id)) status = 404;
       }
       const outcome = route.kind === 'view' && !listing.listed && !result.outcome ? STORE_UNAVAILABLE : result.outcome;
       const nonce = pageNonce();
@@ -698,6 +793,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                   operatorDisconnect: operations !== undefined && operatorDependencies.credentials !== undefined,
                   ...(result.retryServer === undefined ? {} : { retryServer: result.retryServer }),
                   ...(toolReview === undefined ? {} : { toolReview }),
+                  ...(view.kind === 'connect' ? { deviceSignIn: deviceSignInView(view.id) } : {}),
                 },
                 shell,
                 nonce,

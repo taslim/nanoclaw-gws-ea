@@ -15,6 +15,7 @@ import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { notifyMainToolsChanged } from './apply.js';
 import type { ToolDefinition } from './canonical.js';
+import { catalogEntryFor, type CatalogEntry } from './catalog.js';
 import {
   buildSortPrompt,
   normalizeToolSummary,
@@ -113,6 +114,7 @@ interface PendingSort {
   readonly threadId: string;
   readonly sorterVersion: string;
   readonly expected: ReadonlyMap<string, { readonly definitionHash: string; readonly definition: ToolDefinition }>;
+  readonly entry: CatalogEntry | undefined;
   readonly waiters: Array<() => void>;
   readonly isActive: () => boolean;
   readonly claim: () => boolean;
@@ -197,6 +199,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
     let pin: Awaited<ReturnType<ConnectionsStore['getPin']>>;
     let allTools: readonly PinnedAppTool[];
     let grantGeneration: number | undefined;
+    let entry: CatalogEntry | undefined;
     try {
       const snapshot = await store.readAppTools(job.appId);
       if (!snapshot || snapshot.app.status !== 'connected' || !snapshot.pin || snapshot.grantGeneration === undefined) {
@@ -205,6 +208,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       pin = snapshot.pin;
       allTools = snapshot.tools;
       grantGeneration = snapshot.grantGeneration;
+      entry = catalogEntryFor(snapshot.app);
     } catch (error) {
       if (error instanceof ConnectionsStoreError) return;
       throw error;
@@ -271,6 +275,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
         threadId,
         sorterVersion: version,
         expected,
+        entry,
         waiters,
         isActive: () => !claimed && !stopped && !dependencies.signal?.aborted,
         claim: () => {
@@ -457,7 +462,7 @@ export function createAppToolSorter(dependencies: AppToolSorterDependencies): Ap
       }
 
       const at = new Date(now()).toISOString();
-      const { updates, missing } = resolveFinalToolUpdates(pending.expected, entries);
+      const { updates, missing } = resolveFinalToolUpdates(pending.expected, entries, pending.entry);
       let labelsCommitted = false;
       let sortFinished = false;
       try {

@@ -34,7 +34,7 @@ import {
   type AppRelay,
   type HoldCallInput,
 } from './relay.js';
-import type { ConnectionApp, ConnectionsStore } from './store.js';
+import { HOST_CLI_DOMAIN, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeToolDefinition } from './testing/oauth-server.js';
 import { testConnectionsStore } from './testing/store.js';
 
@@ -58,6 +58,7 @@ const CHECKOUT_TOOL: FakeToolDefinition = {
 
 let endpoints: FakeEndpoints;
 let store: ConnectionsStore;
+let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let relay: AppRelay;
 let session: Session;
 let clock: number;
@@ -65,7 +66,7 @@ let heldCalls: HoldCallInput[];
 let sortNotifications: { appId: string; listHash: string }[];
 
 beforeAll(async () => {
-  endpoints = await startFakeEndpoints(['mcp.bistro.example.test', 'recipes.example.test']);
+  endpoints = await startFakeEndpoints(['mcp.bistro.example.test', 'recipes.example.test', 'mcp.shop.com']);
 });
 afterAll(async () => {
   await endpoints.close();
@@ -78,7 +79,7 @@ beforeEach(async () => {
   sortNotifications = [];
   fs.rmSync(ROOT, { recursive: true, force: true });
   fs.mkdirSync(ROOT, { recursive: true });
-  ({ store } = testConnectionsStore(path.join(ROOT, 'connections')));
+  ({ store, raw } = testConnectionsStore(path.join(ROOT, 'connections')));
   await runMigrations(await initTestDb());
   await seedMain('UTC');
   session = await mainSession();
@@ -250,6 +251,54 @@ describe('host relay core', () => {
     expect(fake.toolCalls).toEqual([{ name: 'search_menu', arguments: { query: 'pasta' }, bearer: SENTINEL_ACCESS }]);
     expect(endpoints.requests.filter((r) => r.method === 'GET' && r.path === '/mcp')).toEqual([]);
     expect(await store.recentCompletedResults(app.id, 1)).toHaveLength(1);
+  });
+
+  it('sends a call only under the approved definition, so a changed header mirroring is refused, not resent', async () => {
+    const lookup = (header: string): FakeToolDefinition => ({
+      name: 'lookup_order',
+      description: 'Look up an order in a delivery region.',
+      inputSchema: {
+        type: 'object',
+        properties: { region: { type: 'string', 'x-mcp-header': header } },
+        required: ['region'],
+      },
+      annotations: { readOnlyHint: true },
+    });
+    const fake = new FakeMcpApp({
+      appUrl: FOOD_URL,
+      issuer: 'https://mcp.bistro.example.test',
+      protocol: '2026-07-28',
+      tools: [lookup('Region')],
+    });
+    fake.accessTokens.add(SENTINEL_PASTED);
+    endpoints.use(fake.handle);
+    const app = await connectPastedApp();
+    const { tools } = await relay.pinApp(app.id);
+    await store.applyToolLabels(
+      app.id,
+      tools.map((tool) => ({
+        name: tool.name,
+        definitionHash: tool.definitionHash,
+        label: 'just_do' as const,
+        source: 'principal' as const,
+        reason: 'Allowed for this test',
+      })),
+    );
+    const call = (region: string) =>
+      relay.callTool({
+        serverKey: app.serverKey,
+        toolName: 'lookup_order',
+        args: { region },
+        session,
+        requestId: `req-${randomUUID()}`,
+      });
+    expect(await call('north')).toMatchObject({ status: 'completed' });
+
+    fake.tools = [lookup('Area')];
+    const outcome = await call('south');
+
+    expect(outcome.status).not.toBe('completed');
+    expect(fake.toolCalls.map((recorded) => recorded.arguments)).toEqual([{ region: 'north' }]);
   });
 
   it('refuses calls from any non-main agent group before touching the app', async () => {
@@ -1282,7 +1331,7 @@ describe('host relay core', () => {
     expect(exact50.tools).toHaveLength(50);
 
     totalPages = 51;
-    await expect(relay.pinApp(app.id)).rejects.toThrow(/exceeded 50 pages/);
+    await expect(relay.pinApp(app.id)).rejects.toThrow(/exceeded listMaxPages \(50\)/);
     expect(await store.listTools(app.id)).toHaveLength(50);
     fake.mcpOverride = undefined;
 
@@ -1781,5 +1830,288 @@ describe('host relay core', () => {
     } finally {
       await dialFlipRelay.closeAll();
     }
+  });
+});
+
+describe('catalog rules at the relay', () => {
+  const SHOP_URL = 'https://mcp.shop.com/';
+  const CONTEXT =
+    'A one-off payment for the conference ticket the principal asked for, at the price shown on the page.';
+  const ALLOWED_CREATE = {
+    credentialType: 'shared_payment_token',
+    amount: 4_500,
+    context: CONTEXT,
+    lineItem: ['name:Conference ticket'],
+    total: 'type:total,display_text:Total,amount:4500',
+    requestApproval: true,
+    test: false,
+    metadata: [],
+  };
+
+  async function connectLink(): Promise<ConnectionApp> {
+    const created = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+    return (await store.connect(created.id, created.version, { kind: 'none' })).app;
+  }
+
+  function relayRows(): { readonly calls: number; readonly invocations: number } {
+    return raw((db) => ({
+      calls: db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM relay_calls').get()!.n,
+      invocations: db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM relay_invocations').get()!.n,
+    }));
+  }
+
+  it("refuses retrieving a spend request's card before anything reaches Link, and main sees why", async () => {
+    const app = await connectLink();
+
+    const response = await invokeAction({
+      op: 'tools/call',
+      serverKey: app.serverKey,
+      tool: 'spend-request_retrieve',
+      arguments: { id: 'lsrq_123', include: ['card'] },
+    });
+
+    expect(response.ok).toBe(true);
+    expect(response.data).toMatchObject({
+      status: 'unsent',
+      reason: 'refused_argument',
+      text: expect.stringContaining('"include"'),
+    });
+    expect(relayRows()).toEqual({ calls: 0, invocations: 0 });
+    expect(heldCalls).toEqual([]);
+  });
+
+  it.each([
+    ['an approval it claims', 'spend-request_create', { ...ALLOWED_CREATE, approve: true }, 'approve'],
+    ['an approval detail', 'spend-request_create', { ...ALLOWED_CREATE, approvalDetail: 'Approved' }, 'approvalDetail'],
+    [
+      'an approval policy',
+      'mpp_pay',
+      { url: 'https://api.merchant.example.test/pay', useApprovalPolicy: true },
+      'useApprovalPolicy',
+    ],
+    [
+      'a file to write the card to',
+      'spend-request_retrieve',
+      { id: 'lsrq_123', outputFile: '/tmp/card.json' },
+      'outputFile',
+    ],
+    ['overwriting that file', 'spend-request_retrieve', { id: 'lsrq_123', force: false }, 'force'],
+    ['a card credential', 'spend-request_create', { ...ALLOWED_CREATE, credentialType: 'card' }, 'credentialType'],
+    [
+      'a Link Pay Token, retrievable only as card data',
+      'spend-request_create',
+      { ...ALLOWED_CREATE, credentialType: 'link_pay_token' },
+      'credentialType',
+    ],
+    [
+      'no credential type, which Link reads as a card',
+      'spend-request_create',
+      Object.fromEntries(Object.entries(ALLOWED_CREATE).filter(([key]) => key !== 'credentialType')),
+      'credentialType',
+    ],
+    ['an address that is not https', 'mpp_pay', { url: 'http://api.merchant.example.test/pay' }, 'url'],
+  ])('refuses %s before anything is stored or sent', async (_case, tool, args, argument) => {
+    const app = await connectLink();
+    const requestId = `req-${randomUUID()}`;
+
+    const outcome = await relay.callTool({ serverKey: app.serverKey, toolName: tool, args, session, requestId });
+
+    expect(outcome).toMatchObject({ status: 'unsent', reason: 'refused_argument' });
+    expect(outcome.status === 'unsent' && outcome.text).toContain(`"${argument}"`);
+    expect(relayRows()).toEqual({ calls: 0, invocations: 0 });
+    expect(heldCalls).toEqual([]);
+  });
+
+  it("offers none of a Shop listing's tools once a command a rule names is gone, and the app fails to pin", async () => {
+    const tool = (name: string): FakeToolDefinition => ({
+      name,
+      description: `Shop ${name.replaceAll('_', ' ')}.`,
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    });
+    const fake = new FakeMcpApp({
+      appUrl: SHOP_URL,
+      issuer: 'https://mcp.shop.com',
+      allowUnauthenticated: true,
+      tools: [
+        tool('search_catalog'),
+        tool('complete_checkout'),
+        tool('create_spend_request'),
+        tool('get_spend_request'),
+      ],
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'Shop', url: SHOP_URL, auth: 'none', catalogId: 'shop' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+
+    const pinned = await relay.pinApp(app.id);
+    expect(pinned.tools.map((entry) => entry.name)).toEqual(['complete_checkout', 'search_catalog']);
+
+    fake.tools = [tool('search_catalog'), tool('complete_checkout'), tool('create_spend_request')];
+    await expect(relay.pinApp(app.id)).rejects.toThrow();
+
+    expect(await store.listTools(app.id)).toEqual([]);
+    expect((await relay.listToolsForSession(app.serverKey)).tools).toEqual([]);
+    const outcome = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_catalog',
+      args: { id: 'p-1' },
+      session,
+      requestId: `req-${randomUUID()}`,
+    });
+    expect(outcome).toMatchObject({ status: 'unsent', reason: 'unknown_tool' });
+    expect(fake.toolCalls).toEqual([]);
+  });
+
+  it('keeps a withheld command pinned before the app was known as Shop out of the listing, and never sends it', async () => {
+    const tool = (name: string): FakeToolDefinition => ({
+      name,
+      description: `Shop ${name.replaceAll('_', ' ')}.`,
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    });
+    const listing = ['search_catalog', 'complete_checkout', 'create_spend_request', 'get_spend_request'].map(tool);
+    const fake = new FakeMcpApp({
+      appUrl: SHOP_URL,
+      issuer: 'https://mcp.shop.com',
+      allowUnauthenticated: true,
+      tools: listing,
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'My Shop', url: SHOP_URL, auth: 'none' });
+    expect(created.catalogId).toBeNull();
+    const { app, generation } = await store.connect(created.id, created.version, { kind: 'none' });
+    const pinned = await store.pinTools(app.id, {
+      instructions: null,
+      tools: listing,
+      expectedGrantGeneration: generation,
+      at: new Date(clock).toISOString(),
+    });
+    await store.applyToolLabels(
+      app.id,
+      pinned.tools.map((entry) => ({
+        name: entry.name,
+        definitionHash: entry.definitionHash,
+        label: 'just_do' as const,
+        source: 'principal' as const,
+        reason: 'Allowed for this test',
+      })),
+    );
+    const call = (toolName: string) =>
+      relay.callTool({
+        serverKey: app.serverKey,
+        toolName,
+        args: { id: 'sr-1' },
+        session,
+        requestId: `req-${randomUUID()}`,
+      });
+
+    const withheld = await call('get_spend_request');
+    const offered = await call('search_catalog');
+    const listed = await relay.listToolsForSession(app.serverKey);
+
+    expect(withheld).toMatchObject({ status: 'unsent', reason: 'unknown_tool' });
+    expect(offered).toMatchObject({ status: 'completed' });
+    expect(fake.toolCalls.map((recorded) => recorded.name)).toEqual(['search_catalog']);
+    expect(listed.tools.map((entry) => entry.name).sort()).toEqual(['complete_checkout', 'search_catalog']);
+  });
+
+  function mainNoteTexts(prefix: string): string[] {
+    const file = inboundDbPath(session.agent_group_id, session.id);
+    if (!fs.existsSync(file)) return [];
+    const db = new Database(file, { readonly: true });
+    try {
+      return db
+        .prepare<[string], { content: string }>('SELECT content FROM messages_in WHERE id LIKE ?')
+        .all(`${prefix}%`)
+        .map((row) => (JSON.parse(row.content) as { text: string }).text);
+    } finally {
+      db.close();
+    }
+  }
+
+  it('tells main once, without an address, that the app’s tools are paused until the operator updates', async () => {
+    const tool = (name: string): FakeToolDefinition => ({
+      name,
+      description: `Shop ${name.replaceAll('_', ' ')}.`,
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    });
+    const fake = new FakeMcpApp({
+      appUrl: SHOP_URL,
+      issuer: 'https://mcp.shop.com',
+      allowUnauthenticated: true,
+      tools: [tool('search_catalog'), tool('create_spend_request')],
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'Shop', url: SHOP_URL, auth: 'none', catalogId: 'shop' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+
+    await expect(relay.pinApp(app.id)).rejects.toThrow();
+    await expect(relay.pinApp(app.id)).rejects.toThrow();
+
+    const notes = mainNoteTexts('connection-rules-unmatched:');
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('"Shop"');
+    expect(notes[0]).toContain('paused');
+    expect(notes[0]).toContain('operator');
+    for (const leaked of ['http', 'mcp.shop.com', HOST_CLI_DOMAIN]) expect(notes[0]).not.toContain(leaked);
+  });
+
+  describe('a recorded Link listing that no longer matches the rules', () => {
+    const recorded = (
+      JSON.parse(fs.readFileSync(path.join(import.meta.dirname, 'testing', 'link-1.6.0-tools.json'), 'utf8')) as {
+        readonly tools: readonly FakeToolDefinition[];
+      }
+    ).tools;
+
+    function withProperty(
+      tools: readonly FakeToolDefinition[],
+      toolName: string,
+      change: (properties: Record<string, Record<string, unknown>>) => void,
+    ): FakeToolDefinition[] {
+      return tools.map((entry) => {
+        if (toolName !== 'all' && entry.name !== toolName) return entry;
+        const properties = structuredClone({ ...entry.inputSchema.properties });
+        change(properties);
+        return { ...entry, inputSchema: { ...entry.inputSchema, properties } };
+      });
+    }
+
+    it.each([
+      [
+        'spend-request_create without credentialType',
+        withProperty(recorded, 'spend-request_create', (properties) => {
+          delete properties.credentialType;
+        }),
+      ],
+      [
+        'a credentialType that no longer offers shared_payment_token',
+        withProperty(recorded, 'spend-request_create', (properties) => {
+          properties.credentialType = { ...properties.credentialType, enum: ['card', 'link_pay_token'] };
+        }),
+      ],
+      [
+        'no tool taking approve',
+        withProperty(recorded, 'all', (properties) => {
+          delete properties.approve;
+        }),
+      ],
+    ])('offers none of its tools when it lists %s, and the app fails to pin', async (_case, drifted) => {
+      // Rules apply by the app's catalog entry, whatever carries its listing, so a served listing stands in for the CLI.
+      const fake = new FakeMcpApp({
+        appUrl: OPEN_URL,
+        issuer: 'https://recipes.example.test',
+        allowUnauthenticated: true,
+        tools: [...recorded],
+      });
+      endpoints.use(fake.handle);
+      const created = await store.create({ name: 'Link', url: OPEN_URL, auth: 'none', catalogId: 'link' });
+      const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+      expect((await relay.pinApp(app.id)).tools.length).toBeGreaterThan(0);
+
+      fake.tools = drifted;
+      await expect(relay.pinApp(app.id)).rejects.toThrow();
+
+      expect(await store.listTools(app.id)).toEqual([]);
+      expect((await relay.listToolsForSession(app.serverKey)).tools).toEqual([]);
+    });
   });
 });

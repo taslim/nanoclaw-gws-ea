@@ -20,6 +20,7 @@ import { canonicalJson, normalizeToolDefinition, sha256Hex, toolListHash, type T
 import { ConnectionsKey } from './key.js';
 
 export type AppAuth = 'none' | 'oauth' | 'token';
+export type AppTransport = 'remote' | 'host_cli';
 export type AppStatus = 'connected' | 'needs_reconnecting' | 'not_connected';
 export type ToolLabel = 'ask_first' | 'just_do';
 export type ToolLabelSource = 'sorter' | 'floor' | 'principal' | 'approved_request' | 'fallback';
@@ -139,7 +140,13 @@ export interface RecentRelayResult {
   readonly updatedAt: string;
 }
 export type ConnectionsStoreReason =
-  'store_unavailable' | 'app_not_found' | 'app_changed' | 'duplicate_name' | 'duplicate_host' | 'invalid_details';
+  | 'store_unavailable'
+  | 'app_not_found'
+  | 'app_changed'
+  | 'duplicate_name'
+  | 'duplicate_host'
+  | 'duplicate_catalog_entry'
+  | 'invalid_details';
 
 export class ConnectionsStoreError extends Error {
   constructor(readonly reason: ConnectionsStoreReason) {
@@ -168,14 +175,41 @@ export interface ConnectionApp {
   /** The principal entered the client's details, so they may change them; a registration made for the app is not theirs. */
   readonly clientEntered: boolean;
   readonly status: AppStatus;
+  readonly transport: AppTransport;
+  readonly catalogId: string | null;
   readonly version: number;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
 
 export type NewApp =
-  | { readonly name: string; readonly url: string; readonly auth: 'oauth'; readonly issuer: string }
-  | { readonly name: string; readonly url: string; readonly auth: 'none' | 'token' };
+  | {
+      readonly name: string;
+      readonly url: string;
+      readonly auth: 'oauth';
+      readonly issuer: string;
+      readonly transport?: 'remote';
+      readonly catalogId?: string;
+    }
+  | {
+      readonly name: string;
+      readonly url: string;
+      readonly auth: 'none' | 'token';
+      readonly transport?: 'remote';
+      readonly catalogId?: string;
+    }
+  /** The host runs it and holds its credentials outside the store, so it has no address and no secret here. */
+  | { readonly name: string; readonly transport: 'host_cli'; readonly catalogId: string };
+
+/**
+ * A host-run app's placeholder keeps `url` and `host` present and unique, and an older release reads the row as a
+ * remote app it cannot reach.
+ */
+export const HOST_CLI_DOMAIN = 'host-cli.invalid';
+
+export function isHostCliHost(host: string): boolean {
+  return host === HOST_CLI_DOMAIN || host.endsWith(`.${HOST_CLI_DOMAIN}`);
+}
 
 interface GrantFacts {
   readonly appId: string;
@@ -419,7 +453,7 @@ CREATE TABLE IF NOT EXISTS meta (
 const APP_COLUMNS = `a.id, a.server_key AS serverKey, a.name, a.url, a.host, a.auth, a.issuer,
   a.client IS NOT NULL AS hasClient, a.client_entered AS clientEntered,
   CASE g.state WHEN 'live' THEN 'connected' WHEN 'refused' THEN 'needs_reconnecting' ELSE 'not_connected' END AS status,
-  a.version, a.created_at AS createdAt, a.updated_at AS updatedAt`;
+  a.transport, a.catalog_id AS catalogId, a.version, a.created_at AS createdAt, a.updated_at AS updatedAt`;
 const APP_FROM = 'apps a LEFT JOIN grants g ON g.app_id = a.id';
 
 interface AppRow extends Omit<ConnectionApp, 'hasClient' | 'clientEntered'> {
@@ -620,6 +654,13 @@ function nameOf(value: string): { name: string; key: string } {
   if (!name || name.length > NAME_MAX || hasControlCharacters(name)) invalid();
   return { name, key: name.normalize('NFKC').toLowerCase() };
 }
+/** A catalog id is a DNS label, so it can name a host-run app's placeholder host. */
+const CATALOG_ID = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+function catalogIdOf(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !CATALOG_ID.test(value)) invalid();
+  return value;
+}
 function httpsUrl(value: string): URL {
   let url: URL;
   try {
@@ -685,11 +726,20 @@ export class ConnectionsStore {
     });
   }
 
+  /** Columns are only ever added, so no rebuild or foreign-key cascade can reach an app's grants, pins or labels. */
   private ensureSchema(db: Database.Database): void {
     const columns = db.prepare<[], { name: string }>('PRAGMA table_info(app_tools)').all();
     if (!columns.some((col) => col.name === 'summary')) {
       db.exec('ALTER TABLE app_tools ADD COLUMN summary TEXT');
     }
+    const appColumns = db.prepare<[], { name: string }>('PRAGMA table_info(apps)').all();
+    if (!appColumns.some((col) => col.name === 'transport'))
+      db.exec(
+        "ALTER TABLE apps ADD COLUMN transport TEXT NOT NULL DEFAULT 'remote' CHECK(transport IN ('remote','host_cli'))",
+      );
+    if (!appColumns.some((col) => col.name === 'catalog_id'))
+      db.exec("ALTER TABLE apps ADD COLUMN catalog_id TEXT CHECK(transport = 'remote' OR catalog_id IS NOT NULL)");
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_catalog_id ON apps(catalog_id) WHERE catalog_id IS NOT NULL');
   }
 
   private async use<T>(operation: (db: Database.Database) => T | Promise<T>): Promise<T> {
@@ -806,27 +856,48 @@ export class ConnectionsStore {
     });
   }
 
-  private assertDistinct(db: Database.Database, field: 'name_key' | 'host', value: string, id = ''): void {
+  private assertDistinct(
+    db: Database.Database,
+    field: 'name_key' | 'host' | 'catalog_id',
+    value: string,
+    id = '',
+  ): void {
     if (db.prepare(`SELECT 1 FROM apps WHERE ${field} = ? AND id != ?`).get(value, id))
-      throw new ConnectionsStoreError(field === 'host' ? 'duplicate_host' : 'duplicate_name');
+      throw new ConnectionsStoreError(
+        field === 'host' ? 'duplicate_host' : field === 'catalog_id' ? 'duplicate_catalog_entry' : 'duplicate_name',
+      );
   }
 
   /** Stored Not connected; credentials arrive later through connect or sign-in. */
   async create(spec: NewApp): Promise<ConnectionApp> {
     const { name, key } = nameOf(spec.name);
-    const url = httpsUrl(spec.url);
-    if (!['none', 'oauth', 'token'].includes(spec.auth)) invalid();
-    const issuer = spec.auth === 'oauth' ? httpsUrl(spec.issuer).href : null;
+    const catalogId = catalogIdOf(spec.catalogId);
+    let url: URL;
+    let auth: AppAuth;
+    let issuer: string | null = null;
+    if (spec.transport === 'host_cli') {
+      if (catalogId === null) invalid();
+      url = new URL(`https://${catalogId}.${HOST_CLI_DOMAIN}/`);
+      auth = 'none';
+    } else {
+      url = httpsUrl(spec.url);
+      if (!['none', 'oauth', 'token'].includes(spec.auth)) invalid();
+      auth = spec.auth;
+      if (spec.auth === 'oauth') issuer = httpsUrl(spec.issuer).href;
+    }
+    const transport: AppTransport = spec.transport ?? 'remote';
     return this.use((db) =>
       db
         .transaction(() => {
           this.assertDistinct(db, 'name_key', key);
+          if (catalogId !== null) this.assertDistinct(db, 'catalog_id', catalogId);
           this.assertDistinct(db, 'host', url.hostname);
           const id = randomUUID();
           const at = new Date().toISOString();
           db.prepare(
-            `INSERT INTO apps (id, server_key, name, name_key, url, host, auth, issuer, client, version, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)`,
+            `INSERT INTO apps (id, server_key, name, name_key, url, host, auth, issuer, client, transport, catalog_id,
+                version, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?)`,
           ).run(
             id,
             `app_${randomBytes(6).toString('hex')}`,
@@ -834,8 +905,10 @@ export class ConnectionsStore {
             key,
             url.href,
             url.hostname,
-            spec.auth,
+            auth,
             issuer,
+            transport,
+            catalogId,
             at,
             at,
           );
@@ -1381,6 +1454,13 @@ export class ConnectionsStore {
   async discardSignIn(claim: Pick<ClaimedSignIn, 'appId' | 'stateHash'>): Promise<void> {
     await this.use((db) => {
       db.prepare('DELETE FROM sign_ins WHERE app_id = ? AND state_hash = ?').run(claim.appId, claim.stateHash);
+    });
+  }
+
+  /** Every pending sign-in for the app, claimed or not; a claimed one then completes as expired. */
+  async discardSignIns(appId: string): Promise<void> {
+    await this.use((db) => {
+      db.prepare('DELETE FROM sign_ins WHERE app_id = ?').run(appId);
     });
   }
 

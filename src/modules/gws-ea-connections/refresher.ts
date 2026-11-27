@@ -74,6 +74,7 @@ export interface ConnectionsRefresher {
    * expired (or when `forceRenew` is set). Returns undefined for apps without auth or when no usable token exists.
    */
   ensureToken(appId: string, options?: { readonly forceRenew?: boolean }): Promise<UsableToken | undefined>;
+  refuse(appId: string, generation: number): Promise<void>;
 }
 
 type OAuthGrant = Extract<LiveGrant, { kind: 'oauth' }>;
@@ -181,7 +182,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   }
 
   async function endRefused(app: ConnectionApp, generation: number, code: TerminalCode): Promise<void> {
-    unstored.delete(app.id);
+    // A refusal for another generation leaves a held rotation for renew to store.
+    if (unstored.get(app.id)?.generation === generation) unstored.delete(app.id);
     if (!(await store.markRefused(app.id, generation))) return;
     log.warn('App needs reconnecting', { appId: app.id, code });
     await attempt(app.id, 'Could not clean up refused app state', 'failed', async () => {
@@ -369,6 +371,19 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         await applyStore();
         await dependencies.onTick?.();
       }
+    },
+
+    refuse(appId: string, generation: number): Promise<void> {
+      return withAppLock(appId, async () => {
+        let app: ConnectionApp;
+        try {
+          app = await store.get(appId);
+        } catch (error) {
+          if (error instanceof ConnectionsStoreError && error.reason === 'app_not_found') return;
+          throw error;
+        }
+        await endRefused(app, generation, 'grant_refused');
+      });
     },
 
     async ensureToken(

@@ -141,6 +141,25 @@ export async function startFakeEndpoints(hosts: readonly string[]): Promise<Fake
   };
 }
 
+/**
+ * A 2025 server without sign-in or tools: it answers `initialize`, takes notifications and knows no other method,
+ * `server/discover` included.
+ */
+export function legacyMcpReply(
+  request: FakeRequest,
+  serverInfo: { readonly name: string; readonly title?: string; readonly version: string },
+): FakeReply {
+  const message = JSON.parse(request.body) as { id?: number | string; method?: string };
+  if (message.id === undefined) return { status: 202 };
+  return {
+    status: 200,
+    body:
+      message.method === 'initialize'
+        ? { jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo } }
+        : { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } },
+  };
+}
+
 export interface FakeToolDefinition {
   readonly name: string;
   readonly title?: string;
@@ -180,6 +199,8 @@ export interface FakeToolResult {
 
 export interface FakeAppOptions {
   readonly appUrl: string;
+  /** The resource identifier the server publishes and expects back verbatim; the app's URL unless given. */
+  readonly resource?: string;
   /** Root-path issuer, on the app's host or another. */
   readonly issuer: string;
   readonly registration?: boolean;
@@ -196,6 +217,35 @@ export interface FakeAppOptions {
   readonly allowUnauthenticated?: boolean;
   readonly onToolCall?: (call: RecordedToolCall) => FakeToolResult | FakeReply | undefined;
   readonly fetchClientDocument?: (url: string) => Promise<FakeReply>;
+  /**
+   * `2026-07-28` serves that revision alone, as Shop does: discovery instead of `initialize`, the protocol headers and
+   * request `_meta` on every request, and sign-in asked for only by tool calls.
+   */
+  readonly protocol?: '2025-11-25' | '2026-07-28';
+}
+
+const MODERN_PROTOCOL = '2026-07-28';
+
+interface McpMessage {
+  readonly id?: string | number;
+  readonly method?: string;
+  readonly params?: Record<string, unknown>;
+}
+
+function rpcError(id: string | number | undefined, code: number, message: string, data?: unknown): FakeReply {
+  return {
+    status: 200,
+    body: { jsonrpc: '2.0', id: id ?? null, error: { code, message, ...(data === undefined ? {} : { data }) } },
+  };
+}
+
+function toolCallOf(params: Record<string, unknown>, bearer: string | undefined): RecordedToolCall {
+  const name = typeof params.name === 'string' ? params.name : '';
+  const args =
+    typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
+      ? (params.arguments as Record<string, unknown>)
+      : {};
+  return { name, arguments: args, bearer };
 }
 
 interface Client {
@@ -216,6 +266,7 @@ interface PendingCode {
  */
 export class FakeMcpApp {
   readonly app: URL;
+  readonly resource: string;
   readonly issuer: URL;
   readonly resourceMetadata: Record<string, unknown>;
   readonly serverMetadata: Record<string, unknown>;
@@ -235,9 +286,11 @@ export class FakeMcpApp {
   private readonly serverName: string;
   private readonly allowUnauthenticated: boolean;
   private readonly fetchClientDocument: ((url: string) => Promise<FakeReply>) | undefined;
+  private readonly modern: boolean;
 
   constructor(options: FakeAppOptions) {
     this.app = new URL(options.appUrl);
+    this.resource = options.resource ?? this.app.href;
     this.issuer = new URL(options.issuer);
     this.issParameter = options.issParameter ?? false;
     this.serverName = options.serverName ?? 'Ledgerly';
@@ -246,9 +299,10 @@ export class FakeMcpApp {
     this.allowUnauthenticated = options.allowUnauthenticated ?? false;
     this.onToolCall = options.onToolCall;
     this.fetchClientDocument = options.fetchClientDocument;
+    this.modern = options.protocol === MODERN_PROTOCOL;
     const at = (route: string): string => new URL(route, this.issuer).href;
     this.resourceMetadata = {
-      resource: this.app.href,
+      resource: this.resource,
       authorization_servers: [options.issuer],
       ...(options.scopes ? { scopes_supported: [...options.scopes] } : {}),
     };
@@ -275,7 +329,12 @@ export class FakeMcpApp {
   }
 
   get resourceMetadataUrl(): string {
-    return new URL(`/.well-known/oauth-protected-resource${this.app.pathname}`, this.app).href;
+    return new URL(this.resourceMetadataPath, this.app).href;
+  }
+
+  /** RFC 9728 inserts the well-known segment before the app's path, which is empty for an app at the root. */
+  private get resourceMetadataPath(): string {
+    return `/.well-known/oauth-protected-resource${this.app.pathname.replace(/\/$/u, '')}`;
   }
 
   /** Plays the principal approving at the server's sign-in page; returns the query sent to the redirect URI. */
@@ -335,7 +394,7 @@ export class FakeMcpApp {
       if (request.method === 'POST' && request.path === this.app.pathname) return this.mcp(request);
       if (request.method === 'GET' && request.path === this.app.pathname) return { status: 405 };
       if (request.method === 'DELETE' && request.path === this.app.pathname) return { status: 204 };
-      if (request.method === 'GET' && request.path === `/.well-known/oauth-protected-resource${this.app.pathname}`)
+      if (request.method === 'GET' && request.path === this.resourceMetadataPath)
         return { status: 200, body: this.resourceMetadata };
     }
     if (request.host !== this.issuer.hostname) return undefined;
@@ -359,6 +418,7 @@ export class FakeMcpApp {
     const overridden = await this.mcpOverride?.(request);
     if (overridden) return overridden;
     const bearer = /^Bearer (.+)$/u.exec(request.headers.authorization ?? '')?.[1];
+    if (this.modern) return this.modernMcp(request, bearer);
     if (!this.allowUnauthenticated && (bearer === undefined || !this.accessTokens.has(bearer)))
       return {
         status: 401,
@@ -381,20 +441,11 @@ export class FakeMcpApp {
       case 'tools/list':
         return { status: 200, body: { jsonrpc: '2.0', id, result: { tools: this.tools } } };
       case 'tools/call': {
-        const params = parsed.params ?? {};
-        const name = typeof params.name === 'string' ? params.name : '';
-        const args =
-          typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
-            ? (params.arguments as Record<string, unknown>)
-            : {};
-        const call: RecordedToolCall = { name, arguments: args, bearer };
+        const call = toolCallOf(parsed.params ?? {}, bearer);
         this.toolCalls.push(call);
         const custom = this.onToolCall?.(call);
         if (custom && 'status' in custom) return custom;
-        const result: FakeToolResult = custom ?? {
-          content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: name, arguments: args }) }],
-        };
-        return { status: 200, body: { jsonrpc: '2.0', id, result } };
+        return { status: 200, body: { jsonrpc: '2.0', id, result: custom ?? this.defaultResult(call) } };
       }
       case 'ping':
         return { status: 200, body: { jsonrpc: '2.0', id, result: {} } };
@@ -412,6 +463,79 @@ export class FakeMcpApp {
             },
           },
         };
+    }
+  }
+
+  private defaultResult(call: RecordedToolCall): FakeToolResult {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: call.name, arguments: call.arguments }) }],
+    };
+  }
+
+  /** Each string argument the tool's current definition mirrors into an `Mcp-Param-*` header must arrive there. */
+  private paramHeadersMatch(request: FakeRequest, call: RecordedToolCall): boolean {
+    const properties = this.tools.find((tool) => tool.name === call.name)?.inputSchema.properties ?? {};
+    return Object.entries(properties).every(([key, schema]) => {
+      const header = schema['x-mcp-header'];
+      const value = call.arguments[key];
+      if (typeof header !== 'string' || typeof value !== 'string') return true;
+      return request.headers[`mcp-param-${header.toLowerCase()}`] === value;
+    });
+  }
+
+  /** Discovery and listings are open; a tool call without a live token is refused with where to sign in. */
+  private modernMcp(request: FakeRequest, bearer: string | undefined): FakeReply {
+    const message = JSON.parse(request.body) as McpMessage;
+    const { id, method } = message;
+    const params = message.params ?? {};
+    if (method === 'initialize')
+      return rpcError(id, -32022, 'Unsupported protocol version', {
+        supported: [MODERN_PROTOCOL],
+        requested: params.protocolVersion,
+      });
+    if (id === undefined) return { status: 202 };
+    if (request.headers['mcp-protocol-version'] !== MODERN_PROTOCOL || request.headers['mcp-method'] !== method)
+      return rpcError(id, -32020, 'Header mismatch');
+    const meta = params._meta;
+    if (
+      typeof meta !== 'object' ||
+      meta === null ||
+      !('io.modelcontextprotocol/protocolVersion' in meta) ||
+      !('io.modelcontextprotocol/clientCapabilities' in meta)
+    )
+      return rpcError(id, -32602, 'Missing request metadata');
+    const result = (value: Record<string, unknown>): FakeReply => ({
+      status: 200,
+      body: { jsonrpc: '2.0', id, result: { resultType: 'complete', ...value } },
+    });
+    switch (method) {
+      case 'server/discover':
+        return result({
+          supportedVersions: [MODERN_PROTOCOL],
+          capabilities: { tools: {} },
+          ...(this.instructions === undefined ? {} : { instructions: this.instructions }),
+          _meta: { 'io.modelcontextprotocol/serverInfo': { name: this.serverName, version: '1' } },
+        });
+      case 'tools/list':
+        return result({ tools: this.tools, ttlMs: 0, cacheScope: 'private' });
+      case 'tools/call': {
+        const call = toolCallOf(params, bearer);
+        if (request.headers['mcp-name'] !== call.name || !this.paramHeadersMatch(request, call))
+          return rpcError(id, -32020, 'Header mismatch');
+        if (bearer === undefined || !this.accessTokens.has(bearer)) {
+          const scopes = this.resourceMetadata.scopes_supported;
+          const scope = Array.isArray(scopes) ? `, scope="${scopes.join(' ')}"` : '';
+          return {
+            status: 401,
+            headers: { 'www-authenticate': `Bearer resource_metadata="${this.resourceMetadataUrl}"${scope}` },
+            body: { error: 'invalid_token' },
+          };
+        }
+        this.toolCalls.push(call);
+        return result({ ...this.defaultResult(call) });
+      }
+      default:
+        return rpcError(id, -32601, 'Method not found');
     }
   }
 
@@ -439,7 +563,7 @@ export class FakeMcpApp {
     const form = new URLSearchParams(request.body);
     const clientId = this.authenticated(request, form);
     if (!clientId) return { status: 401, body: { error: 'invalid_client' } };
-    if (form.get('resource') !== this.app.href) return { status: 400, body: { error: 'invalid_target' } };
+    if (form.get('resource') !== this.resource) return { status: 400, body: { error: 'invalid_target' } };
     if (form.get('grant_type') === 'authorization_code') {
       const pending = this.codes.get(form.get('code') ?? '');
       this.codes.delete(form.get('code') ?? '');
@@ -451,7 +575,7 @@ export class FakeMcpApp {
         pending.clientId !== clientId ||
         pending.challenge !== challenge ||
         pending.redirectUri !== form.get('redirect_uri') ||
-        pending.resource !== this.app.href
+        pending.resource !== this.resource
       )
         return { status: 400, body: { error: 'invalid_grant' } };
       return this.issue(clientId);

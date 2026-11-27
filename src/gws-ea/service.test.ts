@@ -121,12 +121,13 @@ describe('GWS-EA instance runtime', () => {
       1,
     );
   });
-  it("binds the custom root's shared host policy locators, voice, without adding per-assistant runtime state", async () => {
+  it("binds the custom root's shared host policy locators, voice and catalog, without adding per-assistant runtime state", async () => {
     const { config } = await fixture();
     const configRoot = path.join(config.home_directory, 'custom-control-root');
     await persistInstanceRuntime(config, upsertEnvVars, configRoot);
     const environment = await readFile(path.join(config.state_root, '.env'), 'utf8');
     expect(environment).toContain(`GWS_EA_VOICE_POLICY_FILE=${path.join(configRoot, 'voice.json')}\n`);
+    expect(environment).toContain(`GWS_EA_CATALOG_POLICY_FILE=${path.join(configRoot, 'catalog.json')}\n`);
     expect(environment).toContain(`GWS_EA_CONFIG_ROOT=${configRoot}\n`);
     expect(environment).toContain(`GWS_EA_STATE_ROOT=${path.dirname(config.instance_root)}\n`);
     expect(environment).toContain(`GWS_EA_INSTANCE_ID=${config.instance_id}\n`);

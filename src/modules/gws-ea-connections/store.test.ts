@@ -968,3 +968,123 @@ describe('tool pinning, principal floors, and call claims', () => {
     });
   });
 });
+
+describe('catalog apps and the store schema', () => {
+  type Rows = Record<string, readonly Record<string, unknown>[]>;
+  const everyTable = (): Rows =>
+    raw((db) => {
+      const tables = db
+        .prepare<[], { name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .all();
+      return Object.fromEntries(
+        tables.map(({ name }) => [
+          name,
+          db.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all() as Record<string, unknown>[],
+        ]),
+      );
+    });
+  const schemaText = (): unknown =>
+    raw((db) => db.prepare('SELECT type, name, sql FROM sqlite_master ORDER BY type, name').all());
+
+  /** The store as releases before the catalog left it: no transport or catalog columns, no catalog index. */
+  const asPreCatalogStore = (): void =>
+    raw(
+      (db) => {
+        db.exec(`DROP INDEX IF EXISTS idx_apps_catalog_id;
+          ALTER TABLE apps DROP COLUMN catalog_id;
+          ALTER TABLE apps DROP COLUMN transport;`);
+      },
+      { writable: true },
+    );
+
+  it('opens a store written before the catalog with every app, grant, pin, label and relay call intact', async () => {
+    const tokenApp = await store.create(LEDGERLY);
+    await store.connect(tokenApp.id, tokenApp.version, { kind: 'token', token: SENTINELS.token });
+    const { app: oauthApp } = await connectedOauth();
+    for (const app of [tokenApp, oauthApp]) {
+      const pinned = await store.pinTools(app.id, {
+        instructions: 'Use with care.',
+        tools: [
+          { name: 'place_order', description: 'Place an order', inputSchema: { type: 'object', properties: {} } },
+        ],
+      });
+      const definitionHash = pinned.tools[0]!.definitionHash;
+      await store.setToolLabel(app.id, 'place_order', 'ask_first', 'principal', { expectedHash: definitionHash });
+      await store.claimDirectCall({
+        id: `direct:sess:${app.id}`,
+        appId: app.id,
+        grantGeneration: 1,
+        toolName: 'place_order',
+        definitionHash,
+        argsHash: 'args-hash',
+      });
+    }
+    asPreCatalogStore();
+    const before = everyTable();
+    expect(Object.keys(before.apps![0]!)).not.toContain('transport');
+    for (const table of ['grants', 'access_tokens', 'app_pins', 'app_tools', 'relay_calls', 'relay_invocations'])
+      expect(before[table]!.length).toBeGreaterThan(0);
+
+    const listed = await store.apps();
+
+    expect(listed.map(({ transport, catalogId }) => ({ transport, catalogId }))).toEqual([
+      { transport: 'remote', catalogId: null },
+      { transport: 'remote', catalogId: null },
+    ]);
+    const after = everyTable();
+    expect(after.apps!.map(({ transport, catalog_id, ...rest }) => rest)).toEqual(before.apps);
+    expect(after.apps!.map(({ transport, catalog_id }) => [transport, catalog_id])).toEqual([
+      ['remote', null],
+      ['remote', null],
+    ]);
+    const { apps: _apps, ...others } = after;
+    const { apps: _beforeApps, ...othersBefore } = before;
+    expect(others).toEqual(othersBefore);
+  });
+
+  it('changes nothing when it opens a store that already has the catalog columns', async () => {
+    const app = await store.create(LEDGERLY);
+    await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+    const schema = schemaText();
+    const rows = everyTable();
+
+    await store.apps();
+
+    expect(schemaText()).toEqual(schema);
+    expect(everyTable()).toEqual(rows);
+  });
+
+  it('stores a host-run app at its placeholder address with no secret, and one app per catalog entry', async () => {
+    const link = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+    expect(link).toMatchObject({
+      url: 'https://link.host-cli.invalid/',
+      host: 'link.host-cli.invalid',
+      auth: 'none',
+      transport: 'host_cli',
+      catalogId: 'link',
+      status: 'not_connected',
+    });
+    await store.connect(link.id, link.version, { kind: 'none' });
+    expect(await store.currentGrant(link.id)).toMatchObject({ kind: 'none', generation: 1 });
+    expect(raw((db) => db.prepare('SELECT secret FROM grants WHERE app_id = ?').get(link.id))).toEqual({
+      secret: null,
+    });
+
+    await expect(store.create({ name: 'Link again', transport: 'host_cli', catalogId: 'link' })).rejects.toMatchObject({
+      reason: 'duplicate_catalog_entry',
+    });
+    const notion = await store.create({
+      name: 'Notion',
+      url: 'https://mcp.notion.com/mcp',
+      auth: 'oauth',
+      issuer: 'https://mcp.notion.com/',
+      catalogId: 'notion',
+    });
+    expect(notion).toMatchObject({ transport: 'remote', catalogId: 'notion', host: 'mcp.notion.com' });
+    const plain = await store.create(LEDGERLY);
+    expect(plain).toMatchObject({ transport: 'remote', catalogId: null });
+    expect(() =>
+      raw((db) => db.prepare("UPDATE apps SET catalog_id = 'notion' WHERE id = ?").run(plain.id), { writable: true }),
+    ).toThrow(/UNIQUE/u);
+  });
+});

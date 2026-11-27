@@ -23,6 +23,7 @@ updates:
     allow:
       # Strictly GWS-EA-only dependencies, excluding @chat-adapter/gchat and
       # @onecli-sh/sdk (which move with Chat SDK / OneCLI skill pins).
+      - dependency-name: "@modelcontextprotocol/client"
       - dependency-name: "@modelcontextprotocol/sdk"
       - dependency-name: "@whiskeysockets/baileys"
       - dependency-name: "google-auth-library"

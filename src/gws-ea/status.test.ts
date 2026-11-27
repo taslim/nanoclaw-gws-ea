@@ -1302,6 +1302,8 @@ describe('status', () => {
     expect(observed.status.connectors.map((entry) => [entry.name, entry.setup])).toEqual([
       ['voice', 'not_installed'],
       ['web', 'not_installed'],
+      ['link', 'not_installed'],
+      ['shop', 'not_installed'],
     ]);
   });
 
@@ -2545,7 +2547,8 @@ describe('connected apps', () => {
     for (const output of [text, json]) {
       expect(output).not.toContain(SENTINEL);
       expect(output).not.toContain('token=');
-      expect(output).not.toContain('client');
+      // The Shop connector's own summary names the operator's client; no app's registration may pass through.
+      expect(output).not.toContain('clientId');
     }
   });
 

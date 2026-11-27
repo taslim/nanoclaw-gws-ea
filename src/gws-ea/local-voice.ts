@@ -169,7 +169,8 @@ export interface VoiceOperatorDependencies extends VoiceInstallDependencies {
   readonly quiescence?: QuiescenceSeams;
 }
 
-async function withManagedInstances<T>(
+/** Holds the machine lock and every assistant's instance lock, so no lifecycle operation races the work. */
+export async function withManagedInstances<T>(
   paths: ControlPlanePaths,
   work: (runtimes: readonly InstanceRuntimeConfig[], unobservedInstanceIds: readonly string[]) => Promise<T>,
   skipBusy?: (instanceId: string) => void,

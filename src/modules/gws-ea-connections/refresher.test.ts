@@ -456,6 +456,30 @@ describe('durable rotation and missing tokens', () => {
     expect((await store.apps())[0]).toMatchObject({ status: 'connected' });
   });
 
+  it('keeps a held rotation through a refusal reported for another generation', async () => {
+    const tokens = serveApp(LEDGERLY);
+    const app = await storedOAuthApp('Ledgerly', LEDGERLY, {
+      refreshToken: 'sentinel-refresh-home',
+      issuedAt: START - 55 * MINUTE,
+      expiresAt: START + 5 * MINUTE,
+    });
+    vi.spyOn(store, 'rotateGrant').mockRejectedValueOnce(new ConnectionsStoreError('store_unavailable'));
+    const refresher = createConnectionsRefresher(dependencies());
+    await refresher.tick();
+    const generation = (await grantOf(app))?.generation ?? -1;
+
+    await refresher.refuse(app.id, generation + 1);
+    // The server rotated the refresh token, so it now refuses the one it replaced.
+    tokens.queued.push({ status: 400, body: { error: 'invalid_grant' } });
+    clock = START + MINUTE;
+    await refresher.tick();
+
+    expect(tokens.presented).toEqual(['sentinel-refresh-home']);
+    expect(await storedTokenOf(app)).toBe('sentinel-access-1');
+    expect((await store.apps())[0]).toMatchObject({ status: 'connected' });
+    expect(refused).toEqual([]);
+  });
+
   it('renews a pre-release grant with no stored access token into the store', async () => {
     const tokens = serveApp(LEDGERLY);
     const app = await oauthApp('Ledgerly', LEDGERLY, {

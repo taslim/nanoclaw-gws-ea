@@ -15,6 +15,8 @@ import {
 } from '../gws-ea-web/kit/index.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
+import { catalogEntryFor, isConfirmedByApp, type AvailableCatalogEntry, type CatalogEntry } from './catalog.js';
+import type { DeviceSignInFailure, DeviceSignInView } from './device-sign-in.js';
 import { escapeInvisibleChars, hasAnyInvisible } from './held-card.js';
 import { type HeldAppCallPayload, type PendingHeldCallItem } from './held-calls.js';
 import type { ConnectionsListing } from './operations.js';
@@ -56,6 +58,7 @@ export interface ConnectionsPageState {
   readonly retryServer?: { readonly key: string; readonly host: string };
   readonly toolReview?: { readonly pin?: AppPin; readonly tools: readonly PinnedAppTool[] };
   readonly heldCall?: HeldCallViewData;
+  readonly deviceSignIn?: DeviceSignInView;
 }
 
 const STATUS_LABELS = {
@@ -148,8 +151,27 @@ export function sortToolsForDisplay(tools: readonly PinnedAppTool[]): readonly P
   });
 }
 
+/** A tool the app confirms itself still runs without the assistant's card, so its off state says where it asks. */
+export function autoStateText(entry: CatalogEntry | undefined, toolName: string): string {
+  return entry && isConfirmedByApp(entry, toolName) ? `Asks in ${entry.name}` : 'Auto';
+}
+
 function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename' | 'tools'): string {
   return `/connections/app/${encodeURIComponent(app.id)}/${action}`;
+}
+
+/** A not-connected catalog app is listed with its entry under Available, and is still the principal's to open. */
+export function listedApp(
+  listing: ConnectionsListing,
+  id: string,
+): { readonly app: ConnectionApp; readonly entry?: CatalogEntry } | undefined {
+  const app = listing.apps.find((candidate) => candidate.id === id);
+  if (app) {
+    const entry = listing.catalogEntries?.[id];
+    return entry ? { app, entry } : { app };
+  }
+  const available = listing.available?.find((candidate) => candidate.app?.id === id);
+  return available?.app ? { app: available.app, entry: available.entry } : undefined;
 }
 
 const BACK = renderBackLink('/connections', 'Connections');
@@ -160,6 +182,11 @@ function addLink(): string {
 
 function hiddenApp(app: ConnectionApp): string {
   return `<input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="version" value="${app.version}">`;
+}
+
+/** A host-run app's address is a placeholder no one can visit, so the page says where it runs instead. */
+function shownHost(app: ConnectionApp): string {
+  return app.transport === 'host_cli' ? 'Installed by your operator' : app.host;
 }
 
 function statusBadge(status: AppStatus): string {
@@ -179,7 +206,7 @@ function deleteConfirmation(app: ConnectionApp): string {
   return `data-confirm-title="${escapeHtml(`Delete ${app.name}?`)}" data-confirm-action="Delete" data-confirm-message="Your assistant will lose access, and saved sign-in and client details will be removed. You can add it again anytime."`;
 }
 
-function appMenu(app: ConnectionApp, index: number, hasPin: boolean): string {
+function appMenu(app: ConnectionApp, menuId: string, hasPin: boolean): string {
   const items = [
     ...(app.status === 'connected' || hasPin
       ? [
@@ -192,7 +219,7 @@ function appMenu(app: ConnectionApp, index: number, hasPin: boolean): string {
       : [menuForm('/connections/disconnect', app, 'Disconnect', 'Disconnecting…')]),
     menuForm('/connections/delete', app, 'Delete', 'Deleting…', deleteConfirmation(app)),
   ];
-  return renderMenu(`app-menu-${index}`, `More for ${app.name}`, items, app.name);
+  return renderMenu(menuId, `More for ${app.name}`, items, app.name);
 }
 
 function appRow(
@@ -227,11 +254,11 @@ function appRow(
       : needsReview && !hasUnsorted
         ? `<a class="button button-secondary row-button app-row-action" href="${escapeHtml(appUrl(app, 'tools'))}" data-navigation>Review</a>`
         : '';
-  const inner = `<span class="row-main"><span class="row-title">${escapeHtml(app.name)}</span><span class="row-sub app-host">${escapeHtml(app.host)}</span></span><span class="app-status">${statusPill}</span>${primaryHref ? icon('arrow', 'row-chevron app-chevron') : ''}`;
+  const inner = `<span class="row-main"><span class="row-title">${escapeHtml(app.name)}</span><span class="row-sub app-host">${escapeHtml(shownHost(app))}</span></span><span class="app-status">${statusPill}</span>${primaryHref ? icon('arrow', 'row-chevron app-chevron') : ''}`;
   const mainSlot = primaryHref
     ? `<a class="app-link" href="${escapeHtml(primaryHref)}" data-navigation>${inner}</a>`
     : `<div class="app-link app-link-static">${inner}</div>`;
-  return `<li class="row app-row">${mainSlot}${desktopAction}${appMenu(app, index, pin !== undefined)}</li>`;
+  return `<li class="row app-row">${mainSlot}${desktopAction}${appMenu(app, `app-menu-${index}`, pin !== undefined)}</li>`;
 }
 
 /** The page names the host it showed, and the host disconnects only if main's entry still points there. */
@@ -265,7 +292,31 @@ function operatorAction(server: OperatorServer, index: number, state: Connection
 /** Only the host is shown: an operator's address can carry a credential in its query. */
 function operatorRow(server: OperatorServer, index: number, state: ConnectionsPageState): string {
   const host = operatorServerHost(server);
-  return `<li class="row app-row operator-row"><div class="app-link app-link-static"><span class="row-main"><span class="row-title">${escapeHtml(server.key)}</span>${host ? `<span class="row-sub app-host">${escapeHtml(host)}</span>` : ''}</span><span class="app-status">${statusBadge('connected')}</span></div>${operatorAction(server, index, state)}</li>`;
+  return `<li class="row app-row operator-row"><div class="app-link app-link-static"><span class="row-main"><span class="row-title">${escapeHtml(server.key)}</span><span class="row-sub">${host ? `<span class="app-host">${escapeHtml(host)}</span>` : ''}<span class="app-origin">Added by your operator</span></span></span><span class="app-status">${statusBadge('connected')}</span></div>${operatorAction(server, index, state)}</li>`;
+}
+
+/**
+ * Connecting starts the entry's sign-in at once, so its Connect posts like a sign-in rather than opening a view. An
+ * entry whose app is still stored, after a disconnect or an abandoned sign-in, keeps that app's menu.
+ */
+function availableRow(
+  { entry, app }: AvailableCatalogEntry,
+  index: number,
+  canChange: boolean,
+  pins: ConnectionsPageState['listing']['pins'],
+): string {
+  const needs = entry.requirements
+    ? `<span class="row-sub catalog-needs">${escapeHtml(entry.requirements)}</span>`
+    : '';
+  const connect = canChange
+    ? `<form method="post" action="/connections/catalog-connect" data-sign-in><input type="hidden" name="entry" value="${escapeHtml(entry.id)}"><button class="button button-secondary row-button" type="submit" aria-label="${escapeHtml(`Connect ${entry.name}`)}" data-pending-label="Opening…">Connect</button></form>`
+    : '';
+  const menu = app ? appMenu(app, `available-menu-${index}`, pins?.[app.id] !== undefined) : '';
+  return `<li class="row catalog-row"><span class="row-main"><span class="row-title">${escapeHtml(entry.name)}</span><span class="row-sub">${escapeHtml(entry.goodFor)}</span>${needs}</span>${connect}${menu}</li>`;
+}
+
+function addOwnRow(): string {
+  return `<li class="row app-row"><a class="app-link add-own-link" href="/connections/new" data-navigation><span class="row-main"><span class="row-title">Add an app by its address</span></span>${icon('arrow', 'row-chevron app-chevron add-own-chevron')}</a></li>`;
 }
 
 function pendingApprovalRow(item: PendingHeldCallItem): string {
@@ -278,45 +329,49 @@ function pendingApprovalRow(item: PendingHeldCallItem): string {
   return `<li class="row app-row approval-row"><a class="app-link approval-link" href="${escapeHtml(href)}" data-navigation>${inner}</a><a class="button button-secondary row-button app-row-action" href="${escapeHtml(href)}" data-navigation>Review</a></li>`;
 }
 
-function section(id: string, title: string | undefined, rows: readonly string[]): string {
-  const heading = title ? `<h2 class="section-title" id="${id}">${title}</h2>` : '';
-  return `<section class="section"${title ? ` aria-labelledby="${id}"` : ' aria-label="Your apps"'}>${heading}<ul class="list">${rows.join('')}</ul></section>`;
+interface ListSection {
+  readonly id: string;
+  readonly title: string;
+  readonly rows: readonly string[];
+}
+
+function section({ id, title, rows }: ListSection, titled: boolean): string {
+  const heading = titled ? `<h2 class="section-title" id="${id}">${title}</h2>` : '';
+  return `<section class="section"${titled ? ` aria-labelledby="${id}"` : ` aria-label="${title}"`}>${heading}<ul class="list">${rows.join('')}</ul></section>`;
 }
 
 function appList(state: ConnectionsPageState): string {
   const { apps, operators, canChange } = state.listing;
   const pendingApprovals = state.listing.pendingApprovals ?? [];
+  const available = state.listing.available ?? [];
   const unavailable = canChange ? '' : notice(UNAVAILABLE);
-  if (apps.length === 0 && operators.length === 0 && pendingApprovals.length === 0)
+  if (apps.length === 0 && operators.length === 0 && pendingApprovals.length === 0 && available.length === 0)
     return `${renderPageHeading('Connections')}${unavailable}${renderEmptyState('No apps yet', 'apps', canChange ? addLink() : '')}`;
-  // Your own apps need no label of their own unless pending approvals or your operator's apps are listed beside them.
-  return `${renderPageHeading('Connections', '', canChange ? addLink() : '')}${unavailable}${
-    pendingApprovals.length
-      ? section(
-          'pending-approvals-heading',
-          'Waiting for approval',
-          pendingApprovals.map((item) => pendingApprovalRow(item)),
-        )
-      : ''
-  }${
-    apps.length
-      ? section(
-          'added-heading',
-          operators.length || pendingApprovals.length ? 'Your apps' : undefined,
-          apps.map((app, index) =>
-            appRow(app, index, canChange, state.listing.pins?.[app.id], state.listing.toolsByApp?.[app.id]),
-          ),
-        )
-      : ''
-  }${
-    operators.length
-      ? section(
-          'operator-heading',
-          'Added by your operator',
-          operators.map((server, index) => operatorRow(server, index, state)),
-        )
-      : ''
-  }`;
+  const sections = [
+    {
+      id: 'pending-approvals-heading',
+      title: 'Waiting for approval',
+      rows: pendingApprovals.map((item) => pendingApprovalRow(item)),
+    },
+    {
+      id: 'connected-heading',
+      title: 'Connected',
+      rows: [
+        ...apps.map((app, index) =>
+          appRow(app, index, canChange, state.listing.pins?.[app.id], state.listing.toolsByApp?.[app.id]),
+        ),
+        ...operators.map((server, index) => operatorRow(server, index, state)),
+      ],
+    },
+    {
+      id: 'available-heading',
+      title: 'Available',
+      rows: available.map((entry, index) => availableRow(entry, index, canChange, state.listing.pins)),
+    },
+    { id: 'add-own-heading', title: 'Add your own', rows: canChange ? [addOwnRow()] : [] },
+  ].filter((candidate) => candidate.rows.length > 0);
+  const showSectionTitles = sections.length > 1;
+  return `${renderPageHeading('Connections')}${unavailable}${sections.map((candidate) => section(candidate, showSectionTitles)).join('')}`;
 }
 
 function actions(label: string, pending: string): string {
@@ -329,7 +384,11 @@ function addForm(state: ConnectionsPageState): string {
   return `${heading}<form method="post" action="/connections/add" data-send><div class="field"><label for="url">Server address</label><input id="url" name="url" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://example.com/mcp" required></div><div class="field"><label for="name">Name <span class="optional" aria-hidden="true">Optional</span></label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" value="${escapeHtml(state.addName ?? '')}" placeholder="App name"></div>${actions('Add app', 'Checking…')}</form>`;
 }
 
-function trustNotice(app: ConnectionApp): string {
+function trustNotice(app: ConnectionApp, entry: CatalogEntry | undefined): string {
+  if (entry)
+    return notice(
+      `<strong>Reviewed for GWS-EA.</strong> Your assistant shares data with ${escapeHtml(entry.name)} once it’s connected.`,
+    );
   return notice(
     `<strong>Only connect apps you trust.</strong> Your operator hasn’t reviewed ${escapeHtml(app.host)}, and your assistant shares data with it.`,
   );
@@ -340,18 +399,19 @@ function changeClientForm(app: ConnectionApp): string {
   return `<form class="change-client" method="post" action="/connections/change-client" data-send>${hiddenApp(app)}<button class="button button-quiet" type="submit" data-pending-label="Removing…">Change client details</button></form>`;
 }
 
-function connectForm(app: ConnectionApp, state: ConnectionsPageState): string {
+function connectForm(app: ConnectionApp, entry: CatalogEntry | undefined, state: ConnectionsPageState): string {
   const signInHost = (app.issuer === null ? undefined : hostOf(app.issuer)) ?? app.host;
+  const trust = trustNotice(app, entry);
   const signIn = `Continue to ${signInHost}`;
   switch (app.auth) {
     case 'none':
-      return `<form method="post" action="/connections/connect" data-send>${hiddenApp(app)}${trustNotice(app)}${actions('Connect', 'Connecting…')}</form>`;
+      return `<form method="post" action="/connections/connect" data-send>${hiddenApp(app)}${trust}${actions('Connect', 'Connecting…')}</form>`;
     case 'token':
-      return `<form method="post" action="/connections/connect" data-send>${hiddenApp(app)}<div class="field"><label for="token">Access token</label><input id="token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></div>${trustNotice(app)}${actions('Connect', 'Checking…')}</form>`;
+      return `<form method="post" action="/connections/connect" data-send>${hiddenApp(app)}<div class="field"><label for="token">Access token</label><input id="token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required></div>${trust}${actions('Connect', 'Checking…')}</form>`;
     case 'oauth':
       if (app.hasClient)
-        return `<form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}${trustNotice(app)}${actions(signIn, 'Opening sign-in…')}</form>${app.clientEntered ? changeClientForm(app) : ''}`;
-      return `<form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}<ol class="steps"><li><h2>Register this redirect URI with ${escapeHtml(signInHost)}</h2><div class="redirect"><code id="redirect-uri">${escapeHtml(state.redirectUri(app))}</code>${renderCopyButton('redirect-uri', 'Copy redirect URI')}</div></li><li><h2>Enter client details</h2><div class="field"><label for="client-id">Client ID</label><input id="client-id" name="clientId" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required></div><div class="field"><label for="client-secret">Client secret <span class="optional" aria-hidden="true">Optional</span></label><input id="client-secret" name="clientSecret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></div></li></ol>${trustNotice(app)}${actions(signIn, 'Opening sign-in…')}</form>`;
+        return `<form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}${trust}${actions(signIn, 'Opening sign-in…')}</form>${app.clientEntered ? changeClientForm(app) : ''}`;
+      return `<form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}<ol class="steps"><li><h2>Register this redirect URI with ${escapeHtml(signInHost)}</h2><div class="redirect"><code id="redirect-uri">${escapeHtml(state.redirectUri(app))}</code>${renderCopyButton('redirect-uri', 'Copy redirect URI')}</div></li><li><h2>Enter client details</h2><div class="field"><label for="client-id">Client ID</label><input id="client-id" name="clientId" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required></div><div class="field"><label for="client-secret">Client secret <span class="optional" aria-hidden="true">Optional</span></label><input id="client-secret" name="clientSecret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"></div></li></ol>${trust}${actions(signIn, 'Opening sign-in…')}</form>`;
   }
 }
 
@@ -359,32 +419,63 @@ function appMissing(): string {
   return `${BACK}${renderEmptyState('App not found', 'apps', '<a class="button button-secondary" href="/connections" data-navigation>All apps</a>')}`;
 }
 
-function connectView(app: ConnectionApp, state: ConnectionsPageState): string {
+const DEVICE_ENDED = {
+  expired: 'The sign-in expired before it was approved.',
+  refused: 'The sign-in was declined.',
+  failed: 'The sign-in couldn’t be read.',
+  not_offered: 'This app isn’t available right now.',
+} satisfies Record<DeviceSignInFailure, string>;
+
+function deviceStartForm(entry: CatalogEntry, label: string): string {
+  return `<form method="post" action="/connections/catalog-connect" data-sign-in><input type="hidden" name="entry" value="${escapeHtml(entry.id)}">${actions(label, 'Starting…')}</form>`;
+}
+
+/**
+ * The app's own sign-in: the principal opens its address and approves a phrase in the app while the page polls. It
+ * never starts a second login while one waits; Try again starts one only after the last has ended.
+ */
+function deviceSignInPanel(app: ConnectionApp, entry: CatalogEntry, view: DeviceSignInView | undefined): string {
+  const trust = trustNotice(app, entry);
+  switch (view?.status) {
+    case 'waiting':
+      return `<div data-device-sign-in="${escapeHtml(app.id)}" data-device-state="waiting"><ol class="steps"><li><h2>Open ${escapeHtml(entry.name)}’s sign-in page</h2><div class="redirect"><a id="device-address" href="${escapeHtml(view.verificationUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(view.verificationUrl)}</a></div></li><li><h2>Approve this phrase in the ${escapeHtml(entry.name)} app</h2><div class="redirect"><code id="device-phrase">${escapeHtml(view.phrase)}</code>${renderCopyButton('device-phrase', 'Copy phrase')}</div></li></ol><p class="device-status" role="status">Waiting for your approval…</p></div>`;
+    case 'ended':
+      return `${notice(`${DEVICE_ENDED[view.reason]} Nothing changed.`)}${deviceStartForm(entry, 'Try again')}`;
+    case 'idle':
+    case 'connected':
+    case undefined:
+      return `${trust}${deviceStartForm(entry, `Continue to ${entry.name}`)}`;
+  }
+}
+
+function connectView(app: ConnectionApp, entry: CatalogEntry | undefined, state: ConnectionsPageState): string {
   // Connecting already says it is not connected; only a lapsed connection is news.
   const status = app.status === 'needs_reconnecting' ? statusBadge(app.status) : '';
-  const heading = `${BACK}${renderPageHeading(`Connect ${app.name}`, `<span>${escapeHtml(app.host)}</span>${status}`)}`;
+  const heading = `${BACK}${renderPageHeading(`Connect ${app.name}`, `<span>${escapeHtml(shownHost(app))}</span>${status}`)}`;
   if (app.status === 'connected') return `${heading}${notice('Already connected.')}`;
   if (!state.listing.canChange) return `${heading}${notice(UNAVAILABLE)}`;
-  return `${heading}${connectForm(app, state)}`;
+  if (app.transport === 'host_cli' && entry) return `${heading}${deviceSignInPanel(app, entry, state.deviceSignIn)}`;
+  return `${heading}${connectForm(app, entry, state)}`;
 }
 
 function renameView(app: ConnectionApp): string {
-  return `${BACK}${renderPageHeading('Rename app', `<span>${escapeHtml(app.host)}</span>`)}<form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save</button><a class="button button-secondary form-cancel" href="/connections" data-navigation>Cancel</a></div></form>`;
+  return `${BACK}${renderPageHeading('Rename app', `<span>${escapeHtml(shownHost(app))}</span>`)}<form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save</button><a class="button button-secondary form-cancel" href="/connections" data-navigation>Cancel</a></div></form>`;
 }
 
-function toolRow(app: ConnectionApp, tool: PinnedAppTool): string {
+function toolRow(app: ConnectionApp, entry: CatalogEntry | undefined, tool: PinnedAppTool): string {
   const isChecking = tool.label === null || tool.unsettled;
   const isAskFirst = tool.label !== 'just_do';
   const nextLabel = isAskFirst ? 'just_do' : 'ask_first';
   const displayName = humanizeToolName(tool.name);
   const desc = toolDescription(tool);
-  const stateText = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : 'Auto';
+  const autoText = autoStateText(entry, tool.name);
+  const stateText = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : autoText;
   const descMarkup = isChecking
     ? '<span class="tool-desc tool-shimmer" data-tool-desc aria-hidden="true"></span>'
     : desc
       ? `<span class="tool-desc" data-tool-desc>${escapeHtml(desc)}</span>`
       : '<span class="tool-desc" data-tool-desc hidden></span>';
-  return `<li class="row tool-row${isChecking ? ' is-checking' : ''}" data-tool-row="${escapeHtml(tool.name)}" data-tool-hash="${escapeHtml(tool.definitionHash)}" data-tool-state="${isChecking ? 'checking' : isAskFirst ? 'ask_first' : 'just_do'}"><div class="tool-info"><div class="tool-head"><span class="tool-title">${escapeHtml(displayName)}</span><code class="tool-slug">${escapeHtml(tool.name)}</code></div>${descMarkup}</div><form class="tool-control" method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}"><input type="hidden" name="definitionHash" value="${escapeHtml(tool.definitionHash)}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${displayName} (${tool.name})`, stateText, name: tool.name })}</form></li>`;
+  return `<li class="row tool-row${isChecking ? ' is-checking' : ''}" data-tool-row="${escapeHtml(tool.name)}" data-tool-hash="${escapeHtml(tool.definitionHash)}" data-tool-state="${isChecking ? 'checking' : isAskFirst ? 'ask_first' : 'just_do'}" data-auto-text="${escapeHtml(autoText)}"><div class="tool-info"><div class="tool-head"><span class="tool-title">${escapeHtml(displayName)}</span><code class="tool-slug">${escapeHtml(tool.name)}</code></div>${descMarkup}</div><form class="tool-control" method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}"><input type="hidden" name="definitionHash" value="${escapeHtml(tool.definitionHash)}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${displayName} (${tool.name})`, stateText, name: tool.name })}</form></li>`;
 }
 
 function toolsSkeleton(): string {
@@ -405,6 +496,7 @@ function reviewForm(
 
 function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
   const sorted = sortToolsForDisplay(tools);
+  const entry = catalogEntryFor(app);
   const labelsHash = toolLabelsHash(sorted);
   const isConnected = app.status === 'connected';
   const hasUnsorted = isConnected && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
@@ -421,7 +513,7 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
   const desktopTally =
     !pin || hasUnsorted ? '' : sorted.length === 0 ? 'No tools' : `${askCount} ask first · ${autoCount} auto`;
   const mobileTally = !pin || hasUnsorted ? '' : sorted.length === 0 ? '0 tools' : `${askCount} on · ${autoCount} off`;
-  const metadata = `<span class="tools-host">${escapeHtml(app.host)}</span><span class="tools-tally" data-tools-tally${desktopTally ? '' : ' hidden'}>${escapeHtml(desktopTally)}</span><span class="tools-badge-slot" data-tools-badge>${reviewBadge}</span>`;
+  const metadata = `<span class="tools-host">${escapeHtml(shownHost(app))}</span><span class="tools-tally" data-tools-tally${desktopTally ? '' : ' hidden'}>${escapeHtml(desktopTally)}</span><span class="tools-badge-slot" data-tools-badge>${reviewBadge}</span>`;
   const heading = `${BACK}${renderPageHeading(app.name, metadata, reviewForm(app, pin, labelsHash, 'review-header-form', showReview))}`;
   const mobileStrip = `<div class="tools-mobile-strip"><span class="tools-mobile-label">Ask before running</span><span class="tools-mobile-tally" data-tools-mobile-tally${mobileTally ? '' : ' hidden'}>${escapeHtml(mobileTally)}</span></div>`;
   const disconnectedLabel = app.status === 'needs_reconnecting' ? 'Reconnect' : 'Connect';
@@ -434,7 +526,7 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
       ? toolsSkeleton()
       : `<div class="tools-empty" data-tools-empty><p>${disconnectedPrompt}</p><a class="button button-primary" href="${escapeHtml(appUrl(app, 'connect'))}" data-navigation>${disconnectedLabel}</a></div>`
     : sorted.length > 0
-      ? `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list>${sorted.map((tool) => toolRow(app, tool)).join('')}</ul></div>`
+      ? `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list>${sorted.map((tool) => toolRow(app, entry, tool)).join('')}</ul></div>`
       : '<div class="tools-empty" data-tools-empty>No tools listed by this app.</div>';
   const mobileDock = reviewForm(app, pin, labelsHash, 'review-dock', showReview);
   return `<div class="tools-view" data-tools-app="${escapeHtml(app.id)}" data-tools-polling="${hasUnsorted ? 'true' : 'false'}" data-tools-list-hash="${escapeHtml(pin?.listHash ?? '')}">${heading}${mobileStrip}<section class="section tools-section" aria-label="App tools" data-tools-body>${bodyMarkup}</section>${mobileDock}</div>`;
@@ -589,9 +681,10 @@ function pageContent(state: ConnectionsPageState): string {
     case 'connect':
     case 'rename':
     case 'tools': {
-      const app = state.listing.apps.find((entry) => entry.id === view.id);
-      if (!app) return appMissing();
-      if (view.kind === 'connect') return connectView(app, state);
+      const listed = listedApp(state.listing, view.id);
+      if (!listed) return appMissing();
+      const { app } = listed;
+      if (view.kind === 'connect') return connectView(app, listed.entry, state);
       if (view.kind === 'rename') return renameView(app);
       return toolsView(app, state.toolReview?.pin, state.toolReview?.tools ?? []);
     }
@@ -621,6 +714,10 @@ const STYLE = `
 .approval-sub-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .approval-dot { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--warning); flex-shrink: 0; }
 .operator-row .app-link { padding-right: 6px; }
+.app-host + .app-origin::before { content: "·"; margin-inline: 6px; color: var(--line-strong); }
+.catalog-row .row-sub { white-space: normal; overflow-wrap: break-word; }
+.catalog-needs { font-size: 12.5px; }
+.add-own-chevron { display: block; }
 @media (hover: hover) and (pointer: fine) {
   a.app-link:hover { background: var(--fill); }
   .tool-row:hover { background: color-mix(in srgb, var(--fill) 65%, transparent); }
@@ -681,6 +778,8 @@ const STYLE = `
 .redirect code { flex: 1; min-width: 0; padding-block: 8px; font: 13px/1.5 ui-monospace, "SF Mono", monospace; }
 .redirect .button { background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
 .change-client { margin-top: 12px; }
+.redirect a { flex: 1; min-width: 0; padding-block: 8px; font: 13px/1.5 ui-monospace, "SF Mono", monospace; overflow-wrap: anywhere; color: var(--accent-text); }
+.device-status { margin-top: 20px; color: var(--muted); font-size: 14px; }
 .change-client .button { margin-left: -16px; }
 
 @keyframes pulse-soft {
@@ -717,6 +816,12 @@ const STYLE = `
   .app-link .badge-success, .app-link .badge:not([class*="badge-"]) { color: var(--muted); }
   .app-link .badge-success::before { background: var(--success); }
   .app-chevron { display: block; grid-area: chevron; }
+  .operator-row .app-link > .row-main > .row-sub { grid-area: status; }
+  .operator-row .app-link > .app-status { display: none; }
+  .app-origin::before { display: none; }
+  .add-own-link { grid-template-areas: "title chevron"; }
+  .catalog-needs { font-size: 13px; }
+  .catalog-row .row-button { min-height: 44px; }
 
   /* Tools view: iOS Settings-inspired stacked card with generous full-width descriptions */
   .tools-view .page-heading { margin-bottom: 16px; }

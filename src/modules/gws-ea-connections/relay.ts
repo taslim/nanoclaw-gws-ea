@@ -1,26 +1,53 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+import {
+  Client,
+  isSpecType,
+  SdkHttpError,
+  StreamableHTTPClientTransport,
+  type CallToolRequestOptions,
+  type FetchLike,
+} from '@modelcontextprotocol/client';
 
 import { getDb } from '../../db/connection.js';
 import { getPendingApproval } from '../../db/sessions.js';
+import { isRecord } from '../../gws-ea/validation.js';
 import { log as hostLog } from '../../log.js';
 import type { Session } from '../../types.js';
 import { EgressError, publicFetch, type EgressDependencies } from '../gws-ea-egress/fetch.js';
 import { resolveDestination } from '../gws-ea-egress/resolve.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { notifyMainToolsChanged } from './apply.js';
+import {
+  catalogEntryFor,
+  catalogRulesMatch,
+  isConfirmedByApp,
+  offeredDefinition,
+  refusedArgumentIn,
+  type CatalogEntry,
+  type RefusedArgument,
+} from './catalog.js';
 import {
   ASSISTANT_SUMMARY_FIELD,
   canonicalArgsHash,
   canonicalJson,
   normalizeToolDefinition,
   sha256Hex,
+  toolDefinitionHash,
+  toolListHash,
   type ToolDefinition,
 } from './canonical.js';
+import {
+  HOST_PROCESS_IDLE_MS,
+  HostCliUnavailableError,
+  HostProcessTransport,
+  firstText,
+  hostCliAuthRefused,
+  isHostCliEntry,
+  resolveHostCliLaunch,
+} from './host-process.js';
 import { withAppLock } from './locks.js';
 import {
   getConnectionsRefresher,
@@ -46,6 +73,7 @@ export const RELAY_SHUTDOWN_WAIT_MS = 15_000;
 const TERMINATE_SESSION_TIMEOUT_MS = 2_000;
 const MAX_LIST_PAGES = 50;
 const MAX_RELAYED_INSTRUCTIONS_CHARS = 2_000;
+const META_TOOL_PAGE_SIZE = 20;
 
 export const ASK_FIRST_DESCRIPTION_SUFFIX = 'Asks the principal first.';
 export const UNSORTED_DESCRIPTION_SUFFIX = 'Still being set up; try again shortly.';
@@ -110,6 +138,7 @@ export interface RelayDependencies {
   readonly now?: () => number;
   readonly onToolsNeedSort?: (appId: string, listHash: string) => void;
   readonly onHoldCall?: HoldCallHandler;
+  readonly hostProcessIdleMs?: number;
 }
 
 export interface AppRelay {
@@ -220,18 +249,44 @@ class RelayClosedError extends Error {
   }
 }
 
-function isHttp401Error(error: unknown): boolean {
-  return error instanceof StreamableHTTPError && error.code === 401;
+class CatalogRulesUnmatchedError extends Error {
+  constructor() {
+    super("The app's tool listing no longer matches its catalog rules");
+  }
 }
 
-interface ManagedClient {
+function isHttp401Error(error: unknown): boolean {
+  return error instanceof SdkHttpError && error.status === 401;
+}
+
+/**
+ * Each connection asks the server for the 2026-07-28 revision first and falls back to the 2025 handshake when the
+ * server shows no sign of it, so apps on either generation connect.
+ */
+function relayClient(): Client {
+  return new Client(
+    { name: 'nanoclaw-host-relay', version: '1.0.0' },
+    { capabilities: {}, versionNegotiation: { mode: 'auto' }, listMaxPages: MAX_LIST_PAGES },
+  );
+}
+
+type ManagedClient = {
   readonly appId: string;
-  readonly url: string;
   readonly grantGeneration: number;
   readonly client: Client;
-  readonly transport: StreamableHTTPClientTransport;
-  readonly auth: { token: string | undefined };
-}
+} & (
+  | {
+      readonly kind: 'remote';
+      readonly transport: StreamableHTTPClientTransport;
+      readonly auth: { token: string | undefined };
+    }
+  | {
+      readonly kind: 'host_process';
+      readonly transport: HostProcessTransport;
+      readonly metaTools: boolean;
+      idleTimer: NodeJS.Timeout | undefined;
+    }
+);
 
 type UpstreamCallResult =
   | { readonly status: 'completed'; readonly result: Record<string, unknown> }
@@ -257,13 +312,24 @@ function computeToolsVersion(listHash: string, tools: readonly PinnedAppTool[]):
   return sha256Hex(canonicalJson({ listHash, tools: summary })).slice(0, 16);
 }
 
-function formatToolForMain(pinned: PinnedAppTool): RelayedTool {
+/**
+ * Said where main calls the tool rather than in its standing guidance: the app's own approval is the decision, so a
+ * second ask in chat would add a step and protect nothing.
+ */
+export function confirmedByAppDescriptionSuffix(appName: string): string {
+  return `${appName} asks the principal to approve this itself; tell them once what is waiting, then check the outcome when they say they approved or its window passes, without asking again or adding your own approval.`;
+}
+
+function formatToolForMain(pinned: PinnedAppTool, entry: CatalogEntry | undefined): RelayedTool {
+  let suffix: string | undefined;
+  if (pinned.label === 'ask_first') suffix = ASK_FIRST_DESCRIPTION_SUFFIX;
+  else if (pinned.label === null) suffix = UNSORTED_DESCRIPTION_SUFFIX;
+  else if (entry && isConfirmedByApp(entry, pinned.definition.name))
+    suffix = confirmedByAppDescriptionSuffix(entry.name);
   const description =
-    pinned.label === 'ask_first'
-      ? appendDescriptionSuffix(pinned.definition.description, ASK_FIRST_DESCRIPTION_SUFFIX)
-      : pinned.label === null
-        ? appendDescriptionSuffix(pinned.definition.description, UNSORTED_DESCRIPTION_SUFFIX)
-        : pinned.definition.description;
+    suffix === undefined
+      ? pinned.definition.description
+      : appendDescriptionSuffix(pinned.definition.description, suffix);
   return {
     name: pinned.definition.name,
     ...(pinned.definition.title === undefined ? {} : { title: pinned.definition.title }),
@@ -272,6 +338,47 @@ function formatToolForMain(pinned: PinnedAppTool): RelayedTool {
     ...(pinned.definition.annotations === undefined ? {} : { annotations: pinned.definition.annotations }),
     label: pinned.label,
   };
+}
+
+/**
+ * The commands the host offers main: the app's listing less the entry's withheld commands, without the arguments main
+ * may never pass. The full listing stays here, so rules naming the pinned commands are checked against what the app
+ * actually lists.
+ */
+function offeredTools(entry: CatalogEntry | undefined, listing: readonly ToolDefinition[]): readonly ToolDefinition[] {
+  if (!entry) return listing;
+  return listing.filter((tool) => !entry.withheld.includes(tool.name)).map((tool) => offeredDefinition(entry, tool));
+}
+
+/** A command pinned before the app was known as the entry's, or before the entry withheld it, is not offered either. */
+function withheldBy(entry: CatalogEntry | undefined, toolName: string): boolean {
+  return entry?.withheld.includes(toolName) === true;
+}
+
+function refusalText(entry: CatalogEntry, toolName: string, rule: RefusedArgument): string {
+  switch (rule.match.kind) {
+    case 'any':
+      return `The assistant may not pass "${rule.argument}" to ${entry.name}, so nothing was sent. Call ${toolName} without it.`;
+    case 'only':
+      return `${toolName} needs "${rule.argument}" set to ${rule.match.values.join(' or ')}, so nothing was sent.`;
+    case 'non_https_url':
+      return `${toolName} takes only an https address in "${rule.argument}", so nothing was sent.`;
+  }
+}
+
+function failureCode(error: unknown): string {
+  if (error instanceof EgressError) return error.code;
+  if (error instanceof ConnectionsStoreError) return error.reason;
+  if (error instanceof HostCliUnavailableError) return error.reason;
+  if (error instanceof CatalogRulesUnmatchedError) return 'rules_unmatched';
+  return 'failed';
+}
+
+function connectFailureReason(error: unknown): string {
+  if (error instanceof UpstreamUnauthorizedError) return 'unauthorized';
+  if (error instanceof EgressError) return error.code;
+  if (error instanceof HostCliUnavailableError) return 'app_unavailable';
+  return 'connect_failed';
 }
 
 function defaultHoldRefusal(): Promise<RelayCallOutcome> {
@@ -287,6 +394,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
   const now = dependencies.now ?? Date.now;
   const timeoutMs = dependencies.timeoutMs ?? RELAY_TIMEOUT_MS;
   const maxBodyBytes = dependencies.maxBodyBytes ?? RELAY_MAX_BODY_BYTES;
+  const hostProcessIdleMs = dependencies.hostProcessIdleMs ?? HOST_PROCESS_IDLE_MS;
   const readRefresher = dependencies.refresher ?? getConnectionsRefresher;
   const baseResolve = dependencies.egress?.resolve ?? resolveDestination;
   const traceStore = new AsyncLocalStorage<CallTrace>();
@@ -326,7 +434,11 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
    */
   async function withRelayQueue<T>(appId: string, operation: () => Promise<T>): Promise<T> {
     const previous = relayQueues.get(appId) ?? Promise.resolve();
-    const run = previous.then(operation, operation);
+    const step = (): Promise<T> => {
+      clearIdleClose(clients.get(appId));
+      return operation();
+    };
+    const run = previous.then(step, step);
     const tail = run.then(
       () => undefined,
       () => undefined,
@@ -335,8 +447,46 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     try {
       return await run;
     } finally {
-      if (relayQueues.get(appId) === tail) relayQueues.delete(appId);
+      if (relayQueues.get(appId) === tail) {
+        relayQueues.delete(appId);
+        armIdleClose(appId);
+      }
     }
+  }
+
+  function clearIdleClose(managed: ManagedClient | undefined): void {
+    if (managed?.kind !== 'host_process' || managed.idleTimer === undefined) return;
+    clearTimeout(managed.idleTimer);
+    managed.idleTimer = undefined;
+  }
+
+  /** A host-run app's child lives only while it is used; the next call after an idle spell spawns a fresh one. */
+  function armIdleClose(appId: string): void {
+    const managed = clients.get(appId);
+    if (managed?.kind !== 'host_process' || closed) return;
+    clearIdleClose(managed);
+    managed.idleTimer = setTimeout(() => {
+      void withRelayQueue(appId, async () => {
+        if (clients.get(appId) === managed) await closeClient(managed);
+      });
+    }, hostProcessIdleMs);
+    managed.idleTimer.unref();
+  }
+
+  function requestOptions(managed: ManagedClient): { readonly timeout: number } | undefined {
+    return managed.kind === 'host_process' ? { timeout: timeoutMs } : undefined;
+  }
+
+  /**
+   * A remote call carries the approved definition, so the client mirrors its parameter headers from it and, when the
+   * server's definition has changed since, fails with a header mismatch instead of refetching the listing and resending
+   * under a definition nobody approved.
+   */
+  function callOptions(managed: ManagedClient, tool: PinnedAppTool): CallToolRequestOptions | undefined {
+    if (managed.kind === 'host_process') return requestOptions(managed);
+    const definition: unknown = tool.definition;
+    if (!isSpecType.Tool(definition)) throw new TypeError('The approved tool definition is not a valid MCP tool');
+    return { toolDefinition: definition };
   }
 
   function trackOp<T>(operation: () => Promise<T>): Promise<T> {
@@ -410,8 +560,9 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
   async function closeClient(managed: ManagedClient): Promise<void> {
     if (clients.get(managed.appId) === managed) clients.delete(managed.appId);
+    clearIdleClose(managed);
     try {
-      if (managed.transport.sessionId) {
+      if (managed.kind === 'remote' && managed.transport.sessionId) {
         const bound = new AbortController();
         try {
           await Promise.race([
@@ -441,6 +592,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     forceReconnect = false,
   ): Promise<ManagedClient> {
     if (closed) throw new RelayClosedError();
+    if (app.transport === 'host_cli') return ensureHostProcessClient(app, grant);
     let token: string | undefined;
     if (app.auth !== 'none') {
       const usable = await resolveBearer(app, grant, forceRenew);
@@ -452,14 +604,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     if (closed) throw new RelayClosedError();
 
     const existing = clients.get(app.id);
-    if (!forceReconnect && existing && existing.url === app.url && existing.grantGeneration === grant.generation) {
+    if (!forceReconnect && existing?.kind === 'remote' && existing.grantGeneration === grant.generation) {
       existing.auth.token = token;
       return existing;
     }
     if (existing) await closeClient(existing);
 
     const auth = { token };
-    const client = new Client({ name: 'nanoclaw-host-relay', version: '1.0.0' }, { capabilities: {} });
+    const client = relayClient();
     const customFetch: FetchLike = async (input, init) => {
       const method = (init?.method ?? 'GET').toUpperCase();
       // Never open the standalone GET SSE stream: returning 405 tells StreamableHTTPClientTransport it is unsupported.
@@ -485,8 +637,8 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       fetch: customFetch,
     });
     const entry: ManagedClient = {
+      kind: 'remote',
       appId: app.id,
-      url: app.url,
       grantGeneration: grant.generation,
       client,
       transport,
@@ -512,16 +664,103 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     return entry;
   }
 
-  async function listAllUpstreamTools(managed: ManagedClient): Promise<readonly ToolDefinition[]> {
-    const collected: ToolDefinition[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
-      const response = await managed.client.listTools(cursor ? { cursor } : undefined);
-      for (const raw of response.tools) collected.push(normalizeToolDefinition(raw));
-      if (!response.nextCursor) return collected;
-      cursor = response.nextCursor;
+  /**
+   * One child per app and grant generation. Its receipt is verified before every spawn, so a changed or missing install
+   * refuses before anything is written to a process.
+   */
+  async function ensureHostProcessClient(app: ConnectionApp, grant: LiveGrant): Promise<ManagedClient> {
+    const existing = clients.get(app.id);
+    if (existing?.kind === 'host_process' && existing.grantGeneration === grant.generation) return existing;
+    if (existing) await closeClient(existing);
+    const catalogEntry = catalogEntryFor(app);
+    if (!catalogEntry || !isHostCliEntry(catalogEntry)) throw new HostCliUnavailableError('not_enabled');
+    const launch = await resolveHostCliLaunch(catalogEntry);
+    if (closed) throw new RelayClosedError();
+    const transport = new HostProcessTransport(launch);
+    transport.onwrite = () => {
+      const activeTrace = traceStore.getStore();
+      if (activeTrace) activeTrace.fetchStarted = true;
+    };
+    const managed: ManagedClient = {
+      kind: 'host_process',
+      appId: app.id,
+      grantGeneration: grant.generation,
+      client: relayClient(),
+      transport,
+      metaTools: catalogEntry.transport.metaTools,
+      idleTimer: undefined,
+    };
+    transport.onclose = () => {
+      clearIdleClose(managed);
+      if (clients.get(app.id) === managed) clients.delete(app.id);
+    };
+    try {
+      await managed.client.connect(transport, { timeout: timeoutMs });
+    } catch (error) {
+      await closeClient(managed);
+      throw error;
     }
-    throw new Error(`Upstream MCP tool catalog exceeded ${MAX_LIST_PAGES} pages`);
+    if (closed) {
+      await closeClient(managed);
+      throw new RelayClosedError();
+    }
+    clients.set(app.id, managed);
+    return managed;
+  }
+
+  /** Every page, read fresh: a pin confirms what the app lists now, never what it listed earlier. */
+  async function listAllUpstreamTools(managed: ManagedClient): Promise<readonly ToolDefinition[]> {
+    const response = await managed.client.listTools(undefined, { ...requestOptions(managed), cacheMode: 'refresh' });
+    return response.tools.map((raw) => normalizeToolDefinition(raw));
+  }
+
+  async function callMetaTool(managed: ManagedClient, name: string, args: Record<string, unknown>): Promise<unknown> {
+    const result = await managed.client.callTool({ name, arguments: args }, requestOptions(managed));
+    const text = firstText(result);
+    if (result.isError === true || text === undefined) {
+      throw new Error(`The app's ${name} gave no readable answer`);
+    }
+    return JSON.parse(text) as unknown;
+  }
+
+  /** The CLI's MCP mode lists its commands by search; each command's schema comes from its details. */
+  async function listInnerTools(managed: ManagedClient): Promise<readonly ToolDefinition[]> {
+    const names: string[] = [];
+    let offset = 0;
+    for (let page = 0; ; page += 1) {
+      if (page >= MAX_LIST_PAGES) throw new Error(`Upstream MCP tool catalog exceeded ${MAX_LIST_PAGES} pages`);
+      const listed = await callMetaTool(managed, 'search_tools', { limit: META_TOOL_PAGE_SIZE, offset });
+      if (!isRecord(listed) || !Array.isArray(listed.tools)) throw new Error('The app listed its tools unreadably');
+      for (const tool of listed.tools as unknown[]) {
+        if (!isRecord(tool) || typeof tool.name !== 'string' || !tool.name) {
+          throw new Error('The app listed a tool without a name');
+        }
+        names.push(tool.name);
+      }
+      if (listed.nextOffset === undefined || listed.nextOffset === null) break;
+      if (typeof listed.nextOffset !== 'number' || listed.nextOffset <= offset) {
+        throw new Error('The app paged its tools unreadably');
+      }
+      offset = listed.nextOffset;
+    }
+    const definitions: ToolDefinition[] = [];
+    for (const name of names) {
+      const definition = normalizeToolDefinition(await callMetaTool(managed, 'get_tool_details', { name }));
+      if (definition.name !== name) throw new Error('The app described a different tool than asked');
+      definitions.push(definition);
+    }
+    return definitions;
+  }
+
+  /** A meta-tool app runs each inner command through its read or write call, chosen by the pinned definition. */
+  function upstreamCall(
+    managed: ManagedClient,
+    tool: PinnedAppTool,
+    args: Record<string, unknown>,
+  ): { readonly name: string; readonly arguments: Record<string, unknown> } {
+    if (managed.kind !== 'host_process' || !managed.metaTools) return { name: tool.name, arguments: args };
+    const route = tool.definition.annotations?.readOnlyHint === true ? 'call_read_tool' : 'call_write_tool';
+    return { name: route, arguments: { name: tool.name, arguments: args } };
   }
 
   async function requireConnectedApp(serverKey: string): Promise<{ app: ConnectionApp; grant: LiveGrant }> {
@@ -540,11 +779,16 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       const run = async (
         forceRenew: boolean,
       ): Promise<{ instructions: string | null; tools: readonly ToolDefinition[] }> => {
-        // Always open a fresh handshake during catalog confirmation so instruction-only changes reach the pin.
+        // A remote app gets a fresh handshake during catalog confirmation so instruction-only changes reach the pin; a
+        // host-run app's instructions change only with its pinned version.
         const managed = await ensureClient(app, grant, forceRenew, true);
         const listTrace = newTrace();
         try {
-          const tools = await traceStore.run(listTrace, () => listAllUpstreamTools(managed));
+          const tools = await traceStore.run(listTrace, () =>
+            managed.kind === 'host_process' && managed.metaTools
+              ? listInnerTools(managed)
+              : listAllUpstreamTools(managed),
+          );
           const instructions = managed.client.getInstructions() ?? null;
           return { instructions, tools };
         } catch (error) {
@@ -568,15 +812,54 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         throw error;
       }
     });
+    const entry = catalogEntryFor(app);
+    if (entry && !catalogRulesMatch(entry, listed.tools)) {
+      // Every tool goes, including ones pinned from an earlier listing: the rules no longer show what is safe to offer.
+      const cleared = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [],
+        expectedGrantGeneration: grant.generation,
+        at: new Date(now()).toISOString(),
+      });
+      if (cleared.changed) await notifyMainToolsChanged(store);
+      await noteRulesUnmatched(app, listed.tools);
+      throw new CatalogRulesUnmatchedError();
+    }
     const result = await store.pinTools(app.id, {
       instructions: listed.instructions,
-      tools: listed.tools,
+      tools: offeredTools(entry, listed.tools),
       expectedGrantGeneration: grant.generation,
       at: new Date(now()).toISOString(),
     });
     if (result.changed) await notifyMainToolsChanged(store);
     if (result.unsortedCount > 0) onToolsNeedSort?.(app.id, result.pin.listHash);
     return result;
+  }
+
+  /**
+   * Main hears once per listing, without waking, why a connected app has no tools, so it neither retries nor tells the
+   * principal the app works. The note's id names the app and the listing: the same listing again writes nothing.
+   */
+  async function noteRulesUnmatched(app: ConnectionApp, listing: readonly ToolDefinition[]): Promise<void> {
+    const listHash = toolListHash(
+      listing.map((tool) => ({ name: tool.name, definitionHash: toolDefinitionHash(tool) })),
+    );
+    try {
+      await writeNoteForMain({
+        id: `connection-rules-unmatched:${app.id}:${listHash}`,
+        timestamp: new Date(now()).toISOString(),
+        text:
+          `The app ${JSON.stringify(app.name)} is still connected, but its tools are paused: its current version no ` +
+          "longer matches what GWS-EA reviewed. They come back once the principal's operator updates GWS-EA.",
+        wake: false,
+      });
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- the tools are already withheld; a lost note must not change that */
+    } catch (error) {
+      hostLog.error('Paused app note not written', {
+        appId: app.id,
+        error: error instanceof Error ? error.name : 'unknown',
+      });
+    }
   }
 
   async function pinApp(appId: string): Promise<PinToolsResult> {
@@ -595,15 +878,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     const job = pinApp(appId)
       .then(() => undefined)
       .catch((error: unknown) => {
-        hostLog.warn('Background app tool refresh failed', {
-          appId,
-          code:
-            error instanceof EgressError
-              ? error.code
-              : error instanceof ConnectionsStoreError
-                ? error.reason
-                : 'failed',
-        });
+        hostLog.warn('Background app tool refresh failed', { appId, code: failureCode(error) });
       })
       .finally(() => {
         if (refreshing.get(appId) === job) refreshing.delete(appId);
@@ -614,11 +889,12 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
   async function invokeUpstreamTool(
     app: ConnectionApp,
     grant: LiveGrant,
-    toolName: string,
+    tool: PinnedAppTool,
     args: Record<string, unknown>,
     options: { readonly verifyBeforeCall?: () => Promise<PreflightResult> } = {},
   ): Promise<UpstreamCallResult> {
-    return withRelayQueue(app.id, async () => {
+    let authRefused = false;
+    const outcome = await withRelayQueue(app.id, async (): Promise<UpstreamCallResult> => {
       if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
       const attempt = async (forceRenew: boolean) => {
         if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
@@ -631,15 +907,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           if (error instanceof UpstreamUnauthorizedError && !forceRenew && app.auth === 'oauth') {
             return 'retry_401' as const;
           }
-          return {
-            status: 'unsent' as const,
-            reason:
-              error instanceof UpstreamUnauthorizedError
-                ? 'unauthorized'
-                : error instanceof EgressError
-                  ? error.code
-                  : 'connect_failed',
-          };
+          return { status: 'unsent' as const, reason: connectFailureReason(error) };
         }
         if (closed) {
           await closeClient(managed);
@@ -663,8 +931,13 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             (await verifyLiveGrant(app.id, grant.generation)) ? { ok: true } : { ok: false, reason: 'grant_changed' });
         try {
           const result = await traceStore.run(callTrace, () =>
-            managed.client.callTool({ name: toolName, arguments: args }),
+            managed.client.callTool(upstreamCall(managed, tool, args), callOptions(managed, tool)),
           );
+          // A child's pipe is read far past the relay's cap, so the cap applies to the answer main would receive.
+          if (managed.kind === 'host_process' && Buffer.byteLength(JSON.stringify(result)) > maxBodyBytes) {
+            return { status: 'too_large' as const };
+          }
+          if (managed.kind === 'host_process' && hostCliAuthRefused(result)) authRefused = true;
           return { status: 'completed' as const, result: result as Record<string, unknown> };
           /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any upstream MCP call failure into too_large, unsent, or unknown */
         } catch (error) {
@@ -701,6 +974,15 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       }
       return first;
     });
+    // Outside the app's queue: ending the grant closes its client, which waits for nothing queued behind this call.
+    if (authRefused) {
+      await readRefresher()
+        ?.refuse(app.id, grant.generation)
+        .catch((error: unknown) => {
+          hostLog.warn('Could not end a refused host-run app sign-in', { appId: app.id, code: failureCode(error) });
+        });
+    }
+    return outcome;
   }
 
   async function settleUpstreamOutcome(
@@ -787,10 +1069,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             await pinApp(app.id);
             /* eslint-disable-next-line no-catch-all/no-catch-all -- startup pinning is best-effort per app so one down app never blocks others */
           } catch (error) {
-            hostLog.warn('Could not pin connected app tools at startup', {
-              appId: app.id,
-              code: error instanceof EgressError ? error.code : 'failed',
-            });
+            hostLog.warn('Could not pin connected app tools at startup', { appId: app.id, code: failureCode(error) });
           }
         }),
       );
@@ -816,19 +1095,24 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       if (stopping) throw new ConnectionsStoreError('store_unavailable');
       return trackOp(async () => {
         const { app, grant } = await requireConnectedApp(serverKey);
+        const entry = catalogEntryFor(app);
+        // A host-run app's address is a placeholder, so its instructions are attributed to the app by name.
+        const source = app.transport === 'host_cli' && entry ? entry.name : app.host;
+        const format = (tools: readonly PinnedAppTool[]): RelayedTool[] =>
+          tools.filter((tool) => !withheldBy(entry, tool.name)).map((tool) => formatToolForMain(tool, entry));
         const loaded = await store.readAppTools(app.id);
         if (loaded?.pin) {
           triggerBackgroundRefresh(app.id);
           return {
-            instructions: formatRelayedInstructions(loaded.pin.instructions, app.host),
-            tools: loaded.tools.map(formatToolForMain),
+            instructions: formatRelayedInstructions(loaded.pin.instructions, source),
+            tools: format(loaded.tools),
             toolsVersion: computeToolsVersion(loaded.pin.listHash, loaded.tools),
           };
         }
         const pinned = await pinConnectedApp(app, grant);
         return {
-          instructions: formatRelayedInstructions(pinned.pin.instructions, app.host),
-          tools: pinned.tools.map(formatToolForMain),
+          instructions: formatRelayedInstructions(pinned.pin.instructions, source),
+          tools: format(pinned.tools),
           toolsVersion: computeToolsVersion(pinned.pin.listHash, pinned.tools),
         };
       });
@@ -844,6 +1128,15 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       }
       return trackOp(async () => {
         const { app, grant } = await requireConnectedApp(input.serverKey);
+        // Refused before anything about the call is stored, so a refused argument can never reach a card or the app.
+        const entry = catalogEntryFor(app);
+        const refused = entry && refusedArgumentIn(entry, input.toolName, input.args);
+        if (entry && refused) {
+          return { status: 'unsent', reason: 'refused_argument', text: refusalText(entry, input.toolName, refused) };
+        }
+        if (withheldBy(entry, input.toolName)) {
+          return { status: 'unsent', reason: 'unknown_tool', text: `Unknown tool "${input.toolName}".` };
+        }
         const loaded = await store.readAppTools(app.id);
         let pin = loaded?.pin;
         let tools: readonly PinnedAppTool[] = loaded?.tools ?? [];
@@ -1122,7 +1415,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           return outcomeFromSettledRecord(directClaim.record, toolsVersion);
         }
 
-        const upstream = await invokeUpstreamTool(app, grant, tool.name, callArgs, {
+        const upstream = await invokeUpstreamTool(app, grant, tool, callArgs, {
           verifyBeforeCall: () =>
             verifySendPreflight({
               appId: app.id,
@@ -1300,7 +1593,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           );
         }
 
-        const upstream = await invokeUpstreamTool(app, grant, input.toolName, input.args, {
+        const upstream = await invokeUpstreamTool(app, grant, freshTool, input.args, {
           verifyBeforeCall: () =>
             verifySendPreflight({
               appId: input.appId,

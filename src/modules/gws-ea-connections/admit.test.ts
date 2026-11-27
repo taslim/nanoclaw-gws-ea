@@ -95,9 +95,19 @@ describe('admitAppUrl', () => {
     ['https://203.0.113.9/mcp', 'invalid_url'],
     ['https://example.test/m%20cp', 'invalid_url'],
     ['https://example.test/mcp;v=1', 'invalid_url'],
+    ['https://link.host-cli.invalid/', 'invalid_url'],
+    ['https://Host-CLI.invalid/mcp', 'invalid_url'],
   ] as const)('refuses %s as %s without asking the gateway', async (url, reason) => {
     expect(await refusal(url)).toBe(reason);
     expect(listed).toEqual([]);
+  });
+
+  it("admits a catalog app's host entered as an address", async () => {
+    expect(await admitAppUrl('https://mcp.notion.com/sse', dependencies())).toEqual({
+      admitted: true,
+      url: 'https://mcp.notion.com/sse',
+      host: 'mcp.notion.com',
+    });
   });
 
   it('refuses the host of an operator http entry', async () => {

@@ -7,7 +7,15 @@ import { log } from '../../log.js';
 import { clientDocumentsServed } from '../gws-ea-web/index.js';
 import { registerWebMount } from '../gws-ea-web/mounts.js';
 import { registerAppActions } from './actions.js';
+import { webHostname } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
+import {
+  CATALOG_RETIRE_COMMAND,
+  parseCatalogRetireRequest,
+  RETIRABLE_CATALOG_ENTRIES,
+  type CatalogRetireReply,
+  type RetirableCatalogEntry,
+} from './catalog-retire.js';
 import { connectionsRoot } from './config.js';
 import { clientDocumentsWebMount, connectionsWebMount, operatorAsApp } from './connections-mount.js';
 import {
@@ -16,8 +24,10 @@ import {
   withdrawHeldAppCalls,
   withdrawToolAskApprovals,
 } from './held-calls.js';
+import { cancelAllDeviceSignIns } from './device-sign-in.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
+import { ConnectionOperations } from './operations.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
 import { drainRelayActions, registerRelayAction } from './relay-actions.js';
 import { getAppRelay, startAppRelay, stopAppRelay, type AppRelay } from './relay.js';
@@ -94,6 +104,48 @@ register({
   },
   handler: () => connectionsHealth(),
 });
+
+/** Disconnecting sends nothing to a redirect address; without web set up, no sign-in endpoint can sit on its host. */
+async function retirementOperations(store: ConnectionsStore): Promise<ConnectionOperations> {
+  return new ConnectionOperations({ store, webHostname: (await webHostname()) ?? '', clientDocumentsServed });
+}
+
+/**
+ * Asked by the operator's uninstall while it holds the assistant's instance lock, so nothing here takes it. An
+ * assistant without a connections store has no apps to retire; one whose store cannot be opened cannot confirm.
+ */
+async function retireCatalogApps(entry: RetirableCatalogEntry): Promise<CatalogRetireReply> {
+  if (!connectionsRoot()) return { schemaVersion: 1, entry, retired: 0, remaining: 0 };
+  const runtime = await ensureConnectionsRuntime();
+  if (!runtime) throw new Error('The connections store is unavailable, so no app was disconnected.');
+  return (await retirementOperations(runtime.store)).retireCatalogEntry(entry);
+}
+
+register({
+  name: CATALOG_RETIRE_COMMAND,
+  description: 'Disconnect every app made from a catalog entry the operator turned off, and report how many remain.',
+  access: 'hidden',
+  hostOnly: true,
+  parseArgs: (raw) => parseCatalogRetireRequest(raw),
+  handler: ({ entry }) => retireCatalogApps(entry),
+});
+
+/**
+ * A stopped assistant missed the operator's uninstall, so it catches up before main's apps are applied and any tools
+ * pinned. One entry that cannot be retired now is retried at the next start and holds up nothing else.
+ */
+async function retireAtStart(store: ConnectionsStore): Promise<void> {
+  const operations = await retirementOperations(store);
+  for (const entry of RETIRABLE_CATALOG_ENTRIES) {
+    try {
+      const { retired, remaining } = await operations.retireCatalogEntry(entry);
+      if (retired > 0) log.info('Catalog apps retired at start', { entry, retired, remaining });
+    } catch (error) {
+      if (!(error instanceof ConnectionsStoreError)) throw error;
+      log.warn('Catalog apps not retired at start', { entry, reason: error.reason });
+    }
+  }
+}
 
 interface ConnectionsRuntime {
   readonly store: ConnectionsStore;
@@ -261,6 +313,7 @@ onHostStart(async ({ signal }) => {
     const runtime = await ensureConnectionsRuntime(signal, hostHookConsumed);
     hostHookConsumed = true;
     if (!runtime) return;
+    await retireAtStart(runtime.store);
     await applyMainServers(runtime.store);
     void (async () => {
       if (signal.aborted) return;
@@ -289,6 +342,7 @@ onHostShutdown(async () => {
   activeStore = undefined;
   hostHookConsumed = false;
   if (pending) await pending.catch(() => undefined);
+  cancelAllDeviceSignIns();
   await drainRelayActions();
   await runHostCleanup([
     stopAppToolSorter,

@@ -43,6 +43,7 @@ beforeAll(async () => {
     'mcp.ledger.example.test',
     'notes.example.test',
     'auth.example.test',
+    'mcp.pantry.example.test',
     ASSISTANT,
   ]);
 });
@@ -277,6 +278,49 @@ describe('authorization', () => {
     query.set('error', 'server_error');
     expect(await codeOf(completeAuthorization(query, pending, LEDGERLY_CLIENT, options))).toBe('failed');
     expect(endpoints.requests).toEqual([]);
+  });
+});
+
+describe('a resource identifier written differently from the app’s address', () => {
+  // Served at the origin's root, it names itself without the trailing slash its address carries.
+  const PANTRY = 'https://mcp.pantry.example.test/';
+  const PANTRY_RESOURCE = 'https://mcp.pantry.example.test';
+  const PANTRY_REDIRECT = appRedirectUri(ASSISTANT, 'mcp.pantry.example.test');
+  const PANTRY_CLIENT: ClientRegistration = { clientId: 'juno-pantry-client', clientSecret: 'juno-pantry-secret' };
+
+  it('sends the identifier exactly as the app publishes it on sign-in, exchange and renewal', async () => {
+    const app = new FakeMcpApp({
+      appUrl: PANTRY,
+      resource: PANTRY_RESOURCE,
+      issuer: 'https://mcp.pantry.example.test',
+      client: { id: PANTRY_CLIENT.clientId, secret: PANTRY_CLIENT.clientSecret ?? '', redirectUri: PANTRY_REDIRECT },
+    });
+    serve(app.handle);
+    const resource = await readProtectedResource(PANTRY, options);
+    if (!resource) throw new Error('Pantry publishes resource metadata');
+    const signIn = await signInServer(resource, undefined, options);
+    const prepared = await prepareAuthorization(signIn, PANTRY_CLIENT, PANTRY_REDIRECT);
+    expect(new URL(prepared.authorizationUrl('state-1')).searchParams.get('resource')).toBe(PANTRY_RESOURCE);
+
+    const { query } = app.approve(prepared.authorizationUrl('state-1'));
+    const pending = {
+      issuer: 'https://mcp.pantry.example.test/',
+      verifier: prepared.verifier,
+      redirectUri: PANTRY_REDIRECT,
+      resource: signIn.resource,
+    };
+    const tokens = await completeAuthorization(query, pending, PANTRY_CLIENT, options);
+    if (!tokens.refreshToken) throw new Error('Pantry issues refresh tokens');
+    const renewed = await refreshAccess(
+      { url: PANTRY, issuer: 'https://mcp.pantry.example.test/' },
+      { refreshToken: tokens.refreshToken, client: PANTRY_CLIENT },
+      options,
+    );
+    expect(app.accessTokens.has(renewed.accessToken)).toBe(true);
+    const sent = endpoints.requests
+      .filter((request) => request.path === '/oauth/token')
+      .map((request) => new URLSearchParams(request.body).get('resource'));
+    expect(sent).toEqual([PANTRY_RESOURCE, PANTRY_RESOURCE]);
   });
 });
 

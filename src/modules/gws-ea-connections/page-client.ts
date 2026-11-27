@@ -1,10 +1,4 @@
-/**
- * Runs inside the page kit's script.
- * - Sign-in starts with a same-origin POST that answers the server's authorization URL.
- * - Tool approval toggles update optimistically in place via same-origin JSON (no full-page lock or re-sort jump).
- * - While a connected app's tools are still being sorted, lightweight same-origin polling updates rows live in place
- *   and stops automatically once settled.
- */
+/** Runs inside the page kit's script. */
 export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   const initialOutcome = new URLSearchParams(location.search).get('outcome');
   if (initialOutcome && initialOutcome !== 'approved' && initialOutcome !== 'declined') {
@@ -19,6 +13,60 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   let reconcileTimer;
   let pollGeneration = 0;
   let reconcileGeneration = 0;
+  let deviceTimer;
+  let deviceGeneration = 0;
+
+  function stopDevicePolling() {
+    deviceGeneration += 1;
+    if (deviceTimer) {
+      clearTimeout(deviceTimer);
+      deviceTimer = undefined;
+    }
+  }
+
+  function startDevicePolling() {
+    stopDevicePolling();
+    const root = document.querySelector('[data-device-sign-in]');
+    if (!root || root.dataset.deviceState !== 'waiting') return;
+    const appId = root.dataset.deviceSignIn;
+    const gen = deviceGeneration;
+    const schedule = () => {
+      if (gen === deviceGeneration) deviceTimer = setTimeout(() => { void tick(); }, 2000);
+    };
+    const tick = async () => {
+      if (gen !== deviceGeneration || !root.isConnected) return;
+      if (document.visibilityState === 'hidden') return schedule();
+      try {
+        const response = await fetch('/connections/app/' + encodeURIComponent(appId) + '/sign-in-status', {
+          method: 'GET', headers: { Accept: 'application/json' }, credentials: 'same-origin', cache: 'no-store',
+        });
+        if (gen !== deviceGeneration || !root.isConnected) return;
+        if (response.status === 404) {
+          location.assign('/connections');
+          return;
+        }
+        if (response.ok) {
+          const data = await response.json();
+          if (gen !== deviceGeneration || !root.isConnected) return;
+          if (data.status === 'connected') {
+            location.assign('/connections?outcome=connected');
+            return;
+          }
+          // A sign-in started again from another tab has its own address and phrase.
+          const shownPhrase = root.querySelector('#device-phrase')?.textContent;
+          const shownAddress = root.querySelector('#device-address')?.getAttribute('href');
+          if (data.status !== 'waiting' || data.phrase !== shownPhrase || data.verificationUrl !== shownAddress) {
+            location.assign(location.pathname);
+            return;
+          }
+        }
+      } catch {
+        // A missed check is retried on the next one.
+      }
+      schedule();
+    };
+    schedule();
+  }
 
   async function signIn(form) {
     if (signingIn || kit.busy()) return;
@@ -46,6 +94,11 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
       if (response.ok && typeof data.authorizationUrl === 'string' && data.authorizationUrl.startsWith('https://')) {
         leaving = true;
         location.assign(data.authorizationUrl);
+        return;
+      }
+      if (response.ok && typeof data.location === 'string' && data.location.startsWith('/connections/')) {
+        leaving = true;
+        location.assign(data.location);
         return;
       }
       kit.message(typeof data.error === 'string' ? data.error : 'Couldn’t open sign-in. Try again.', response.status === 409);
@@ -92,7 +145,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     if (button) {
       button.setAttribute('aria-checked', isAskFirst ? 'true' : 'false');
       const stateNode = button.querySelector('.switch-state');
-      if (stateNode) stateNode.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : 'Auto';
+      if (stateNode) stateNode.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : row.dataset.autoText || 'Auto';
     }
   }
 
@@ -126,6 +179,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     li.dataset.toolRow = tool.name;
     li.dataset.toolHash = tool.definitionHash;
     li.dataset.toolState = isChecking ? 'checking' : isAskFirst ? 'ask_first' : 'just_do';
+    li.dataset.autoText = tool.autoText || 'Auto';
 
     const info = document.createElement('div');
     info.className = 'tool-info';
@@ -172,7 +226,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     button.dataset.switchName = tool.name;
     const stateSpan = document.createElement('span');
     stateSpan.className = 'switch-state';
-    stateSpan.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : 'Auto';
+    stateSpan.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : li.dataset.autoText;
     const track = document.createElement('span');
     track.className = 'switch-track';
     track.setAttribute('aria-hidden', 'true');
@@ -573,7 +627,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
             outcome.textContent = '';
             outcome.hidden = true;
           }
-          kit.announce(titleText + ': ' + (confirmed === 'ask_first' ? 'Ask first' : 'Auto'));
+          kit.announce(titleText + ': ' + (confirmed === 'ask_first' ? 'Ask first' : (liveRow && liveRow.dataset.autoText) || 'Auto'));
         }
         return;
       }
@@ -624,6 +678,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     mutationEpoch += 1;
     cancelReconciliation();
     startToolsPolling();
+    startDevicePolling();
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
@@ -632,4 +687,5 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     }
   });
   startToolsPolling();
+  startDevicePolling();
 `;

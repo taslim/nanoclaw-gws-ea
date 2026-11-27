@@ -1125,29 +1125,37 @@ describe('exhaustive deterministic floor coverage', () => {
     const safeDef = toolDef('lookup_item', 'Look up an item');
     const safeHash = toolDefinitionHash(safeDef);
     const expected = new Map([['lookup_item', { definitionHash: safeHash, definition: safeDef }]]);
-    const conflict = resolveFinalToolUpdates(expected, [
-      { name: 'lookup_item', definitionHash: safeHash, label: 'just_do', summary: 'Look up an item', reason: 'Read' },
-      {
-        name: 'lookup_item',
-        definitionHash: safeHash,
-        label: 'ask_first',
-        summary: 'Mutate an item',
-        reason: 'Mutates',
-      },
-    ]);
+    const conflict = resolveFinalToolUpdates(
+      expected,
+      [
+        { name: 'lookup_item', definitionHash: safeHash, label: 'just_do', summary: 'Look up an item', reason: 'Read' },
+        {
+          name: 'lookup_item',
+          definitionHash: safeHash,
+          label: 'ask_first',
+          summary: 'Mutate an item',
+          reason: 'Mutates',
+        },
+      ],
+      undefined,
+    );
     expect(conflict.updates).toEqual([]);
     expect(conflict.missing).toEqual([{ name: 'lookup_item', definitionHash: safeHash }]);
 
-    const staleIgnored = resolveFinalToolUpdates(expected, [
-      { name: 'lookup_item', definitionHash: 'stale-hash', label: 'ask_first', summary: 'Old', reason: 'Old' },
-      {
-        name: 'lookup_item',
-        definitionHash: safeHash,
-        label: 'just_do',
-        summary: 'Look up an item',
-        reason: 'Current read',
-      },
-    ]);
+    const staleIgnored = resolveFinalToolUpdates(
+      expected,
+      [
+        { name: 'lookup_item', definitionHash: 'stale-hash', label: 'ask_first', summary: 'Old', reason: 'Old' },
+        {
+          name: 'lookup_item',
+          definitionHash: safeHash,
+          label: 'just_do',
+          summary: 'Look up an item',
+          reason: 'Current read',
+        },
+      ],
+      undefined,
+    );
     expect(staleIgnored.missing).toEqual([]);
     expect(staleIgnored.updates).toMatchObject([{ name: 'lookup_item', label: 'just_do' }]);
 
@@ -1304,5 +1312,123 @@ describe('exhaustive deterministic floor coverage', () => {
     expect(freshLabelsHash).not.toBe(staleLabelsHash);
     expect(await store.markToolsReviewed(app.id, pin.listHash, undefined, freshLabelsHash)).toBe(true);
     expect((await store.getPin(app.id))?.needsReview).toBe(false);
+  });
+});
+
+describe('catalog apps whose tools the app confirms itself', () => {
+  const recordedLink = JSON.parse(
+    fs.readFileSync(path.join(import.meta.dirname, 'testing', 'link-1.6.0-tools.json'), 'utf8'),
+  ) as { readonly tools: readonly ToolDefinition[] };
+
+  function recordedLinkTool(name: string): ToolDefinition {
+    const tool = recordedLink.tools.find((candidate) => candidate.name === name);
+    if (!tool) throw new Error(`The recorded Link listing has no ${name}`);
+    return normalizeToolDefinition(tool);
+  }
+
+  async function connectedLink(tools: readonly ToolDefinition[]) {
+    const created = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+    const pinned = await store.pinTools(app.id, { instructions: null, tools });
+    return { app, pin: pinned.pin, tools: pinned.tools };
+  }
+
+  /** Runs one sort whose reply labels every pinned tool as given. */
+  async function sortAs(
+    appId: string,
+    listHash: string,
+    labels: Readonly<Record<string, 'ask_first' | 'just_do'>>,
+  ): Promise<void> {
+    let wokeSession: Session | undefined;
+    vi.mocked(requestWake).mockImplementation(async (session) => {
+      wokeSession = session;
+      return true;
+    });
+    sorter ??= createAppToolSorter({ store, timeoutMs: 2_000 });
+    registerSortToolsAction({ sorter: () => sorter });
+    const done = sorter.enqueue(appId, listHash);
+    await vi.waitFor(() => expect(wokeSession).toBeDefined());
+    const pinned = await store.listTools(appId);
+    const reply = await sendSortTools(
+      {
+        tools: pinned.map((tool) => ({
+          name: tool.name,
+          definition_hash: tool.definitionHash,
+          label: labels[tool.name],
+          summary: `Sorted ${tool.name}`,
+          reason: 'Sorter judgment',
+        })),
+      },
+      wokeSession!,
+    );
+    expect(reply.ok).toBe(true);
+    await done;
+  }
+
+  it('runs the tools Link confirms in its own app without asking, despite their floor names, and sorts its other tools', async () => {
+    const create = recordedLinkTool('spend-request_create');
+    const pay = recordedLinkTool('mpp_pay');
+    expect(evaluateToolFloors(create).floor).toBe(true);
+    expect(evaluateToolFloors(pay).floor).toBe(true);
+    const { app, pin } = await connectedLink([create, pay, recordedLinkTool('payment-methods_update')]);
+
+    await sortAs(app.id, pin.listHash, {
+      'spend-request_create': 'ask_first',
+      mpp_pay: 'ask_first',
+      'payment-methods_update': 'ask_first',
+    });
+
+    const after = new Map((await store.listTools(app.id)).map((tool) => [tool.name, tool]));
+    for (const name of ['spend-request_create', 'mpp_pay']) {
+      expect(after.get(name)).toMatchObject({
+        label: 'just_do',
+        labelSource: 'floor',
+        summary: `Sorted ${name}`,
+        unsettled: false,
+      });
+    }
+    expect(after.get('payment-methods_update')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'sorter',
+      unsettled: false,
+    });
+  });
+
+  it("holds Shop's complete_checkout for the card through the checkout name floor", async () => {
+    const created = await store.create({ name: 'Shop', url: 'https://mcp.shop.com/', auth: 'none', catalogId: 'shop' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+    const { pin } = await store.pinTools(app.id, {
+      instructions: null,
+      tools: [toolDef('complete_checkout', 'Complete the checkout with the saved payment method')],
+    });
+
+    await sortAs(app.id, pin.listHash, { complete_checkout: 'just_do' });
+
+    expect(await store.getTool(app.id, 'complete_checkout')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'floor',
+      reason: expect.stringContaining('checkout'),
+    });
+  });
+
+  it("keeps the principal's Ask first on a tool Link confirms itself when it is sorted again", async () => {
+    const { app } = await connectedLink([recordedLinkTool('spend-request_create')]);
+    await store.setToolLabel(app.id, 'spend-request_create', 'ask_first', 'principal');
+
+    const changed = {
+      ...recordedLinkTool('spend-request_create'),
+      description: 'Create a one-time or recurring spend request for the principal to approve',
+    };
+    const repinned = await store.pinTools(app.id, { instructions: null, tools: [changed] });
+    expect((await store.getTool(app.id, 'spend-request_create'))?.label).toBeNull();
+
+    await sortAs(app.id, repinned.pin.listHash, { 'spend-request_create': 'just_do' });
+
+    expect(await store.getTool(app.id, 'spend-request_create')).toMatchObject({
+      label: 'ask_first',
+      labelSource: 'principal',
+      principalFloor: true,
+      unsettled: false,
+    });
   });
 });

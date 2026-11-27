@@ -6,7 +6,7 @@ import { parseInvocation } from './command-parser.js';
 
 describe('connector command contract', () => {
   it('gives each connector the four lifecycle and inspection actions as complete paths', () => {
-    for (const name of ['voice', 'web']) {
+    for (const name of ['voice', 'web', 'link', 'shop']) {
       const commands = COMMAND_DEFINITIONS.filter(
         (command) => command.path[0] === 'connectors' && command.path[2] === name,
       );
@@ -36,12 +36,12 @@ describe('connector command contract', () => {
   });
 });
 
-it('keeps the connector catalog limited to optional voice and web setup', () => {
+it('keeps the connector catalog limited to optional voice, web, Link and Shop setup', () => {
   expect(
     COMMAND_DEFINITIONS.filter((command) => command.path[0] === 'connectors' && command.path[1] === 'install').map(
       (command) => command.path[2],
     ),
-  ).toEqual(['voice', 'web']);
+  ).toEqual(['voice', 'web', 'link', 'shop']);
   expect(() => parseInvocation(['connectors', 'install', 'onepassword'])).toThrow();
 });
 it.each([['--delete-vault'], ['--abandon', 'onepassword'], ['--abandon', 'login-key']])(

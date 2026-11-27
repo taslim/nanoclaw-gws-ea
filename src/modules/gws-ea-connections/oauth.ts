@@ -1,5 +1,5 @@
 /**
- * Signing in to an app's server on the principal's behalf. The MCP SDK's client auth helpers carry the protocol:
+ * Signing in to an app's server on the principal's behalf. The MCP client's auth helpers carry the protocol:
  * protected-resource discovery, PKCE authorization URLs, registration, exchange and refresh with `resource`. This
  * module adds what they leave to the caller: the server must describe itself consistently, every endpoint is https
  * and off the assistant's own hostname, S256 is required, the authorization response's `iss` is checked, and
@@ -12,18 +12,20 @@ import {
   buildDiscoveryUrls,
   discoverOAuthProtectedResourceMetadata,
   exchangeAuthorization,
+  OAuthClientFlowError,
+  OAuthError,
   refreshAuthorization,
   registerClient,
+  RegistrationRejectedError,
   selectClientAuthMethod,
   startAuthorization,
-} from '@modelcontextprotocol/sdk/client/auth.js';
+} from '@modelcontextprotocol/client';
 
 import { isRecord } from '../../gws-ea/validation.js';
 import { EgressError, publicFetch, type EgressDependencies, type PublicFetch } from '../gws-ea-egress/fetch.js';
 import type { ClientRegistration, GrantCredentials } from './store.js';
 
-/** The revision servers mostly implement today, sent on discovery and MCP requests. */
-export const MCP_PROTOCOL_VERSION = '2025-11-25';
+const MCP_PROTOCOL_VERSION = '2025-11-25';
 
 /** A token answer without `expires_in` is treated as lasting this long. */
 export const ACCESS_LIFETIME_WITHOUT_EXPIRY_MS = 60 * 60_000;
@@ -98,6 +100,7 @@ export interface AuthorizationServer {
 }
 
 export interface ProtectedResource {
+  /** As the server published it: it may write the app's address differently, e.g. without a root path's slash. */
   readonly resource: string;
   readonly issuer: string;
   readonly scopes: readonly string[];
@@ -105,7 +108,10 @@ export interface ProtectedResource {
 
 /** Everything a sign-in to one app needs from discovery. */
 export interface SignInServer {
-  /** The app's URL, sent as `resource` on every authorization and token request. */
+  /**
+   * The app's resource identifier, sent as `resource` on every authorization and token request exactly as the server
+   * published it, since an authorization server may compare it as a string.
+   */
   readonly resource: string;
   readonly scope: string | undefined;
   readonly server: AuthorizationServer;
@@ -177,15 +183,31 @@ function watched(fetch: PublicFetch): Watched {
   };
 }
 
-function oauthErrorCode(error: unknown): string | undefined {
-  if (!(error instanceof Error) || !('errorCode' in error)) return undefined;
-  return typeof error.errorCode === 'string' ? error.errorCode : undefined;
+/** A refused registration keeps the server's answer as raw text, where its RFC 7591 `error` code sits. */
+function registrationErrorCode(body: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return isRecord(parsed) && typeof parsed.error === 'string' ? parsed.error : undefined;
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
 }
 
-/** The SDK refuses with plain errors, and a malformed answer surfaces as a schema or JSON error. */
+function oauthErrorCode(error: unknown): string | undefined {
+  if (error instanceof OAuthError) return error.code;
+  if (error instanceof RegistrationRejectedError) return registrationErrorCode(error.body);
+  return undefined;
+}
+
+/**
+ * The SDK refuses with plain errors or its own flow errors, and a malformed answer surfaces as a schema or JSON
+ * error.
+ */
 function malformedOrRefused(error: unknown): boolean {
   return (
     error instanceof SyntaxError ||
+    error instanceof OAuthClientFlowError ||
     (error instanceof Error && (error.constructor === Error || error.name === 'ZodError'))
   );
 }
@@ -293,7 +315,7 @@ export async function discoverAuthorizationServer(
 
 /**
  * The app's protected-resource metadata, from the location its 401 named or the well-known one. Undefined when the
- * server publishes none. Its `resource` must be the app's URL.
+ * server publishes none. Its `resource` must name the app's URL.
  */
 export async function readProtectedResource(
   appUrl: string,
@@ -316,7 +338,7 @@ export async function readProtectedResource(
   }
   if (!sameUrl(document.resource, appUrl)) return fail('resource_mismatch');
   return {
-    resource: appUrl,
+    resource: document.resource,
     issuer: issuerOf(document.authorization_servers?.[0], options.assistantHost),
     scopes: strings(document.scopes_supported),
   };
@@ -556,7 +578,7 @@ export async function refreshAccess(
       metadata: sdkMetadata(server),
       clientInformation: information,
       refreshToken: grant.refreshToken,
-      resource: app.url,
+      resource: resource?.resource ?? app.url,
       fetchFn: watch.fetch,
     }),
   );

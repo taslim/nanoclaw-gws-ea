@@ -10,7 +10,7 @@ import { listProviderHostContracts } from '../../provider-contracts/index.js';
 import { AGENT_GOOGLE_HOSTS } from '../gws-ea-google/grant.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { mainOperatorServers, type OperatorServer } from './apply.js';
-import type { ConnectionApp, ConnectionsStore } from './store.js';
+import { isHostCliHost, type ConnectionApp, type ConnectionsStore } from './store.js';
 
 /** Every app credential the host publishes carries this name prefix and the app's ID. */
 export const APP_CREDENTIAL_PREFIX = 'gws-ea-app-';
@@ -31,7 +31,6 @@ const HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]
 const PATH = /^\/[A-Za-z0-9._~/-]*$/u;
 
 export type AdmissionRefusal =
-  /** Not a URL this host can call: unparseable, an address literal, a port, a fragment or unusual path characters. */
   | 'invalid_url'
   | 'not_https'
   /** Sign-in details or a query, which is where a URL carries credentials; an app's address names it and nothing more. */
@@ -69,7 +68,14 @@ function parsed(input: string): URL | AdmissionRefusal {
   const url = new URL(input.trim());
   if (url.protocol !== 'https:') return 'not_https';
   if (url.username || url.password || url.search || input.includes('?')) return 'credentials_in_url';
-  if (url.hash || input.includes('#') || url.port !== '' || !HOST.test(url.hostname) || !PATH.test(url.pathname))
+  if (
+    url.hash ||
+    input.includes('#') ||
+    url.port !== '' ||
+    !HOST.test(url.hostname) ||
+    !PATH.test(url.pathname) ||
+    isHostCliHost(url.hostname)
+  )
     return 'invalid_url';
   return url;
 }

@@ -331,6 +331,29 @@ const connectorAssistant = object({
   reasons: array(text),
   next_actions: array(nextAction),
 });
+const LINK_DETAILS_SCHEMA = object({
+  name: { const: 'link' },
+  policy_file: text,
+  pinned_version: text,
+  enabled: nullable(bool),
+  versions: array(
+    object({
+      version: text,
+      installation_dir: text,
+      pinned: bool,
+      receipt: choices('verified', 'invalid', 'not_checked'),
+      reason: nullable(text),
+    }),
+  ),
+});
+const shopRedirect = { instance_id: text, redirect_uri: nullable(text) };
+const SHOP_DETAILS_SCHEMA = object({
+  name: { const: 'shop' },
+  policy_file: text,
+  client_id: nullable(text),
+  client_secret: bool,
+  assistants: array(object(shopRedirect)),
+});
 export const CONNECTOR_OBSERVATION_SCHEMA = object({
   name: connectorName,
   summary: text,
@@ -357,7 +380,7 @@ export const CONNECTOR_OBSERVATION_SCHEMA = object({
   assistants: array(connectorAssistant),
   reasons: array(text),
   next_actions: array(nextAction),
-  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, array(WEB_CAPABILITY_SCHEMA)] },
+  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, array(WEB_CAPABILITY_SCHEMA), LINK_DETAILS_SCHEMA, SHOP_DETAILS_SCHEMA] },
 });
 export const STATUS_DATA_SCHEMA = object({
   instance_id: text,
@@ -410,8 +433,39 @@ const webProvisioning = object({
   message: nullable(text),
   changed: bool,
 });
+const catalogRetirement = object({
+  instance_id: text,
+  outcome: choices('retired', 'stopped', 'unconfirmed'),
+  retired: nullable(count),
+  remaining: nullable(count),
+  message: text,
+});
+const catalogUninstall = {
+  scope: { const: 'host' },
+  outcome: choices('removed', 'pending'),
+  reason: nullable(text),
+  assistants: array(catalogRetirement),
+};
 export const CONNECTOR_OPERATION_SCHEMA = {
   oneOf: [
+    object({
+      name: { const: 'link' },
+      scope: { const: 'host' },
+      enabled: { const: true },
+      version: text,
+      installation_dir: text,
+    }),
+    object({ name: { const: 'link' }, enabled: { const: false }, ...catalogUninstall }),
+    object({
+      name: { const: 'shop' },
+      scope: { const: 'host' },
+      registered: { const: true },
+      client_id: text,
+      client_secret: bool,
+      assistants: array(object({ ...shopRedirect, message: text })),
+      operator_actions: array(text),
+    }),
+    object({ name: { const: 'shop' }, registered: { const: false }, ...catalogUninstall }),
     VOICE_OPERATION_SCHEMA,
     object({
       name: { const: 'web' },

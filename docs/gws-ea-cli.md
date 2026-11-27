@@ -14,7 +14,7 @@ remain errors even with `--help`.
 
 A connector provides optional functionality that gws-ea sets up outside the
 base install: downloaded programs or models, or provisioned accounts
-and services. The catalog contains `voice` and `web`.
+and services. The catalog contains `voice`, `web`, `link` and `shop`.
 Each has four commands:
 
 ```sh
@@ -27,7 +27,8 @@ gws-ea connectors check <name> [--id <instance_id>]
 
 Installation and configuration belong to the operator host. Voice shares
 immutable programs and models; web keeps separate resources
-for each assistant in the operator's selected account. Access remains a
+for each assistant in the operator's selected account; link shares the pinned
+Link program; shop records the operator's Shopify client. Access remains a
 separate decision: agent permissions, the principal's confirmed addresses, and
 artifact reader grants retain their own boundaries. Installing a connector
 makes its supported functionality available without a second switch.
@@ -47,7 +48,8 @@ eligible assistants. Existing resources are retained. A missing prerequisite
 or operator approval becomes pending with the next action; optional setup never
 fails a committed update. Rollback does not provision connectors.
 
-See [voice](gws-ea-voice.md) and [HTML artifacts](gws-ea-artifacts.md) for their lifecycle details. The
+See [voice](gws-ea-voice.md) and [HTML artifacts](gws-ea-artifacts.md) for their lifecycle details, and
+[catalog apps](#catalog-apps-link-and-shop) for `link` and `shop`. The
 [built-in browser](#browser-access) detects Chrome; the [web alias](#web-alias)
 is optional assistant identity.
 
@@ -200,6 +202,78 @@ Updates and rollbacks preserve the store. Releases that predate host-held access
 tokens cannot read them and expect a published gateway credential, so OAuth
 grants that cannot renew end while rolled back; after rolling forward, reconnect
 those apps on the Connections page.
+
+### Catalog apps, Link and Shop
+
+The Connections page also lists reviewed catalog apps under Available, which the
+principal connects in one action without an address: Chowdeck, Notion, Granola
+and Todoist need no operator setup; Link and Shop appear once their connectors
+are installed. An app added earlier by address on a catalog app's host counts as
+that app. Main knows which apps are available and offers one when an errand the
+principal asked for needs it; connecting still happens only on the page. Catalog
+apps use the same relay, tool sorting and 👍/👎 cards as any other app. A tool
+the app confirms with the principal itself, such as a Link payment, runs without
+the card and shows "Asks in Link" until the principal chooses Ask first. The
+relay refuses arguments that assert approval, write files, return card numbers or
+payment tokens, request a card credential, or pay a non-HTTPS address; spend
+requests that issue a card are refused until the browser can fill one.
+
+```sh
+gws-ea connectors install link
+gws-ea connectors show link
+gws-ea connectors check link --id <instance_id>
+gws-ea connectors uninstall link
+```
+
+Installing `link` needs `pnpm` and the npm registry. It installs the Link CLI
+version this checkout pins from the committed lockfile, frozen and without
+install scripts, into `<config root>/connectors/link/<version>`, records a
+receipt, and enables Link in the host catalog policy `<config root>/catalog.json`
+that each assistant's `.env` points to. An assistant offers Link only while the
+version its release pins is installed, and verifies that version's receipt
+before every start of the program. After an update pins a new version, the
+connector provisioning that follows create, resume, update, start and restart
+installs it beside the older ones, so a rolled-back assistant keeps its own; a
+failed install leaves Link pending with `gws-ea connectors install link` as the
+next action. `check` verifies each recorded version's receipt.
+
+Each assistant runs its own Link process on demand and closes it after five idle
+minutes. The process gets a fixed environment, its own working directory under
+the connections store and its own public-only proxy for all its traffic. Its
+credentials stay in `auth.json` in that directory (0600, outside every container
+mount), where the CLI refreshes them; like the store's Keychain key, the file
+protects them from other users, not from processes running as the same macOS
+user. The principal connects by approving the phrase the page shows in the Link
+app; disconnecting signs out and deletes the file. Payments work only for US and
+Canadian Link accounts.
+
+```sh
+gws-ea connectors install shop --client-id CLIENT_ID
+gws-ea connectors install shop --client-id CLIENT_ID \
+  --client-secret-file ~/.config/gws-ea/shop-client-secret
+gws-ea connectors show shop --id <instance_id>
+gws-ea connectors check shop
+gws-ea connectors uninstall shop
+```
+
+Shop signs in with a client the operator registers in the Shopify Dev Dashboard,
+enabled for the `personal_agent` scope and the `https://mcp.shop.com` resource.
+Install records its client ID and, when the dashboard issued one, a managed copy
+of the secret read from an owner-only file under the operator config root that
+holds only the secret. Install and `show shop` list each assistant's redirect
+URL, `https://<assistant hostname>/connections/callback/mcp.shop.com`: allow each
+one in the Shopify client. An assistant without web serving has none yet.
+Creating an assistant while Shop is installed leaves a pending Shop entry naming
+the new redirect URL to allow. Rerun install to change the client; principals
+reconnect once their sign-in stops renewing. `check` verifies the stored secret
+and that every assistant has a redirect URL.
+
+Uninstalling either connector first stops new connections, then asks every
+running assistant to disconnect its apps of that kind; main gets a note that the
+operator turned the app off, and the app stays on the page as Not connected.
+Stopped assistants disconnect when they next start. The installed Link versions
+or the stored Shop secret are removed only once every running assistant confirms;
+until then the result is pending, and rerunning uninstall continues.
 
 ## Find and inspect an assistant
 
