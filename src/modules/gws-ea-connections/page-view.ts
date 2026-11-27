@@ -15,7 +15,7 @@ import {
 } from '../gws-ea-web/kit/index.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
-import type { AvailableCatalogEntry, CatalogEntry } from './catalog.js';
+import { catalogEntryFor, type AvailableCatalogEntry, type CatalogEntry } from './catalog.js';
 import { escapeInvisibleChars, hasAnyInvisible } from './held-card.js';
 import { type HeldAppCallPayload, type PendingHeldCallItem } from './held-calls.js';
 import type { ConnectionsListing } from './operations.js';
@@ -147,6 +147,11 @@ export function sortToolsForDisplay(tools: readonly PinnedAppTool[]): readonly P
     const rightAsk = right.label !== 'just_do' ? 0 : 1;
     return leftAsk - rightAsk || left.name.localeCompare(right.name);
   });
+}
+
+/** A tool the app confirms itself still runs without the assistant's card, so its off state says where it asks. */
+export function autoStateText(entry: CatalogEntry | undefined, toolName: string): string {
+  return entry?.confirmedByApp.includes(toolName) ? `Asks in ${entry.name}` : 'Auto';
 }
 
 function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename' | 'tools'): string {
@@ -408,19 +413,20 @@ function renameView(app: ConnectionApp): string {
   return `${BACK}${renderPageHeading('Rename app', `<span>${escapeHtml(app.host)}</span>`)}<form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save</button><a class="button button-secondary form-cancel" href="/connections" data-navigation>Cancel</a></div></form>`;
 }
 
-function toolRow(app: ConnectionApp, tool: PinnedAppTool): string {
+function toolRow(app: ConnectionApp, entry: CatalogEntry | undefined, tool: PinnedAppTool): string {
   const isChecking = tool.label === null || tool.unsettled;
   const isAskFirst = tool.label !== 'just_do';
   const nextLabel = isAskFirst ? 'just_do' : 'ask_first';
   const displayName = humanizeToolName(tool.name);
   const desc = toolDescription(tool);
-  const stateText = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : 'Auto';
+  const autoText = autoStateText(entry, tool.name);
+  const stateText = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : autoText;
   const descMarkup = isChecking
     ? '<span class="tool-desc tool-shimmer" data-tool-desc aria-hidden="true"></span>'
     : desc
       ? `<span class="tool-desc" data-tool-desc>${escapeHtml(desc)}</span>`
       : '<span class="tool-desc" data-tool-desc hidden></span>';
-  return `<li class="row tool-row${isChecking ? ' is-checking' : ''}" data-tool-row="${escapeHtml(tool.name)}" data-tool-hash="${escapeHtml(tool.definitionHash)}" data-tool-state="${isChecking ? 'checking' : isAskFirst ? 'ask_first' : 'just_do'}"><div class="tool-info"><div class="tool-head"><span class="tool-title">${escapeHtml(displayName)}</span><code class="tool-slug">${escapeHtml(tool.name)}</code></div>${descMarkup}</div><form class="tool-control" method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}"><input type="hidden" name="definitionHash" value="${escapeHtml(tool.definitionHash)}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${displayName} (${tool.name})`, stateText, name: tool.name })}</form></li>`;
+  return `<li class="row tool-row${isChecking ? ' is-checking' : ''}" data-tool-row="${escapeHtml(tool.name)}" data-tool-hash="${escapeHtml(tool.definitionHash)}" data-tool-state="${isChecking ? 'checking' : isAskFirst ? 'ask_first' : 'just_do'}" data-auto-text="${escapeHtml(autoText)}"><div class="tool-info"><div class="tool-head"><span class="tool-title">${escapeHtml(displayName)}</span><code class="tool-slug">${escapeHtml(tool.name)}</code></div>${descMarkup}</div><form class="tool-control" method="post" action="/connections/tool-label" data-tool-switch><input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="tool" value="${escapeHtml(tool.name)}"><input type="hidden" name="label" value="${nextLabel}"><input type="hidden" name="definitionHash" value="${escapeHtml(tool.definitionHash)}">${renderSwitch({ checked: isAskFirst, label: `Ask first for ${displayName} (${tool.name})`, stateText, name: tool.name })}</form></li>`;
 }
 
 function toolsSkeleton(): string {
@@ -441,6 +447,7 @@ function reviewForm(
 
 function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]): string {
   const sorted = sortToolsForDisplay(tools);
+  const entry = catalogEntryFor(app);
   const labelsHash = toolLabelsHash(sorted);
   const isConnected = app.status === 'connected';
   const hasUnsorted = isConnected && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
@@ -470,7 +477,7 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
       ? toolsSkeleton()
       : `<div class="tools-empty" data-tools-empty><p>${disconnectedPrompt}</p><a class="button button-primary" href="${escapeHtml(appUrl(app, 'connect'))}" data-navigation>${disconnectedLabel}</a></div>`
     : sorted.length > 0
-      ? `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list>${sorted.map((tool) => toolRow(app, tool)).join('')}</ul></div>`
+      ? `<div class="tools-card"><div class="tools-card-head" aria-hidden="true"><span>Tool</span><span>Ask before running</span></div><ul class="list tools-list" data-tools-list>${sorted.map((tool) => toolRow(app, entry, tool)).join('')}</ul></div>`
       : '<div class="tools-empty" data-tools-empty>No tools listed by this app.</div>';
   const mobileDock = reviewForm(app, pin, labelsHash, 'review-dock', showReview);
   return `<div class="tools-view" data-tools-app="${escapeHtml(app.id)}" data-tools-polling="${hasUnsorted ? 'true' : 'false'}" data-tools-list-hash="${escapeHtml(pin?.listHash ?? '')}">${heading}${mobileStrip}<section class="section tools-section" aria-label="App tools" data-tools-body>${bodyMarkup}</section>${mobileDock}</div>`;

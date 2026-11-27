@@ -14,7 +14,7 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
-import { catalogEntry, isRemoteEntry } from './catalog.js';
+import { catalogEntry, catalogEntryFor, isRemoteEntry } from './catalog.js';
 import { getPendingHeldCallApproval, resolveHeldCallFromWeb, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
@@ -33,6 +33,7 @@ import {
   type OperatorDisconnectOutcome,
 } from './operator.js';
 import {
+  autoStateText,
   humanizeToolName,
   listedApp,
   renderConnectionsPage,
@@ -433,6 +434,7 @@ function wantsJson(acceptHeader: string | string[] | undefined): boolean {
 /** Safe display metadata for live polling on the tool-approvals screen; never exposes secrets or raw server prompts. */
 function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, tools: readonly PinnedAppTool[]) {
   const sorted = sortToolsForDisplay(tools);
+  const entry = catalogEntryFor(app);
   const hasUnsorted =
     app.status === 'connected' && (!pin || sorted.some((tool) => tool.label === null || tool.unsettled));
   return {
@@ -450,6 +452,7 @@ function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, to
       label: tool.label,
       unsettled: tool.unsettled,
       description: toolDescription(tool),
+      autoText: autoStateText(entry, tool.name),
     })),
   };
 }

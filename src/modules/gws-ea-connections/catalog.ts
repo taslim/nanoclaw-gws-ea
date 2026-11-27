@@ -9,6 +9,7 @@ import { readRegularFileBounded } from '../../anchored-dir.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { hostOf } from './admit.js';
+import type { ToolDefinition } from './canonical.js';
 import { catalogPolicyFile } from './config.js';
 import type { ConnectionApp } from './store.js';
 
@@ -33,8 +34,10 @@ export type CatalogTransport =
     };
 
 export type RefusedArgumentMatch =
+  /** Refused whenever main passes it, whatever its value. */
   | { readonly kind: 'any' }
-  | { readonly kind: 'values'; readonly values: readonly string[] }
+  /** Main must pass one of these values; leaving it out is refused too, because the app's default may lie outside them. */
+  | { readonly kind: 'only'; readonly values: readonly string[] }
   | { readonly kind: 'non_https_url' };
 
 /** An argument main may never pass, keyed on the exact names of the pinned schema. */
@@ -147,13 +150,120 @@ export const CATALOG: readonly CatalogEntry[] = [
       { tools: 'all', argument: 'force', match: ANY },
       // Returns card numbers or payment tokens whatever its value.
       { tools: 'all', argument: 'include', match: ANY },
-      // A card would open a spending limit the assistant cannot use until host-filled cards exist.
-      { tools: ['spend-request_create'], argument: 'credentialType', match: { kind: 'values', values: ['card'] } },
+      // Only a shared payment token can be spent by the assistant, through mpp_pay or a UCP checkout. A card or a Link
+      // Pay Token reaches it only through `include`, so approving one would open a spending limit it cannot use until
+      // host-filled cards exist. Link defaults to a card when the type is left out.
+      {
+        tools: ['spend-request_create'],
+        argument: 'credentialType',
+        match: { kind: 'only', values: ['shared_payment_token'] },
+      },
       { tools: ['mpp_pay'], argument: 'url', match: { kind: 'non_https_url' } },
     ],
     prerequisite: 'link_install',
   },
 ];
+
+function ruleCovers(rule: RefusedArgument, toolName: string): boolean {
+  return rule.tools === 'all' || rule.tools.includes(toolName);
+}
+
+function argumentSchema(definition: ToolDefinition, argument: string): Record<string, unknown> | undefined {
+  const { properties } = definition.inputSchema;
+  if (!isRecord(properties) || !Object.hasOwn(properties, argument)) return undefined;
+  const schema = properties[argument];
+  return isRecord(schema) ? schema : {};
+}
+
+function isHttpsUrl(value: unknown): boolean {
+  return typeof value === 'string' && URL.canParse(value) && new URL(value).protocol === 'https:';
+}
+
+/** The rule a call to `toolName` with `args` breaks, if any. */
+export function refusedArgumentIn(
+  entry: CatalogEntry,
+  toolName: string,
+  args: Record<string, unknown>,
+): RefusedArgument | undefined {
+  return entry.refusedArguments.find((rule) => {
+    if (!ruleCovers(rule, toolName)) return false;
+    const present = Object.hasOwn(args, rule.argument);
+    const value: unknown = present ? args[rule.argument] : undefined;
+    switch (rule.match.kind) {
+      case 'any':
+        return present;
+      case 'only':
+        return typeof value !== 'string' || !rule.match.values.includes(value);
+      case 'non_https_url':
+        return present && !isHttpsUrl(value);
+    }
+  });
+}
+
+/**
+ * Whether every command and argument the entry's rules name is in the app's full listing. A rule that names nothing
+ * the app lists no longer describes it, so none of the app's tools can be offered under it.
+ */
+export function catalogRulesMatch(entry: CatalogEntry, listing: readonly ToolDefinition[]): boolean {
+  const byName = new Map(listing.map((tool) => [tool.name, tool]));
+  if (![...entry.confirmedByApp, ...entry.withheld].every((name) => byName.has(name))) return false;
+  return entry.refusedArguments.every((rule) => {
+    const named =
+      rule.tools === 'all'
+        ? listing.filter((tool) => argumentSchema(tool, rule.argument) !== undefined)
+        : rule.tools.map((name) => byName.get(name));
+    if (named.length === 0) return false;
+    return named.every((tool) => {
+      const schema = tool && argumentSchema(tool, rule.argument);
+      if (!schema) return false;
+      if (rule.match.kind !== 'only' || !Array.isArray(schema.enum)) return true;
+      const listed: readonly unknown[] = schema.enum;
+      return rule.match.values.every((value) => listed.includes(value));
+    });
+  });
+}
+
+/**
+ * The definition main is offered: arguments it may never pass are gone, and one limited to some values lists only
+ * those and is required, so main never relies on the app's default.
+ */
+export function offeredDefinition(entry: CatalogEntry, definition: ToolDefinition): ToolDefinition {
+  const { properties, required } = definition.inputSchema;
+  if (!isRecord(properties)) return definition;
+  const nextProperties: Record<string, unknown> = { ...properties };
+  let nextRequired = Array.isArray(required) ? required.filter((name): name is string => typeof name === 'string') : [];
+  let changed = false;
+  for (const rule of entry.refusedArguments) {
+    const schema = argumentSchema(definition, rule.argument);
+    if (!ruleCovers(rule, definition.name) || !schema) continue;
+    switch (rule.match.kind) {
+      case 'any':
+        delete nextProperties[rule.argument];
+        nextRequired = nextRequired.filter((name) => name !== rule.argument);
+        changed = true;
+        break;
+      case 'only': {
+        const { default: _appDefault, ...rest } = schema;
+        nextProperties[rule.argument] = { ...rest, enum: [...rule.match.values] };
+        if (!nextRequired.includes(rule.argument)) nextRequired = [...nextRequired, rule.argument];
+        changed = true;
+        break;
+      }
+      case 'non_https_url':
+        break;
+    }
+  }
+  if (!changed) return definition;
+  const { required: _required, ...schemaRest } = definition.inputSchema;
+  return {
+    ...definition,
+    inputSchema: {
+      ...schemaRest,
+      properties: nextProperties,
+      ...(nextRequired.length > 0 ? { required: nextRequired } : {}),
+    },
+  };
+}
 
 export function catalogEntry(id: string): CatalogEntry | undefined {
   return CATALOG.find((entry) => entry.id === id);

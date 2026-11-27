@@ -58,6 +58,7 @@ const CHECKOUT_TOOL: FakeToolDefinition = {
 
 let endpoints: FakeEndpoints;
 let store: ConnectionsStore;
+let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let relay: AppRelay;
 let session: Session;
 let clock: number;
@@ -65,7 +66,7 @@ let heldCalls: HoldCallInput[];
 let sortNotifications: { appId: string; listHash: string }[];
 
 beforeAll(async () => {
-  endpoints = await startFakeEndpoints(['mcp.bistro.example.test', 'recipes.example.test']);
+  endpoints = await startFakeEndpoints(['mcp.bistro.example.test', 'recipes.example.test', 'mcp.shop.com']);
 });
 afterAll(async () => {
   await endpoints.close();
@@ -78,7 +79,7 @@ beforeEach(async () => {
   sortNotifications = [];
   fs.rmSync(ROOT, { recursive: true, force: true });
   fs.mkdirSync(ROOT, { recursive: true });
-  ({ store } = testConnectionsStore(path.join(ROOT, 'connections')));
+  ({ store, raw } = testConnectionsStore(path.join(ROOT, 'connections')));
   await runMigrations(await initTestDb());
   await seedMain('UTC');
   session = await mainSession();
@@ -1781,5 +1782,135 @@ describe('host relay core', () => {
     } finally {
       await dialFlipRelay.closeAll();
     }
+  });
+});
+
+describe('catalog rules at the relay', () => {
+  const SHOP_URL = 'https://mcp.shop.com/';
+  const CONTEXT =
+    'A one-off payment for the conference ticket the principal asked for, at the price shown on the page.';
+  const ALLOWED_CREATE = {
+    credentialType: 'shared_payment_token',
+    amount: 4_500,
+    context: CONTEXT,
+    lineItem: ['name:Conference ticket'],
+    total: 'type:total,display_text:Total,amount:4500',
+    requestApproval: true,
+    test: false,
+    metadata: [],
+  };
+
+  async function connectLink(): Promise<ConnectionApp> {
+    const created = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+    return (await store.connect(created.id, created.version, { kind: 'none' })).app;
+  }
+
+  function relayRows(): { readonly calls: number; readonly invocations: number } {
+    return raw((db) => ({
+      calls: db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM relay_calls').get()!.n,
+      invocations: db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM relay_invocations').get()!.n,
+    }));
+  }
+
+  it("refuses retrieving a spend request's card before anything reaches Link, and main sees why", async () => {
+    const app = await connectLink();
+
+    const response = await invokeAction({
+      op: 'tools/call',
+      serverKey: app.serverKey,
+      tool: 'spend-request_retrieve',
+      arguments: { id: 'lsrq_123', include: ['card'] },
+    });
+
+    expect(response.ok).toBe(true);
+    expect(response.data).toMatchObject({
+      status: 'unsent',
+      reason: 'refused_argument',
+      text: expect.stringContaining('"include"'),
+    });
+    expect(relayRows()).toEqual({ calls: 0, invocations: 0 });
+    expect(heldCalls).toEqual([]);
+  });
+
+  it.each([
+    ['an approval it claims', 'spend-request_create', { ...ALLOWED_CREATE, approve: true }, 'approve'],
+    ['an approval detail', 'spend-request_create', { ...ALLOWED_CREATE, approvalDetail: 'Approved' }, 'approvalDetail'],
+    [
+      'an approval policy',
+      'mpp_pay',
+      { url: 'https://api.merchant.example.test/pay', useApprovalPolicy: true },
+      'useApprovalPolicy',
+    ],
+    [
+      'a file to write the card to',
+      'spend-request_retrieve',
+      { id: 'lsrq_123', outputFile: '/tmp/card.json' },
+      'outputFile',
+    ],
+    ['overwriting that file', 'spend-request_retrieve', { id: 'lsrq_123', force: false }, 'force'],
+    ['a card credential', 'spend-request_create', { ...ALLOWED_CREATE, credentialType: 'card' }, 'credentialType'],
+    [
+      'a Link Pay Token, retrievable only as card data',
+      'spend-request_create',
+      { ...ALLOWED_CREATE, credentialType: 'link_pay_token' },
+      'credentialType',
+    ],
+    [
+      'no credential type, which Link reads as a card',
+      'spend-request_create',
+      Object.fromEntries(Object.entries(ALLOWED_CREATE).filter(([key]) => key !== 'credentialType')),
+      'credentialType',
+    ],
+    ['an address that is not https', 'mpp_pay', { url: 'http://api.merchant.example.test/pay' }, 'url'],
+  ])('refuses %s before anything is stored or sent', async (_case, tool, args, argument) => {
+    const app = await connectLink();
+    const requestId = `req-${randomUUID()}`;
+
+    const outcome = await relay.callTool({ serverKey: app.serverKey, toolName: tool, args, session, requestId });
+
+    expect(outcome).toMatchObject({ status: 'unsent', reason: 'refused_argument' });
+    expect(outcome.status === 'unsent' && outcome.text).toContain(`"${argument}"`);
+    expect(relayRows()).toEqual({ calls: 0, invocations: 0 });
+    expect(heldCalls).toEqual([]);
+  });
+
+  it("offers none of a Shop listing's tools once a command a rule names is gone, and the app fails to pin", async () => {
+    const tool = (name: string): FakeToolDefinition => ({
+      name,
+      description: `Shop ${name.replaceAll('_', ' ')}.`,
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } } },
+    });
+    const fake = new FakeMcpApp({
+      appUrl: SHOP_URL,
+      issuer: 'https://mcp.shop.com',
+      allowUnauthenticated: true,
+      tools: [
+        tool('search_catalog'),
+        tool('complete_checkout'),
+        tool('create_spend_request'),
+        tool('get_spend_request'),
+      ],
+    });
+    endpoints.use(fake.handle);
+    const created = await store.create({ name: 'Shop', url: SHOP_URL, auth: 'none', catalogId: 'shop' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+
+    const pinned = await relay.pinApp(app.id);
+    expect(pinned.tools.map((entry) => entry.name)).toEqual(['complete_checkout', 'search_catalog']);
+
+    fake.tools = [tool('search_catalog'), tool('complete_checkout'), tool('create_spend_request')];
+    await expect(relay.pinApp(app.id)).rejects.toThrow();
+
+    expect(await store.listTools(app.id)).toEqual([]);
+    expect((await relay.listToolsForSession(app.serverKey)).tools).toEqual([]);
+    const outcome = await relay.callTool({
+      serverKey: app.serverKey,
+      toolName: 'search_catalog',
+      args: { id: 'p-1' },
+      session,
+      requestId: `req-${randomUUID()}`,
+    });
+    expect(outcome).toMatchObject({ status: 'unsent', reason: 'unknown_tool' });
+    expect(fake.toolCalls).toEqual([]);
   });
 });

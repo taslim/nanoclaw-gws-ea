@@ -1,6 +1,7 @@
 import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { ASSISTANT_SUMMARY_FIELD, sha256Hex, type ToolDefinition } from './canonical.js';
+import type { CatalogEntry } from './catalog.js';
 import { testSafeRegex } from './safe-regex.js';
 import type { PinnedAppTool, ToolLabel, ToolLabelUpdate } from './store.js';
 
@@ -459,9 +460,15 @@ export interface ParsedSortToolEntry {
   readonly reason: string;
 }
 
+/**
+ * A tool the app's catalog entry marks as confirmed by the app runs without the assistant's approval, whatever its name
+ * floors say: the app asks the principal itself, and a second approval would add a step without adding a guarantee.
+ * The store still keeps a label the principal set.
+ */
 export function resolveFinalToolUpdates(
   expected: ReadonlyMap<string, { readonly definitionHash: string; readonly definition: ToolDefinition }>,
   entries: readonly ParsedSortToolEntry[],
+  entry: Pick<CatalogEntry, 'name' | 'confirmedByApp'> | undefined,
 ): {
   readonly updates: readonly ToolLabelUpdate[];
   readonly missing: readonly { readonly name: string; readonly definitionHash: string }[];
@@ -481,9 +488,20 @@ export function resolveFinalToolUpdates(
   const updates: ToolLabelUpdate[] = [];
   const missing: { readonly name: string; readonly definitionHash: string }[] = [];
   for (const [name, target] of expected) {
-    const entry = matched.get(name);
-    if (!entry || conflicted.has(name)) {
+    const sorted = matched.get(name);
+    if (!sorted || conflicted.has(name)) {
       missing.push({ name, definitionHash: target.definitionHash });
+      continue;
+    }
+    if (entry?.confirmedByApp.includes(name)) {
+      updates.push({
+        name,
+        definitionHash: target.definitionHash,
+        label: 'just_do',
+        source: 'floor',
+        summary: sorted.summary,
+        reason: `${entry.name} asks the principal to approve this itself`,
+      });
       continue;
     }
     const floor = evaluateToolFloors(target.definition);
@@ -493,17 +511,17 @@ export function resolveFinalToolUpdates(
         definitionHash: target.definitionHash,
         label: 'ask_first',
         source: 'floor',
-        summary: floor.suspicious ? 'Flagged for manual approval' : entry.summary,
+        summary: floor.suspicious ? 'Flagged for manual approval' : sorted.summary,
         reason: floor.reasons[0] ?? 'Requires principal approval',
       });
     } else {
       updates.push({
         name,
         definitionHash: target.definitionHash,
-        label: entry.label,
+        label: sorted.label,
         source: 'sorter',
-        summary: entry.summary,
-        reason: entry.reason,
+        summary: sorted.summary,
+        reason: sorted.reason,
       });
     }
   }

@@ -1621,6 +1621,54 @@ describe('the catalog on the page', () => {
     expect(listSection(list, 'Available')).not.toContain('value="notion"');
   });
 
+  it('shows a tool Link confirms in its own app as asking in Link, until the principal chooses Ask first', async () => {
+    const created = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+    const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+    const empty = { type: 'object', properties: {} };
+    const pinned = await store.pinTools(app.id, {
+      instructions: null,
+      tools: [
+        { name: 'spend-request_create', description: 'Create a spend request', inputSchema: empty },
+        { name: 'spend-request_list', description: 'List spend requests', inputSchema: empty },
+      ],
+    });
+    const hash = (name: string): string => pinned.tools.find((tool) => tool.name === name)!.definitionHash;
+    await store.applyToolLabels(app.id, [
+      {
+        name: 'spend-request_create',
+        definitionHash: hash('spend-request_create'),
+        label: 'just_do',
+        source: 'floor',
+        reason: 'Link asks the principal to approve this itself',
+      },
+      {
+        name: 'spend-request_list',
+        definitionHash: hash('spend-request_list'),
+        label: 'just_do',
+        source: 'sorter',
+        reason: 'Read-only list',
+      },
+    ]);
+    const switchState = (body: string, tool: string): string | undefined =>
+      new RegExp(`data-switch-name="${tool}"><span class="switch-state">([^<]*)</span>`, 'u').exec(body)?.[1];
+
+    const view = (await request(`/connections/app/${app.id}/tools`)).body;
+    expect(switchState(view, 'spend-request_create')).toBe('Asks in Link');
+    expect(switchState(view, 'spend-request_list')).toBe('Auto');
+    const status = JSON.parse((await request(`/connections/app/${app.id}/tools-status`)).body) as {
+      tools: { name: string; autoText: string }[];
+    };
+    expect(status.tools.map(({ name, autoText }) => ({ name, autoText }))).toEqual([
+      { name: 'spend-request_create', autoText: 'Asks in Link' },
+      { name: 'spend-request_list', autoText: 'Auto' },
+    ]);
+
+    await store.setToolLabel(app.id, 'spend-request_create', 'ask_first', 'principal');
+    expect(switchState((await request(`/connections/app/${app.id}/tools`)).body, 'spend-request_create')).toBe(
+      'Ask first',
+    );
+  });
+
   it('refuses an entry that is not offered, storing nothing', async () => {
     const shop = await catalogConnect('shop');
     expect(shop.status).toBe(409);

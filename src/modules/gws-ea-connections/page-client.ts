@@ -98,7 +98,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     if (button) {
       button.setAttribute('aria-checked', isAskFirst ? 'true' : 'false');
       const stateNode = button.querySelector('.switch-state');
-      if (stateNode) stateNode.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : 'Auto';
+      if (stateNode) stateNode.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : row.dataset.autoText || 'Auto';
     }
   }
 
@@ -132,6 +132,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     li.dataset.toolRow = tool.name;
     li.dataset.toolHash = tool.definitionHash;
     li.dataset.toolState = isChecking ? 'checking' : isAskFirst ? 'ask_first' : 'just_do';
+    li.dataset.autoText = tool.autoText || 'Auto';
 
     const info = document.createElement('div');
     info.className = 'tool-info';
@@ -178,7 +179,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     button.dataset.switchName = tool.name;
     const stateSpan = document.createElement('span');
     stateSpan.className = 'switch-state';
-    stateSpan.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : 'Auto';
+    stateSpan.textContent = isChecking ? 'Checking…' : isAskFirst ? 'Ask first' : li.dataset.autoText;
     const track = document.createElement('span');
     track.className = 'switch-track';
     track.setAttribute('aria-hidden', 'true');
@@ -579,7 +580,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
             outcome.textContent = '';
             outcome.hidden = true;
           }
-          kit.announce(titleText + ': ' + (confirmed === 'ask_first' ? 'Ask first' : 'Auto'));
+          kit.announce(titleText + ': ' + (confirmed === 'ask_first' ? 'Ask first' : (liveRow && liveRow.dataset.autoText) || 'Auto'));
         }
         return;
       }

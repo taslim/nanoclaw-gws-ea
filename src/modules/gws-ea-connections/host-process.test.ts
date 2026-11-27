@@ -284,9 +284,52 @@ describe('host-run apps through the relay', () => {
 
     const expected = RECORDED.tools.map((tool) => tool.name).filter((name) => !WITHHELD.includes(name));
     expect(tools.map((tool) => tool.name).sort()).toEqual([...expected].sort());
-    expect(tools.find((tool) => tool.name === 'spend-request_create')?.definition.inputSchema).toEqual(
-      RECORDED.tools.find((tool) => tool.name === 'spend-request_create')?.inputSchema,
+    expect(tools.find((tool) => tool.name === 'ucp_checkout_complete')?.definition.inputSchema).toEqual(
+      RECORDED.tools.find((tool) => tool.name === 'ucp_checkout_complete')?.inputSchema,
     );
+  });
+
+  it('offers no argument the host refuses, and only a shared payment token as the credential type', async () => {
+    const { dir } = await fakeInstall();
+    writePolicy(dir);
+    const app = await connectLink();
+
+    const { tools } = await relayWith().pinApp(app.id);
+
+    const refused = ['approve', 'approvalDetail', 'useApprovalPolicy', 'outputFile', 'force', 'include'];
+    for (const { name, definition } of tools) {
+      const properties = Object.keys((definition.inputSchema.properties ?? {}) as Record<string, unknown>);
+      const required = (definition.inputSchema.required ?? []) as string[];
+      expect({ name, offered: properties.filter((key) => refused.includes(key)) }).toEqual({ name, offered: [] });
+      expect(required.every((key) => properties.includes(key))).toBe(true);
+    }
+    const create = tools.find((tool) => tool.name === 'spend-request_create')?.definition.inputSchema;
+    expect(create?.properties).toMatchObject({
+      credentialType: { type: 'string', enum: ['shared_payment_token'] },
+      amount: { type: 'integer' },
+    });
+    expect((create?.properties as Record<string, Record<string, unknown>>).credentialType).not.toHaveProperty(
+      'default',
+    );
+    expect(create?.required).toContain('credentialType');
+  });
+
+  it('sends an allowed spend request to Link and nothing for a call with a refused argument', async () => {
+    const { dir } = await fakeInstall();
+    writePolicy(dir);
+    const app = await connectLink();
+    const relay = relayWith();
+    await pinAndAllow(relay, app);
+    const allowed = { credentialType: 'shared_payment_token', amount: 1200, context: 'Lunch for Juno Hale' };
+
+    const refused = await call(relay, app, 'spend-request_retrieve', { id: 'lsrq_123', include: ['card'] });
+    const created = await call(relay, app, 'spend-request_create', allowed);
+
+    expect(refused).toMatchObject({ status: 'unsent', reason: 'refused_argument' });
+    expect(created.status).toBe('completed');
+    expect(innerCalls()).toEqual([
+      { meta: 'call_write_tool', arguments: { name: 'spend-request_create', arguments: allowed } },
+    ]);
   });
 
   it('sends a command without readOnlyHint through call_write_tool and a read-only one through call_read_tool', async () => {
@@ -297,7 +340,11 @@ describe('host-run apps through the relay', () => {
     const relay = relayWith();
     await pinAndAllow(relay, app);
 
-    const created = await call(relay, app, 'spend-request_create', { amount: 1200, context: 'Lunch for Juno Hale' });
+    const created = await call(relay, app, 'spend-request_create', {
+      credentialType: 'shared_payment_token',
+      amount: 1200,
+      context: 'Lunch for Juno Hale',
+    });
     const listed = await call(relay, app, 'spend-request_list', { includeHistory: false });
 
     expect(created).toMatchObject({
@@ -309,7 +356,7 @@ describe('host-run apps through the relay', () => {
             text: JSON.stringify({
               ok: true,
               tool: 'spend-request_create',
-              arguments: { amount: 1200, context: 'Lunch for Juno Hale' },
+              arguments: { credentialType: 'shared_payment_token', amount: 1200, context: 'Lunch for Juno Hale' },
             }),
           },
         ],
@@ -319,7 +366,10 @@ describe('host-run apps through the relay', () => {
     expect(innerCalls()).toEqual([
       {
         meta: 'call_write_tool',
-        arguments: { name: 'spend-request_create', arguments: { amount: 1200, context: 'Lunch for Juno Hale' } },
+        arguments: {
+          name: 'spend-request_create',
+          arguments: { credentialType: 'shared_payment_token', amount: 1200, context: 'Lunch for Juno Hale' },
+        },
       },
       { meta: 'call_read_tool', arguments: { name: 'spend-request_list', arguments: { includeHistory: false } } },
     ]);
@@ -514,12 +564,11 @@ describe.skipIf(!linkInstall)('the real pinned Link CLI', { timeout: 60_000 }, (
           .sort(),
       );
 
+      // The host takes only https addresses for mpp_pay; a direct dial would still reach the listener with a TLS hello.
       const outcome = await call(relay, app, 'mpp_pay', {
-        url: `${target.url}/pay`,
+        url: `${target.url.replace(/^http:/u, 'https:')}/pay`,
         header: [],
         test: false,
-        approve: false,
-        useApprovalPolicy: false,
       });
 
       expect(outcome).toMatchObject({ status: 'completed', result: { isError: true } });

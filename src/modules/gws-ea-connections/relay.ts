@@ -14,7 +14,14 @@ import { EgressError, publicFetch, type EgressDependencies } from '../gws-ea-egr
 import { resolveDestination } from '../gws-ea-egress/resolve.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { notifyMainToolsChanged } from './apply.js';
-import { catalogEntryFor, type CatalogEntry } from './catalog.js';
+import {
+  catalogEntryFor,
+  catalogRulesMatch,
+  offeredDefinition,
+  refusedArgumentIn,
+  type CatalogEntry,
+  type RefusedArgument,
+} from './catalog.js';
 import {
   ASSISTANT_SUMMARY_FIELD,
   canonicalArgsHash,
@@ -231,6 +238,12 @@ class RelayClosedError extends Error {
   }
 }
 
+class CatalogRulesUnmatchedError extends Error {
+  constructor() {
+    super("The app's tool listing no longer matches its catalog rules");
+  }
+}
+
 function isHttp401Error(error: unknown): boolean {
   return error instanceof StreamableHTTPError && error.code === 401;
 }
@@ -296,18 +309,31 @@ function formatToolForMain(pinned: PinnedAppTool): RelayedTool {
 }
 
 /**
- * The commands the host offers main: the app's listing less the entry's withheld commands. The full listing stays
- * here, so rules naming the pinned commands are checked against what the app actually lists.
+ * The commands the host offers main: the app's listing less the entry's withheld commands, without the arguments main
+ * may never pass. The full listing stays here, so rules naming the pinned commands are checked against what the app
+ * actually lists.
  */
 function offeredTools(entry: CatalogEntry | undefined, listing: readonly ToolDefinition[]): readonly ToolDefinition[] {
-  if (!entry || entry.withheld.length === 0) return listing;
-  return listing.filter((tool) => !entry.withheld.includes(tool.name));
+  if (!entry) return listing;
+  return listing.filter((tool) => !entry.withheld.includes(tool.name)).map((tool) => offeredDefinition(entry, tool));
+}
+
+function refusalText(entry: CatalogEntry, toolName: string, rule: RefusedArgument): string {
+  switch (rule.match.kind) {
+    case 'any':
+      return `The assistant may not pass "${rule.argument}" to ${entry.name}, so nothing was sent. Call ${toolName} without it.`;
+    case 'only':
+      return `${toolName} needs "${rule.argument}" set to ${rule.match.values.join(' or ')}, so nothing was sent.`;
+    case 'non_https_url':
+      return `${toolName} takes only an https address in "${rule.argument}", so nothing was sent.`;
+  }
 }
 
 function failureCode(error: unknown): string {
   if (error instanceof EgressError) return error.code;
   if (error instanceof ConnectionsStoreError) return error.reason;
   if (error instanceof HostCliUnavailableError) return error.reason;
+  if (error instanceof CatalogRulesUnmatchedError) return 'rules_unmatched';
   return 'failed';
 }
 
@@ -737,9 +763,21 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
         throw error;
       }
     });
+    const entry = catalogEntryFor(app);
+    if (entry && !catalogRulesMatch(entry, listed.tools)) {
+      // Every tool goes, including ones pinned from an earlier listing: the rules no longer show what is safe to offer.
+      const cleared = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [],
+        expectedGrantGeneration: grant.generation,
+        at: new Date(now()).toISOString(),
+      });
+      if (cleared.changed) await notifyMainToolsChanged(store);
+      throw new CatalogRulesUnmatchedError();
+    }
     const result = await store.pinTools(app.id, {
       instructions: listed.instructions,
-      tools: offeredTools(catalogEntryFor(app), listed.tools),
+      tools: offeredTools(entry, listed.tools),
       expectedGrantGeneration: grant.generation,
       at: new Date(now()).toISOString(),
     });
@@ -1008,6 +1046,12 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       }
       return trackOp(async () => {
         const { app, grant } = await requireConnectedApp(input.serverKey);
+        // Refused before anything about the call is stored, so a refused argument can never reach a card or the app.
+        const entry = catalogEntryFor(app);
+        const refused = entry && refusedArgumentIn(entry, input.toolName, input.args);
+        if (entry && refused) {
+          return { status: 'unsent', reason: 'refused_argument', text: refusalText(entry, input.toolName, refused) };
+        }
         const loaded = await store.readAppTools(app.id);
         let pin = loaded?.pin;
         let tools: readonly PinnedAppTool[] = loaded?.tools ?? [];
