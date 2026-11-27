@@ -350,7 +350,10 @@ function parseBillingAccount(value: string | undefined): string | undefined {
 function isBusy(error: unknown): boolean {
   return (
     error instanceof GwsEaError &&
-    (error.code === 'instance_busy' || error.code === 'voice_busy' || error.code === 'registry_busy')
+    (error.code === 'instance_busy' ||
+      error.code === 'voice_busy' ||
+      error.code === 'catalog_busy' ||
+      error.code === 'registry_busy')
   );
 }
 
@@ -2526,6 +2529,13 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               : undefined,
             recordEffect,
           },
+          catalog: {
+            environment,
+            upsertEnvVars: runtime.upsertEnvVars,
+            serviceHelpers: runtime.serviceHelpers,
+            progress: (line) => presenter.line(line),
+            recordEffect,
+          },
         };
         const lifecycle = handler.command;
         run = await startRunLog({ paths, command: commandPath });
@@ -2558,9 +2568,19 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
               : []),
           ];
-        } else
-          actions =
-            handler.command === 'install' ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', name] }] : [];
+        } else {
+          paused = 'outcome' in result && result.outcome === 'pending';
+          actions = [
+            ...(paused
+              ? [{ kind: 'command' as const, argv: ['gws-ea', 'connectors', handler.command, name] }]
+              : handler.command === 'install'
+                ? [{ kind: 'command' as const, argv: ['gws-ea', 'connectors', 'check', name] }]
+                : []),
+            ...('operator_actions' in result
+              ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
+              : []),
+          ];
+        }
         run.complete();
         presenter.report({
           outcome: paused ? 'paused' : 'ready',

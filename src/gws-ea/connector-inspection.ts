@@ -15,6 +15,7 @@ import {
 } from './web-connector.js';
 import { readWebOperatorConfig, webOperatorFiles, webApi, type WebOperatorConfig } from './web-cloudflare.js';
 import { CONNECTOR_ACTIONS, connectorDefinition, type ConnectorName, type ConnectorDefinition } from './connectors.js';
+import type { LinkConnectorDetails, ShopConnectorDetails } from './catalog-connector.js';
 import {
   inspectVoiceCapability,
   capabilityLines,
@@ -66,7 +67,8 @@ export interface ConnectorObservation {
   readonly assistants: readonly ConnectorAssistantObservation[];
   readonly reasons: readonly string[];
   readonly next_actions: readonly NextAction[];
-  readonly details: VoiceCapabilityObservation | readonly WebCapabilityObservation[];
+  readonly details:
+    VoiceCapabilityObservation | readonly WebCapabilityObservation[] | LinkConnectorDetails | ShopConnectorDetails;
 }
 export interface ConnectorInspection {
   readonly check?: boolean;
@@ -233,6 +235,8 @@ export async function inspectConnector(
   name: ConnectorName,
   options: ConnectorInspection = {},
 ): Promise<ConnectorObservation> {
+  if (name === 'link' || name === 'shop')
+    return (await import('./catalog-connector.js')).inspectCatalogConnector(paths, name, options);
   const definition = connectorDefinition(name);
   const checked = options.check === true;
   if (options.instanceId) await getInstanceReservation(paths, options.instanceId);
@@ -486,20 +490,41 @@ export async function inspectConnector(
   };
 }
 
+function detailLines(details: ConnectorObservation['details'], timezone: string): readonly string[] {
+  if (!('name' in details))
+    return details.flatMap((assistant) => [
+      `  Assistant ${assistant.instance_id}: ${assistant.hostname ? `https://${assistant.hostname}` : 'address not provisioned'}`,
+      `    Origin: ${assistant.activation}; remote: ${assistant.remote.replaceAll('_', ' ')}; listener: ${assistant.listener.replaceAll('_', ' ')}`,
+    ]);
+  switch (details.name) {
+    case 'voice':
+      return capabilityLines(details, true, timezone).slice(1, -1);
+    case 'link':
+      return [
+        `  This release pins Link ${details.pinned_version}.`,
+        ...details.versions.map(
+          (version) =>
+            `  Version ${version.version}: ${version.installation_dir}; receipt ${version.receipt.replaceAll('_', ' ')}${version.pinned ? ' (pinned)' : ''}`,
+        ),
+      ];
+    case 'shop':
+      return [
+        `  Client: ${details.client_id ?? 'not registered'}${details.client_secret ? ', with a stored secret' : ''}`,
+        ...details.assistants.map(
+          (assistant) =>
+            `  Assistant ${assistant.instance_id}: redirect URL ${assistant.redirect_uri ?? 'unavailable until web serves it'}`,
+        ),
+      ];
+  }
+}
+
 export function connectorLines(
   observation: ConnectorObservation,
   detailed = true,
   timezone = Intl.DateTimeFormat().resolvedOptions().timeZone,
 ): readonly string[] {
   const details = observation.details;
-  const specific = !detailed
-    ? []
-    : 'name' in details
-      ? capabilityLines(details, true, timezone).slice(1, -1)
-      : details.flatMap((assistant) => [
-          `  Assistant ${assistant.instance_id}: ${assistant.hostname ? `https://${assistant.hostname}` : 'address not provisioned'}`,
-          `    Origin: ${assistant.activation}; remote: ${assistant.remote.replaceAll('_', ' ')}; listener: ${assistant.listener.replaceAll('_', ' ')}`,
-        ]);
+  const specific = !detailed ? [] : detailLines(details, timezone);
   return [
     `${observation.name} (host): ${observation.summary}`,
     `  Setup: ${observation.setup.replaceAll('_', ' ')}; readiness: ${observation.readiness.status.replaceAll('_', ' ')}.`,

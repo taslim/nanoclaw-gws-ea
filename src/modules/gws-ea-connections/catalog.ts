@@ -296,6 +296,10 @@ const EXACT_VERSION = /^\d+\.\d+\.\d+$/u;
 /** RFC 6749 client identifiers are visible ASCII. */
 const CLIENT_ID = /^[\x21-\x7e]{1,2048}$/u;
 
+export function isClientId(value: string): boolean {
+  return CLIENT_ID.test(value);
+}
+
 /** What the operator enabled on this host; written by `gws-ea connector`, read by every assistant on use. */
 export interface CatalogPolicy {
   readonly schemaVersion: typeof CATALOG_POLICY_SCHEMA_VERSION;
@@ -330,7 +334,7 @@ function parseLink(value: unknown): CatalogPolicy['link'] | undefined {
 
 function parseShop(value: unknown): CatalogPolicy['shop'] | undefined {
   if (value === undefined || value === null) return null;
-  if (!isRecord(value) || typeof value.clientId !== 'string' || !CLIENT_ID.test(value.clientId)) return undefined;
+  if (!isRecord(value) || typeof value.clientId !== 'string' || !isClientId(value.clientId)) return undefined;
   const secret = value.clientSecretFile;
   if (secret !== undefined && secret !== null && !absoluteFile(secret)) return undefined;
   return { clientId: value.clientId, clientSecretFile: absoluteFile(secret) ? secret : null };

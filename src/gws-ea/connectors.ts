@@ -3,32 +3,48 @@ import type { CommandOptions } from './command-parser.js';
 import type { ControlPlanePaths } from './paths.js';
 import type { ConnectorInspection, ConnectorObservation } from './connector-inspection.js';
 import type { VoiceOperatorDependencies } from './local-voice.js';
+import type {
+  CatalogConnectorDependencies,
+  LinkInstallData,
+  LinkUninstallData,
+  ShopInstallData,
+  ShopUninstallData,
+} from './catalog-connector.js';
 import type { WebCapabilityDependencies, WebConnectorOperation, WebConnectorUninstallData } from './web-connector.js';
 import type { OptionDefinition } from './command-definitions.js';
 import { DEFAULT_VOICE_MODEL } from './install-voice.js';
 import { VOICE_MODEL_CATALOG } from './voice-assets.js';
 
-export const CONNECTOR_NAMES = ['voice', 'web'] as const;
+export const CONNECTOR_NAMES = ['voice', 'web', 'link', 'shop'] as const;
 export type ConnectorName = (typeof CONNECTOR_NAMES)[number];
 export const CONNECTOR_ACTIONS = ['install', 'uninstall', 'show', 'check'] as const;
 export type ConnectorAction = (typeof CONNECTOR_ACTIONS)[number];
 export type ConnectorOperation =
   | { readonly name: 'voice'; readonly scope: 'host'; readonly enabled: boolean; readonly installation_dir?: string }
   | WebConnectorOperation
-  | WebConnectorUninstallData;
+  | WebConnectorUninstallData
+  | LinkInstallData
+  | LinkUninstallData
+  | ShopInstallData
+  | ShopUninstallData;
 export interface ConnectorLifecycleContext {
   readonly paths: ControlPlanePaths;
   readonly options: CommandOptions;
   readonly voice: VoiceOperatorDependencies;
   readonly web: WebCapabilityDependencies;
+  readonly catalog: CatalogConnectorDependencies;
 }
 interface ConnectorInstallResults {
   voice: Extract<ConnectorOperation, { name: 'voice' }>;
   web: WebConnectorOperation;
+  link: LinkInstallData;
+  shop: ShopInstallData;
 }
 interface ConnectorUninstallResults {
   voice: Extract<ConnectorOperation, { name: 'voice' }>;
   web: WebConnectorUninstallData;
+  link: LinkUninstallData;
+  shop: ShopUninstallData;
 }
 export interface ConnectorDefinitionFor<Name extends ConnectorName> {
   readonly inspect: (paths: ControlPlanePaths, options?: ConnectorInspection) => Promise<ConnectorObservation>;
@@ -175,6 +191,80 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
       ],
       uninstall: [
         'Closes every assistant’s origin before removing verified owned resources, shared resources last. Local artifact content remains.',
+      ],
+      show: observation,
+      check,
+    },
+  },
+  {
+    name: 'link',
+    inspect: async (paths, options) =>
+      (await import('./connector-inspection.js')).inspectConnector(paths, 'link', options),
+    install: async ({ paths, catalog }) => (await import('./catalog-connector.js')).installLink(paths, catalog),
+    uninstall: async ({ paths, catalog }) => (await import('./catalog-connector.js')).uninstallLink(paths, catalog),
+    summary: 'Run the pinned Link CLI on this host so principals can connect their own Link wallet.',
+    prerequisites: ['pnpm on PATH and access to the npm registry for installation.'],
+    account: 'No operator account; each principal signs in to their own Link account on the Connections page.',
+    scope: {
+      installation: 'host',
+      configuration: 'host',
+      resources: 'host',
+      access:
+        'Every assistant whose release pins an installed Link version; each principal connects their own account.',
+    },
+    options: { install: [], uninstall: [], show: [id], check: [id] },
+    effects: {
+      install: [
+        'Installs the Link version this checkout pins from its committed lockfile, records a verified receipt, then offers Link on every assistant whose release pins an installed version.',
+      ],
+      uninstall: [
+        'Stops new Link connections first and disconnects Link on every running assistant; stopped ones disconnect when they next start. Installed versions are removed once every running assistant confirms.',
+      ],
+      show: observation,
+      check,
+    },
+  },
+  {
+    name: 'shop',
+    inspect: async (paths, options) =>
+      (await import('./connector-inspection.js')).inspectConnector(paths, 'shop', options),
+    install: async ({ paths, options, catalog }) =>
+      (await import('./catalog-connector.js')).installShop(
+        paths,
+        { clientId: options['client-id'], clientSecretFile: options['client-secret-file'] },
+        catalog,
+      ),
+    uninstall: async ({ paths, catalog }) => (await import('./catalog-connector.js')).uninstallShop(paths, catalog),
+    summary: 'Register the operator’s Shopify client so principals can connect their own Shop account.',
+    prerequisites: [
+      'A Shopify Dev Dashboard client enabled for the personal_agent scope and the https://mcp.shop.com resource.',
+      'Web serving for each assistant: the client must allow that assistant’s redirect URL.',
+    ],
+    account: 'The operator’s Shopify Dev Dashboard client; each principal signs in to their own Shop account.',
+    scope: {
+      installation: 'host',
+      configuration: 'host',
+      resources: 'assistant',
+      access: 'Every assistant whose release includes the catalog; each principal connects their own account.',
+    },
+    options: {
+      install: [
+        value('client-id', 'client_id', 'Client ID of the Shopify Dev Dashboard app; required.'),
+        file(
+          'client-secret-file',
+          'Owner-only file under the operator config root holding the client secret, when the dashboard issued one.',
+        ),
+      ],
+      uninstall: [],
+      show: [id],
+      check: [id],
+    },
+    effects: {
+      install: [
+        'Records the client and lists each assistant’s redirect URL to allow in Shopify; Shop is then offered on every assistant whose release includes the catalog.',
+      ],
+      uninstall: [
+        'Stops new Shop connections first and disconnects Shop on every running assistant; stopped ones disconnect when they next start. The stored client secret is removed once every running assistant confirms.',
       ],
       show: observation,
       check,

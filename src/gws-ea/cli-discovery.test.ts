@@ -60,10 +60,10 @@ describe('local CLI discovery and grammar', () => {
     expect(await runCli(['schema', 'connectors', '--json'], io.runtime)).toBe(0);
     const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
       JSON.parse(io.stdout.join('\n'));
-    expect(schema.commands).toHaveLength(9);
+    expect(schema.commands).toHaveLength(17);
     expect(schema.commands.some((command) => command.path.includes('browser'))).toBe(false);
     expect(schema.commands.some((command) => command.path.includes('artifacts'))).toBe(false);
-    for (const name of ['voice', 'web']) {
+    for (const name of ['voice', 'web', 'link', 'shop']) {
       const commands = schema.commands.filter((command) => command.path[2] === name);
       expect(commands.map((command) => command.path[1])).toEqual(['install', 'uninstall', 'show', 'check']);
       for (const command of commands) {

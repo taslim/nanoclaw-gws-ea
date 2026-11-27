@@ -177,7 +177,7 @@ it.each(['list', 'show'] as const)(
     });
     if (command === 'list') {
       const names = (result as { data: { connectors: { name: string }[] } }).data.connectors.map(({ name }) => name);
-      expect(names).toEqual(['voice', 'web']);
+      expect(names).toEqual(['voice', 'web', 'link', 'shop']);
     }
     expect(runCommand).not.toHaveBeenCalled();
   },

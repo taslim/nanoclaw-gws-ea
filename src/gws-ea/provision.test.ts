@@ -2733,6 +2733,25 @@ describe('production step order and pause outcomes', () => {
 });
 
 describe('optional web setup after creation', () => {
+  it.each([
+    { name: 'shop', reason: 'shop_redirect_to_allow' },
+    { name: 'link', reason: 'command_failed' },
+  ] as const)('continues through alias setup when $name reports pending host-wide setup', async ({ name, reason }) => {
+    const harness = await productionHarness();
+    const provisioning = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
+      pending: [{ name, reason, message: 'Host-wide setup is pending.' }],
+      next_actions: [{ kind: 'external', instruction: 'Finish the host-wide setup.' }],
+    });
+    try {
+      const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
+        provisionAssistantResources(operation, {}, { skip: true }),
+      );
+      expect(result).toMatchObject({ status: 'ready', pendingConnectors: [{ name, reason }] });
+      expect(result).not.toHaveProperty('pause');
+    } finally {
+      provisioning.mockRestore();
+    }
+  });
   it.each(['web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'])(
     'continues through alias setup when web is pending for %s',
     async (reason) => {

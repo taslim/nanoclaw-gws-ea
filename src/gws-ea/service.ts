@@ -38,7 +38,11 @@ import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { BROWSER_ROOT_ENV } from '../modules/gws-ea-browser/availability.js';
-import { CONNECTIONS_ROOT_ENV } from '../modules/gws-ea-connections/config.js';
+import {
+  CATALOG_POLICY_FILE_ENV,
+  CATALOG_POLICY_FILE_NAME,
+  CONNECTIONS_ROOT_ENV,
+} from '../modules/gws-ea-connections/config.js';
 import { WEB_POLICY_FILE_ENV } from '../modules/gws-ea-web/policy.js';
 import { VOICE_POLICY_FILE_ENV } from '../modules/gws-ea-voice/config.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
@@ -388,6 +392,7 @@ export async function persistInstanceRuntime(
 export function hostPolicyLocators(configRoot: string): Readonly<Record<string, string>> {
   return {
     [VOICE_POLICY_FILE_ENV]: path.join(configRoot, 'voice.json'),
+    [CATALOG_POLICY_FILE_ENV]: path.join(configRoot, CATALOG_POLICY_FILE_NAME),
   };
 }
 

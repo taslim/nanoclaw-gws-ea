@@ -1,5 +1,6 @@
 import type { ConnectorObservation } from './connector-inspection.js';
 import type { WebConnectorOperation, WebConnectorUninstallData } from './web-connector.js';
+import type { LinkInstallData, LinkUninstallData, ShopInstallData, ShopUninstallData } from './catalog-connector.js';
 import {
   COMMAND_DEFINITIONS,
   findCommand,
@@ -69,6 +70,10 @@ export type CommandData =
   | ConnectorObservation
   | WebConnectorOperation
   | WebConnectorUninstallData
+  | LinkInstallData
+  | LinkUninstallData
+  | ShopInstallData
+  | ShopUninstallData
   | AssistantListing
   | AssistantStatus;
 export interface ManagedResult<T = CommandData> {

@@ -1451,9 +1451,11 @@ export async function provisionAssistantResources(
   alias: AliasStepOptions & { readonly skip?: boolean } = {},
   web: ConnectorProvisioningDependencies['web'] = {},
 ): Promise<ProvisionResult> {
-  const connectors = await provisionInstalledConnectors(operation, reporter, { web });
+  const connectors = await provisionInstalledConnectors(operation, reporter, { web }, { created: true });
+  // Catalog connectors are host-wide, so their pending setup is reported without holding up this assistant.
   const actionable = connectors.pending.find(
     (entry) =>
+      entry.name === 'web' &&
       !['instance_busy', 'web_busy', 'web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'].includes(
         entry.reason,
       ),
