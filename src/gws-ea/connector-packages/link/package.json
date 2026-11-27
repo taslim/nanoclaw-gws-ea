@@ -1,0 +1,10 @@
+{
+  "name": "gws-ea-link-connector",
+  "private": true,
+  "description": "The pinned Link CLI that gws-ea installs per host; undici is needed for LINK_HTTP_PROXY and link-cli does not declare it.",
+  "packageManager": "pnpm@10.34.9",
+  "dependencies": {
+    "@stripe/link-cli": "1.6.0",
+    "undici": "7.30.2"
+  }
+}

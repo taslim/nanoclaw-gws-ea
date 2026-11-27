@@ -1,0 +1,1458 @@
+{
+  "package": "@stripe/link-cli",
+  "version": "1.6.0",
+  "metaTools": [
+    "search_tools",
+    "get_tool_details",
+    "call_read_tool",
+    "call_write_tool"
+  ],
+  "tools": [
+    {
+      "name": "approval-policy_retrieve",
+      "description": "Retrieve the approval policy for the current app and user",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "auth_login",
+      "description": "Authenticate with Link",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "clientName": {
+            "default": "Link CLI",
+            "description": "Agent or app name shown in the Link app when approving the device connection",
+            "type": "string"
+          },
+          "scope": {
+            "description": "Optional space-separated Link scopes to request. Quote the value when passing multiple scopes.",
+            "type": "string"
+          },
+          "sourceActions": {
+            "default": [],
+            "description": "Source action to request via authorization_details (repeatable). On login, explicit actions replace defaults. Accepted values: read_balances, read_external_transactions, read_link_transactions, read_source_details.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "read_balances",
+                "read_external_transactions",
+                "read_link_transactions",
+                "read_source_details"
+              ]
+            }
+          },
+          "authorizationDetail": {
+            "default": [],
+            "description": "Freeform authorization_details entry as raw JSON (repeatable).",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "interval": {
+            "default": 0,
+            "description": "Poll interval in seconds. When > 0, polls until authenticated or timeout is reached, yielding status on each attempt.",
+            "type": "number"
+          },
+          "maxAttempts": {
+            "default": 0,
+            "description": "Max poll attempts. 0 = unlimited (use timeout instead).",
+            "type": "number"
+          },
+          "timeout": {
+            "default": 300,
+            "description": "Polling timeout in seconds.",
+            "type": "number"
+          },
+          "financialInsights": {
+            "description": "Request all financial-insights source actions by default. Use --no-financial-insights to opt out.",
+            "type": "boolean"
+          },
+          "agenticPayments": {
+            "description": "Request the payment_methods.agentic scope by default. Use --no-agentic-payments to opt out.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "clientName",
+          "sourceActions",
+          "authorizationDetail",
+          "interval",
+          "maxAttempts",
+          "timeout"
+        ]
+      }
+    },
+    {
+      "name": "auth_logout",
+      "description": "Log out from Link",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "auth_status",
+      "description": "Check authentication status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "interval": {
+            "default": 0,
+            "description": "Poll interval in seconds. When > 0, polls until authenticated or timeout is reached, yielding status on each attempt.",
+            "type": "number"
+          },
+          "maxAttempts": {
+            "default": 0,
+            "description": "Max poll attempts. 0 = unlimited (use timeout instead).",
+            "type": "number"
+          },
+          "timeout": {
+            "default": 300,
+            "description": "Polling timeout in seconds.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "interval",
+          "maxAttempts",
+          "timeout"
+        ]
+      }
+    },
+    {
+      "name": "auth_upgrade",
+      "description": "Re-authenticate with Link, merging the requested access with your current access so the new session is a superset",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "clientName": {
+            "default": "Link CLI",
+            "description": "Agent or app name shown in the Link app when approving the device connection",
+            "type": "string"
+          },
+          "scope": {
+            "description": "Optional space-separated Link scopes to request. Quote the value when passing multiple scopes.",
+            "type": "string"
+          },
+          "sourceActions": {
+            "default": [],
+            "description": "Source action to request via authorization_details (repeatable). On login, explicit actions replace defaults. Accepted values: read_balances, read_external_transactions, read_link_transactions, read_source_details.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "read_balances",
+                "read_external_transactions",
+                "read_link_transactions",
+                "read_source_details"
+              ]
+            }
+          },
+          "authorizationDetail": {
+            "default": [],
+            "description": "Freeform authorization_details entry as raw JSON (repeatable).",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "interval": {
+            "default": 0,
+            "description": "Poll interval in seconds. When > 0, polls until authenticated or timeout is reached, yielding status on each attempt.",
+            "type": "number"
+          },
+          "maxAttempts": {
+            "default": 0,
+            "description": "Max poll attempts. 0 = unlimited (use timeout instead).",
+            "type": "number"
+          },
+          "timeout": {
+            "default": 300,
+            "description": "Polling timeout in seconds.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "clientName",
+          "sourceActions",
+          "authorizationDetail",
+          "interval",
+          "maxAttempts",
+          "timeout"
+        ]
+      }
+    },
+    {
+      "name": "balances_list",
+      "description": "List balances from your Link wallet",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "default": [],
+            "description": "Filter by source ID. Repeat to include multiple sources.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "limit": {
+            "description": "Maximum number of balances to return (1-100).",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 100
+          },
+          "startingAfter": {
+            "description": "Cursor: return balances after this balance ID.",
+            "type": "string"
+          },
+          "endingBefore": {
+            "description": "Cursor: return balances before this balance ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ]
+      }
+    },
+    {
+      "name": "demo",
+      "description": "Run an interactive demo of both Link payment flows (virtual card + machine payment)",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "onlyCard": {
+            "default": false,
+            "description": "Run only the virtual card flow",
+            "type": "boolean"
+          },
+          "onlySpt": {
+            "default": false,
+            "description": "Run only the machine payment (SPT) flow",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "onlyCard",
+          "onlySpt"
+        ]
+      }
+    },
+    {
+      "name": "insights_list",
+      "description": "List financial insights, optionally filtered by insight ID",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "description": "Maximum number of results to return (1-100).",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "startingAfter": {
+            "description": "Return results after this insight ID.",
+            "type": "string"
+          },
+          "insight": {
+            "default": [],
+            "description": "Filter by insight ID. Repeat to include multiple insights.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "insight"
+        ]
+      }
+    },
+    {
+      "name": "insights_list-available-types",
+      "description": "List insight IDs, descriptions, and access requirements",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "description": "Maximum number of results to return (1-100).",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "startingAfter": {
+            "description": "Return results after this insight ID.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "mpp_decode",
+      "description": "Decode a stripe WWW-Authenticate challenge and extract network_id",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "description": "Raw WWW-Authenticate header value; may include multiple payment challenges"
+          }
+        },
+        "required": [
+          "challenge"
+        ]
+      }
+    },
+    {
+      "name": "mpp_pay",
+      "description": "Pay a URL via the Machine Payment Protocol. Handles the full 402 flow: probes the URL, parses the challenge, creates a spend request, gets approval, and pays with the SPT. Pass --spend-request-id to skip creation and use a pre-approved spend request.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "URL to pay"
+          },
+          "spendRequestId": {
+            "description": "Approved spend request ID with credential_type \"shared_payment_token\". If omitted, the command handles the full flow: probe URL, parse challenge, create spend request, get approval, and pay.",
+            "type": "string"
+          },
+          "approvedChallenge": {
+            "description": "Original WWW-Authenticate challenge to verify when continuing an approval flow",
+            "type": "string"
+          },
+          "method": {
+            "description": "HTTP method (default: GET, or POST if --data is provided)",
+            "type": "string"
+          },
+          "data": {
+            "description": "Request body (implies POST if --method is not set)",
+            "type": "string"
+          },
+          "header": {
+            "default": [],
+            "description": "Request header in \"Name: Value\" format (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "context": {
+            "description": "Min 100 chars — describe the purchase and rationale; the user reads this when approving. Required when --spend-request-id is not provided.",
+            "type": "string",
+            "minLength": 100
+          },
+          "amount": {
+            "description": "Amount in cents (derived from 402 challenge if omitted; required if challenge has no amount)",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "paymentMethodId": {
+            "description": "Payment method ID (uses default if omitted)",
+            "type": "string"
+          },
+          "test": {
+            "default": false,
+            "description": "Use test mode (creates testmode credentials from test card data)",
+            "type": "boolean"
+          },
+          "approve": {
+            "default": false,
+            "description": "",
+            "type": "boolean"
+          },
+          "useApprovalPolicy": {
+            "default": false,
+            "description": "Use approval policy through the delegated approval flow (beta, available only to select OAuth clients)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url",
+          "header",
+          "test",
+          "approve",
+          "useApprovalPolicy"
+        ]
+      }
+    },
+    {
+      "name": "onboard",
+      "description": "Guided setup: authenticate, verify payment methods, and demo both payment flows",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "payment-methods_add",
+      "description": "Open the Link wallet to add a new payment method",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "payment-methods_list",
+      "description": "List all payment methods on your account",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "payment-methods_retrieve",
+      "description": "Retrieve a payment method by ID",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Payment method ID"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "payment-methods_update",
+      "description": "Update a payment method nickname or wallet default status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Payment method ID"
+          },
+          "nickname": {
+            "description": "New nickname; pass an empty string to clear the nickname",
+            "type": "string"
+          },
+          "isDefault": {
+            "description": "Set this payment method as the wallet default (true) or clear its default status (false)",
+            "type": "string",
+            "enum": [
+              "true",
+              "false"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "report",
+      "description": "Report the outcome of an agent action on a domain. Call after every purchase attempt.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "Domain where the outcome occurred"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "success",
+              "blocked",
+              "abandoned"
+            ],
+            "description": "What happened: success, blocked, or abandoned"
+          },
+          "spendRequestId": {
+            "type": "string",
+            "description": "Spend request ID (lsrq_...)"
+          },
+          "tag": {
+            "description": "Outcome tags (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "stripe_checkout",
+                "captcha",
+                "anti_bot_script",
+                "cdn_block",
+                "waf_block",
+                "dns_block",
+                "rate_limited",
+                "login_required",
+                "3ds_challenge",
+                "page_inaccessible",
+                "timeout",
+                "site_error",
+                "payment_declined",
+                "other"
+              ]
+            }
+          },
+          "step": {
+            "description": "Where in the flow the agent was",
+            "type": "string",
+            "maxLength": 500
+          },
+          "freeformContext": {
+            "description": "Additional context (max 500 chars)",
+            "type": "string",
+            "maxLength": 500
+          },
+          "attemptTrace": {
+            "description": "A detailed, replayable account of what you did on this domain, written so another agent could follow it. Use one numbered line per step. For each step include: the URL path, the visible label or selector you acted on, the action you took, and what you observed as a result. Quote error messages and challenge text verbatim. If you failed, include the steps you tried and the specific reason each one failed, including dead ends — those are as valuable as the path that worked. Do not include the buyer's personal data: no email, name, address, phone, card number, or order number. Refer to them as [email], [address], etc. Anything past 8000 chars is truncated by the server, not rejected — send it anyway rather than skipping the report.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "outcome",
+          "spendRequestId"
+        ]
+      }
+    },
+    {
+      "name": "serve",
+      "description": "Start an HTTP server exposing link-cli as an MCP endpoint at /mcp",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "port": {
+            "default": 54321,
+            "description": "Port to listen on",
+            "type": "number"
+          },
+          "host": {
+            "default": "127.0.0.1",
+            "description": "Host/interface to bind. Defaults to loopback; set explicitly (e.g. 0.0.0.0) to expose beyond localhost.",
+            "type": "string"
+          },
+          "allowOrigin": {
+            "default": [],
+            "description": "Browser Origin to trust for CORS (repeatable). By default every browser Origin is rejected; MCP clients and curl send no Origin and are unaffected. Only set this for a browser app you control.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "port",
+          "host",
+          "allowOrigin"
+        ]
+      }
+    },
+    {
+      "name": "shipping-address_list",
+      "description": "List all shipping addresses on your account",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "sources_list",
+      "description": "List sources from your Link wallet",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "description": "Maximum number of sources to return (1-100).",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 100
+          },
+          "startingAfter": {
+            "description": "Cursor: return sources after this source ID.",
+            "type": "string"
+          },
+          "endingBefore": {
+            "description": "Cursor: return sources before this source ID.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "spend-request_cancel",
+      "description": "Cancel a spend request and revoke its payment credentials. This does not cancel a subscription with the merchant",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Spend request ID"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "spend-request_create",
+      "description": "Create a one-time or recurring spend request",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "idempotencyKey": {
+            "description": "Opaque, non-sensitive value to reuse only when retrying the same logical creation",
+            "type": "string",
+            "minLength": 1
+          },
+          "completionCallbackUrl": {
+            "description": "Callback destination (max 2,048 characters). Supply together with --nonce. Returned approval and supported action URLs include this callback context; live-mode HTTPS and URL security are validated by the API.",
+            "type": "string",
+            "maxLength": 2048,
+            "format": "uri"
+          },
+          "nonce": {
+            "description": "Opaque callback nonce (max 512 UTF-16 code units). Supply together with --completion-callback-url, save unchanged, and verify an exact match when the callback is received.",
+            "type": "string",
+            "maxLength": 512
+          },
+          "paymentMethodId": {
+            "description": "Payment method ID",
+            "type": "string"
+          },
+          "credentialType": {
+            "default": "card",
+            "description": "\"card\" for checkout forms, \"link_pay_token\" for supported Stripe payment surfaces, or \"shared_payment_token\" for HTTP 402/machine payment flows",
+            "type": "string",
+            "enum": [
+              "shared_payment_token",
+              "card",
+              "link_pay_token"
+            ]
+          },
+          "networkId": {
+            "description": "Merchant network ID (optional for card, required for shared_payment_token) — use `link-cli mpp decode` to extract for machine payments",
+            "type": "string"
+          },
+          "merchantAccountId": {
+            "description": "Stripe account ID from data-stripe-merchant-account; required for link_pay_token requests",
+            "type": "string"
+          },
+          "amount": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Amount in the currency’s minor units. For recurring requests, the spending limit per period"
+          },
+          "currency": {
+            "description": "Currency code. Omit to use the consumer’s default spend-request currency. Specify explicitly when the amount comes from a checkout with a known currency.",
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3
+          },
+          "merchantName": {
+            "description": "Merchant name (required for regular card requests; omit for link_pay_token and shared_payment_token)",
+            "type": "string"
+          },
+          "merchantUrl": {
+            "description": "Merchant URL (required for regular card requests; omit for link_pay_token and shared_payment_token)",
+            "type": "string"
+          },
+          "context": {
+            "type": "string",
+            "minLength": 100,
+            "description": "Min 100 chars — describe the purchase and rationale; the user reads this when approving"
+          },
+          "lineItem": {
+            "default": [],
+            "description": "Line item (repeatable, key:value format). unit_amount uses the currency’s minor units. Keys: name (required), quantity, unit_amount, description, sku, url, image_url, product_url. Example: \"name:Shoes,unit_amount:5000,quantity:2\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "total": {
+            "default": [],
+            "description": "Total (repeatable, key:value format). amount uses the currency’s minor units. Keys: type (required; one of: subtotal, tax, total, items_base_amount, items_discount, discount, fulfillment, shipping, fee, gift_wrap, tip, store_credit), display_text (required), amount (required). Example: \"type:total,display_text:Total,amount:5000\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "requestApproval": {
+            "default": true,
+            "description": "Request approval and poll until the request leaves the approval waiting states",
+            "type": "boolean"
+          },
+          "test": {
+            "default": false,
+            "description": "Use test mode (creates testmode credentials from test card data)",
+            "type": "boolean"
+          },
+          "approve": {
+            "default": false,
+            "description": "",
+            "type": "boolean"
+          },
+          "useApprovalPolicy": {
+            "default": false,
+            "description": "Use approval policy through the delegated approval flow (beta, available only to select OAuth clients)",
+            "type": "boolean"
+          },
+          "outputFile": {
+            "description": "Write full card credentials to this file path; stdout shows redacted card data only",
+            "type": "string"
+          },
+          "force": {
+            "default": false,
+            "description": "Overwrite output file if it already exists",
+            "type": "boolean"
+          },
+          "approvalDetail": {
+            "description": "Approval details object (MCP/agent: pass as object; CLI: pass as JSON string). Required fields: approved_at (unix timestamp), approval_method (click|programmatic|voice), app_name, external_user_id. Optional: ip_address, user_agent, device_type (mobile|web), agent_log_id, external_user_name, external_session_id, device_id, authentication_method (biometric_face|biometric_fingerprint|passkey).",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          },
+          "metadata": {
+            "default": [],
+            "description": "Metadata key:value pair (repeatable). Attaches arbitrary string data to the spend request. Max 50 keys, key <= 40 chars, value <= 500 chars. Example: \"order_id:ord_123\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              ]
+            }
+          },
+          "expiresAt": {
+            "description": "Spend request expiry as Unix seconds or an ISO 8601 timestamp ending in Z (UTC), e.g. 2027-02-01T12:00:00Z. ISO input is converted to Unix seconds for the API; responses return ISO timestamps ending in Z (UTC). Use for delayed merchant charges (preorders or bookings). At least 3 hours ahead; maximum 365 days for one-time requests or 1827 days for recurring requests, subject to country limits. Omit for the server default (7 days for one-time requests; country maximum for recurring requests). Does not extend the approval window.",
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "Z$",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            ]
+          },
+          "recurringInterval": {
+            "description": "Reset the spending limit every day, week, month, or year. Omit for a one-time purchase",
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "year"
+            ]
+          },
+          "recurringIntervalCount": {
+            "description": "Number of intervals per recurring period (positive integer; defaults to 1). Requires --recurring-interval",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "credentialType",
+          "amount",
+          "context",
+          "lineItem",
+          "total",
+          "requestApproval",
+          "test",
+          "approve",
+          "useApprovalPolicy",
+          "force",
+          "metadata"
+        ]
+      }
+    },
+    {
+      "name": "spend-request_list",
+      "description": "List spend requests. By default returns only active requests (created, pending_approval, approved). Use --include-history to return all spend requests including expired and terminal states.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "includeHistory": {
+            "default": false,
+            "description": "Include expired and terminal spend requests",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "includeHistory"
+        ]
+      }
+    },
+    {
+      "name": "spend-request_request-approval",
+      "description": "Request approval for a spend request",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Spend request ID"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "spend-request_retrieve",
+      "description": "Retrieve a spend request",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Spend request ID"
+          },
+          "nextAction": {
+            "default": false,
+            "description": "Return only the existing next_action (or null) in one snapshot. Does not poll, force verification, or return payment credentials; timeout is ignored in this mode.",
+            "type": "boolean"
+          },
+          "timeout": {
+            "default": 600,
+            "description": "Polling timeout in seconds. When reached during active polling, exits non-zero with POLLING_TIMEOUT. Default exceeds the server-side spend-request expiry so polling outlives the request itself.",
+            "type": "number"
+          },
+          "interval": {
+            "default": 0,
+            "description": "Poll interval in seconds. When > 0, waits for the initial waiting status to change, timeout to be reached, or max attempts to be exhausted. Returns immediately for statuses other than created, pending_approval, or requires_action with auto_resume.",
+            "type": "number"
+          },
+          "maxAttempts": {
+            "default": 0,
+            "description": "Max poll attempts. 0 = unlimited. Exhaustion during active polling exits non-zero with POLLING_TIMEOUT.",
+            "type": "number"
+          },
+          "include": {
+            "default": [],
+            "description": "Include extra data (repeatable, e.g. --include card, or --include link_pay_token for an approved Link Pay Token request)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "outputFile": {
+            "description": "Write full card credentials to this file path; stdout shows redacted card data only",
+            "type": "string"
+          },
+          "force": {
+            "default": false,
+            "description": "Overwrite output file if it already exists",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "nextAction",
+          "timeout",
+          "interval",
+          "maxAttempts",
+          "include",
+          "force"
+        ]
+      }
+    },
+    {
+      "name": "spend-request_update",
+      "description": "Update a spend request",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Spend request ID"
+          },
+          "paymentMethodId": {
+            "description": "Payment method ID",
+            "type": "string"
+          },
+          "amount": {
+            "description": "Amount in the currency’s minor units",
+            "type": "number"
+          },
+          "merchantUrl": {
+            "description": "Merchant URL",
+            "type": "string"
+          },
+          "profileId": {
+            "description": "Profile ID",
+            "type": "string"
+          },
+          "merchantId": {
+            "description": "Merchant ID",
+            "type": "string"
+          },
+          "currency": {
+            "description": "Currency code",
+            "type": "string"
+          },
+          "lineItem": {
+            "default": [],
+            "description": "Line item (repeatable, key:value format). unit_amount uses the currency’s minor units. Keys: name (required), quantity, unit_amount, description, sku, url, image_url, product_url. Example: \"name:Shoes,unit_amount:5000,quantity:2\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "total": {
+            "default": [],
+            "description": "Total (repeatable, key:value format). amount uses the currency’s minor units. Keys: type (required; one of: subtotal, tax, total, items_base_amount, items_discount, discount, fulfillment, shipping, fee, gift_wrap, tip, store_credit), display_text (required), amount (required). Example: \"type:total,display_text:Total,amount:5000\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "approve": {
+            "default": false,
+            "description": "Use the delegated approval flow for this update",
+            "type": "boolean"
+          },
+          "useApprovalPolicy": {
+            "default": false,
+            "description": "Use approval policy through the delegated approval flow (beta, available only to select OAuth clients)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "lineItem",
+          "total",
+          "approve",
+          "useApprovalPolicy"
+        ]
+      }
+    },
+    {
+      "name": "transactions_list",
+      "description": "List transactions from Link and external accounts, including non-Link activity",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "description": "Maximum number of transactions to return (1-100).",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 100
+          },
+          "startingAfter": {
+            "description": "Cursor: return transactions after this transaction ID.",
+            "type": "string"
+          },
+          "endingBefore": {
+            "description": "Cursor: return transactions before this transaction ID.",
+            "type": "string"
+          },
+          "startDate": {
+            "description": "Only include transactions on or after this YYYY-MM-DD date.",
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "endDate": {
+            "description": "Only include transactions on or before this YYYY-MM-DD date.",
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "category": {
+            "description": "Filter by transaction category.",
+            "type": "string"
+          },
+          "origin": {
+            "description": "Filter by transaction origin: link or external_connection.",
+            "type": "string",
+            "enum": [
+              "link",
+              "external_connection"
+            ]
+          },
+          "source": {
+            "default": [],
+            "description": "Filter by source ID. Repeat to include multiple sources.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "source"
+        ]
+      }
+    },
+    {
+      "name": "ucp_catalog_search",
+      "description": "Search the Universal Commerce Protocol catalog. --query is always required. Use --test for synthetic demo results.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Free-text search query (required, max 200 chars)"
+          },
+          "business": {
+            "description": "Business target to restrict results to a single seller",
+            "type": "string"
+          },
+          "id": {
+            "description": "Exact SKU ID to look up",
+            "type": "string"
+          },
+          "brand": {
+            "default": [],
+            "description": "Filter by brand (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "category": {
+            "default": [],
+            "description": "Filter by category (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "color": {
+            "default": [],
+            "description": "Filter by color (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "size": {
+            "default": [],
+            "description": "Filter by size (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "material": {
+            "default": [],
+            "description": "Filter by material (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "gender": {
+            "default": [],
+            "description": "Filter by gender (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "condition": {
+            "default": [],
+            "description": "Filter by condition (repeatable)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "priceMin": {
+            "description": "Minimum price in cents",
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "priceMax": {
+            "description": "Maximum price in cents",
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "currency": {
+            "description": "Three-letter ISO currency code",
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3
+          },
+          "availability": {
+            "description": "Filter by availability (e.g. in_stock)",
+            "type": "string"
+          },
+          "sort": {
+            "description": "Sort order",
+            "type": "string"
+          },
+          "groupBy": {
+            "description": "Group results by a field",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Number of results, 1-20 (default 20)",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20
+          },
+          "offset": {
+            "default": 0,
+            "description": "Result offset, 0-1000 (default 0)",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "includeFacets": {
+            "default": false,
+            "description": "Include facet aggregations in the response",
+            "type": "boolean"
+          },
+          "test": {
+            "default": false,
+            "description": "Use demo mode — returns synthetic results without a live search",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query",
+          "brand",
+          "category",
+          "color",
+          "size",
+          "material",
+          "gender",
+          "condition",
+          "limit",
+          "offset",
+          "includeFacets",
+          "test"
+        ]
+      }
+    },
+    {
+      "name": "ucp_checkout_cancel",
+      "description": "Cancel a UCP checkout by ID and business.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Checkout session ID",
+            "type": "string",
+            "minLength": 1
+          },
+          "business": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Business target (required)"
+          }
+        },
+        "required": [
+          "business"
+        ]
+      }
+    },
+    {
+      "name": "ucp_checkout_complete",
+      "description": "Call the UCP completion API and return its checkout response. The server resolves the payment token from --spend-request-id; --business is also required.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Checkout session ID"
+          },
+          "spendRequestId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Approved spend request ID whose shared payment token is resolved by the server (required). Create one with `spend-request create --credential-type shared_payment_token --network-id <business>`, using the same business value passed to UCP"
+          },
+          "business": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Business target used to verify the spend request belongs to the same seller profile (required)"
+          }
+        },
+        "required": [
+          "id",
+          "spendRequestId",
+          "business"
+        ]
+      }
+    },
+    {
+      "name": "ucp_checkout_create",
+      "description": "Create a UCP checkout for a business and line items. The seller determines currency. Omitted buyer details use saved Link details; omitted fulfillment uses a complete saved default shipping address when available.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "business": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Business target (required)"
+          },
+          "lineItem": {
+            "default": [],
+            "description": "Line item (repeatable, key:value format). Keys: id (required), quantity (positive integer, default 1). Example: \"id:sku_123,quantity:2\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "buyer": {
+            "description": "Buyer in key:value format or an object. Optional keys: first_name, last_name, email, phone_number. Example: \"email:jane@example.com,first_name:Jane\"",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          },
+          "fulfillment": {
+            "description": "Entire UCP fulfillment object as a JSON string (CLI) or object (MCP/agent)",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          },
+          "fullfilment": {
+            "description": "Alias for --fulfillment; supply the entire JSON object",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          }
+        },
+        "required": [
+          "business",
+          "lineItem"
+        ]
+      }
+    },
+    {
+      "name": "ucp_checkout_retrieve",
+      "description": "Retrieve a UCP checkout by ID and business and return its checkout response.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Checkout session ID",
+            "type": "string",
+            "minLength": 1
+          },
+          "business": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Business target (required)"
+          }
+        },
+        "required": [
+          "business"
+        ]
+      }
+    },
+    {
+      "name": "ucp_checkout_update",
+      "description": "Update a UCP checkout. Omitted line items, buyer, and fulfillment sections keep existing checkout values; saved Link wallet details are not reloaded.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Checkout session ID",
+            "type": "string",
+            "minLength": 1
+          },
+          "business": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Business target (required)"
+          },
+          "lineItem": {
+            "description": "Line item (repeatable, key:value format). Omit to keep existing items. Keys: id (required), quantity (positive integer, default 1). Example: \"id:sku_123,quantity:2\"",
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              ]
+            }
+          },
+          "buyer": {
+            "description": "Buyer in key:value format or an object. Optional keys: first_name, last_name, email, phone_number. Example: \"email:jane@example.com,first_name:Jane\"",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          },
+          "fulfillment": {
+            "description": "Entire UCP fulfillment object as a JSON string (CLI) or object (MCP/agent)",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          },
+          "fullfilment": {
+            "description": "Alias for --fulfillment; supply the entire JSON object",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              }
+            ]
+          }
+        },
+        "required": [
+          "business"
+        ]
+      }
+    },
+    {
+      "name": "user-info_retrieve",
+      "description": "Retrieve user info, including optional address, balance eligibility, Agent Wallet spend limits, and verification requirements",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ]
+}

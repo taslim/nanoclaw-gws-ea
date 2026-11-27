@@ -125,21 +125,30 @@ export const CATALOG: readonly CatalogEntry[] = [
       metaTools: true,
     },
     confirmedByApp: ['spend-request_create', 'spend-request_request-approval', 'mpp_pay'],
-    // The host owns the sign-in, and account setup happens in the Link app.
-    withheld: ['auth_login', 'auth_upgrade', 'auth_logout', 'auth_status', 'onboard', 'demo', 'payment-methods_add'],
+    // The host owns the sign-in, and account setup happens in the Link app. `serve` would expose the signed-in CLI as an
+    // HTTP endpoint on a listener of the caller's choosing.
+    withheld: [
+      'auth_login',
+      'auth_upgrade',
+      'auth_logout',
+      'auth_status',
+      'onboard',
+      'demo',
+      'payment-methods_add',
+      'serve',
+    ],
     refusedArguments: [
       // Main may never tell Link the principal already approved.
       { tools: 'all', argument: 'approve', match: ANY },
-      { tools: 'all', argument: 'approval_detail', match: ANY },
-      { tools: 'all', argument: 'use_approval_policy', match: ANY },
-      // Files and credential locations stay the host's.
-      { tools: 'all', argument: 'output_file', match: ANY },
+      { tools: 'all', argument: 'approvalDetail', match: ANY },
+      { tools: 'all', argument: 'useApprovalPolicy', match: ANY },
+      // Files stay the host's: these write card credentials to a path.
+      { tools: 'all', argument: 'outputFile', match: ANY },
       { tools: 'all', argument: 'force', match: ANY },
-      { tools: 'all', argument: 'auth', match: ANY },
       // Returns card numbers or payment tokens whatever its value.
       { tools: 'all', argument: 'include', match: ANY },
       // A card would open a spending limit the assistant cannot use until host-filled cards exist.
-      { tools: ['spend-request_create'], argument: 'credential_type', match: { kind: 'values', values: ['card'] } },
+      { tools: ['spend-request_create'], argument: 'credentialType', match: { kind: 'values', values: ['card'] } },
       { tools: ['mpp_pay'], argument: 'url', match: { kind: 'non_https_url' } },
     ],
     prerequisite: 'link_install',
