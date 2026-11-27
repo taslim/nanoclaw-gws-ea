@@ -35,7 +35,6 @@ export class HostCliUnavailableError extends Error {
 export interface HostCliLaunch {
   readonly entryFile: string;
   readonly args: readonly string[];
-  /** The per-assistant directory: the child's working directory and HOME. */
   readonly workDir: string;
   readonly authFile: string;
 }
@@ -73,7 +72,6 @@ function installationFor(entry: HostCliEntry, policy: CatalogPolicy): string | u
   }
 }
 
-/** Owner-only, created when missing; never followed through a link. */
 async function privateDirectory(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const info = await lstat(dir);
@@ -86,7 +84,6 @@ async function privateDirectory(dir: string): Promise<void> {
   }
 }
 
-/** Where the entry's per-assistant directory and credentials sit, whether or not anything is there yet. */
 export function hostCliPaths(entry: HostCliEntry): { readonly workDir: string; readonly authFile: string } {
   const root = connectionsRoot();
   if (!root || !path.isAbsolute(root)) throw new HostCliUnavailableError('no_connections_root');
@@ -108,7 +105,6 @@ async function launchFrom(entry: HostCliEntry, installationDir: string | undefin
   return { entryFile, args: entry.transport.mcpArgs, workDir, authFile };
 }
 
-/** Only the version this release pins, only while the operator enables it, and only once its receipt verifies. */
 export async function resolveHostCliLaunch(entry: HostCliEntry): Promise<HostCliLaunch> {
   const state = await readCatalogPolicy();
   if (!operatorEnabled(entry, state)) throw new HostCliUnavailableError('not_enabled');
@@ -124,6 +120,12 @@ export async function resolveInstalledHostCli(entry: HostCliEntry): Promise<Host
   return launchFrom(entry, state.status === 'read' ? installationFor(entry, state.policy) : undefined);
 }
 
+export function firstText(result: { readonly content?: unknown }): string | undefined {
+  if (!Array.isArray(result.content)) return undefined;
+  const first: unknown = result.content[0];
+  return isRecord(first) && first.type === 'text' && typeof first.text === 'string' ? first.text : undefined;
+}
+
 /**
  * link-cli answers a call it cannot authenticate with its message as the result's only text: no saved sign-in, or a
  * refresh token the sign-in server refused. A refresh that failed any other way may pass, so it does not count.
@@ -131,14 +133,11 @@ export async function resolveInstalledHostCli(entry: HostCliEntry): Promise<Host
 const HOST_CLI_AUTH_REFUSED = /^(?:Not authenticated\.|Token refresh failed \(40[01]\):)/u;
 
 export function hostCliAuthRefused(result: Record<string, unknown>): boolean {
-  if (result.isError !== true || !Array.isArray(result.content)) return false;
-  const first: unknown = result.content[0];
-  return (
-    isRecord(first) && first.type === 'text' && typeof first.text === 'string' && HOST_CLI_AUTH_REFUSED.test(first.text)
-  );
+  if (result.isError !== true) return false;
+  const text = firstText(result);
+  return text !== undefined && HOST_CLI_AUTH_REFUSED.test(text);
 }
 
-/** One child and its proxy, which closes with it however the child ends. */
 export class HostProcessTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;

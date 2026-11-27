@@ -29,10 +29,8 @@ import {
 /** Without a positive interval the CLI only saves a pending code and exits. */
 const LOGIN_INTERVAL_S = 5;
 const LOGIN_TIMEOUT_S = 300;
-/** The login prints its address and phrase as soon as the sign-in server answers; one that has not by then is stuck. */
-const FIRST_RECORD_MS = 30_000;
-/** A login still running well past the CLI's own timeout is killed. */
-const LOGIN_DEADLINE_MS = (LOGIN_TIMEOUT_S + 30) * 1000;
+const FIRST_RECORD_STUCK_MS = 30_000;
+const LOGIN_KILL_AFTER_MS = (LOGIN_TIMEOUT_S + 30) * 1000;
 const COMMAND_DEADLINE_MS = 30_000;
 const KILL_GRACE_MS = 2_000;
 const PENDING_FILE = 'auth.pending.json';
@@ -59,7 +57,6 @@ export interface DeviceSignInStart {
   readonly complete: (pendingFile: string, current: () => boolean) => Promise<boolean>;
 }
 
-/** The CLI's `--format jsonl` lines: each record as it is made, then how the command ended. */
 type CliLine =
   | { readonly type: 'chunk'; readonly data: Record<string, unknown> }
   | { readonly type: 'done' }
@@ -82,12 +79,10 @@ function parseLine(line: string): CliLine | undefined {
 }
 
 interface CliRun {
-  /** Settles once the child has exited and its proxy has closed. */
   readonly finished: Promise<void>;
   kill(): void;
 }
 
-/** Each line is handed over parsed, or undefined when it is not a line the CLI writes. */
 async function runCli(
   launch: HostCliLaunch,
   authFile: string,
@@ -228,7 +223,7 @@ class DeviceSignIn {
     let unreadable = false;
     let authenticated = false;
     let failure: DeviceSignInFailure | undefined;
-    const run = await runCli(launch, this.#pendingFile, loginArgs(clientName), LOGIN_DEADLINE_MS, (line) => {
+    const run = await runCli(launch, this.#pendingFile, loginArgs(clientName), LOGIN_KILL_AFTER_MS, (line) => {
       if (!line) {
         unreadable = true;
         run.kill();
@@ -251,7 +246,7 @@ class DeviceSignIn {
       if (shown) return;
       unreadable = true;
       run.kill();
-    }, FIRST_RECORD_MS);
+    }, FIRST_RECORD_STUCK_MS);
     await run.finished;
     clearTimeout(firstDeadline);
     if (this.#cancelled) {
@@ -346,7 +341,6 @@ export async function signOutHostCli(entry: HostCliEntry): Promise<void> {
   await rm(path.join(paths.workDir, PENDING_FILE), { force: true });
 }
 
-/** The assistant's first name, so the principal sees which assistant asks to connect. */
 export async function hostCliClientName(): Promise<string> {
   const { assistant_first_name: firstName } = await getGwsEaProfile();
   return firstName ? `${firstName} (GWS-EA)` : 'GWS-EA';

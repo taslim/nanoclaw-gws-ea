@@ -105,7 +105,6 @@ export type ConnectRefusal =
   | 'needs_client'
   | 'client_refused'
   | 'client_unavailable'
-  /** The app signs in with the operator's client, and the operator has removed it. */
   | 'not_offered'
   | 'unreachable'
   | 'unsupported';
@@ -124,12 +123,9 @@ export type SignInStartOutcome =
 
 export type CatalogConnectOutcome =
   | SignInStartOutcome
-  /** Its sign-in needs the principal on the app's Connect view: client details, a token, or a confirmation. */
   | { readonly status: 'connect_view'; readonly app: ConnectionApp }
   | { readonly status: 'add_refused'; readonly reason: AddRefusal }
-  /** A host-run app's sign-in is under way, or just ended; its Connect view shows which. */
   | { readonly status: 'device_sign_in'; readonly app: ConnectionApp }
-  /** The operator has not set up what the entry needs on this host. */
   | { readonly status: 'not_offered' };
 
 /**
@@ -160,7 +156,6 @@ export interface ConnectionOperationsOptions {
   readonly onDisconnected?: (appId: string) => Promise<void>;
   /** Optional gateway credential handle for retiring legacy `gws-ea-app-` credentials when removing an app. */
   readonly gateway?: OperatorCredentials | null;
-  /** How a host-run app's sign-in names the assistant to the principal. */
   readonly clientName?: () => Promise<string>;
   readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
 }
@@ -171,12 +166,9 @@ export interface ConnectionsListing {
   readonly listed: boolean;
   /** Apps can be added and connected: the store's secrets and main's servers are readable. */
   readonly canChange: boolean;
-  /** The principal's apps, less the not-connected catalog apps listed under `available`. */
   readonly apps: readonly ConnectionApp[];
   readonly operators: readonly OperatorServer[];
-  /** Each listed app's catalog entry, by app id; present when the apps were listed. */
   readonly catalogEntries?: Readonly<Record<string, CatalogEntry>>;
-  /** Catalog entries this assistant can connect and has not; present when the apps were listed. */
   readonly available?: readonly AvailableCatalogEntry[];
   /** Pinned tool metadata per principal app id, read without Keychain. */
   readonly pins?: Readonly<Record<string, AppPin>>;
@@ -892,7 +884,6 @@ export class ConnectionOperations {
     return outcome;
   }
 
-  /** The operator's client for an app whose catalog entry signs in with one; undefined for any other app. */
   private async operatorClientFor(app: ConnectionApp): Promise<OperatorClient | undefined> {
     const entry = catalogEntryFor(app);
     if (!entry || !usesOperatorClient(entry)) return undefined;

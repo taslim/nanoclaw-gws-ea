@@ -464,7 +464,7 @@ function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, to
   };
 }
 
-/** What the Connect view polls for while a host-run app's sign-in waits; never anything the CLI saved. */
+/** Never anything the CLI saved. */
 function signInStatusPayload(app: ConnectionApp, view: DeviceSignInView): Readonly<Record<string, string>> {
   if (app.status === 'connected') return { status: 'connected' };
   switch (view.status) {

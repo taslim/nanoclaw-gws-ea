@@ -15,7 +15,7 @@ import {
 } from '../gws-ea-web/kit/index.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
-import { catalogEntryFor, type AvailableCatalogEntry, type CatalogEntry } from './catalog.js';
+import { catalogEntryFor, isConfirmedByApp, type AvailableCatalogEntry, type CatalogEntry } from './catalog.js';
 import type { DeviceSignInFailure, DeviceSignInView } from './device-sign-in.js';
 import { escapeInvisibleChars, hasAnyInvisible } from './held-card.js';
 import { type HeldAppCallPayload, type PendingHeldCallItem } from './held-calls.js';
@@ -58,7 +58,6 @@ export interface ConnectionsPageState {
   readonly retryServer?: { readonly key: string; readonly host: string };
   readonly toolReview?: { readonly pin?: AppPin; readonly tools: readonly PinnedAppTool[] };
   readonly heldCall?: HeldCallViewData;
-  /** A host-run app's sign-in as it stands, for its Connect view. */
   readonly deviceSignIn?: DeviceSignInView;
 }
 
@@ -154,7 +153,7 @@ export function sortToolsForDisplay(tools: readonly PinnedAppTool[]): readonly P
 
 /** A tool the app confirms itself still runs without the assistant's card, so its off state says where it asks. */
 export function autoStateText(entry: CatalogEntry | undefined, toolName: string): string {
-  return entry?.confirmedByApp.includes(toolName) ? `Asks in ${entry.name}` : 'Auto';
+  return entry && isConfirmedByApp(entry, toolName) ? `Asks in ${entry.name}` : 'Auto';
 }
 
 function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename' | 'tools'): string {
@@ -358,9 +357,8 @@ function appList(state: ConnectionsPageState): string {
     { id: 'available-heading', title: 'Available', rows: available.map((entry) => availableRow(entry, canChange)) },
     { id: 'add-own-heading', title: 'Add your own', rows: canChange ? [addOwnRow()] : [] },
   ].filter((candidate) => candidate.rows.length > 0);
-  // A lone section needs no label of its own.
-  const titled = sections.length > 1;
-  return `${renderPageHeading('Connections')}${unavailable}${sections.map((candidate) => section(candidate, titled)).join('')}`;
+  const showSectionTitles = sections.length > 1;
+  return `${renderPageHeading('Connections')}${unavailable}${sections.map((candidate) => section(candidate, showSectionTitles)).join('')}`;
 }
 
 function actions(label: string, pending: string): string {

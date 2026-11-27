@@ -1,7 +1,7 @@
 import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { ASSISTANT_SUMMARY_FIELD, sha256Hex, type ToolDefinition } from './canonical.js';
-import type { CatalogEntry } from './catalog.js';
+import { isConfirmedByApp, type CatalogEntry } from './catalog.js';
 import { testSafeRegex } from './safe-regex.js';
 import type { PinnedAppTool, ToolLabel, ToolLabelUpdate } from './store.js';
 
@@ -493,7 +493,7 @@ export function resolveFinalToolUpdates(
       missing.push({ name, definitionHash: target.definitionHash });
       continue;
     }
-    if (entry?.confirmedByApp.includes(name)) {
+    if (entry && isConfirmedByApp(entry, name)) {
       updates.push({
         name,
         definitionHash: target.definitionHash,

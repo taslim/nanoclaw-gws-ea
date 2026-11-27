@@ -31,10 +31,6 @@ const HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]
 const PATH = /^\/[A-Za-z0-9._~/-]*$/u;
 
 export type AdmissionRefusal =
-  /**
-   * Not a URL this host can call: unparseable, an address literal, a port, a fragment, unusual path characters, or
-   * the placeholder address reserved for apps the host runs itself.
-   */
   | 'invalid_url'
   | 'not_https'
   /** Sign-in details or a query, which is where a URL carries credentials; an app's address names it and nothing more. */

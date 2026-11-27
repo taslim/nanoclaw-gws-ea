@@ -7,7 +7,6 @@ import { isRecord } from '../../gws-ea/validation.js';
 
 export const CATALOG_RETIRE_COMMAND = 'gws-ea-connections-catalog-retire';
 
-/** The entries an operator enables, so the only ones an operator can retire. */
 export const RETIRABLE_CATALOG_ENTRIES = ['link', 'shop'] as const;
 export type RetirableCatalogEntry = (typeof RETIRABLE_CATALOG_ENTRIES)[number];
 
@@ -18,9 +17,7 @@ export interface CatalogRetireRequest {
 export interface CatalogRetireReply {
   readonly schemaVersion: 1;
   readonly entry: RetirableCatalogEntry;
-  /** Apps this call disconnected. */
   readonly retired: number;
-  /** Apps for the entry still connected after this call; the operator waits for zero. */
   readonly remaining: number;
 }
 

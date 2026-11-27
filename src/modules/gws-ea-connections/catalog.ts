@@ -1,7 +1,6 @@
 /**
  * The apps a principal can connect without an address. Entries are reviewed and pinned here and ship with a release;
- * the page, main's facts and the operator connectors all read this one list, and every rule an entry carries is data
- * that the relay and the sorter apply by exact name.
+ * every rule an entry carries is data applied by exact name.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,11 +18,9 @@ export type CatalogTransport =
   | { readonly kind: 'remote'; readonly url: string }
   | {
       readonly kind: 'host_cli';
-      /** The npm package, installed per pinned version from a committed lockfile. */
       readonly package: string;
       /** An exact version: the install receipt is verified against it before every spawn. */
       readonly version: string;
-      /** The command in the package's `bin` map. */
       readonly bin: string;
       readonly mcpArgs: readonly string[];
       /**
@@ -34,32 +31,27 @@ export type CatalogTransport =
     };
 
 export type RefusedArgumentMatch =
-  /** Refused whenever main passes it, whatever its value. */
   | { readonly kind: 'any' }
   /** Main must pass one of these values; leaving it out is refused too, because the app's default may lie outside them. */
   | { readonly kind: 'only'; readonly values: readonly string[] }
   | { readonly kind: 'non_https_url' };
 
-/** An argument main may never pass, keyed on the exact names of the pinned schema. */
 export interface RefusedArgument {
   readonly tools: 'all' | readonly string[];
   readonly argument: string;
   readonly match: RefusedArgumentMatch;
 }
 
-/** What the operator sets up once per host before an entry can be offered. */
 export type OperatorPrerequisite = 'none' | 'link_install' | 'shop_client';
 
 export interface CatalogEntry {
   readonly id: CatalogEntryId;
   readonly name: string;
   readonly goodFor: string;
-  /** What the principal's account needs, shown before connecting. */
   readonly requirements?: string;
   readonly transport: CatalogTransport;
   /** Tools whose action the app itself confirms with the principal, so the assistant adds no approval of its own. */
   readonly confirmedByApp: readonly string[];
-  /** Commands the host never offers. */
   readonly withheld: readonly string[];
   readonly refusedArguments: readonly RefusedArgument[];
   readonly prerequisite: OperatorPrerequisite;
@@ -179,7 +171,6 @@ function isHttpsUrl(value: unknown): boolean {
   return typeof value === 'string' && URL.canParse(value) && new URL(value).protocol === 'https:';
 }
 
-/** The rule a call to `toolName` with `args` breaks, if any. */
 export function refusedArgumentIn(
   entry: CatalogEntry,
   toolName: string,
@@ -198,6 +189,10 @@ export function refusedArgumentIn(
         return present && !isHttpsUrl(value);
     }
   });
+}
+
+export function isConfirmedByApp(entry: Pick<CatalogEntry, 'confirmedByApp'>, toolName: string): boolean {
+  return entry.confirmedByApp.includes(toolName);
 }
 
 /**
@@ -301,7 +296,6 @@ export function isClientId(value: string): boolean {
   return CLIENT_CREDENTIAL.test(value);
 }
 
-/** What the operator enabled on this host; written by `gws-ea connector`, read by every assistant on use. */
 export interface CatalogPolicy {
   readonly schemaVersion: typeof CATALOG_POLICY_SCHEMA_VERSION;
   readonly link: {
@@ -312,10 +306,9 @@ export interface CatalogPolicy {
 }
 
 export type CatalogPolicyState =
-  /** No locator or no file: the operator has enabled nothing. */
   | { readonly status: 'absent' }
   | { readonly status: 'read'; readonly policy: CatalogPolicy }
-  /** Unreadable or malformed. Nothing it names is offered, and nothing is read as the operator disabling it. */
+  /** Nothing it names is offered, and nothing is read as the operator disabling it. */
   | { readonly status: 'invalid' };
 
 function absoluteFile(value: unknown): value is string {
@@ -387,7 +380,6 @@ function invalidPolicy(): CatalogPolicyState {
   return { status: 'invalid' };
 }
 
-/** Whether the entry signs in with the client the operator registered, rather than one made for the app. */
 export function usesOperatorClient(entry: CatalogEntry): boolean {
   return entry.prerequisite === 'shop_client';
 }
@@ -395,7 +387,6 @@ export function usesOperatorClient(entry: CatalogEntry): boolean {
 export type OperatorClient =
   | { readonly status: 'none' }
   | { readonly status: 'registered'; readonly client: ClientRegistration }
-  /** Registered, but its secret file is missing, malformed or not owner-only. */
   | { readonly status: 'unreadable' };
 
 /**
@@ -458,14 +449,11 @@ export function operatorDisabled(entry: CatalogEntry, state: CatalogPolicyState)
 
 export interface AvailableCatalogEntry {
   readonly entry: CatalogEntry;
-  /** The app an earlier connect left not connected; connecting again reuses it. */
   readonly app?: ConnectionApp;
 }
 
 export interface CatalogPlacement {
-  /** The principal's apps, less the not-connected ones listed as available entries. */
   readonly apps: readonly ConnectionApp[];
-  /** Each listed app's catalog entry, by app id. */
   readonly entries: Readonly<Record<string, CatalogEntry>>;
   readonly available: readonly AvailableCatalogEntry[];
 }

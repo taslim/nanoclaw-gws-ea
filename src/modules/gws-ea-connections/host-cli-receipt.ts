@@ -22,7 +22,6 @@ export interface HostCliReceipt {
   readonly schemaVersion: typeof RECEIPT_SCHEMA_VERSION;
   readonly package: string;
   readonly version: string;
-  /** The canonical path of the package's bin entry inside the installation. */
   readonly entryFile: string;
   readonly sha256: string;
   /** Where `undici` resolves from the entry file: `LINK_HTTP_PROXY` loads it and the CLI does not declare it. */

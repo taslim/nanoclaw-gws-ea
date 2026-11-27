@@ -1,13 +1,4 @@
-/**
- * Runs inside the page kit's script.
- * - Sign-in starts with a same-origin POST that answers the server's authorization URL, or, for a catalog app whose
- *   sign-in needs the principal first, its Connect view.
- * - Tool approval toggles update optimistically in place via same-origin JSON (no full-page lock or re-sort jump).
- * - While a connected app's tools are still being sorted, lightweight same-origin polling updates rows live in place
- *   and stops automatically once settled.
- * - While a host-run app's sign-in waits for the principal's approval, its Connect view polls the sign-in's status and
- *   leaves for the app list once the app is connected, or redraws itself once the sign-in ends.
- */
+/** Runs inside the page kit's script. */
 export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   const initialOutcome = new URLSearchParams(location.search).get('outcome');
   if (initialOutcome && initialOutcome !== 'approved' && initialOutcome !== 'declined') {

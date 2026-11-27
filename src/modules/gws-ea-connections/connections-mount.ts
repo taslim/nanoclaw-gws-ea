@@ -3,7 +3,7 @@ import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import type { PrincipalPageMount, PrincipalSubpathLinkContext, PublicMount } from '../gws-ea-web/mounts.js';
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
-import { catalogEntryFor, type AvailableCatalogEntry } from './catalog.js';
+import { catalogEntryFor, isConfirmedByApp, type AvailableCatalogEntry } from './catalog.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { isLiveHeldCallView } from './held-calls.js';
 import { CLIENT_DOCUMENT_PATH } from './oauth.js';
@@ -56,7 +56,6 @@ export interface ConnectionToolFact {
   readonly label: ToolLabel | 'unsorted';
   readonly summary?: string;
   readonly reason: string | null;
-  /** Present when the app asks the principal to approve this itself, whatever label the assistant's card has. */
   readonly confirmedByApp?: true;
 }
 
@@ -78,9 +77,7 @@ export interface AvailableAppFact {
   readonly name: string;
   readonly goodFor: string;
   readonly requirements?: string;
-  /** A host-run app signs in by the principal approving a phrase in the app; a remote one on its sign-in page. */
   readonly signIn: 'phrase_approval' | 'sign_in_page';
-  /** The principal's not-connected app for this entry, which connecting again reuses. */
   readonly app?: { readonly name: string; readonly key: string };
 }
 
@@ -102,7 +99,7 @@ export function operatorAsApp(server: OperatorServer): (ConnectionLinkFact & { r
   return host ? { name: server.key, key: server.key, host, origin: 'operator', status: 'connected' } : undefined;
 }
 
-/** Main learns which apps exist, which it could offer and how they stand, never an address that carries a secret. */
+/** Never an address that carries a secret. */
 export async function connectionsLinkFacts(
   read: () => Promise<ConnectionsListing> = () => currentListing(false),
 ): Promise<{ readonly apps: readonly ConnectionLinkFact[]; readonly available?: readonly AvailableAppFact[] }> {
@@ -121,7 +118,7 @@ export async function connectionsLinkFacts(
                 label: tool.label ?? 'unsorted',
                 ...(tool.summary ? { summary: tool.summary } : {}),
                 reason: tool.reason,
-                ...(entry?.confirmedByApp.includes(tool.name) ? { confirmedByApp: true as const } : {}),
+                ...(entry && isConfirmedByApp(entry, tool.name) ? { confirmedByApp: true as const } : {}),
               }))
             : undefined;
         return {

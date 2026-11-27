@@ -25,7 +25,6 @@ import { isRecord } from '../../gws-ea/validation.js';
 import { EgressError, publicFetch, type EgressDependencies, type PublicFetch } from '../gws-ea-egress/fetch.js';
 import type { ClientRegistration, GrantCredentials } from './store.js';
 
-/** The revision servers mostly implement today, sent on discovery requests. */
 const MCP_PROTOCOL_VERSION = '2025-11-25';
 
 /** A token answer without `expires_in` is treated as lasting this long. */

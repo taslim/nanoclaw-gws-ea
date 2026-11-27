@@ -20,7 +20,6 @@ import { canonicalJson, normalizeToolDefinition, sha256Hex, toolListHash, type T
 import { ConnectionsKey } from './key.js';
 
 export type AppAuth = 'none' | 'oauth' | 'token';
-/** A remote MCP server, or a catalog CLI the host runs itself. */
 export type AppTransport = 'remote' | 'host_cli';
 export type AppStatus = 'connected' | 'needs_reconnecting' | 'not_connected';
 export type ToolLabel = 'ask_first' | 'just_do';
@@ -177,7 +176,6 @@ export interface ConnectionApp {
   readonly clientEntered: boolean;
   readonly status: AppStatus;
   readonly transport: AppTransport;
-  /** The catalog entry the app was made from; an app added by address may still be an entry's, by its host. */
   readonly catalogId: string | null;
   readonly version: number;
   readonly createdAt: string;
@@ -204,8 +202,8 @@ export type NewApp =
   | { readonly name: string; readonly transport: 'host_cli'; readonly catalogId: string };
 
 /**
- * A reserved name that never resolves. A host-run app's placeholder keeps `url` and `host` present and unique, and an
- * older release reads the row as a remote app it cannot reach.
+ * A host-run app's placeholder keeps `url` and `host` present and unique, and an older release reads the row as a
+ * remote app it cannot reach.
  */
 export const HOST_CLI_DOMAIN = 'host-cli.invalid';
 

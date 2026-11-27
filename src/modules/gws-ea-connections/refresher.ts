@@ -74,7 +74,6 @@ export interface ConnectionsRefresher {
    * expired (or when `forceRenew` is set). Returns undefined for apps without auth or when no usable token exists.
    */
   ensureToken(appId: string, options?: { readonly forceRenew?: boolean }): Promise<UsableToken | undefined>;
-  /** Ends a grant whose app itself said it refused the sign-in, exactly as a refused renewal ends one. */
   refuse(appId: string, generation: number): Promise<void>;
 }
 

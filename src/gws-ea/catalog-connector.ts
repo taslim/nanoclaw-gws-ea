@@ -3,7 +3,7 @@
  * committed lockfile, and the operator's registered Shop client. One owner-only policy records both; every
  * assistant reads it on use, so the operator never touches an assistant to enable or retire an entry.
  */
-import { copyFile, lstat, mkdtemp, rename, rm } from 'node:fs/promises';
+import { copyFile, mkdtemp, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,6 +17,7 @@ import {
   isClientId,
   readCatalogPolicy,
   type CatalogPolicy,
+  type CatalogPolicyState,
 } from '../modules/gws-ea-connections/catalog.js';
 import {
   catalogRetireArgs,
@@ -39,6 +40,7 @@ import { assertOwnedDirectory, preparePrivateDirectory, type ControlPlanePaths }
 import { buildToolEnvironment, runSanitizedCommand } from './process.js';
 import { registerSecret, safeErrorCode, safeErrorMessage } from './redact.js';
 import { getInstanceReservation, readRegistry } from './registry.js';
+import { exists } from './release-layout.js';
 import type { NextAction } from './result.js';
 import { readOperatorFile, writePrivateTextFile } from './secrets.js';
 import { bindInstanceHostPolicies, type InstanceRuntimeConfig, type UpsertEnvVars } from './service.js';
@@ -47,7 +49,6 @@ import { GwsEaError } from './types.js';
 
 export type CatalogConnectorName = RetirableCatalogEntry;
 
-const NAMES: Readonly<Record<CatalogConnectorName, string>> = { link: 'Link', shop: 'Shop' };
 const LINK_PACKAGE_FILES = ['package.json', 'pnpm-lock.yaml'] as const;
 const LINK_PACKAGE_DIRECTORY = path.join(path.dirname(fileURLToPath(import.meta.url)), 'connector-packages', 'link');
 const LINK_INSTALL_TIMEOUT_MS = 10 * 60_000;
@@ -68,10 +69,8 @@ export interface LinkInstallData {
   readonly installation_dir: string;
 }
 
-/** What one assistant answered when asked to disconnect an entry the operator retired. */
 export interface CatalogRetirement {
   readonly instance_id: string;
-  /** `stopped`: not running, so it disconnects the entry when it next starts. */
   readonly outcome: 'retired' | 'stopped' | 'unconfirmed';
   readonly retired: number | null;
   readonly remaining: number | null;
@@ -152,7 +151,7 @@ function shopSecretFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
   return path.join(connectorRoot(paths, 'shop'), 'client-secret');
 }
 
-/** The version this checkout's catalog pins; assistants on this release spawn exactly it. */
+/** Assistants on this release spawn exactly this version. */
 export function pinnedLinkTransport(): HostCliTransport {
   const transport = catalogEntry('link')?.transport;
   if (transport?.kind !== 'host_cli') throw new Error('The catalog has no host-run Link entry');
@@ -166,14 +165,10 @@ function shopHost(): string {
   return host;
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await lstat(target);
-    return true;
-  } catch (error) {
-    if (isErrno(error, 'ENOENT')) return false;
-    throw error;
-  }
+function entryName(entry: CatalogConnectorName): string {
+  const name = catalogEntry(entry)?.name;
+  if (!name) throw new Error(`The catalog has no ${entry} entry`);
+  return name;
 }
 
 async function readPolicy(paths: ControlPlanePaths): Promise<CatalogPolicy> {
@@ -189,6 +184,18 @@ async function readPolicy(paths: ControlPlanePaths): Promise<CatalogPolicy> {
 
 async function writePolicy(paths: ControlPlanePaths, policy: CatalogPolicy): Promise<void> {
   await writePrivate(catalogPolicyFile(paths), policy);
+}
+
+async function writePolicyIfChanged(
+  paths: ControlPlanePaths,
+  before: CatalogPolicy,
+  after: CatalogPolicy,
+  dependencies: CatalogConnectorDependencies,
+): Promise<void> {
+  if (JSON.stringify(after) === JSON.stringify(before)) return;
+  dependencies.recordEffect?.(null);
+  await writePolicy(paths, after);
+  dependencies.recordEffect?.(true);
 }
 
 async function underCatalogLock<T>(paths: ControlPlanePaths, work: () => Promise<T>): Promise<T> {
@@ -229,7 +236,7 @@ async function ensureLinkVersion(
     return destination;
     // eslint-disable-next-line no-catch-all/no-catch-all -- An unverifiable installation is replaced; spawns already refuse it.
   } catch (_error) {
-    // Installed afresh below.
+    /* empty */
   }
   await preparePrivateDirectory(path.dirname(root));
   await preparePrivateDirectory(root);
@@ -318,12 +325,12 @@ export async function installLink(
   return underCatalogLock(paths, async () => {
     const policy = await readPolicy(paths);
     const installationDir = await ensureLinkVersion(paths, transport, dependencies);
-    const next = withLinkVersion(policy, transport.version, installationDir);
-    if (JSON.stringify(next) !== JSON.stringify(policy)) {
-      dependencies.recordEffect?.(null);
-      await writePolicy(paths, next);
-      dependencies.recordEffect?.(true);
-    }
+    await writePolicyIfChanged(
+      paths,
+      policy,
+      withLinkVersion(policy, transport.version, installationDir),
+      dependencies,
+    );
     await bindAssistants(paths, dependencies);
     return {
       name: 'link',
@@ -353,19 +360,38 @@ export async function provisionLink(
       return;
       // eslint-disable-next-line no-catch-all/no-catch-all -- An unverifiable installation is reinstalled under the lock below.
     } catch (_error) {
-      // Reinstalled below.
+      /* empty */
     }
   }
   await underCatalogLock(paths, async () => {
     const policy = await readPolicy(paths);
     if (policy.link?.enabled !== true) return;
     const installationDir = await ensureLinkVersion(paths, transport, dependencies);
-    const next = withLinkVersion(policy, transport.version, installationDir);
-    if (JSON.stringify(next) === JSON.stringify(policy)) return;
-    dependencies.recordEffect?.(null);
-    await writePolicy(paths, next);
-    dependencies.recordEffect?.(true);
+    await writePolicyIfChanged(
+      paths,
+      policy,
+      withLinkVersion(policy, transport.version, installationDir),
+      dependencies,
+    );
   });
+}
+
+function stoppedRetirement(instanceId: string, name: string): CatalogRetirement {
+  return {
+    instance_id: instanceId,
+    outcome: 'stopped',
+    retired: null,
+    remaining: null,
+    message: `Not running; it disconnects ${name} when it next starts.`,
+  };
+}
+
+function unconfirmedRetirement(
+  instanceId: string,
+  message: string,
+  remaining: number | null = null,
+): CatalogRetirement {
+  return { instance_id: instanceId, outcome: 'unconfirmed', retired: null, remaining, message };
 }
 
 async function retireOn(
@@ -373,29 +399,16 @@ async function retireOn(
   entry: CatalogConnectorName,
   dependencies: CatalogConnectorDependencies,
 ): Promise<CatalogRetirement> {
-  const name = NAMES[entry];
+  const name = entryName(entry);
   const id = runtime.instance_id;
-  const stopped = (): CatalogRetirement => ({
-    instance_id: id,
-    outcome: 'stopped',
-    retired: null,
-    remaining: null,
-    message: `Not running; it disconnects ${name} when it next starts.`,
-  });
-  const unconfirmed = (why: string, remaining: number | null = null): CatalogRetirement => ({
-    instance_id: id,
-    outcome: 'unconfirmed',
-    retired: null,
-    remaining,
-    message: `${why} Rerun gws-ea connectors uninstall ${entry} once it is serving, or stop it with gws-ea stop --id ${id}: a stopped assistant disconnects ${name} when it next starts.`,
-  });
+  const recovery = `Rerun gws-ea connectors uninstall ${entry} once it is serving, or stop it with gws-ea stop --id ${id}: a stopped assistant disconnects ${name} when it next starts.`;
   if (dependencies.serviceHelpers) {
     try {
       const service = createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(runtime)).detect();
-      if (!service.active && !service.transitional && service.mode !== 'unmanaged') return stopped();
+      if (!service.active && !service.transitional && service.mode !== 'unmanaged') return stoppedRetirement(id, name);
       // eslint-disable-next-line no-catch-all/no-catch-all -- An unobservable service is asked directly; only its answer confirms.
     } catch (_error) {
-      // Asked below.
+      /* empty */
     }
   }
   let answer: unknown;
@@ -403,13 +416,17 @@ async function retireOn(
     answer = await runInstanceNclJson(runtime, catalogRetireArgs(entry));
     // eslint-disable-next-line no-catch-all/no-catch-all -- A failed request is an unconfirmed assistant, reported with its recovery.
   } catch (error) {
-    return unconfirmed(`It could not be asked to disconnect ${name}: ${safeErrorMessage(error)}`);
+    return unconfirmedRetirement(
+      id,
+      `It could not be asked to disconnect ${name}: ${safeErrorMessage(error)} ${recovery}`,
+    );
   }
   const reply = parseCatalogRetireReply(answer, entry);
-  if (!reply) return unconfirmed(`It gave no readable answer about disconnecting ${name}.`);
+  if (!reply) return unconfirmedRetirement(id, `It gave no readable answer about disconnecting ${name}. ${recovery}`);
   if (reply.remaining > 0)
-    return unconfirmed(
-      `It still has ${reply.remaining} ${name} connection(s) it could not disconnect.`,
+    return unconfirmedRetirement(
+      id,
+      `It still has ${reply.remaining} ${name} connection(s) it could not disconnect. ${recovery}`,
       reply.remaining,
     );
   return {
@@ -426,30 +443,22 @@ async function retireEverywhere(
   entry: CatalogConnectorName,
   dependencies: CatalogConnectorDependencies,
 ): Promise<CatalogRetirement[]> {
-  const name = NAMES[entry];
+  const name = entryName(entry);
   const assistants: CatalogRetirement[] = [];
   await withManagedInstances(
     paths,
     async (runtimes, missing) => {
       // Without a recorded runtime there is no service to run it; it reads the policy when it starts.
-      for (const id of missing)
-        assistants.push({
-          instance_id: id,
-          outcome: 'stopped',
-          retired: null,
-          remaining: null,
-          message: `Not running; it disconnects ${name} when it next starts.`,
-        });
+      for (const id of missing) assistants.push(stoppedRetirement(id, name));
       for (const runtime of runtimes) assistants.push(await retireOn(runtime, entry, dependencies));
     },
     (id) =>
-      assistants.push({
-        instance_id: id,
-        outcome: 'unconfirmed',
-        retired: null,
-        remaining: null,
-        message: `Another operation is running on it. Rerun gws-ea connectors uninstall ${entry} after it finishes.`,
-      }),
+      assistants.push(
+        unconfirmedRetirement(
+          id,
+          `Another operation is running on it. Rerun gws-ea connectors uninstall ${entry} after it finishes.`,
+        ),
+      ),
   );
   return assistants.sort((left, right) => left.instance_id.localeCompare(right.instance_id));
 }
@@ -472,18 +481,14 @@ async function uninstallEntry(
       entry === 'link'
         ? { ...policy, link: policy.link && { enabled: false, versions: policy.link.versions } }
         : { ...policy, shop: null };
-    if (JSON.stringify(disabled) !== JSON.stringify(policy)) {
-      dependencies.recordEffect?.(null);
-      await writePolicy(paths, disabled);
-      dependencies.recordEffect?.(true);
-    }
+    await writePolicyIfChanged(paths, policy, disabled, dependencies);
     const assistants = await retireEverywhere(paths, entry, dependencies);
     const unconfirmed = assistants.filter((assistant) => assistant.outcome === 'unconfirmed');
     if (unconfirmed.length)
       return {
         scope: 'host',
         outcome: 'pending',
-        reason: `${NAMES[entry]} accepts no new connections, but its host files stay until every running assistant confirms it is disconnected: ${unconfirmed.map((assistant) => assistant.instance_id).join(', ')}.`,
+        reason: `${entryName(entry)} accepts no new connections, but its host files stay until every running assistant confirms it is disconnected: ${unconfirmed.map((assistant) => assistant.instance_id).join(', ')}.`,
         assistants,
       };
     dependencies.recordEffect?.(null);
@@ -508,7 +513,6 @@ export async function uninstallShop(
   return { name: 'shop', registered: false, ...(await uninstallEntry(paths, 'shop', dependencies)) };
 }
 
-/** Each assistant's Shop redirect address lives on its claimed web hostname. */
 async function shopRedirects(paths: ControlPlanePaths, instanceId?: string): Promise<ShopRedirect[]> {
   const instances = (await readRegistry(paths)).instances;
   const host = shopHost();
@@ -657,6 +661,149 @@ const command = (action: string, name: CatalogConnectorName): NextAction => ({
   argv: ['gws-ea', 'connectors', action, name],
 });
 
+interface CatalogInspection {
+  readonly setup: ConnectorObservation['setup'];
+  readonly ready: boolean;
+  readonly assistants: ConnectorObservation['assistants'];
+  readonly reasons: string[];
+  readonly actions: NextAction[];
+  readonly details: LinkConnectorDetails | ShopConnectorDetails;
+}
+
+async function inspectLink(
+  state: CatalogPolicyState,
+  file: string,
+  checked: boolean,
+  invalidPolicy: string,
+): Promise<CatalogInspection> {
+  const reasons: string[] = [];
+  const actions: NextAction[] = [];
+  let setup: ConnectorObservation['setup'];
+  let ready = false;
+  const pinned = pinnedLinkTransport();
+  const link = state.status === 'read' ? state.policy.link : null;
+  const versions: LinkConnectorDetails['versions'][number][] = [];
+  for (const [version, { installationDir }] of Object.entries(link?.versions ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    let receipt: LinkConnectorDetails['versions'][number]['receipt'] = 'not_checked';
+    let reason: string | null = null;
+    if (checked)
+      try {
+        await verifyHostCliReceipt(installationDir, { ...pinned, version });
+        receipt = 'verified';
+        // eslint-disable-next-line no-catch-all/no-catch-all -- A failed verification is the observed fact, never a failed inspection.
+      } catch (error) {
+        receipt = 'invalid';
+        reason = error instanceof Error ? error.message : 'Verification failed.';
+      }
+    versions.push({
+      version,
+      installation_dir: installationDir,
+      pinned: version === pinned.version,
+      receipt,
+      reason,
+    });
+  }
+  const details: LinkConnectorDetails = {
+    name: 'link',
+    policy_file: file,
+    pinned_version: pinned.version,
+    enabled: state.status === 'invalid' ? null : link?.enabled === true,
+    versions,
+  };
+  const current = versions.find((version) => version.pinned);
+  if (state.status === 'invalid') {
+    setup = 'unknown';
+    reasons.push(invalidPolicy);
+  } else if (!link) {
+    setup = 'not_installed';
+    reasons.push('link is not installed.');
+    actions.push(command('install', 'link'));
+  } else if (!link.enabled) {
+    setup = 'uninstall_incomplete';
+    reasons.push('Link uninstall is incomplete: it accepts no new connections, and its versions stay installed.');
+    actions.push(command('uninstall', 'link'));
+  } else if (!current) {
+    setup = 'pending';
+    reasons.push(`This release pins Link ${pinned.version}, which is not installed.`);
+    actions.push(command('install', 'link'));
+  } else {
+    setup = 'installed';
+    ready = current.receipt === 'verified';
+    if (checked && !ready) {
+      reasons.push(`Link ${pinned.version} does not verify: ${current.reason ?? 'verification failed'}`);
+      actions.push(command('install', 'link'));
+    }
+  }
+  return { setup, ready, assistants: [], reasons, actions, details };
+}
+
+async function inspectShop(
+  paths: ControlPlanePaths,
+  state: CatalogPolicyState,
+  file: string,
+  checked: boolean,
+  invalidPolicy: string,
+  instanceId: string | undefined,
+): Promise<CatalogInspection> {
+  const reasons: string[] = [];
+  const actions: NextAction[] = [];
+  let setup: ConnectorObservation['setup'];
+  let ready = false;
+  let assistants: ConnectorObservation['assistants'] = [];
+  const shop = state.status === 'read' ? state.policy.shop : null;
+  const redirects = shop ? await shopRedirects(paths, instanceId) : [];
+  const details: ShopConnectorDetails = {
+    name: 'shop',
+    policy_file: file,
+    client_id: shop?.clientId ?? null,
+    client_secret: shop?.clientSecretFile != null,
+    assistants: redirects,
+  };
+  if (state.status === 'invalid') {
+    setup = 'unknown';
+    reasons.push(invalidPolicy);
+  } else if (!shop) {
+    if (await exists(connectorRoot(paths, 'shop'))) {
+      setup = 'uninstall_incomplete';
+      reasons.push('Shop uninstall is incomplete: it accepts no new connections, and its client secret stays stored.');
+      actions.push(command('uninstall', 'shop'));
+    } else {
+      setup = 'not_installed';
+      reasons.push('shop is not installed.');
+      actions.push(command('install', 'shop'));
+    }
+  } else {
+    setup = 'installed';
+    let secretReadable = true;
+    if (checked && shop.clientSecretFile)
+      try {
+        await readOperatorFile(
+          shop.clientSecretFile,
+          paths.configRoot,
+          'Shop client secret',
+          'shop_client_secret_invalid',
+        );
+        // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable secret is the observed fact; its contents never reach output.
+      } catch (_error) {
+        secretReadable = false;
+        reasons.push('The stored Shop client secret is missing or not owner-only.');
+        actions.push(command('install', 'shop'));
+      }
+    assistants = redirects.map((redirect) => ({
+      instance_id: redirect.instance_id,
+      compatibility: 'compatible',
+      setup: redirect.redirect_uri ? 'installed' : 'pending',
+      readiness: readiness(checked, secretReadable && redirect.redirect_uri !== null),
+      reasons: redirect.redirect_uri ? [] : [NO_WEB_ADDRESS],
+      next_actions: [],
+    }));
+    ready = secretReadable && redirects.every((redirect) => redirect.redirect_uri !== null);
+  }
+  return { setup, ready, assistants, reasons, actions, details };
+}
+
 /** `show` reads local records only; `check` also verifies receipts and the stored secret, and never repairs. */
 export async function inspectCatalogConnector(
   paths: ControlPlanePaths,
@@ -668,123 +815,11 @@ export async function inspectCatalogConnector(
   if (options.instanceId) await getInstanceReservation(paths, options.instanceId);
   const file = catalogPolicyFile(paths);
   const state = await readCatalogPolicy(file);
-  const reasons: string[] = [];
-  const actions: NextAction[] = [];
-  let setup: ConnectorObservation['setup'];
-  let ready = false;
-  let assistants: ConnectorObservation['assistants'] = [];
-  let details: LinkConnectorDetails | ShopConnectorDetails;
   const invalidPolicy = `The catalog policy at ${file} is unreadable; nothing it records is offered. Restore a valid owner-only policy, or remove it and reinstall.`;
-  if (name === 'link') {
-    const pinned = pinnedLinkTransport();
-    const link = state.status === 'read' ? state.policy.link : null;
-    const versions: LinkConnectorDetails['versions'][number][] = [];
-    for (const [version, { installationDir }] of Object.entries(link?.versions ?? {}).sort(([a], [b]) =>
-      a.localeCompare(b),
-    )) {
-      let receipt: LinkConnectorDetails['versions'][number]['receipt'] = 'not_checked';
-      let reason: string | null = null;
-      if (checked)
-        try {
-          await verifyHostCliReceipt(installationDir, { ...pinned, version });
-          receipt = 'verified';
-          // eslint-disable-next-line no-catch-all/no-catch-all -- A failed verification is the observed fact, never a failed inspection.
-        } catch (error) {
-          receipt = 'invalid';
-          reason = error instanceof Error ? error.message : 'Verification failed.';
-        }
-      versions.push({
-        version,
-        installation_dir: installationDir,
-        pinned: version === pinned.version,
-        receipt,
-        reason,
-      });
-    }
-    details = {
-      name: 'link',
-      policy_file: file,
-      pinned_version: pinned.version,
-      enabled: state.status === 'invalid' ? null : link?.enabled === true,
-      versions,
-    };
-    const current = versions.find((version) => version.pinned);
-    if (state.status === 'invalid') {
-      setup = 'unknown';
-      reasons.push(invalidPolicy);
-    } else if (!link) {
-      setup = 'not_installed';
-      reasons.push('link is not installed.');
-      actions.push(command('install', name));
-    } else if (!link.enabled) {
-      setup = 'uninstall_incomplete';
-      reasons.push('Link uninstall is incomplete: it accepts no new connections, and its versions stay installed.');
-      actions.push(command('uninstall', name));
-    } else if (!current) {
-      setup = 'pending';
-      reasons.push(`This release pins Link ${pinned.version}, which is not installed.`);
-      actions.push(command('install', name));
-    } else {
-      setup = 'installed';
-      ready = current.receipt === 'verified';
-      if (checked && !ready) {
-        reasons.push(`Link ${pinned.version} does not verify: ${current.reason ?? 'verification failed'}`);
-        actions.push(command('install', name));
-      }
-    }
-  } else {
-    const shop = state.status === 'read' ? state.policy.shop : null;
-    const redirects = shop ? await shopRedirects(paths, options.instanceId) : [];
-    details = {
-      name: 'shop',
-      policy_file: file,
-      client_id: shop?.clientId ?? null,
-      client_secret: shop?.clientSecretFile != null,
-      assistants: redirects,
-    };
-    if (state.status === 'invalid') {
-      setup = 'unknown';
-      reasons.push(invalidPolicy);
-    } else if (!shop) {
-      if (await exists(connectorRoot(paths, 'shop'))) {
-        setup = 'uninstall_incomplete';
-        reasons.push(
-          'Shop uninstall is incomplete: it accepts no new connections, and its client secret stays stored.',
-        );
-        actions.push(command('uninstall', name));
-      } else {
-        setup = 'not_installed';
-        reasons.push('shop is not installed.');
-        actions.push(command('install', name));
-      }
-    } else {
-      setup = 'installed';
-      let secretReadable = true;
-      if (checked && shop.clientSecretFile)
-        try {
-          await readOperatorFile(
-            shop.clientSecretFile,
-            paths.configRoot,
-            'Shop client secret',
-            'shop_client_secret_invalid',
-          );
-          // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable secret is the observed fact; its contents never reach output.
-        } catch (_error) {
-          secretReadable = false;
-          reasons.push('The stored Shop client secret is missing or not owner-only.');
-          actions.push(command('install', name));
-        }
-      assistants = redirects.map((redirect) => ({
-        instance_id: redirect.instance_id,
-        compatibility: 'compatible',
-        setup: redirect.redirect_uri ? 'installed' : 'pending',
-        readiness: readiness(checked, secretReadable && redirect.redirect_uri !== null),
-        reasons: redirect.redirect_uri ? [] : [NO_WEB_ADDRESS],
-        next_actions: [],
-      }));
-      ready = secretReadable && redirects.every((redirect) => redirect.redirect_uri !== null);
-    }
-  }
+  const { setup, ready, assistants, reasons, actions, details } =
+    name === 'link'
+      ? await inspectLink(state, file, checked, invalidPolicy)
+      : await inspectShop(paths, state, file, checked, invalidPolicy, options.instanceId);
   return {
     name,
     summary: definition.summary,

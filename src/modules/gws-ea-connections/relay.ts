@@ -15,6 +15,7 @@ import { notifyMainToolsChanged } from './apply.js';
 import {
   catalogEntryFor,
   catalogRulesMatch,
+  isConfirmedByApp,
   offeredDefinition,
   refusedArgumentIn,
   type CatalogEntry,
@@ -32,6 +33,7 @@ import {
   HOST_PROCESS_IDLE_MS,
   HostCliUnavailableError,
   HostProcessTransport,
+  firstText,
   hostCliAuthRefused,
   isHostCliEntry,
   resolveHostCliLaunch,
@@ -271,7 +273,6 @@ type ManagedClient = {
   | {
       readonly kind: 'host_process';
       readonly transport: HostProcessTransport;
-      /** The app offers search and call meta-tools; its inner commands are pinned and called through them. */
       readonly metaTools: boolean;
       idleTimer: NodeJS.Timeout | undefined;
     }
@@ -310,14 +311,15 @@ export function confirmedByAppDescriptionSuffix(appName: string): string {
 }
 
 function formatToolForMain(pinned: PinnedAppTool, entry: CatalogEntry | undefined): RelayedTool {
+  let suffix: string | undefined;
+  if (pinned.label === 'ask_first') suffix = ASK_FIRST_DESCRIPTION_SUFFIX;
+  else if (pinned.label === null) suffix = UNSORTED_DESCRIPTION_SUFFIX;
+  else if (entry && isConfirmedByApp(entry, pinned.definition.name))
+    suffix = confirmedByAppDescriptionSuffix(entry.name);
   const description =
-    pinned.label === 'ask_first'
-      ? appendDescriptionSuffix(pinned.definition.description, ASK_FIRST_DESCRIPTION_SUFFIX)
-      : pinned.label === null
-        ? appendDescriptionSuffix(pinned.definition.description, UNSORTED_DESCRIPTION_SUFFIX)
-        : entry?.confirmedByApp.includes(pinned.definition.name)
-          ? appendDescriptionSuffix(pinned.definition.description, confirmedByAppDescriptionSuffix(entry.name))
-          : pinned.definition.description;
+    suffix === undefined
+      ? pinned.definition.description
+      : appendDescriptionSuffix(pinned.definition.description, suffix);
   return {
     name: pinned.definition.name,
     ...(pinned.definition.title === undefined ? {} : { title: pinned.definition.title }),
@@ -355,6 +357,13 @@ function failureCode(error: unknown): string {
   if (error instanceof HostCliUnavailableError) return error.reason;
   if (error instanceof CatalogRulesUnmatchedError) return 'rules_unmatched';
   return 'failed';
+}
+
+function connectFailureReason(error: unknown): string {
+  if (error instanceof UpstreamUnauthorizedError) return 'unauthorized';
+  if (error instanceof EgressError) return error.code;
+  if (error instanceof HostCliUnavailableError) return 'app_unavailable';
+  return 'connect_failed';
 }
 
 function defaultHoldRefusal(): Promise<RelayCallOutcome> {
@@ -680,12 +689,11 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
 
   async function callMetaTool(managed: ManagedClient, name: string, args: Record<string, unknown>): Promise<unknown> {
     const result = await managed.client.callTool({ name, arguments: args }, requestOptions(managed));
-    const content = Array.isArray(result.content) ? (result.content as unknown[]) : [];
-    const first = content[0];
-    if (result.isError === true || !isRecord(first) || first.type !== 'text' || typeof first.text !== 'string') {
+    const text = firstText(result);
+    if (result.isError === true || text === undefined) {
       throw new Error(`The app's ${name} gave no readable answer`);
     }
-    return JSON.parse(first.text) as unknown;
+    return JSON.parse(text) as unknown;
   }
 
   /** The CLI's MCP mode lists its commands by search; each command's schema comes from its details. */
@@ -845,17 +853,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           if (error instanceof UpstreamUnauthorizedError && !forceRenew && app.auth === 'oauth') {
             return 'retry_401' as const;
           }
-          return {
-            status: 'unsent' as const,
-            reason:
-              error instanceof UpstreamUnauthorizedError
-                ? 'unauthorized'
-                : error instanceof EgressError
-                  ? error.code
-                  : error instanceof HostCliUnavailableError
-                    ? 'app_unavailable'
-                    : 'connect_failed',
-          };
+          return { status: 'unsent' as const, reason: connectFailureReason(error) };
         }
         if (closed) {
           await closeClient(managed);

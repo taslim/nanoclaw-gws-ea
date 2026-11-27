@@ -1,10 +1,4 @@
-/**
- * A stand-in for the pinned Link CLI's MCP mode, offering the same four meta-tools over the commands recorded from
- * the real CLI. Node runs it directly by stripping types, so it imports only packages and builtins.
- *
- * It reads `fake-app.json` from its working directory for per-test behavior and appends what it saw to
- * `fake-app.jsonl` there.
- */
+/** Node runs it directly by stripping types, so it imports only packages and builtins. */
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -18,16 +12,11 @@ const FAKE_APP_CONTROL_FILE = 'fake-app.json';
 const FAKE_APP_LOG_FILE = 'fake-app.jsonl';
 
 export interface FakeAppControl {
-  /** Inner commands whose details carry `readOnlyHint: true`. */
   readonly readOnly?: readonly string[];
-  /** Inner commands that never answer. */
   readonly hang?: readonly string[];
-  /** Inner command answered with a text of `largeResultBytes` characters. */
   readonly largeResult?: string;
   readonly largeResultBytes?: number;
-  /** Written to stderr at start. */
   readonly stderrText?: string;
-  /** Every inner command answers as link-cli does without a saved sign-in. */
   readonly notAuthenticated?: boolean;
 }
 

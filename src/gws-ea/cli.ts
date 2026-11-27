@@ -2544,6 +2544,10 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           return connectorDefinition(name)[lifecycle](lifecycleContext);
         });
         data = result;
+        const external =
+          'operator_actions' in result
+            ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
+            : [];
         if (result.name === 'web') {
           paused =
             'assistants' in result
@@ -2564,21 +2568,16 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                     argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
                   },
                 ]),
-            ...('operator_actions' in result
-              ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
-              : []),
+            ...external,
           ];
         } else {
           paused = 'outcome' in result && result.outcome === 'pending';
+          let next: string | undefined;
+          if (paused) next = handler.command;
+          else if (handler.command === 'install') next = 'check';
           actions = [
-            ...(paused
-              ? [{ kind: 'command' as const, argv: ['gws-ea', 'connectors', handler.command, name] }]
-              : handler.command === 'install'
-                ? [{ kind: 'command' as const, argv: ['gws-ea', 'connectors', 'check', name] }]
-                : []),
-            ...('operator_actions' in result
-              ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
-              : []),
+            ...(next === undefined ? [] : [{ kind: 'command' as const, argv: ['gws-ea', 'connectors', next, name] }]),
+            ...external,
           ];
         }
         run.complete();

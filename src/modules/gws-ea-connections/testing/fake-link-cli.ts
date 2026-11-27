@@ -1,11 +1,4 @@
-/**
- * A stand-in for the pinned Link CLI. Its `auth` commands write `--format jsonl` lines shaped like link-cli 1.6.0's,
- * recorded against a loopback sign-in server, and keep their state in the file `LINK_AUTH_FILE` names; `--mcp` runs the
- * meta-tool stand-in. Node runs it directly by stripping types, so it imports only builtins.
- *
- * It reads `fake-link.json` from its working directory for per-test behavior and appends each command it ran to
- * `fake-link.jsonl` there. A waiting login settles when the test writes `approve` or `deny` to `fake-link-answer`.
- */
+/** Node runs it directly by stripping types, so it imports only builtins. */
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -15,11 +8,9 @@ const LOG_FILE = 'fake-link.jsonl';
 const ANSWER_FILE = 'fake-link-answer';
 
 export interface FakeLinkControl {
-  /** How the login goes once it has printed its address and phrase. */
   readonly login?: 'wait' | 'approve' | 'deny' | 'expire' | 'timeout' | 'garbled' | 'no_phrase';
   readonly verificationUrl?: string;
   readonly phrase?: string;
-  /** The access and refresh tokens an approval saves. */
   readonly token?: string;
   readonly logoutFails?: boolean;
 }

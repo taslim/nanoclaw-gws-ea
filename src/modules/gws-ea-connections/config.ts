@@ -2,7 +2,6 @@ import { readEnvFile } from '../../env.js';
 
 export const CONNECTIONS_ROOT_ENV = 'GWS_EA_CONNECTIONS_ROOT';
 export const CATALOG_POLICY_FILE_ENV = 'GWS_EA_CATALOG_POLICY_FILE';
-/** The policy's name under the operator's config root. */
 export const CATALOG_POLICY_FILE_NAME = 'catalog.json';
 
 function setting(name: string): string | undefined {
