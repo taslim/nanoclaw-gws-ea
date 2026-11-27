@@ -74,6 +74,8 @@ export interface ConnectionsRefresher {
    * expired (or when `forceRenew` is set). Returns undefined for apps without auth or when no usable token exists.
    */
   ensureToken(appId: string, options?: { readonly forceRenew?: boolean }): Promise<UsableToken | undefined>;
+  /** Ends a grant whose app itself said it refused the sign-in, exactly as a refused renewal ends one. */
+  refuse(appId: string, generation: number): Promise<void>;
 }
 
 type OAuthGrant = Extract<LiveGrant, { kind: 'oauth' }>;
@@ -369,6 +371,19 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         await applyStore();
         await dependencies.onTick?.();
       }
+    },
+
+    refuse(appId: string, generation: number): Promise<void> {
+      return withAppLock(appId, async () => {
+        let app: ConnectionApp;
+        try {
+          app = await store.get(appId);
+        } catch (error) {
+          if (error instanceof ConnectionsStoreError && error.reason === 'app_not_found') return;
+          throw error;
+        }
+        await endRefused(app, generation, 'grant_refused');
+      });
     },
 
     async ensureToken(

@@ -16,6 +16,7 @@ import {
 import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
 import { catalogEntryFor, type AvailableCatalogEntry, type CatalogEntry } from './catalog.js';
+import type { DeviceSignInFailure, DeviceSignInView } from './device-sign-in.js';
 import { escapeInvisibleChars, hasAnyInvisible } from './held-card.js';
 import { type HeldAppCallPayload, type PendingHeldCallItem } from './held-calls.js';
 import type { ConnectionsListing } from './operations.js';
@@ -57,6 +58,8 @@ export interface ConnectionsPageState {
   readonly retryServer?: { readonly key: string; readonly host: string };
   readonly toolReview?: { readonly pin?: AppPin; readonly tools: readonly PinnedAppTool[] };
   readonly heldCall?: HeldCallViewData;
+  /** A host-run app's sign-in as it stands, for its Connect view. */
+  readonly deviceSignIn?: DeviceSignInView;
 }
 
 const STATUS_LABELS = {
@@ -182,6 +185,11 @@ function hiddenApp(app: ConnectionApp): string {
   return `<input type="hidden" name="id" value="${escapeHtml(app.id)}"><input type="hidden" name="version" value="${app.version}">`;
 }
 
+/** A host-run app's address is a placeholder no one can visit, so the page says where it runs instead. */
+function shownHost(app: ConnectionApp): string {
+  return app.transport === 'host_cli' ? 'Installed by your operator' : app.host;
+}
+
 function statusBadge(status: AppStatus): string {
   return renderBadge(STATUS_LABELS[status], STATUS_TONES[status]);
 }
@@ -247,7 +255,7 @@ function appRow(
       : needsReview && !hasUnsorted
         ? `<a class="button button-secondary row-button app-row-action" href="${escapeHtml(appUrl(app, 'tools'))}" data-navigation>Review</a>`
         : '';
-  const inner = `<span class="row-main"><span class="row-title">${escapeHtml(app.name)}</span><span class="row-sub app-host">${escapeHtml(app.host)}</span></span><span class="app-status">${statusPill}</span>${primaryHref ? icon('arrow', 'row-chevron app-chevron') : ''}`;
+  const inner = `<span class="row-main"><span class="row-title">${escapeHtml(app.name)}</span><span class="row-sub app-host">${escapeHtml(shownHost(app))}</span></span><span class="app-status">${statusPill}</span>${primaryHref ? icon('arrow', 'row-chevron app-chevron') : ''}`;
   const mainSlot = primaryHref
     ? `<a class="app-link" href="${escapeHtml(primaryHref)}" data-navigation>${inner}</a>`
     : `<div class="app-link app-link-static">${inner}</div>`;
@@ -400,17 +408,46 @@ function appMissing(): string {
   return `${BACK}${renderEmptyState('App not found', 'apps', '<a class="button button-secondary" href="/connections" data-navigation>All apps</a>')}`;
 }
 
+const DEVICE_ENDED = {
+  expired: 'The sign-in expired before it was approved.',
+  refused: 'The sign-in was declined.',
+  failed: 'The sign-in couldn’t be read.',
+} satisfies Record<DeviceSignInFailure, string>;
+
+function deviceStartForm(entry: CatalogEntry, label: string): string {
+  return `<form method="post" action="/connections/catalog-connect" data-sign-in><input type="hidden" name="entry" value="${escapeHtml(entry.id)}">${actions(label, 'Starting…')}</form>`;
+}
+
+/**
+ * The app's own sign-in: the principal opens its address and approves a phrase in the app while the page polls. It
+ * never starts a second login while one waits; Try again starts one only after the last has ended.
+ */
+function deviceSignInPanel(app: ConnectionApp, entry: CatalogEntry, view: DeviceSignInView | undefined): string {
+  const trust = trustNotice(app, entry);
+  switch (view?.status) {
+    case 'waiting':
+      return `<div data-device-sign-in="${escapeHtml(app.id)}" data-device-state="waiting"><ol class="steps"><li><h2>Open ${escapeHtml(entry.name)}’s sign-in page</h2><div class="redirect"><a id="device-address" href="${escapeHtml(view.verificationUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(view.verificationUrl)}</a></div></li><li><h2>Approve this phrase in the ${escapeHtml(entry.name)} app</h2><div class="redirect"><code id="device-phrase">${escapeHtml(view.phrase)}</code>${renderCopyButton('device-phrase', 'Copy phrase')}</div></li></ol><p class="device-status" role="status">Waiting for your approval…</p></div>`;
+    case 'ended':
+      return `${notice(`${DEVICE_ENDED[view.reason]} Nothing changed.`)}${deviceStartForm(entry, 'Try again')}`;
+    case 'idle':
+    case 'connected':
+    case undefined:
+      return `${trust}${deviceStartForm(entry, `Continue to ${entry.name}`)}`;
+  }
+}
+
 function connectView(app: ConnectionApp, entry: CatalogEntry | undefined, state: ConnectionsPageState): string {
   // Connecting already says it is not connected; only a lapsed connection is news.
   const status = app.status === 'needs_reconnecting' ? statusBadge(app.status) : '';
-  const heading = `${BACK}${renderPageHeading(`Connect ${app.name}`, `<span>${escapeHtml(app.host)}</span>${status}`)}`;
+  const heading = `${BACK}${renderPageHeading(`Connect ${app.name}`, `<span>${escapeHtml(shownHost(app))}</span>${status}`)}`;
   if (app.status === 'connected') return `${heading}${notice('Already connected.')}`;
   if (!state.listing.canChange) return `${heading}${notice(UNAVAILABLE)}`;
+  if (app.transport === 'host_cli' && entry) return `${heading}${deviceSignInPanel(app, entry, state.deviceSignIn)}`;
   return `${heading}${connectForm(app, entry, state)}`;
 }
 
 function renameView(app: ConnectionApp): string {
-  return `${BACK}${renderPageHeading('Rename app', `<span>${escapeHtml(app.host)}</span>`)}<form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save</button><a class="button button-secondary form-cancel" href="/connections" data-navigation>Cancel</a></div></form>`;
+  return `${BACK}${renderPageHeading('Rename app', `<span>${escapeHtml(shownHost(app))}</span>`)}<form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}"></div><div class="form-actions"><button class="button button-primary" type="submit">Save</button><a class="button button-secondary form-cancel" href="/connections" data-navigation>Cancel</a></div></form>`;
 }
 
 function toolRow(app: ConnectionApp, entry: CatalogEntry | undefined, tool: PinnedAppTool): string {
@@ -464,7 +501,7 @@ function toolsView(app: ConnectionApp, pin: AppPin | undefined, tools: readonly 
   const desktopTally =
     !pin || hasUnsorted ? '' : sorted.length === 0 ? 'No tools' : `${askCount} ask first · ${autoCount} auto`;
   const mobileTally = !pin || hasUnsorted ? '' : sorted.length === 0 ? '0 tools' : `${askCount} on · ${autoCount} off`;
-  const metadata = `<span class="tools-host">${escapeHtml(app.host)}</span><span class="tools-tally" data-tools-tally${desktopTally ? '' : ' hidden'}>${escapeHtml(desktopTally)}</span><span class="tools-badge-slot" data-tools-badge>${reviewBadge}</span>`;
+  const metadata = `<span class="tools-host">${escapeHtml(shownHost(app))}</span><span class="tools-tally" data-tools-tally${desktopTally ? '' : ' hidden'}>${escapeHtml(desktopTally)}</span><span class="tools-badge-slot" data-tools-badge>${reviewBadge}</span>`;
   const heading = `${BACK}${renderPageHeading(app.name, metadata, reviewForm(app, pin, labelsHash, 'review-header-form', showReview))}`;
   const mobileStrip = `<div class="tools-mobile-strip"><span class="tools-mobile-label">Ask before running</span><span class="tools-mobile-tally" data-tools-mobile-tally${mobileTally ? '' : ' hidden'}>${escapeHtml(mobileTally)}</span></div>`;
   const disconnectedLabel = app.status === 'needs_reconnecting' ? 'Reconnect' : 'Connect';
@@ -729,6 +766,8 @@ const STYLE = `
 .redirect code { flex: 1; min-width: 0; padding-block: 8px; font: 13px/1.5 ui-monospace, "SF Mono", monospace; }
 .redirect .button { background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
 .change-client { margin-top: 12px; }
+.redirect a { flex: 1; min-width: 0; padding-block: 8px; font: 13px/1.5 ui-monospace, "SF Mono", monospace; overflow-wrap: anywhere; color: var(--accent-text); }
+.device-status { margin-top: 20px; color: var(--muted); font-size: 14px; }
 .change-client .button { margin-left: -16px; }
 
 @keyframes pulse-soft {

@@ -7,8 +7,12 @@ import {
   type AdmissionRefusal,
 } from './admit.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers, type OperatorServer } from './apply.js';
+import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../gws-ea-profile/main-note.js';
 import {
+  catalogEntry,
   catalogEntryFor,
+  isRemoteEntry,
+  operatorDisabled,
   operatorEnabled,
   placeCatalogApps,
   readCatalogPolicy,
@@ -17,6 +21,21 @@ import {
   type CatalogPolicyState,
   type RemoteCatalogEntry,
 } from './catalog.js';
+import type { CatalogRetireReply, RetirableCatalogEntry } from './catalog-retire.js';
+import {
+  adoptApprovedSignIn,
+  cancelDeviceSignIn,
+  hostCliClientName,
+  signOutHostCli,
+  startDeviceSignIn,
+} from './device-sign-in.js';
+import {
+  HostCliUnavailableError,
+  isHostCliEntry,
+  resolveHostCliLaunch,
+  type HostCliEntry,
+  type HostCliLaunch,
+} from './host-process.js';
 import { checkRestartSoon } from './idle-restart.js';
 import { withAppLock } from './locks.js';
 import {
@@ -103,6 +122,8 @@ export type CatalogConnectOutcome =
   /** Its sign-in needs the principal on the app's Connect view: client details, a token, or a confirmation. */
   | { readonly status: 'connect_view'; readonly app: ConnectionApp }
   | { readonly status: 'add_refused'; readonly reason: AddRefusal }
+  /** A host-run app's sign-in is under way, or just ended; its Connect view shows which. */
+  | { readonly status: 'device_sign_in'; readonly app: ConnectionApp }
   /** The operator has not set up what the entry needs on this host. */
   | { readonly status: 'not_offered' };
 
@@ -134,6 +155,9 @@ export interface ConnectionOperationsOptions {
   readonly onDisconnected?: (appId: string) => Promise<void>;
   /** Optional gateway credential handle for retiring legacy `gws-ea-app-` credentials when removing an app. */
   readonly gateway?: OperatorCredentials | null;
+  /** How a host-run app's sign-in names the assistant to the principal. */
+  readonly clientName?: () => Promise<string>;
+  readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
 }
 
 /** What the page and the home summary show; it holds no URL and nothing sealed. */
@@ -297,6 +321,8 @@ export class ConnectionOperations {
   private readonly onConnected: (app: ConnectionApp) => Promise<void>;
   private readonly onDisconnected: (appId: string) => Promise<void>;
   private readonly gateway: OperatorCredentials | null | undefined;
+  private readonly clientName: () => Promise<string>;
+  private readonly writeNote: (note: NoteForMain) => Promise<NoteForMainResult>;
 
   constructor(options: ConnectionOperationsOptions) {
     this.store = options.store;
@@ -311,6 +337,8 @@ export class ConnectionOperations {
     this.applyMain = options.applyMain ?? applyMainServers;
     this.documentsServed = options.clientDocumentsServed;
     this.gateway = options.gateway;
+    this.clientName = options.clientName ?? hostCliClientName;
+    this.writeNote = options.writeNote ?? writeNoteForMain;
     this.onConnected =
       options.onConnected ??
       (async (app) => {
@@ -359,8 +387,14 @@ export class ConnectionOperations {
    * Adds the entry's app, or reuses the one an earlier connect left, and starts its sign-in. The entry's lock keeps a
    * second tab from adding it twice.
    */
-  async connectCatalogEntry(entry: RemoteCatalogEntry, principalId: string): Promise<CatalogConnectOutcome> {
+  async connectCatalogEntry(entry: CatalogEntry, principalId: string): Promise<CatalogConnectOutcome> {
     if (!operatorEnabled(entry, await readCatalogPolicy())) return { status: 'not_offered' };
+    if (isHostCliEntry(entry)) return this.connectHostCliEntry(entry);
+    if (!isRemoteEntry(entry)) return { status: 'not_offered' };
+    return this.connectRemoteEntry(entry, principalId);
+  }
+
+  private connectRemoteEntry(entry: RemoteCatalogEntry, principalId: string): Promise<CatalogConnectOutcome> {
     return withAppLock(`catalog:${entry.id}`, async (): Promise<CatalogConnectOutcome> => {
       let app = (await this.store.apps()).find((candidate) => catalogEntryFor(candidate)?.id === entry.id);
       if (app?.status === 'connected') return refusedConnect('already_connected');
@@ -372,6 +406,68 @@ export class ConnectionOperations {
       if (app.auth !== 'oauth' || !app.hasClient) return { status: 'connect_view', app };
       return this.startSignIn(app.id, app.version, principalId);
     });
+  }
+
+  /**
+   * Starts the CLI's device login for the entry's app, or finds the one under way, and answers once its address and
+   * phrase are known. The login outlives this request; approval connects the app from the login itself.
+   */
+  private connectHostCliEntry(entry: HostCliEntry): Promise<CatalogConnectOutcome> {
+    return withAppLock(`catalog:${entry.id}`, async (): Promise<CatalogConnectOutcome> => {
+      let app = (await this.store.apps()).find((candidate) => candidate.catalogId === entry.id);
+      if (app?.status === 'connected') return refusedConnect('already_connected');
+      let launch: HostCliLaunch;
+      try {
+        launch = await resolveHostCliLaunch(entry);
+      } catch (error) {
+        if (error instanceof HostCliUnavailableError) return { status: 'not_offered' };
+        throw error;
+      }
+      if (!app) {
+        try {
+          app = await this.store.create({ name: entry.name, transport: 'host_cli', catalogId: entry.id });
+        } catch (error) {
+          if (error instanceof ConnectionsStoreError && error.reason === 'duplicate_name')
+            return { status: 'add_refused', reason: 'duplicate_name' };
+          throw error;
+        }
+      }
+      const appId = app.id;
+      await startDeviceSignIn({
+        appId,
+        launch,
+        clientName: await this.clientName(),
+        complete: (pendingFile, current) => this.completeDeviceSignIn(appId, launch, pendingFile, current),
+      });
+      return { status: 'device_sign_in', app };
+    });
+  }
+
+  /** Under the app's lock, so a disconnect that cancelled the sign-in meanwhile always wins. */
+  private async completeDeviceSignIn(
+    appId: string,
+    launch: HostCliLaunch,
+    pendingFile: string,
+    current: () => boolean,
+  ): Promise<boolean> {
+    const connected = await withAppLock(appId, async (): Promise<ConnectionApp | undefined> => {
+      if (!current()) return undefined;
+      let app: ConnectionApp;
+      try {
+        app = await this.store.get(appId);
+      } catch (error) {
+        if (error instanceof ConnectionsStoreError && error.reason === 'app_not_found') return undefined;
+        throw error;
+      }
+      await adoptApprovedSignIn(pendingFile, launch.authFile);
+      const result = await this.store.connect(app.id, app.version, { kind: 'none' });
+      await this.notifyDisconnected(result.app.id);
+      return result.app;
+    });
+    if (!connected) return false;
+    await this.pinConnected(connected);
+    await this.apply();
+    return true;
   }
 
   /**
@@ -432,7 +528,7 @@ export class ConnectionOperations {
     const outcome = await withAppLock(id, async (): Promise<ConnectOutcome> => {
       const app = await this.current(id, version);
       if (app.status === 'connected') return refusedConnect('already_connected');
-      if (app.auth === 'oauth') return refusedConnect('wrong_method');
+      if (app.auth === 'oauth' || app.transport === 'host_cli') return refusedConnect('wrong_method');
       if (app.auth === 'none') {
         const probe = await probeApp(app.url, this.oauth);
         if (probe.status !== 'ok') return refusedConnect(probe.status);
@@ -587,13 +683,24 @@ export class ConnectionOperations {
   /** Revocation is best-effort; the app stays listed, Not connected. */
   async disconnect(id: string, version: number): Promise<ConnectionApp> {
     return withAppLock(id, async () => {
-      const before = await this.current(id, version);
-      const { app, released } = await this.store.disconnect(id, version);
-      await this.notifyDisconnected(app.id);
-      await revokeGrant(before.issuer, released, this.oauth);
+      const app = await this.release(await this.current(id, version));
       await this.apply();
       return app;
     });
+  }
+
+  /**
+   * Under the app's lock: ends the grant before anything else, so no new call can start, then closes what it had open
+   * and revokes. A host-run app's CLI child is closed before its sign-out runs, so one process uses its credentials.
+   */
+  private async release(before: ConnectionApp): Promise<ConnectionApp> {
+    if (before.transport === 'host_cli') cancelDeviceSignIn(before.id);
+    const { app, released } = await this.store.disconnect(before.id, before.version);
+    await this.notifyDisconnected(app.id);
+    const entry = before.transport === 'host_cli' ? catalogEntryFor(before) : undefined;
+    if (entry && isHostCliEntry(entry)) await signOutHostCli(entry);
+    else await revokeGrant(before.issuer, released, this.oauth);
+    return app;
   }
 
   /** Best-effort cleanup of any legacy `gws-ea-app-` gateway credentials on the removed app's host. */
@@ -627,13 +734,60 @@ export class ConnectionOperations {
   async remove(id: string, version: number): Promise<void> {
     return withAppLock(id, async () => {
       const before = await this.current(id, version);
-      const { app, released } = await this.store.disconnect(id, version);
-      await this.notifyDisconnected(app.id);
-      await revokeGrant(before.issuer, released, this.oauth);
+      const app = await this.release(before);
       const gatewayCleaned = await this.retireGatewayAppCredentials(app.id, before.host);
       await this.store.remove(app.id, app.version, { pendingGatewayCleanup: !gatewayCleaned });
       await this.apply();
     });
+  }
+
+  /**
+   * Disconnects every app made from the entry once the operator has turned it off on this host, and notes main for
+   * each. While the entry is still offered, or the policy cannot be read, nothing is retired.
+   */
+  async retireCatalogEntry(entryId: RetirableCatalogEntry): Promise<CatalogRetireReply> {
+    const entry = catalogEntry(entryId);
+    const own = async (): Promise<readonly ConnectionApp[]> =>
+      (await this.store.apps()).filter((app) => app.catalogId === entryId);
+    let retired = 0;
+    if (entry && operatorDisabled(entry, await readCatalogPolicy())) {
+      // Under each app's lock, so a sign-in finishing now has either connected, and is disconnected below, or never will.
+      for (const app of await own()) await withAppLock(app.id, async () => cancelDeviceSignIn(app.id));
+      for (const app of await own()) {
+        if (app.status === 'not_connected') continue;
+        try {
+          await this.disconnect(app.id, app.version);
+        } catch (error) {
+          if (!(error instanceof ConnectionsStoreError)) throw error;
+          log.warn('Catalog app not retired', { appId: app.id, code: error.reason });
+          continue;
+        }
+        retired += 1;
+        await this.noteRetired(app, entry);
+      }
+    }
+    const remaining = (await own()).filter((app) => app.status !== 'not_connected').length;
+    return { schemaVersion: 1, entry: entryId, retired, remaining };
+  }
+
+  /** Main hears once, without waking, that the app's tools are gone and why; its id makes writing it again a no-op. */
+  private async noteRetired(app: ConnectionApp, entry: CatalogEntry): Promise<void> {
+    try {
+      await this.writeNote({
+        id: `connection-retired:${app.id}:${app.version}`,
+        timestamp: new Date().toISOString(),
+        text:
+          `The principal's operator turned ${entry.name} off on this host, so the app ${JSON.stringify(app.name)} ` +
+          'was disconnected and its tools are gone. It can be connected again once the operator turns it back on.',
+        wake: false,
+      });
+      /* eslint-disable-next-line no-catch-all/no-catch-all -- the app is already disconnected; a lost note must not undo or block that */
+    } catch (error) {
+      log.error('Retired app note not written', {
+        appId: app.id,
+        error: error instanceof Error ? error.name : 'unknown',
+      });
+    }
   }
 
   /**

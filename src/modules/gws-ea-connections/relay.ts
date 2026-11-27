@@ -34,6 +34,7 @@ import {
   HOST_PROCESS_IDLE_MS,
   HostCliUnavailableError,
   HostProcessTransport,
+  hostCliAuthRefused,
   isHostCliEntry,
   resolveHostCliLaunch,
 } from './host-process.js';
@@ -817,7 +818,8 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     args: Record<string, unknown>,
     options: { readonly verifyBeforeCall?: () => Promise<PreflightResult> } = {},
   ): Promise<UpstreamCallResult> {
-    return withRelayQueue(app.id, async () => {
+    let authRefused = false;
+    const outcome = await withRelayQueue(app.id, async (): Promise<UpstreamCallResult> => {
       if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
       const attempt = async (forceRenew: boolean) => {
         if (closed) return { status: 'unsent' as const, reason: 'relay_stopping' };
@@ -870,6 +872,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
           if (managed.kind === 'host_process' && Buffer.byteLength(JSON.stringify(result)) > maxBodyBytes) {
             return { status: 'too_large' as const };
           }
+          if (managed.kind === 'host_process' && hostCliAuthRefused(result)) authRefused = true;
           return { status: 'completed' as const, result: result as Record<string, unknown> };
           /* eslint-disable-next-line no-catch-all/no-catch-all -- classify any upstream MCP call failure into too_large, unsent, or unknown */
         } catch (error) {
@@ -906,6 +909,15 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       }
       return first;
     });
+    // Outside the app's queue: ending the grant closes its client, which waits for nothing queued behind this call.
+    if (authRefused) {
+      await readRefresher()
+        ?.refuse(app.id, grant.generation)
+        .catch((error: unknown) => {
+          hostLog.warn('Could not end a refused host-run app sign-in', { appId: app.id, code: failureCode(error) });
+        });
+    }
+    return outcome;
   }
 
   async function settleUpstreamOutcome(

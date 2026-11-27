@@ -5,6 +5,8 @@
  * - Tool approval toggles update optimistically in place via same-origin JSON (no full-page lock or re-sort jump).
  * - While a connected app's tools are still being sorted, lightweight same-origin polling updates rows live in place
  *   and stops automatically once settled.
+ * - While a host-run app's sign-in waits for the principal's approval, its Connect view polls the sign-in's status and
+ *   leaves for the app list once the app is connected, or redraws itself once the sign-in ends.
  */
 export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   const initialOutcome = new URLSearchParams(location.search).get('outcome');
@@ -20,6 +22,57 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
   let reconcileTimer;
   let pollGeneration = 0;
   let reconcileGeneration = 0;
+  let deviceTimer;
+  let deviceGeneration = 0;
+
+  function stopDevicePolling() {
+    deviceGeneration += 1;
+    if (deviceTimer) {
+      clearTimeout(deviceTimer);
+      deviceTimer = undefined;
+    }
+  }
+
+  function startDevicePolling() {
+    stopDevicePolling();
+    const root = document.querySelector('[data-device-sign-in]');
+    if (!root || root.dataset.deviceState !== 'waiting') return;
+    const appId = root.dataset.deviceSignIn;
+    const gen = deviceGeneration;
+    const schedule = () => {
+      if (gen === deviceGeneration) deviceTimer = setTimeout(() => { void tick(); }, 2000);
+    };
+    const tick = async () => {
+      if (gen !== deviceGeneration || !root.isConnected) return;
+      if (document.visibilityState === 'hidden') return schedule();
+      try {
+        const response = await fetch('/connections/app/' + encodeURIComponent(appId) + '/sign-in-status', {
+          method: 'GET', headers: { Accept: 'application/json' }, credentials: 'same-origin', cache: 'no-store',
+        });
+        if (gen !== deviceGeneration || !root.isConnected) return;
+        if (response.status === 404) {
+          location.assign('/connections');
+          return;
+        }
+        if (response.ok) {
+          const data = await response.json();
+          if (gen !== deviceGeneration || !root.isConnected) return;
+          if (data.status === 'connected') {
+            location.assign('/connections?outcome=connected');
+            return;
+          }
+          if (data.status !== 'waiting') {
+            location.assign(location.pathname);
+            return;
+          }
+        }
+      } catch {
+        // A missed check is retried on the next one.
+      }
+      schedule();
+    };
+    schedule();
+  }
 
   async function signIn(form) {
     if (signingIn || kit.busy()) return;
@@ -631,6 +684,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     mutationEpoch += 1;
     cancelReconciliation();
     startToolsPolling();
+    startDevicePolling();
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
@@ -639,4 +693,5 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     }
   });
   startToolsPolling();
+  startDevicePolling();
 `;

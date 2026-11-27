@@ -10,6 +10,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import type { Transport, TransportSendOptions } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 
+import { isRecord } from '../../gws-ea/validation.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from '../gws-ea-browser/proxy.js';
 import { operatorEnabled, readCatalogPolicy, type CatalogEntry, type CatalogPolicy } from './catalog.js';
 import { connectionsRoot } from './config.js';
@@ -86,11 +87,16 @@ async function privateDirectory(dir: string): Promise<void> {
   }
 }
 
-/** Only the version this release pins, only while the operator enables it, and only once its receipt verifies. */
-export async function resolveHostCliLaunch(entry: HostCliEntry): Promise<HostCliLaunch> {
-  const state = await readCatalogPolicy();
-  const installationDir = state.status === 'read' ? installationFor(entry, state.policy) : undefined;
-  if (!operatorEnabled(entry, state) || installationDir === undefined) throw new HostCliUnavailableError('not_enabled');
+/** Where the entry's per-assistant directory and credentials sit, whether or not anything is there yet. */
+export function hostCliPaths(entry: HostCliEntry): { readonly workDir: string; readonly authFile: string } {
+  const root = connectionsRoot();
+  if (!root || !path.isAbsolute(root)) throw new HostCliUnavailableError('no_connections_root');
+  const workDir = path.join(root, entry.id);
+  return { workDir, authFile: path.join(workDir, 'auth.json') };
+}
+
+async function launchFrom(entry: HostCliEntry, installationDir: string | undefined): Promise<HostCliLaunch> {
+  if (installationDir === undefined) throw new HostCliUnavailableError('not_enabled');
   let entryFile: string;
   try {
     ({ entryFile } = await verifyHostCliReceipt(installationDir, entry.transport));
@@ -98,11 +104,39 @@ export async function resolveHostCliLaunch(entry: HostCliEntry): Promise<HostCli
     if (error instanceof HostCliInstallError) throw new HostCliUnavailableError('invalid_install');
     throw error;
   }
-  const root = connectionsRoot();
-  if (!root || !path.isAbsolute(root)) throw new HostCliUnavailableError('no_connections_root');
-  const workDir = path.join(root, entry.id);
+  const { workDir, authFile } = hostCliPaths(entry);
   await privateDirectory(workDir);
-  return { entryFile, args: entry.transport.mcpArgs, workDir, authFile: path.join(workDir, 'auth.json') };
+  return { entryFile, args: entry.transport.mcpArgs, workDir, authFile };
+}
+
+/** Only the version this release pins, only while the operator enables it, and only once its receipt verifies. */
+export async function resolveHostCliLaunch(entry: HostCliEntry): Promise<HostCliLaunch> {
+  const state = await readCatalogPolicy();
+  if (!operatorEnabled(entry, state)) throw new HostCliUnavailableError('not_enabled');
+  return launchFrom(entry, state.status === 'read' ? installationFor(entry, state.policy) : undefined);
+}
+
+/**
+ * The pinned version while it is still installed, enabled or not: an operator disables an entry before removing its
+ * files, so the CLI can still revoke a sign-in on the way out.
+ */
+export async function resolveInstalledHostCli(entry: HostCliEntry): Promise<HostCliLaunch> {
+  const state = await readCatalogPolicy();
+  return launchFrom(entry, state.status === 'read' ? installationFor(entry, state.policy) : undefined);
+}
+
+/**
+ * link-cli answers a call it cannot authenticate with its message as the result's only text: no saved sign-in, or a
+ * refresh token the sign-in server refused. A refresh that failed any other way may pass, so it does not count.
+ */
+const HOST_CLI_AUTH_REFUSED = /^(?:Not authenticated\.|Token refresh failed \(40[01]\):)/u;
+
+export function hostCliAuthRefused(result: Record<string, unknown>): boolean {
+  if (result.isError !== true || !Array.isArray(result.content)) return false;
+  const first: unknown = result.content[0];
+  return (
+    isRecord(first) && first.type === 'text' && typeof first.text === 'string' && HOST_CLI_AUTH_REFUSED.test(first.text)
+  );
 }
 
 /** One child and its proxy, which closes with it however the child ends. */

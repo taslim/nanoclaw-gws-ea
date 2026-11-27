@@ -14,7 +14,8 @@ import {
   sendJson,
   sendPage,
 } from '../gws-ea-web/kit/index.js';
-import { catalogEntry, catalogEntryFor, isRemoteEntry } from './catalog.js';
+import { catalogEntry, catalogEntryFor } from './catalog.js';
+import { deviceSignInView, type DeviceSignInView } from './device-sign-in.js';
 import { getPendingHeldCallApproval, resolveHeldCallFromWeb, resolvePrincipalZoneAt } from './held-calls.js';
 import {
   ConnectionOperations,
@@ -82,12 +83,14 @@ type WriteAction = (typeof WRITES)[number];
 type Route =
   | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: ListOutcome }
   | { readonly kind: 'tools-status'; readonly id: string }
+  | { readonly kind: 'sign-in-status'; readonly id: string }
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
 
 const EXACT_APP_ID = new RegExp(`^${APP_ID_PATTERN}$`, 'u');
 const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/(connect|rename|tools)$`, 'u');
 const APP_TOOLS_STATUS = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/tools-status$`, 'u');
+const APP_SIGN_IN_STATUS = new RegExp(`^/connections/app/(${APP_ID_PATTERN})/sign-in-status$`, 'u');
 const HELD_VIEW = /^\/connections\/held\/([A-Za-z0-9_-]{4,128})$/u;
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
@@ -234,6 +237,8 @@ function readRoute(method: string | undefined, url: string | undefined): Route |
     if (callback) return { kind: 'callback', host: callback[1], query: new URLSearchParams(search ?? '') };
     const statusMatch = search === undefined ? APP_TOOLS_STATUS.exec(pathname) : null;
     if (statusMatch) return { kind: 'tools-status', id: statusMatch[1] };
+    const signInMatch = search === undefined ? APP_SIGN_IN_STATUS.exec(pathname) : null;
+    if (signInMatch) return { kind: 'sign-in-status', id: signInMatch[1] };
   }
   if (method !== 'GET' && method !== 'HEAD') return undefined;
   if (pathname === '/connections') {
@@ -457,6 +462,20 @@ function buildToolsStatusPayload(app: ConnectionApp, pin: AppPin | undefined, to
   };
 }
 
+/** What the Connect view polls for while a host-run app's sign-in waits; never anything the CLI saved. */
+function signInStatusPayload(app: ConnectionApp, view: DeviceSignInView): Readonly<Record<string, string>> {
+  if (app.status === 'connected') return { status: 'connected' };
+  switch (view.status) {
+    case 'waiting':
+      return { status: 'waiting', verificationUrl: view.verificationUrl, phrase: view.phrase };
+    case 'ended':
+      return { status: 'ended', reason: view.reason };
+    case 'idle':
+    case 'connected':
+      return { status: 'idle' };
+  }
+}
+
 /** A sign-in start answers JSON: the page opens the server's sign-in address itself. */
 async function startSignIn(
   response: ServerResponse,
@@ -493,6 +512,7 @@ function catalogConnectReply(outcome: CatalogConnectOutcome): {
     case 'started':
       return { status: 200, body: { authorizationUrl: outcome.authorizationUrl } };
     case 'connect_view':
+    case 'device_sign_in':
       return { status: 200, body: { location: viewLocation({ kind: 'connect', id: outcome.app.id }) } };
     case 'refused':
       return { status: connectRefusalStatus(outcome.reason), body: { error: connectMessage(outcome.reason) } };
@@ -516,7 +536,7 @@ async function connectCatalogEntry(
 ): Promise<void> {
   only(data, ['entry']);
   const entry = catalogEntry(text(data, 'entry'));
-  if (!entry || !isRemoteEntry(entry)) throw new InvalidSubmission();
+  if (!entry) throw new InvalidSubmission();
   if (!operations) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
   try {
     const { status, body } = catalogConnectReply(await operations.connectCatalogEntry(entry, principal));
@@ -641,6 +661,18 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
           throw error;
         }
       }
+      if (route.kind === 'sign-in-status') {
+        if (!operations) return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+        try {
+          const app = await operations.store.get(route.id);
+          if (app.transport !== 'host_cli') return refuse(response);
+          return sendJson(response, 200, signInStatusPayload(app, deviceSignInView(app.id)));
+        } catch (error) {
+          if (!(error instanceof ConnectionsStoreError)) throw error;
+          if (error.reason === 'app_not_found') return refuse(response);
+          return sendJson(response, 503, { error: STORE_UNAVAILABLE });
+        }
+      }
       if (route.kind === 'callback') {
         if (!operations) return sendReturn(response, 'failed');
         const outcome = await operations.finishSignIn(route.host, principal, route.query);
@@ -759,6 +791,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                   operatorDisconnect: operations !== undefined && operatorDependencies.credentials !== undefined,
                   ...(result.retryServer === undefined ? {} : { retryServer: result.retryServer }),
                   ...(toolReview === undefined ? {} : { toolReview }),
+                  ...(view.kind === 'connect' ? { deviceSignIn: deviceSignInView(view.id) } : {}),
                 },
                 shell,
                 nonce,

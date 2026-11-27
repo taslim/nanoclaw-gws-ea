@@ -27,6 +27,8 @@ export interface FakeAppControl {
   readonly largeResultBytes?: number;
   /** Written to stderr at start. */
   readonly stderrText?: string;
+  /** Every inner command answers as link-cli does without a saved sign-in. */
+  readonly notAuthenticated?: boolean;
 }
 
 export type FakeAppRecord =
@@ -125,6 +127,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToo
       const name = String(args.name);
       if (!tools.some((tool) => tool.name === name)) return text({ error: `Unknown tool: ${name}` }, true);
       if (control.hang?.includes(name)) return new Promise<CallToolResult>(() => undefined);
+      if (control.notAuthenticated) {
+        return {
+          content: [{ type: 'text', text: 'Not authenticated. Run "link-cli auth login" first.' }],
+          isError: true,
+        };
+      }
       if (control.largeResult === name) {
         return { content: [{ type: 'text', text: 'x'.repeat(control.largeResultBytes ?? 0) }] };
       }

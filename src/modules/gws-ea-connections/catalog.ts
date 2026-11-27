@@ -398,6 +398,24 @@ export function operatorEnabled(entry: CatalogEntry, state: CatalogPolicyState):
   }
 }
 
+/**
+ * Whether the operator has turned the entry off on this host, which retires its apps. An entry that is not available
+ * yet, such as Link enabled without this release's pinned version, is not off; nor is anything an unreadable policy
+ * names.
+ */
+export function operatorDisabled(entry: CatalogEntry, state: CatalogPolicyState): boolean {
+  if (state.status === 'invalid') return false;
+  const policy = state.status === 'read' ? state.policy : undefined;
+  switch (entry.prerequisite) {
+    case 'none':
+      return false;
+    case 'link_install':
+      return policy?.link?.enabled !== true;
+    case 'shop_client':
+      return policy?.shop == null;
+  }
+}
+
 export interface AvailableCatalogEntry {
   readonly entry: CatalogEntry;
   /** The app an earlier connect left not connected; connecting again reuses it. */

@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -16,6 +17,10 @@ vi.mock('../../host-lifecycle.js', async (original) => ({
 }));
 vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+}));
+vi.mock('../gws-ea-profile/main-note.js', async (original) => ({
+  ...(await original<typeof import('../gws-ea-profile/main-note.js')>()),
+  writeNoteForMain: vi.fn(async () => 'written'),
 }));
 vi.mock('./store.js', async (original) => ({
   ...(await original<typeof import('./store.js')>()),
@@ -62,8 +67,10 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { applyMainServers, MainServersUnreadableError } from './apply.js';
-import { CONNECTIONS_ROOT_ENV } from './config.js';
+import { CATALOG_RETIRE_COMMAND } from './catalog-retire.js';
+import { CATALOG_POLICY_FILE_ENV, CONNECTIONS_ROOT_ENV } from './config.js';
 import { connectionsHealth } from './index.js';
 import { ConnectionsStoreError, getConnectionsStore, type ConnectionsStore } from './store.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
@@ -239,5 +246,98 @@ describe('the host-start hook', () => {
     const defect = new TypeError('a programming error');
     vi.mocked(applyMainServers).mockRejectedValueOnce(defect);
     await expect(start()).rejects.toBe(defect);
+  });
+});
+
+describe('retiring catalog apps the operator turned off', () => {
+  const linkAuth = (): string => path.join(directory, 'connections', 'link', 'auth.json');
+
+  async function connectedLink(): Promise<void> {
+    const created = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+    await store.connect(created.id, created.version, { kind: 'none' });
+    await mkdir(path.dirname(linkAuth()), { recursive: true, mode: 0o700 });
+    await writeFile(linkAuth(), JSON.stringify({ auth: { access_token: SENTINEL_TOKEN } }), { mode: 0o600 });
+  }
+
+  async function writePolicy(link: { readonly enabled: boolean; readonly version: string }): Promise<void> {
+    const file = path.join(directory, 'catalog.json');
+    await writeFile(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        link: {
+          enabled: link.enabled,
+          versions: { [link.version]: { installationDir: path.join(directory, 'gone') } },
+        },
+        shop: null,
+      }),
+      { mode: 0o600 },
+    );
+    process.env[CATALOG_POLICY_FILE_ENV] = file;
+  }
+
+  const linkStatus = async (): Promise<string | undefined> =>
+    (await store.apps()).find((app) => app.catalogId === 'link')?.status;
+
+  beforeEach(() => {
+    process.env[CONNECTIONS_ROOT_ENV] = path.join(directory, 'connections');
+    vi.mocked(getConnectionsStore).mockResolvedValue(store);
+    vi.mocked(writeNoteForMain).mockClear();
+  });
+  afterEach(() => {
+    delete process.env[CONNECTIONS_ROOT_ENV];
+    delete process.env[CATALOG_POLICY_FILE_ENV];
+  });
+
+  it('is a hidden host-only command that takes one retirable entry', () => {
+    const command = lookup(CATALOG_RETIRE_COMMAND);
+
+    expect(command).toMatchObject({ access: 'hidden', hostOnly: true });
+    expect(command?.parseArgs({ entry: 'link' })).toEqual({ entry: 'link' });
+    expect(() => command?.parseArgs({ entry: 'notion' })).toThrow('--entry');
+  });
+
+  it('disconnects a running assistant’s Link when asked, and answers that none remain', async () => {
+    await connectedLink();
+    await writePolicy({ enabled: true, version: '1.6.0' });
+    if (!host.start) throw new Error('the connections module registered no host-start hook');
+    await host.start({ signal: new AbortController().signal });
+    expect(await linkStatus()).toBe('connected');
+    // The operator's uninstall disables the entry first, then asks.
+    await writePolicy({ enabled: false, version: '1.6.0' });
+    const command = lookup(CATALOG_RETIRE_COMMAND);
+    if (!command) throw new Error('the retire command is not registered');
+
+    const reply = await command.handler(command.parseArgs({ entry: 'link' }), { caller: 'host' });
+
+    expect(reply).toEqual({ schemaVersion: 1, entry: 'link', retired: 1, remaining: 0 });
+    expect(await linkStatus()).toBe('not_connected');
+    expect(existsSync(linkAuth())).toBe(false);
+    expect(writeNoteForMain).toHaveBeenCalledWith(expect.objectContaining({ wake: false }));
+  });
+
+  it('disconnects Link at the next start of an assistant that was stopped when the operator disabled it', async () => {
+    await connectedLink();
+    await writePolicy({ enabled: false, version: '1.6.0' });
+    if (!host.start) throw new Error('the connections module registered no host-start hook');
+
+    await host.start({ signal: new AbortController().signal });
+
+    expect(await linkStatus()).toBe('not_connected');
+    expect(existsSync(linkAuth())).toBe(false);
+    expect(writeNoteForMain).toHaveBeenCalledOnce();
+    expect(writeNoteForMain).toHaveBeenCalledWith(expect.objectContaining({ wake: false }));
+  });
+
+  it('retires nothing at start when Link is enabled but this release’s pinned version is not installed', async () => {
+    await connectedLink();
+    await writePolicy({ enabled: true, version: '0.0.1' });
+    if (!host.start) throw new Error('the connections module registered no host-start hook');
+
+    await host.start({ signal: new AbortController().signal });
+
+    expect(await linkStatus()).toBe('connected');
+    expect(existsSync(linkAuth())).toBe(true);
+    expect(writeNoteForMain).not.toHaveBeenCalled();
   });
 });
