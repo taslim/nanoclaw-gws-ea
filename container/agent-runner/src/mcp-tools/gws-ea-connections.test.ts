@@ -112,3 +112,15 @@ it('teaches that held/setup app answers are normal and when the Connections link
     expect(instructions).toContain(rule);
   expect(instructions).not.toMatch(/authenticate/iu);
 });
+
+it('tells the principal once when an app asks them itself, then checks the outcome without asking again', () => {
+  const instructions = fs.readFileSync(new URL('./gws-ea-connections.instructions.md', import.meta.url), 'utf8');
+  for (const rule of [
+    'confirmed by the app',
+    'Tell the principal once',
+    'when they say they approved or the window passes',
+    'asking a second time',
+    'approval of your own',
+  ])
+    expect(instructions).toContain(rule);
+});

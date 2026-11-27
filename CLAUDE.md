@@ -85,7 +85,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/gws-ea-browser/` | Built-in host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
 | `src/modules/gws-ea-browser/{login-key,login-store,credential-*,logins-*}.ts` | Built-in encrypted saved logins and per-assistant macOS Keychain keys; durable signup and password-change attempts; the principal-only saved-logins page |
 | `src/modules/gws-ea-web/{home,mounts,page-link,kit/}` | Principal home at `/`, the principal-page mount registry, the `principal_page` link tool and the shared page kit |
-| `src/modules/gws-ea-connections/` | The principal's custom remote MCP apps for main: host-held encrypted app store and OAuth/token credentials (none in gateway), host MCP relay and container stdio relay, isolated tool sorter with deterministic floors, held 👍/👎 call approval cards, Connections page with tool-approval review and held-call details, and main's approval-gated add/delete/label-change actions |
+| `src/modules/gws-ea-connections/` | The principal's custom remote MCP apps for main: host-held encrypted app store and OAuth/token credentials (none in gateway), host MCP relay and container stdio relay, isolated tool sorter with deterministic floors, held 👍/👎 call approval cards, Connections page with tool-approval review and held-call details, and main's approval-gated add/delete/label-change actions. Curated catalog (`catalog.ts`) listed under Available: remote apps, plus host-run CLI apps like Link spawned only from receipt-verified installs behind a public-only proxy; tools the app confirms itself skip the held card |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group scaffold: `groups/<folder>/` (`plugins/`, staged `instructions.prepend.md`), the `container_configs` row, and the provider's state dir — agent-runner source is a shared read-only mount, not copied per group |
@@ -224,7 +224,9 @@ resume an approved row at host start; they must make re-entry idempotent.
 ### Operator connectors
 
 A connector is optional functionality where gws-ea manages setup beyond its base
-install: shared voice assets or Cloudflare web serving. The typed catalog in `src/gws-ea/connectors.ts` supplies `install`,
+install: shared voice assets, Cloudflare web serving, or the `link` and `shop`
+catalog apps (the pinned Link CLI per version, the operator's Shopify client,
+recorded in one host catalog policy). The typed catalog in `src/gws-ea/connectors.ts` supplies `install`,
 `uninstall`, `show` and `check` for each. Installation/configuration is host-wide;
 voice assets are shared and account resources are per assistant. Access remains
 in native agent capability grants and principal/reader permissions. Local

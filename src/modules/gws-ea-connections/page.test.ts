@@ -1671,6 +1671,132 @@ describe('the catalog on the page', () => {
     );
   });
 
+  describe('main’s facts', () => {
+    const facts = (): ReturnType<typeof connectionsLinkFacts> => connectionsLinkFacts(() => operations().listing());
+    const enableLink = async (): Promise<void> => {
+      const link = catalogEntry('link');
+      if (link?.transport.kind !== 'host_cli') throw new Error('Link is a host-run entry');
+      await writeCatalogPolicy({
+        schemaVersion: 1,
+        link: {
+          enabled: true,
+          versions: { [link.transport.version]: { installationDir: path.join(directory, 'link') } },
+        },
+      });
+    };
+
+    it('lists the apps main can offer, with what each needs and how it signs in, beside the connected ones', async () => {
+      await enableLink();
+      const created = await store.create({ name: 'Notion', url: NOTION, auth: 'none', catalogId: 'notion' });
+      const { app: notion } = await store.connect(created.id, created.version, { kind: 'none' });
+
+      const answer = await facts();
+      expect(answer.apps).toEqual([
+        { name: 'Notion', key: notion.serverKey, host: 'mcp.notion.com', origin: 'principal', status: 'connected' },
+      ]);
+      expect(answer.available).toEqual([
+        {
+          id: 'chowdeck',
+          name: 'Chowdeck',
+          goodFor: 'Ordering food and groceries for delivery',
+          signIn: 'sign_in_page',
+        },
+        {
+          id: 'granola',
+          name: 'Granola',
+          goodFor: 'Looking up notes and transcripts of meetings Granola recorded',
+          requirements: 'Transcripts and edits need a paid Granola plan.',
+          signIn: 'sign_in_page',
+        },
+        {
+          id: 'todoist',
+          name: 'Todoist',
+          goodFor: 'Managing tasks and projects in Todoist',
+          signIn: 'sign_in_page',
+        },
+        {
+          id: 'link',
+          name: 'Link',
+          goodFor: 'Paying with your Link wallet; you approve each payment in the Link app',
+          requirements:
+            'Payments work only for US and Canadian Link accounts, and financial insights only for US accounts.',
+          signIn: 'phrase_approval',
+        },
+      ]);
+      expect(JSON.stringify(answer)).not.toContain('https://');
+    });
+
+    it('lists a not-connected app on an entry’s host with that entry, under its own name and key', async () => {
+      const added = await store.create({ name: 'Team wiki', url: NOTION, auth: 'none' });
+
+      const answer = await facts();
+      expect(answer.apps).toEqual([]);
+      expect(answer.available?.find((entry) => entry.id === 'notion')).toEqual({
+        id: 'notion',
+        name: 'Notion',
+        goodFor: 'Finding, reading and updating pages and databases in Notion',
+        signIn: 'sign_in_page',
+        app: { name: 'Team wiki', key: added.serverKey },
+      });
+    });
+
+    it('marks the tools Link confirms itself, and gives a host-run app no address or placeholder host', async () => {
+      await enableLink();
+      const created = await store.create({ name: 'Link', transport: 'host_cli', catalogId: 'link' });
+      const { app } = await store.connect(created.id, created.version, { kind: 'none' });
+      const empty = { type: 'object', properties: {} };
+      const pinned = await store.pinTools(app.id, {
+        instructions: null,
+        tools: [
+          { name: 'spend-request_create', description: 'Create a spend request', inputSchema: empty },
+          { name: 'spend-request_list', description: 'List spend requests', inputSchema: empty },
+        ],
+      });
+      const hash = (name: string): string => pinned.tools.find((tool) => tool.name === name)!.definitionHash;
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'spend-request_create',
+          definitionHash: hash('spend-request_create'),
+          label: 'just_do',
+          source: 'floor',
+          reason: 'Link asks the principal to approve this itself',
+        },
+        {
+          name: 'spend-request_list',
+          definitionHash: hash('spend-request_list'),
+          label: 'just_do',
+          source: 'sorter',
+          reason: 'Read-only list',
+        },
+      ]);
+      await store.setToolLabel(app.id, 'spend-request_create', 'ask_first', 'principal');
+
+      const answer = await facts();
+      expect(answer.apps).toEqual([
+        {
+          name: 'Link',
+          key: app.serverKey,
+          origin: 'principal',
+          status: 'connected',
+          needsReview: true,
+          tools: [
+            {
+              name: 'spend-request_create',
+              label: 'ask_first',
+              reason: 'Set to ask first',
+              confirmedByApp: true,
+            },
+            { name: 'spend-request_list', label: 'just_do', reason: 'Read-only list' },
+          ],
+        },
+      ]);
+      expect(answer.available?.map((entry) => entry.id)).not.toContain('link');
+      const text = JSON.stringify(answer);
+      expect(text).not.toContain('https://');
+      expect(text).not.toContain('host-cli.invalid');
+    });
+  });
+
   describe('Shop, signed in with the operator’s client', () => {
     const SHOP = 'https://mcp.shop.com/';
     const SHOP_RESOURCE = 'https://mcp.shop.com';
