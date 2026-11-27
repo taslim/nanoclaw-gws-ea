@@ -141,6 +141,25 @@ export async function startFakeEndpoints(hosts: readonly string[]): Promise<Fake
   };
 }
 
+/**
+ * A 2025 server without sign-in or tools: it answers `initialize`, takes notifications and knows no other method,
+ * `server/discover` included.
+ */
+export function legacyMcpReply(
+  request: FakeRequest,
+  serverInfo: { readonly name: string; readonly title?: string; readonly version: string },
+): FakeReply {
+  const message = JSON.parse(request.body) as { id?: number | string; method?: string };
+  if (message.id === undefined) return { status: 202 };
+  return {
+    status: 200,
+    body:
+      message.method === 'initialize'
+        ? { jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-11-25', capabilities: {}, serverInfo } }
+        : { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } },
+  };
+}
+
 export interface FakeToolDefinition {
   readonly name: string;
   readonly title?: string;
@@ -198,6 +217,35 @@ export interface FakeAppOptions {
   readonly allowUnauthenticated?: boolean;
   readonly onToolCall?: (call: RecordedToolCall) => FakeToolResult | FakeReply | undefined;
   readonly fetchClientDocument?: (url: string) => Promise<FakeReply>;
+  /**
+   * `2026-07-28` serves that revision alone, as Shop does: discovery instead of `initialize`, the protocol headers and
+   * request `_meta` on every request, and sign-in asked for only by tool calls.
+   */
+  readonly protocol?: '2025-11-25' | '2026-07-28';
+}
+
+const MODERN_PROTOCOL = '2026-07-28';
+
+interface McpMessage {
+  readonly id?: string | number;
+  readonly method?: string;
+  readonly params?: Record<string, unknown>;
+}
+
+function rpcError(id: string | number | undefined, code: number, message: string, data?: unknown): FakeReply {
+  return {
+    status: 200,
+    body: { jsonrpc: '2.0', id: id ?? null, error: { code, message, ...(data === undefined ? {} : { data }) } },
+  };
+}
+
+function toolCallOf(params: Record<string, unknown>, bearer: string | undefined): RecordedToolCall {
+  const name = typeof params.name === 'string' ? params.name : '';
+  const args =
+    typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
+      ? (params.arguments as Record<string, unknown>)
+      : {};
+  return { name, arguments: args, bearer };
 }
 
 interface Client {
@@ -238,6 +286,7 @@ export class FakeMcpApp {
   private readonly serverName: string;
   private readonly allowUnauthenticated: boolean;
   private readonly fetchClientDocument: ((url: string) => Promise<FakeReply>) | undefined;
+  private readonly modern: boolean;
 
   constructor(options: FakeAppOptions) {
     this.app = new URL(options.appUrl);
@@ -250,6 +299,7 @@ export class FakeMcpApp {
     this.allowUnauthenticated = options.allowUnauthenticated ?? false;
     this.onToolCall = options.onToolCall;
     this.fetchClientDocument = options.fetchClientDocument;
+    this.modern = options.protocol === MODERN_PROTOCOL;
     const at = (route: string): string => new URL(route, this.issuer).href;
     this.resourceMetadata = {
       resource: this.resource,
@@ -368,6 +418,7 @@ export class FakeMcpApp {
     const overridden = await this.mcpOverride?.(request);
     if (overridden) return overridden;
     const bearer = /^Bearer (.+)$/u.exec(request.headers.authorization ?? '')?.[1];
+    if (this.modern) return this.modernMcp(request, bearer);
     if (!this.allowUnauthenticated && (bearer === undefined || !this.accessTokens.has(bearer)))
       return {
         status: 401,
@@ -390,20 +441,11 @@ export class FakeMcpApp {
       case 'tools/list':
         return { status: 200, body: { jsonrpc: '2.0', id, result: { tools: this.tools } } };
       case 'tools/call': {
-        const params = parsed.params ?? {};
-        const name = typeof params.name === 'string' ? params.name : '';
-        const args =
-          typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
-            ? (params.arguments as Record<string, unknown>)
-            : {};
-        const call: RecordedToolCall = { name, arguments: args, bearer };
+        const call = toolCallOf(parsed.params ?? {}, bearer);
         this.toolCalls.push(call);
         const custom = this.onToolCall?.(call);
         if (custom && 'status' in custom) return custom;
-        const result: FakeToolResult = custom ?? {
-          content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: name, arguments: args }) }],
-        };
-        return { status: 200, body: { jsonrpc: '2.0', id, result } };
+        return { status: 200, body: { jsonrpc: '2.0', id, result: custom ?? this.defaultResult(call) } };
       }
       case 'ping':
         return { status: 200, body: { jsonrpc: '2.0', id, result: {} } };
@@ -421,6 +463,67 @@ export class FakeMcpApp {
             },
           },
         };
+    }
+  }
+
+  private defaultResult(call: RecordedToolCall): FakeToolResult {
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: call.name, arguments: call.arguments }) }],
+    };
+  }
+
+  /** Discovery and listings are open; a tool call without a live token is refused with where to sign in. */
+  private modernMcp(request: FakeRequest, bearer: string | undefined): FakeReply {
+    const message = JSON.parse(request.body) as McpMessage;
+    const { id, method } = message;
+    const params = message.params ?? {};
+    if (method === 'initialize')
+      return rpcError(id, -32022, 'Unsupported protocol version', {
+        supported: [MODERN_PROTOCOL],
+        requested: params.protocolVersion,
+      });
+    if (id === undefined) return { status: 202 };
+    if (request.headers['mcp-protocol-version'] !== MODERN_PROTOCOL || request.headers['mcp-method'] !== method)
+      return rpcError(id, -32020, 'Header mismatch');
+    const meta = params._meta;
+    if (
+      typeof meta !== 'object' ||
+      meta === null ||
+      !('io.modelcontextprotocol/protocolVersion' in meta) ||
+      !('io.modelcontextprotocol/clientCapabilities' in meta)
+    )
+      return rpcError(id, -32602, 'Missing request metadata');
+    const result = (value: Record<string, unknown>): FakeReply => ({
+      status: 200,
+      body: { jsonrpc: '2.0', id, result: { resultType: 'complete', ...value } },
+    });
+    switch (method) {
+      case 'server/discover':
+        return result({
+          supportedVersions: [MODERN_PROTOCOL],
+          capabilities: { tools: {} },
+          ...(this.instructions === undefined ? {} : { instructions: this.instructions }),
+          _meta: { 'io.modelcontextprotocol/serverInfo': { name: this.serverName, version: '1' } },
+        });
+      case 'tools/list':
+        return result({ tools: this.tools, ttlMs: 0, cacheScope: 'private' });
+      case 'tools/call': {
+        const call = toolCallOf(params, bearer);
+        if (request.headers['mcp-name'] !== call.name) return rpcError(id, -32020, 'Header mismatch');
+        if (bearer === undefined || !this.accessTokens.has(bearer)) {
+          const scopes = this.resourceMetadata.scopes_supported;
+          const scope = Array.isArray(scopes) ? `, scope="${scopes.join(' ')}"` : '';
+          return {
+            status: 401,
+            headers: { 'www-authenticate': `Bearer resource_metadata="${this.resourceMetadataUrl}"${scope}` },
+            body: { error: 'invalid_token' },
+          };
+        }
+        this.toolCalls.push(call);
+        return result({ ...this.defaultResult(call) });
+      }
+      default:
+        return rpcError(id, -32601, 'Method not found');
     }
   }
 

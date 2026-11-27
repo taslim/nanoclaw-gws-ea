@@ -1,5 +1,5 @@
 /**
- * Signing in to an app's server on the principal's behalf. The MCP SDK's client auth helpers carry the protocol:
+ * Signing in to an app's server on the principal's behalf. The MCP client's auth helpers carry the protocol:
  * protected-resource discovery, PKCE authorization URLs, registration, exchange and refresh with `resource`. This
  * module adds what they leave to the caller: the server must describe itself consistently, every endpoint is https
  * and off the assistant's own hostname, S256 is required, the authorization response's `iss` is checked, and
@@ -12,18 +12,21 @@ import {
   buildDiscoveryUrls,
   discoverOAuthProtectedResourceMetadata,
   exchangeAuthorization,
+  OAuthClientFlowError,
+  OAuthError,
   refreshAuthorization,
   registerClient,
+  RegistrationRejectedError,
   selectClientAuthMethod,
   startAuthorization,
-} from '@modelcontextprotocol/sdk/client/auth.js';
+} from '@modelcontextprotocol/client';
 
 import { isRecord } from '../../gws-ea/validation.js';
 import { EgressError, publicFetch, type EgressDependencies, type PublicFetch } from '../gws-ea-egress/fetch.js';
 import type { ClientRegistration, GrantCredentials } from './store.js';
 
-/** The revision servers mostly implement today, sent on discovery and MCP requests. */
-export const MCP_PROTOCOL_VERSION = '2025-11-25';
+/** The revision servers mostly implement today, sent on discovery requests. */
+const MCP_PROTOCOL_VERSION = '2025-11-25';
 
 /** A token answer without `expires_in` is treated as lasting this long. */
 export const ACCESS_LIFETIME_WITHOUT_EXPIRY_MS = 60 * 60_000;
@@ -181,15 +184,31 @@ function watched(fetch: PublicFetch): Watched {
   };
 }
 
-function oauthErrorCode(error: unknown): string | undefined {
-  if (!(error instanceof Error) || !('errorCode' in error)) return undefined;
-  return typeof error.errorCode === 'string' ? error.errorCode : undefined;
+/** A refused registration keeps the server's answer as raw text, where its RFC 7591 `error` code sits. */
+function registrationErrorCode(body: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return isRecord(parsed) && typeof parsed.error === 'string' ? parsed.error : undefined;
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
 }
 
-/** The SDK refuses with plain errors, and a malformed answer surfaces as a schema or JSON error. */
+function oauthErrorCode(error: unknown): string | undefined {
+  if (error instanceof OAuthError) return error.code;
+  if (error instanceof RegistrationRejectedError) return registrationErrorCode(error.body);
+  return undefined;
+}
+
+/**
+ * The SDK refuses with plain errors or its own flow errors, and a malformed answer surfaces as a schema or JSON
+ * error.
+ */
 function malformedOrRefused(error: unknown): boolean {
   return (
     error instanceof SyntaxError ||
+    error instanceof OAuthClientFlowError ||
     (error instanceof Error && (error.constructor === Error || error.name === 'ZodError'))
   );
 }

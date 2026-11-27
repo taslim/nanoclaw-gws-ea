@@ -1,9 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { Client, SdkHttpError, StreamableHTTPClientTransport, type FetchLike } from '@modelcontextprotocol/client';
 
 import { getDb } from '../../db/connection.js';
 import { getPendingApproval } from '../../db/sessions.js';
@@ -246,7 +244,18 @@ class CatalogRulesUnmatchedError extends Error {
 }
 
 function isHttp401Error(error: unknown): boolean {
-  return error instanceof StreamableHTTPError && error.code === 401;
+  return error instanceof SdkHttpError && error.status === 401;
+}
+
+/**
+ * Each connection asks the server for the 2026-07-28 revision first and falls back to the 2025 handshake when the
+ * server shows no sign of it, so apps on either generation connect.
+ */
+function relayClient(): Client {
+  return new Client(
+    { name: 'nanoclaw-host-relay', version: '1.0.0' },
+    { capabilities: {}, versionNegotiation: { mode: 'auto' }, listMaxPages: MAX_LIST_PAGES },
+  );
 }
 
 type ManagedClient = {
@@ -556,7 +565,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     if (existing) await closeClient(existing);
 
     const auth = { token };
-    const client = new Client({ name: 'nanoclaw-host-relay', version: '1.0.0' }, { capabilities: {} });
+    const client = relayClient();
     const customFetch: FetchLike = async (input, init) => {
       const method = (init?.method ?? 'GET').toUpperCase();
       // Never open the standalone GET SSE stream: returning 405 tells StreamableHTTPClientTransport it is unsupported.
@@ -630,7 +639,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
       kind: 'host_process',
       appId: app.id,
       grantGeneration: grant.generation,
-      client: new Client({ name: 'nanoclaw-host-relay', version: '1.0.0' }, { capabilities: {} }),
+      client: relayClient(),
       transport,
       metaTools: catalogEntry.transport.metaTools,
       idleTimer: undefined,
@@ -653,20 +662,14 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
     return managed;
   }
 
+  /** Every page, read fresh: a pin confirms what the app lists now, never what it listed earlier. */
   async function listAllUpstreamTools(managed: ManagedClient): Promise<readonly ToolDefinition[]> {
-    const collected: ToolDefinition[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
-      const response = await managed.client.listTools(cursor ? { cursor } : undefined, requestOptions(managed));
-      for (const raw of response.tools) collected.push(normalizeToolDefinition(raw));
-      if (!response.nextCursor) return collected;
-      cursor = response.nextCursor;
-    }
-    throw new Error(`Upstream MCP tool catalog exceeded ${MAX_LIST_PAGES} pages`);
+    const response = await managed.client.listTools(undefined, { ...requestOptions(managed), cacheMode: 'refresh' });
+    return response.tools.map((raw) => normalizeToolDefinition(raw));
   }
 
   async function callMetaTool(managed: ManagedClient, name: string, args: Record<string, unknown>): Promise<unknown> {
-    const result = await managed.client.callTool({ name, arguments: args }, undefined, requestOptions(managed));
+    const result = await managed.client.callTool({ name, arguments: args }, requestOptions(managed));
     const content = Array.isArray(result.content) ? (result.content as unknown[]) : [];
     const first = content[0];
     if (result.isError === true || !isRecord(first) || first.type !== 'text' || typeof first.text !== 'string') {
@@ -866,7 +869,7 @@ export function createAppRelay(dependencies: RelayDependencies): AppRelay {
             (await verifyLiveGrant(app.id, grant.generation)) ? { ok: true } : { ok: false, reason: 'grant_changed' });
         try {
           const result = await traceStore.run(callTrace, () =>
-            managed.client.callTool(upstreamCall(managed, tool, args), undefined, requestOptions(managed)),
+            managed.client.callTool(upstreamCall(managed, tool, args), requestOptions(managed)),
           );
           // A child's pipe is read far past the relay's cap, so the cap applies to the answer main would receive.
           if (managed.kind === 'host_process' && Buffer.byteLength(JSON.stringify(result)) > maxBodyBytes) {

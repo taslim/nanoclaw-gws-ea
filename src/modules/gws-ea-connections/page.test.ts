@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { inspect } from 'node:util';
 import { chromium, type BrowserContext } from 'playwright-core';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import {
   closeDb,
@@ -31,7 +31,7 @@ import { catalogEntry } from './catalog.js';
 import { createClientDocumentHandler } from './client-document.js';
 import { CATALOG_POLICY_FILE_ENV } from './config.js';
 import { clientDocumentsWebMount, connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
-import { canonicalArgsHash } from './canonical.js';
+import { canonicalArgsHash, toolDefinitionHash } from './canonical.js';
 import {
   HELD_APP_CALL_ACTION,
   registerHeldAppCallHandlers,
@@ -41,7 +41,7 @@ import {
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
 import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
-import type { AppRelay } from './relay.js';
+import { startAppRelay, stopAppRelay, type AppRelay } from './relay.js';
 import { toolLabelsHash, type ConnectionApp, type ConnectionsStore } from './store.js';
 
 const deliveryAdapterOverride = vi.hoisted(() => ({
@@ -59,6 +59,7 @@ vi.mock('../../delivery.js', async (importOriginal) => {
 });
 import {
   FakeMcpApp,
+  legacyMcpReply,
   startFakeEndpoints,
   type FakeEndpoints,
   type FakeHandler,
@@ -375,13 +376,13 @@ const notesServer: FakeHandler = (incoming) => {
   if (incoming.host !== 'notes.example.test' || incoming.method !== 'POST') return undefined;
   if (incoming.headers.authorization !== `Bearer ${SENTINEL_TOKEN}`)
     return { status: 401, body: { error: 'unauthorized' } };
-  return { status: 200, body: { jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'Notes', version: '1' } } } };
+  return legacyMcpReply(incoming, { name: 'Notes', version: '1' });
 };
 
 /** Answers without sign-in and advertises its name. */
 const recipesServer: FakeHandler = (incoming) =>
   incoming.host === 'recipes.example.test' && incoming.method === 'POST'
-    ? { status: 200, body: { jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'Recipes', version: '1' } } } }
+    ? legacyMcpReply(incoming, { name: 'Recipes', version: '1' })
     : undefined;
 
 async function mainServers(): Promise<Record<string, unknown>> {
@@ -1678,9 +1679,16 @@ describe('the catalog on the page', () => {
     /** The secret the operator stored after rotating the first one. */
     const SENTINEL_ROTATED = 'sentinel-rotated-secret-W8p1';
 
+    const SEARCH_PRODUCTS = {
+      name: 'search_products',
+      inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
+      annotations: { readOnlyHint: true },
+    } as const;
+
     /**
-     * Shaped like Shop's: no registration endpoint, client documents and public clients taken, `iss` sent back, and
-     * a resource identifier without its root path's slash.
+     * Shaped like Shop's: MCP 2026-07-28 alone, with its listing open and its tool calls signed in; no registration
+     * endpoint, client documents and public clients taken, `iss` sent back, and a resource identifier without its root
+     * path's slash.
      */
     function fakeShop(secret: string): FakeMcpApp {
       return new FakeMcpApp({
@@ -1692,6 +1700,12 @@ describe('the catalog on the page', () => {
         scopes: ['personal_agent'],
         fetchClientDocument,
         client: { id: SHOP_CLIENT, secret, redirectUri: SHOP_REDIRECT },
+        protocol: '2026-07-28',
+        tools: [
+          SEARCH_PRODUCTS,
+          { name: 'create_spend_request', inputSchema: { type: 'object' } },
+          { name: 'get_spend_request', inputSchema: { type: 'object' } },
+        ],
       });
     }
 
@@ -1708,10 +1722,12 @@ describe('the catalog on the page', () => {
       return authorizationUrl;
     }
 
-    it('connects in one action, sending the client’s secret only to the token endpoint', async () => {
+    it('connects in one action, sending the client’s secret only to the token endpoint, and relays a signed-in call', async () => {
       const shop = fakeShop(SENTINEL_SECRET);
       serve(shop.handle);
       await registerShopClient(SENTINEL_SECRET);
+      const relay = startAppRelay({ store, egress: endpoints.egress });
+      onTestFinished(() => stopAppRelay(500));
 
       const authorizationUrl = await startShop();
       expect(Object.fromEntries(new URL(authorizationUrl).searchParams)).toMatchObject({
@@ -1736,6 +1752,40 @@ describe('the catalog on the page', () => {
       expect(listSection((await request('/connections')).body, 'Connected')).toContain(
         '<span class="row-title">Shop</span>',
       );
+
+      // Connecting pinned the listing, less the commands the catalog withholds.
+      expect((await store.listTools(app.id)).map((tool) => tool.name)).toEqual(['search_products']);
+      await store.applyToolLabels(app.id, [
+        {
+          name: 'search_products',
+          definitionHash: toolDefinitionHash(SEARCH_PRODUCTS),
+          label: 'just_do',
+          source: 'sorter',
+          reason: 'Read-only search',
+        },
+      ]);
+      const outcome = await relay.callTool({
+        serverKey: (await onlyApp()).serverKey,
+        toolName: 'search_products',
+        args: { query: 'trail shoes' },
+        session: {
+          id: 'session-shop',
+          agent_group_id: MAIN,
+          messaging_group_id: null,
+          thread_id: null,
+          agent_provider: null,
+          status: 'active',
+          container_status: 'running',
+          last_active: null,
+          created_at: new Date().toISOString(),
+        },
+        requestId: 'request-shop-search',
+      });
+      expect(outcome).toMatchObject({ status: 'completed' });
+      expect(shop.toolCalls).toEqual([
+        { name: 'search_products', arguments: { query: 'trail shoes' }, bearer: expect.any(String) },
+      ]);
+      expect(shop.accessTokens.has(shop.toolCalls[0]?.bearer ?? '')).toBe(true);
       assertNoSentinels();
     });
 

@@ -1,15 +1,28 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { checkPastedToken, probeApp } from './probe.js';
-import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
+import {
+  FakeMcpApp,
+  legacyMcpReply,
+  startFakeEndpoints,
+  type FakeEndpoints,
+  type FakeHandler,
+} from './testing/oauth-server.js';
 
 const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
 const LEDGER = 'https://mcp.ledger.example.test/mcp';
+const SHOP = 'https://mcp.shop.com/';
 
 let endpoints: FakeEndpoints;
 
 beforeAll(async () => {
-  endpoints = await startFakeEndpoints(['app.ledgerly.example.test', 'mcp.ledger.example.test', 'auth.example.test']);
+  endpoints = await startFakeEndpoints([
+    'app.ledgerly.example.test',
+    'mcp.ledger.example.test',
+    'auth.example.test',
+    'mcp.shop.com',
+    'accounts.shop.app',
+  ]);
 });
 afterAll(async () => {
   await endpoints.close();
@@ -31,43 +44,39 @@ function ledgerly(): FakeMcpApp {
   });
 }
 
-const initialized =
-  (name: string): FakeHandler =>
-  (request) =>
-    request.method === 'POST'
+/** A 2025 server without sign-in, answering in JSON or as an event stream. */
+const legacy =
+  (serverInfo: { readonly name: string; readonly version: string }, stream = false): FakeHandler =>
+  (request) => {
+    if (request.method !== 'POST') return undefined;
+    const reply = legacyMcpReply(request, serverInfo);
+    return stream && reply.body !== undefined
       ? {
-          status: 200,
-          body: {
-            jsonrpc: '2.0',
-            id: 1,
-            result: { protocolVersion: '2025-11-25', serverInfo: { name, version: '2' } },
-          },
+          status: reply.status,
+          headers: { 'content-type': 'text/event-stream' },
+          body: `event: message\ndata: ${JSON.stringify(reply.body)}\n\n`,
         }
-      : undefined;
+      : reply;
+  };
 
 describe('probeApp', () => {
   it('classifies a server that answers without sign-in, keeping the name it advertises', async () => {
-    serve(initialized('Ledger'));
+    serve(legacy({ name: 'Ledger', version: '2' }));
     expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({
       status: 'ok',
       method: { kind: 'none' },
       advertisedName: 'Ledger',
     });
-    const [request] = endpoints.requests;
-    expect(request.headers.authorization).toBeUndefined();
-    expect(JSON.parse(request.body)).toMatchObject({ method: 'initialize' });
+    expect(endpoints.requests.every((request) => request.headers.authorization === undefined)).toBe(true);
+    expect(endpoints.requests.map((request) => (JSON.parse(request.body) as { method: string }).method)).toEqual([
+      'server/discover',
+      'initialize',
+      'notifications/initialized',
+    ]);
   });
 
   it('reads an event-stream answer and drops an advertised name unfit to show', async () => {
-    serve((request) =>
-      request.method === 'POST'
-        ? {
-            status: 200,
-            headers: { 'content-type': 'text/event-stream' },
-            body: `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'Led\u0007ger' } } })}\n\n`,
-          }
-        : undefined,
-    );
+    serve(legacy({ name: 'Led\u0007ger', version: '2' }, true));
     expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({
       status: 'ok',
       method: { kind: 'none' },
@@ -116,6 +125,34 @@ describe('probeApp', () => {
       status: 'ok',
       method: { kind: 'oauth', issuer: 'https://auth.example.test/', dynamicRegistration: true, scope: 'ledger:read' },
     });
+  });
+
+  it('classifies a Shop-shaped 2026-07-28 server, which lists its tools before sign-in, as OAuth from its metadata', async () => {
+    const shop = new FakeMcpApp({
+      appUrl: SHOP,
+      resource: 'https://mcp.shop.com',
+      issuer: 'https://accounts.shop.app',
+      scopes: ['personal_agent'],
+      protocol: '2026-07-28',
+      tools: [{ name: 'search_products', inputSchema: { type: 'object' } }],
+    });
+    serve(shop.handle);
+    expect(await probeApp(SHOP, { fetches: endpoints.fetches })).toMatchObject({
+      status: 'ok',
+      method: {
+        kind: 'oauth',
+        issuer: 'https://accounts.shop.app/',
+        scope: 'personal_agent',
+        signIn: { resource: 'https://mcp.shop.com' },
+      },
+      advertisedName: undefined,
+    });
+    const mcp = endpoints.requests.filter((request) => request.method === 'POST');
+    expect(mcp.map((request) => [request.headers['mcp-protocol-version'], request.headers['mcp-method']])).toEqual([
+      ['2026-07-28', 'server/discover'],
+      ['2026-07-28', 'tools/list'],
+    ]);
+    expect(endpoints.requests.every((request) => request.headers.authorization === undefined)).toBe(true);
   });
 
   it.each([
@@ -170,10 +207,10 @@ describe('checkPastedToken', () => {
     serve(app.handle);
     expect(await checkPastedToken(LEDGERLY, 'pasted-token-stale', { fetches: endpoints.fetches })).toBe('refused');
     expect(await checkPastedToken(LEDGERLY, 'pasted-token-good', { fetches: endpoints.fetches })).toBe('valid');
-    expect(endpoints.requests.map((request) => request.headers.authorization)).toEqual([
-      'Bearer pasted-token-stale',
-      'Bearer pasted-token-good',
-    ]);
+    expect(new Set(endpoints.requests.map((request) => request.headers.authorization))).toEqual(
+      new Set(['Bearer pasted-token-stale', 'Bearer pasted-token-good']),
+    );
+    expect(app.toolCalls).toEqual([]);
   });
 
   it('refuses a token no header could carry without sending it', async () => {

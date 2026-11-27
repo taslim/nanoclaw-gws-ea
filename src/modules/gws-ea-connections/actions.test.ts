@@ -34,7 +34,13 @@ import type { AdmissionDependencies } from './admit.js';
 import { applyMainServers, appRelayServerEntry, mainOperatorServers } from './apply.js';
 import { ConnectionOperations } from './operations.js';
 import type { ConnectionsStore } from './store.js';
-import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
+import {
+  FakeMcpApp,
+  legacyMcpReply,
+  startFakeEndpoints,
+  type FakeEndpoints,
+  type FakeHandler,
+} from './testing/oauth-server.js';
 import { testConnectionsStore } from './testing/store.js';
 
 const HOST = 'juno.example.test';
@@ -49,9 +55,7 @@ const SENTINEL_SECRET = 'sentinel-client-secret-H2v6';
 /** Answers without sign-in and advertises its name. */
 function openServer(host: string, name: string): FakeHandler {
   return (incoming) =>
-    incoming.host === host && incoming.method === 'POST'
-      ? { status: 200, body: { jsonrpc: '2.0', id: 1, result: { serverInfo: { name, version: '1' } } } }
-      : undefined;
+    incoming.host === host && incoming.method === 'POST' ? legacyMcpReply(incoming, { name, version: '1' }) : undefined;
 }
 
 /** Ledgerly as it publishes itself: OAuth on its own authorization server, a client registered by hand. */

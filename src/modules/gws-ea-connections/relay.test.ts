@@ -1283,7 +1283,7 @@ describe('host relay core', () => {
     expect(exact50.tools).toHaveLength(50);
 
     totalPages = 51;
-    await expect(relay.pinApp(app.id)).rejects.toThrow(/exceeded 50 pages/);
+    await expect(relay.pinApp(app.id)).rejects.toThrow(/exceeded listMaxPages \(50\)/);
     expect(await store.listTools(app.id)).toHaveLength(50);
     fake.mcpOverride = undefined;
 
