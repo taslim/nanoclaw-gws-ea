@@ -558,6 +558,22 @@ describe('disconnecting Link', () => {
     expect((await linkApp()).status).toBe('not_connected');
   });
 
+  it('starts a new sign-in only after a slow disconnect has signed out, so the new attempt keeps its pending file', async () => {
+    const app = await connectedLink();
+    control({ logoutDelayMs: 400, login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE });
+
+    const disconnecting = request('/connections/disconnect', 'POST', { id: app.id, version: String(app.version) });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const connecting = connectLink();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    answer('approve');
+    await disconnecting;
+    await connecting;
+    await vi.waitFor(async () => expect((await linkApp()).status).toBe('connected'), { timeout: 5000 });
+
+    expect(fs.existsSync(authFile())).toBe(true);
+  });
+
   it('stops a login that is still waiting, so a later approval connects nothing', async () => {
     control({ login: 'wait', verificationUrl: ADDRESS, phrase: PHRASE });
     await connectLink();

@@ -15,6 +15,8 @@ export interface FakeLinkControl {
   readonly logoutFails?: boolean;
   /** A login that takes this long to exit once asked to stop, as one finishing its last poll would. */
   readonly stopDelayMs?: number;
+  /** A sign-out that takes this long, as a slow revoke would. */
+  readonly logoutDelayMs?: number;
 }
 
 export interface FakeLinkRecord {
@@ -152,6 +154,7 @@ if (args.includes('--mcp')) {
     );
     done('auth status');
   } else if (group === 'auth' && command === 'logout') {
+    if (control.logoutDelayMs !== undefined) await new Promise((resolve) => setTimeout(resolve, control.logoutDelayMs));
     if (control.logoutFails) fail('Request failed: POST https://login.link.com/device/revoke');
     if (authFile) fs.rmSync(authFile, { force: true });
     process.stdout.write('{"authenticated":false}\n');

@@ -430,13 +430,17 @@ export class ConnectionOperations {
         }
       }
       const appId = app.id;
-      await startDeviceSignIn({
-        appId,
-        entry,
-        launch,
-        clientName: await this.clientName(),
-        complete: (pendingFile, current) => this.completeDeviceSignIn(entry, appId, launch, pendingFile, current),
-      });
+      const clientName = await this.clientName();
+      // Under the app's lock too, so no login starts while a disconnect is still signing out and clearing pending files.
+      await withAppLock(appId, () =>
+        startDeviceSignIn({
+          appId,
+          entry,
+          launch,
+          clientName,
+          complete: (pendingFile, current) => this.completeDeviceSignIn(entry, appId, launch, pendingFile, current),
+        }),
+      );
       return { status: 'device_sign_in', app };
     });
   }
